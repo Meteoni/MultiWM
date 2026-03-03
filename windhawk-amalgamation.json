@@ -1,0 +1,16 @@
+{
+  "formatVersion": 1,
+  "sourceDirectory": "src",
+  "outputDirectory": "output",
+  "entries": [
+    "**/*.cpp"
+  ],
+  "exclude": [],
+  "includeDirectories": [
+    "src"
+  ],
+  "externalIncludes": [],
+  "inlineAngleIncludes": false,
+  "generate": "onSave",
+  "debounceMs": 250
+}

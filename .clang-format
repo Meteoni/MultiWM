@@ -1,0 +1,5 @@
+BasedOnStyle: Chromium
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+CommentPragmas: '^[ \t]+(@[a-zA-Z]+|WHAM@[0-9]+ )'
