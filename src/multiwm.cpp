@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              tiling-helper
-// @name            Tiling Helper
+// @id              tiling-helper-experimental
+// @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
 // @version         1.0.0
 // @author          u2x1
@@ -51,6 +51,10 @@ resize-adjusted ratios per virtual desktop.
 - EnableTiling: true
   $name: '[Tiling] Enable'
   $description: Enable hotkey to tile windows on current monitor
+
+- EnableTileNewWin: false
+  $name: '[Tiling] Tile New Windows'
+  $description: Automatically retile when a new window is created (only applies when tiling is enabled)
 
 - EnableResizeRetile: true
   $name: '[Tiling] Retile On Resize'
@@ -214,6 +218,10 @@ enum HotkeyIds {
   HK_SWAP_MASTER = 4
 };
 
+// Messages to hotkey thread
+constexpr UINT WM_APP_TILE = WM_APP + 2;
+constexpr UINT WM_APP_PRUNE_DESTROY = WM_APP + 3;
+
 static UINT g_tilingModifiers = MOD_ALT;
 static UINT g_tileKey = 'D';
 static UINT g_layoutKey = 'L';
@@ -232,6 +240,7 @@ static bool g_enableResizeRetile = true;
 static bool g_captureLayoutOnTile = true;
 static bool g_enableLayoutCycle = true;
 static bool g_retileSuspended = false;
+static bool g_enableTileNewWin = false;
 
 // Per-desktop + monitor state
 struct GuidHash {
@@ -284,6 +293,7 @@ static SRWLOCK g_moveSizeRectsLock = SRWLOCK_INIT;
 static volatile LONG g_retileInProgress = 0;
 static HWINEVENTHOOK g_hMoveSizeHook = nullptr;
 static HWINEVENTHOOK g_hMinimizeHook = nullptr;
+static HWINEVENTHOOK g_hCreateDestroyHook = nullptr;
 
 //=============================================================================
 //Cache Rects
@@ -950,6 +960,29 @@ bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
          MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == targetMonitor;
 }
 
+static bool IsWindowTrackedInAnyState(HWND hwnd) {
+  if (!hwnd) return false;
+
+  // normalize to root owner so events from owned windows still match
+  HWND root = GetAncestor(hwnd, GA_ROOTOWNER);
+  if (root) hwnd = root;
+
+  bool tracked = false;
+
+  AcquireSRWLockShared(&g_tilingStateLock);
+  for (const auto& kv : g_tilingStateMap) {
+    const TilingState& st = kv.second;
+    // Fast membership test (linear, but st.windows is small)
+    if (ContainsWindow(st.windows, hwnd)) {
+      tracked = true;
+      break;
+    }
+  }
+  ReleaseSRWLockShared(&g_tilingStateLock);
+
+  return tracked;
+}
+
 void PlaceWindow(HWND hwnd, const RECT& targetRect) {
   if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
 
@@ -967,7 +1000,84 @@ void PlaceWindow(HWND hwnd, const RECT& targetRect) {
   SetWindowPos(hwnd, nullptr, targetRect.left - offsetLeft, targetRect.top - offsetTop,
                targetRect.right - targetRect.left + offsetLeft + offsetRight,
                targetRect.bottom - targetRect.top + offsetTop + offsetBottom,
-               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
+               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING); // | SWP_ASYNCWINDOWPOS);
+}
+
+void SwapMaster() {
+  HWND fg = GetForegroundWindow();
+  if (!fg) return;
+
+  HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+  if (!mon) return;
+
+  GUID desktopId{};
+  if (!GetWindowDesktopIdSafe(fg, &desktopId)) return;
+
+  DesktopMonitorKey key{desktopId, mon};
+
+  // Avoid racing with resize-retile
+  if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) return;
+
+  bool didSwap  = false;
+  HWND oldMaster = nullptr;
+  HWND resolved  = nullptr;
+  RECT rMaster{}, rResolved{};
+  bool lockHeld {false};
+
+  // ---- critical section (state mutation) ----
+  AcquireSRWLockExclusive(&g_tilingStateLock);
+  lockHeld = true;
+
+  {
+    auto it = g_tilingStateMap.find(key);
+    if (it == g_tilingStateMap.end() || it->second.windows.size() < 2) goto swap_cleanup;
+
+    TilingState& st = it->second;
+
+    resolved = ResolveToTiledWindow(fg, st.windows);
+    if (!resolved) goto swap_cleanup;
+
+    size_t idx = (size_t)-1;
+    for (size_t i = 0; i < st.windows.size(); ++i) {
+      if (st.windows[i] == resolved) { idx = i; break; }
+    }
+    if (idx == (size_t)-1 || idx == 0) goto swap_cleanup;
+
+    oldMaster = st.windows[0];
+
+    // Capture current slot rects (frame bounds)
+    if (!GetWindowFrameRect(oldMaster, &rMaster)) goto swap_cleanup;
+    if (!GetWindowFrameRect(resolved,  &rResolved)) goto swap_cleanup;
+
+    // Persist slot swap
+    std::swap(st.windows[0], st.windows[idx]);
+    didSwap = true;
+  }
+
+swap_cleanup:
+  if (lockHeld) {
+    ReleaseSRWLockExclusive(&g_tilingStateLock);
+    lockHeld = false;
+  }
+
+  // Apply swap visually (keep g_retileInProgress=1 while moving to suppress event-triggered retiling)
+  if (didSwap) {
+    PlaceWindow(oldMaster, rResolved);
+    PlaceWindow(resolved,  rMaster);
+
+    // cleaning up rect caches just in case. 
+    // don't think it's necessary tho
+    AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+    g_moveSizeStartRects.erase(oldMaster);
+    g_moveSizeEndRects.erase(oldMaster);
+    g_moveSizeStartRects.erase(resolved);
+    g_moveSizeEndRects.erase(resolved);
+    ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+
+  }
+
+  InterlockedExchange(&g_retileInProgress, 0);
+  return;
 }
 
 void TileWindows() {
@@ -1082,6 +1192,116 @@ void TileWindows() {
   Wh_Log(L"Tiled %zu windows with layout %d", windows.size(), static_cast<int>(layout));
 }
 
+
+// Used for window destroy hadling
+// Contains inline code from HandleTrivialState() but unavoidable to not cause deadlocks
+static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
+  HWND fg = GetForegroundWindow();
+  HWND anchor = nullptr;
+
+  // Really don't want dead HWNDs to be there
+  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+  g_moveSizeStartRects.erase(deadHwnd);
+  g_moveSizeEndRects.erase(deadHwnd);
+  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+
+  // Obtains current desktopID
+  // "Well ackually since curDesk is a GUID we can't just set it to a null value and check for it later..." 
+  // Okay sure mama
+  GUID curDesk{};
+  bool haveDesk = false;
+  if (fg && IsWindow(fg)) {
+    haveDesk = GetWindowDesktopIdSafe(fg, &curDesk);   // foreground's desktop
+  }
+  if (!haveDesk) {
+    haveDesk = InitializeVirtualDesktopAPI() && GetCurrentDesktopId(&curDesk);  // fallback
+  }
+  if (!haveDesk) return nullptr; // Don't pick a fallback at all if getdesktop fails
+
+
+  HMONITOR curMon = fg ? MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) : nullptr;
+  if (!curMon) {
+    POINT p{};
+    if (!GetCursorPos(&p)) p = POINT{0, 0};
+    curMon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+  }
+
+
+  AcquireSRWLockExclusive(&g_tilingStateLock);
+
+  for (auto it = g_tilingStateMap.begin(); it != g_tilingStateMap.end(); ) {
+    const DesktopMonitorKey key = it->first;
+    TilingState& st = it->second;
+
+    // Erase dead hwnd & empty state
+    // also marks whether current state has been touched or not (affected)
+    size_t before = st.windows.size();
+    st.windows.erase(std::remove(st.windows.begin(), st.windows.end(), deadHwnd), st.windows.end());
+    bool affected = (st.windows.size() != before);
+
+    if (st.windows.empty()) {
+      it = g_tilingStateMap.erase(it);
+      continue;
+    }
+    // ignoring last window (st.windows() = 1) case here
+    // so that RetileOnResize() can pick up the erase + placement job later...
+
+
+    // Pick anchor once: prefer foreground if it maps into this state's windows
+    // otherwise: pick first entry in st.window with the same "monitor % desktopID" pair as fg
+    bool keyMatches = (IsEqualGUID(key.desktopId, curDesk)) &&
+                      (key.monitor == curMon);
+
+    if (!anchor && keyMatches && affected) {
+      if (fg && IsWindow(fg)) {
+        HWND resolved = ResolveToTiledWindow(fg, st.windows);
+        if (resolved && IsWindow(resolved)) anchor = resolved;
+      }
+      if (!anchor) {
+        for (HWND w : st.windows) {
+          if (w && IsWindow(w) && !IsIconic(w)) { anchor = w; break; }
+        }
+      }
+      // If all windows are minimized somehow: 
+      // skip minimiization check to at least return an anchor
+      if (!anchor) {
+        for (HWND w : st.windows) {
+          if (w && IsWindow(w)) { anchor = w; break; }
+        }
+      }
+  }
+
+    ++it;
+  }
+
+  ReleaseSRWLockExclusive(&g_tilingStateLock);
+  return anchor;
+}
+
+// used as helper of HandleTrivialState()
+static void EraseState(const DesktopMonitorKey & key){
+  AcquireSRWLockExclusive(&g_tilingStateLock);
+  g_tilingStateMap.erase(key);
+  ReleaseSRWLockExclusive(&g_tilingStateLock);
+}
+
+// true: handled "<=1 windows in TilingState" case; false otherwise
+// returns "true": caller should (probably) also return
+static bool HandleTrivialState(const DesktopMonitorKey & key, TilingState & state, const RECT & workArea){
+  if (state.windows.empty()){
+    EraseState(key);
+    return true;
+  }
+
+  else if (state.windows.size() == 1){
+    PlaceWindow(state.windows[0], workArea);
+    EraseState(key);
+    return true;
+  }
+
+  return false;
+}
+
 void RetileFromResize(HWND hwnd) {
   if (!g_enableTiling || !IsWindow(hwnd)) {
     return;
@@ -1125,8 +1345,9 @@ void RetileFromResize(HWND hwnd) {
     if (!ContainsWindow(state.windows, resizedHwnd)) {
       HWND resolved = ResolveToTiledWindow(resizedHwnd, state.windows);
       if (resolved) {
-        // Makes it so that a window from another desktop (not found in "state" doesn't trigger retile)
-        resizedHwnd = resolved; return;
+        resizedHwnd = resolved; 
+        // (intentional) early return to not handle windows from another desktop
+        return;
 
       } else {
         Wh_Log(L"Unresolved window");
@@ -1136,28 +1357,25 @@ void RetileFromResize(HWND hwnd) {
   } else {
     // No saved tiling state for this desktop+monitor:
     // do not auto-rebuild state on resize/move events.
-    Wh_Log(L"No known state for current desktop");
+    Wh_Log(L"Tiling not set up for current desktop");
     return;
-    // Below code is ignored 
 
-    
+    // Below code is disabled for now to emulate windows default multitasking behavior. 
+    // Can be reused if a tileOnDefault setting is added. 
+  
     std::vector<HWND> windows = CollectTileWindows(monitor);
     if (windows.empty()) {
       return;
     }
 
     if (!ContainsWindow(windows, resizedHwnd)) {
-
-
       HWND resolved = ResolveToTiledWindow(resizedHwnd, windows);
       if (resolved) {
         resizedHwnd = resolved;
       } else {
         return;
-      }
-      
-    // Auto-retile really shouldn't do anything if theres no state for this desktop. This fallback is extremely unnecessary
-    return; 
+      }  
+      return; 
     }
 
     TileLayout layout = g_currentLayout;
@@ -1165,15 +1383,12 @@ void RetileFromResize(HWND hwnd) {
     state.layout = layout;
     hasState = true;
 
-    
   }
 
-  if (state.windows.empty()) {
-    return;
-  }
+  // checks for dead state
+  if (HandleTrivialState(key, state, workArea)) return;
 
-
-  // Mouse un-tile functionality
+  // Un-tile functionality
   // Compares cached window states 
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   auto itStart = g_moveSizeStartRects.find(hwnd);
@@ -1199,41 +1414,16 @@ void RetileFromResize(HWND hwnd) {
               state.windows.end()
               );
 
-              //Cleanup if no windows
-              if (state.windows.empty()) {
-                  AcquireSRWLockExclusive(&g_tilingStateLock);
-                  g_tilingStateMap.erase(key);
-                  ReleaseSRWLockExclusive(&g_tilingStateLock);
-                  return;
-              }
-              
-              else if (state.windows.size() == 1){
-                  state.masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
-
-                  // If already have workArea here, force the last window to fill it
-                  PlaceWindow(state.windows[0], workArea);
-                  // Persist updated state
-                  AcquireSRWLockExclusive(&g_tilingStateLock);
-                  
-                  // Reset everything in state before writing back
-                  state.layout = g_currentLayout;
-                  state.windows.clear();
-                  state.stackWeights.clear();
-                  state.gridWeights.clear();
-                  g_tilingStateMap[key] = state;
-                  ReleaseSRWLockExclusive(&g_tilingStateLock);
-                  return;
-              };
+              // handles trivial state
+              if (HandleTrivialState(key, state, workArea)) return;
 
               AcquireSRWLockExclusive(&g_tilingStateLock);
               g_tilingStateMap[key] = state;
               ReleaseSRWLockExclusive(&g_tilingStateLock);
               
-              //return;
           }
 
       } else {
-          // No end rect cached, clean up start just in case
           Wh_Log(L"End rect missing; cleaned up start rect");
           g_moveSizeStartRects.erase(hwnd);
           ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
@@ -1241,7 +1431,7 @@ void RetileFromResize(HWND hwnd) {
   } else {
   g_moveSizeEndRects.erase(hwnd);
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
-  //Wh_Log(L"Start rect missing; cleaned orphan end rect (in state cache) just in case");
+  Wh_Log(L"Start rect missing; cleaned end rect cache");
   }
 
     
@@ -1253,28 +1443,11 @@ void RetileFromResize(HWND hwnd) {
             return !IsWindow(w) || !GetWindowFrameRect(w, &r);
         }),
     state.windows.end());
-  if (state.windows.empty()) {
-      AcquireSRWLockExclusive(&g_tilingStateLock);
-      g_tilingStateMap.erase(key);
-      ReleaseSRWLockExclusive(&g_tilingStateLock);
-      return;
-  }
-  if (state.windows.size() == 1) {
-      PlaceWindow(state.windows[0], workArea);
 
-      // Clear state (treat single-window as "not tiled")
-      AcquireSRWLockExclusive(&g_tilingStateLock);
-      state.layout = g_currentLayout;
-      state.windows.clear();
-      state.stackWeights.clear();
-      state.gridWeights.clear();
-      g_tilingStateMap[key] = state;
-      ReleaseSRWLockExclusive(&g_tilingStateLock);
-      return;
-  }
+  if (HandleTrivialState(key, state, workArea)) return;
+
 
   //Start looping over state to place all windows
-  //Switched to an iterator loop due to having to erase within the loop
   for (auto itWin = state.windows.begin(); itWin != state.windows.end(); ) {
       HWND w = *itWin;
 
@@ -1289,21 +1462,8 @@ void RetileFromResize(HWND hwnd) {
           if (IsIconic(w)) {
               Wh_Log(L"Window left monitor (minimized); removing from state");
               itWin = state.windows.erase(itWin); 
-              if (state.windows.empty()) {
-                  AcquireSRWLockExclusive(&g_tilingStateLock);
-                  g_tilingStateMap.erase(key);
-                  ReleaseSRWLockExclusive(&g_tilingStateLock);
-                  return;
-              }
 
-              if (state.windows.size() == 1) {
-                  PlaceWindow(state.windows[0], workArea);
-
-                  AcquireSRWLockExclusive(&g_tilingStateLock);
-                  g_tilingStateMap.erase(key);  // better than storing empty state
-                  ReleaseSRWLockExclusive(&g_tilingStateLock);
-                  return;
-              }
+              if (HandleTrivialState(key, state, workArea)) return;
 
               // If the resized target was removed, retarget
               if (w == resizedHwnd || !ContainsWindow(state.windows, resizedHwnd)) {
@@ -1322,6 +1482,7 @@ void RetileFromResize(HWND hwnd) {
 
       ++itWin; // only increment when not erasing
   }
+  
   std::vector<RECT> windowRects(state.windows.size());
 
   constexpr LONG kMinRetileSpan = 80; 
@@ -1522,38 +1683,116 @@ void OnWindowResizeEnd(HWND hwnd) {
   }
 }
 
-void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
-  
-  if (((event != EVENT_SYSTEM_MOVESIZESTART)&&(event != EVENT_SYSTEM_MOVESIZEEND))&&(event != EVENT_SYSTEM_MINIMIZESTART)) return;
-  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd) return;
 
-  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
-  if (event == EVENT_SYSTEM_MOVESIZESTART) {
-      //Wh_Log(L"EVENT_SYSTEM_MOVESIZESTART");
-      RECT r{};
-      if (GetWindowFrameRect(hwnd, &r)) {
-      g_moveSizeStartRects[hwnd] = r;
-      }
-  }
-  else if (event == EVENT_SYSTEM_MOVESIZEEND) {
-      //Wh_Log(L"EVENT_SYSTEM_MOVESIZEEND");
-      RECT r{};
-      if (GetWindowFrameRect(hwnd, &r)) {
-      g_moveSizeEndRects[hwnd] = r;
-      }
-  }
-  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+static void RequestTileWindows() {
+  if (!g_enableTiling || g_retileSuspended) return;
+  if (!g_threadId) return;
 
-  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
-  if (!hwnd) return;
-  
-  if (event == EVENT_SYSTEM_MOVESIZEEND || event == EVENT_SYSTEM_MINIMIZESTART) 
-    //if (event == EVENT_SYSTEM_MINIMIZESTART) {RetileFromResize(hwnd);return;};
-    OnWindowResizeEnd(hwnd);
-  return;
+  // Reuse existing guards
+  if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) return;
+
+  if (!PostThreadMessage(g_threadId, WM_APP_TILE, 0, 0)) {
+    InterlockedExchange(&g_retileInProgress, 0);
+  }
+} 
+
+static void RequestPruneDestroyed(HWND dead) {
+  if (!g_enableTiling || g_retileSuspended) return;
+  if (!dead) return;
+  if (!g_threadId) return;
+  if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) return;
+
+  if (!PostThreadMessage(g_threadId, WM_APP_PRUNE_DESTROY, (WPARAM)dead, 0)) {
+    InterlockedExchange(&g_retileInProgress, 0);   
+  }
 }
 
-void InstallMoveSizeHook() {
+void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+  
+  switch (event) {
+    case EVENT_SYSTEM_MOVESIZESTART:
+    case EVENT_SYSTEM_MOVESIZEEND:
+    case EVENT_SYSTEM_MINIMIZESTART:
+    case EVENT_SYSTEM_MINIMIZEEND:
+    case EVENT_OBJECT_CREATE:
+    case EVENT_OBJECT_DESTROY:
+    case EVENT_OBJECT_SHOW:
+    case EVENT_OBJECT_HIDE:
+      break;
+    default:
+      return;
+  }
+
+  // For window-level events only.
+  if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
+    return;
+  }
+
+  const bool tracked = IsWindowTrackedInAnyState(hwnd);
+
+  // Cache start/end rects for move/size events.
+  if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
+    if (!tracked) return;
+
+    AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+
+    RECT r{};
+    if (GetWindowFrameRect(hwnd, &r)) {
+      if (event == EVENT_SYSTEM_MOVESIZESTART) {
+        g_moveSizeStartRects[hwnd] = r;
+      } else { // MOVESIZEEND
+        g_moveSizeEndRects[hwnd] = r;
+      }
+    }
+
+    ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+
+    if (event == EVENT_SYSTEM_MOVESIZEEND) {
+      OnWindowResizeEnd(hwnd);
+    }
+    return;
+  }
+
+  // Minimize start: treat like "resize end" for auto-retile behavior.
+  if (event == EVENT_SYSTEM_MINIMIZESTART) {
+    if (!tracked) return;
+
+    if (IsIconic(hwnd)) {
+      OnWindowResizeEnd(hwnd);
+    }
+    return;
+  }
+
+  
+  // WinDestroy handling is so hard omg
+  if (event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_HIDE) {
+    if (tracked) {    
+      RequestPruneDestroyed(hwnd);
+    }
+    return;
+  }
+  
+  if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
+    if (tracked) {
+      RequestTileWindows();
+    }
+    return;
+  }
+
+
+  // Handle window creation / restoration (TileNewWin)
+  if (g_enableTileNewWin && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE)) {
+    if (!tracked) {
+      HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+      if (mon && IsTileEligible(hwnd, mon)) {
+          RequestTileWindows();
+      }
+    }
+    return;
+  }
+}
+
+void InstallWinEventHooks() {
   if (!g_hMoveSizeHook) {
     g_hMoveSizeHook = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
                                       nullptr, WinEventProc, 0, 0,
@@ -1567,9 +1806,18 @@ void InstallMoveSizeHook() {
                                       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     if (!g_hMinimizeHook) Wh_Log(L"Failed to install minimization hook");
   }
+
+  if (!g_hCreateDestroyHook) {
+    g_hCreateDestroyHook = SetWinEventHook(
+      EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
+      nullptr, WinEventProc, 0, 0,
+      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+    );
+    if (!g_hCreateDestroyHook) Wh_Log(L"Failed to install create/destroy hook");
+  }
 }
 
-void RemoveMoveSizeHook() {
+void RemoveWinEventHooks() {
     if (g_hMoveSizeHook) {
         UnhookWinEvent(g_hMoveSizeHook);
         g_hMoveSizeHook = nullptr;
@@ -1577,6 +1825,10 @@ void RemoveMoveSizeHook() {
     if (g_hMinimizeHook) {
         UnhookWinEvent(g_hMinimizeHook);
         g_hMinimizeHook = nullptr;
+    }
+    if (g_hCreateDestroyHook) {
+        UnhookWinEvent(g_hCreateDestroyHook);
+        g_hCreateDestroyHook = nullptr;
     }
 }
 
@@ -1648,7 +1900,10 @@ void LoadSettings() {
   g_enableResizeRetile = Wh_GetIntSetting(L"EnableResizeRetile") != 0;
   g_captureLayoutOnTile = Wh_GetIntSetting(L"CaptureLayoutOnTile") != 0;
   g_enableLayoutCycle = Wh_GetIntSetting(L"EnableLayoutCycle") != 0;
+  // New! 
+  g_enableTileNewWin = Wh_GetIntSetting(L"EnableTileNewWin") != 0;
   g_retileSuspended = false;
+
 
   g_tileKey = ReadStringSetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
   g_layoutKey = ReadStringSetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
@@ -1667,8 +1922,8 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
   SetEvent(g_hReadyEvent);
 
-  if (g_enableTiling && g_enableResizeRetile && !g_retileSuspended) {
-    InstallMoveSizeHook();
+  if (g_enableTiling && !g_retileSuspended && (g_enableResizeRetile || g_enableTileNewWin)) {
+    InstallWinEventHooks();
   }
 
   if (g_enableTiling) {
@@ -1683,8 +1938,17 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   }
   Wh_Log(L"Hotkeys registered");
 
+
+  if (g_enableTileNewWin) {
+      if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+        TileWindows();
+        InterlockedExchange(&g_retileInProgress, 0);
+      }
+      Wh_Log(L"TileNewWin Enabled: Tiled current workplace on startup");
+  }
+
   while (!g_stopHotkeyThread) {
-    DWORD waitResult = MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+    DWORD waitResult = MsgWaitForMultipleObjects(0, nullptr, FALSE, INFINITE, QS_ALLINPUT);
 
     if (waitResult == WAIT_OBJECT_0) {
       while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -1697,104 +1961,51 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
           InterlockedExchange(&g_retileInProgress, 0);
           continue;
         }
+        if (msg.message == WM_APP_TILE) {
+          TileWindows();
+          InterlockedExchange(&g_retileInProgress, 0);
+          continue;
+        }
+        if (msg.message == WM_APP_PRUNE_DESTROY) {
+          HWND dead = (HWND)msg.wParam;
+          
+          HWND anchor = PruneDestroyedAndPickAnchor(dead);
+          if (anchor) RetileFromResize(anchor);
+
+          InterlockedExchange(&g_retileInProgress, 0); // isn't this redundant
+          continue;
+        }
         if (msg.message == WM_HOTKEY) {
           UINT hotkeyId = static_cast<UINT>(msg.wParam);
           if (hotkeyId == HK_TILE) {
-            TileWindows();
-            continue;
+              if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+                TileWindows();
+                InterlockedExchange(&g_retileInProgress, 0);
+              }
+              continue;
           }
           if (hotkeyId == HK_LAYOUT) {
             g_currentLayout =
                 static_cast<TileLayout>((static_cast<int>(g_currentLayout) + 1) % static_cast<int>(TileLayout::COUNT));
-            TileWindows();
+              if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+                TileWindows();
+                InterlockedExchange(&g_retileInProgress, 0);
+              }
+              continue;
+          }
+          if (hotkeyId == HK_SWAP_MASTER) {
+            SwapMaster();
             continue;
           }
-        if (hotkeyId == HK_SWAP_MASTER) {
-        HWND fg = GetForegroundWindow();
-        if (!fg) continue;
-
-        HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
-        if (!mon) continue;
-
-        RECT monWork{};
-        if (!GetMonitorWorkArea(mon, &monWork)) continue;
-
-        RECT workArea = {monWork.left + g_tileMargin, monWork.top + g_tileMargin,
-                        monWork.right - g_tileMargin, monWork.bottom - g_tileMargin};
-        if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) continue;
-
-        GUID desktopId{};
-
-        if (!GetWindowDesktopIdSafe(fg, &desktopId)) {
-            continue;
-        }
-
-        DesktopMonitorKey key{desktopId, mon};
-
-        // Avoid racing with resize-retile
-        if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) continue;
-
-        TilingState stCopy;
-        {
-            AcquireSRWLockExclusive(&g_tilingStateLock);
-
-            auto it = g_tilingStateMap.find(key);
-            if (it == g_tilingStateMap.end() || it->second.windows.empty()) {
-            ReleaseSRWLockExclusive(&g_tilingStateLock);
-            InterlockedExchange(&g_retileInProgress, 0);
-            continue;
-            }
-
-            TilingState& st = it->second;
-
-            HWND resolved = ResolveToTiledWindow(fg, st.windows);
-            if (!resolved) {
-            ReleaseSRWLockExclusive(&g_tilingStateLock);
-            InterlockedExchange(&g_retileInProgress, 0);
-            continue;
-            }
-
-            size_t idx = (size_t)-1;
-            for (size_t i = 0; i < st.windows.size(); ++i) {
-            if (st.windows[i] == resolved) { idx = i; break; }
-            }
-            if (idx == (size_t)-1 || idx == 0) {
-            ReleaseSRWLockExclusive(&g_tilingStateLock);
-            InterlockedExchange(&g_retileInProgress, 0);
-            continue;
-            }
-
-            // Swap windows: resolved becomes "master" (index 0)
-            std::swap(st.windows[0], st.windows[idx]);
-            
-
-
-            /*
-            if ((st.layout == TileLayout::Columns || st.layout == TileLayout::Rows) &&
-                st.gridWeights.size() == st.windows.size()) {
-            std::swap(st.gridWeights[0], st.gridWeights[idx]);
-            }
-            */
-
-
-            // Still need to figure out how to retile cleanly while preserving slots
-            // Swapping windows already makes the selected window take the master area
-            stCopy = st; // copy out & release lock before moving windows
-            ReleaseSRWLockExclusive(&g_tilingStateLock);
-            RetileFromResize(resolved); 
-        }
-        InterlockedExchange(&g_retileInProgress, 0);
-        continue;
-        }                 
           if (hotkeyId == HK_RETILE_TOGGLE && g_enableResizeRetile) {
             g_retileSuspended = !g_retileSuspended;
             if (g_retileSuspended) {
-              RemoveMoveSizeHook();
+              RemoveWinEventHooks();
               InterlockedExchange(&g_retileInProgress, 0);
               ResetTilingStateMemory();
               Wh_Log(L"Retile-on-resize suspended; tiling memory reset");
             } else {
-              InstallMoveSizeHook();
+              InstallWinEventHooks();
               Wh_Log(L"Retile-on-resize resumed");
             }
             continue;
@@ -1816,7 +2027,7 @@ cleanup:
     }
   }
 
-  RemoveMoveSizeHook();
+  RemoveWinEventHooks();
 
   CleanupVirtualDesktopAPI();
   CoUninitialize();
