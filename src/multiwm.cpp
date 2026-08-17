@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.6.3
+// @version         1.7.0
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -24,16 +24,17 @@ resize-adjusted ratios per virtual desktop.
 - Adjustable margin, gap, and master size
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
 - Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
-- Optional capture of current window sizes when tiling (useful if auto-retile is off)
+- Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
+- User move-only drags float that window without forgetting it
+- Optional capture of current window sizes when manually tiling
 
 ## Default Hotkeys
 - Tile windows: Alt + D
 - Cycle layout: Alt + L
-- Toggle retile-on-resize: Alt + R
 
 ## Notes
 - Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
-- Floating is a first-class workspace mode: windows remain managed but are not repositioned.
+- Floating exists both as a workspace mode and as a per-window managed state.
 - Native virtual-desktop notifications are selected from the actual Explorer build/revision; unsupported builds fall back to settled WinEvent reconciliation.
 - If Virtual Desktop APIs are unavailable, tiling still works but per-desktop memory is disabled.
 */
@@ -63,21 +64,13 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Tiling] Tile New Windows Toggle Key'
   $description: 'Key to pause/resume Auto-tiling at runtime.'
 
-- EnableResizeRetile: true
-  $name: '[Tiling] Retile On Resize'
-  $description: Automatically retile when a tiled window is resized (only applies when tiling is enabled)
-
-- RetileToggleKey: "R"
-  $name: '[Tiling] Retile Toggle Key'
-  $description: 'Key to pause/resume retile-on-resize. Workspace memory is preserved.'
-
 - SwapMasterKey: "M"
   $name: '[Tiling] Switch Master Window Key'
-  $description: 'Key to set another master window. Only active when Retile On Resize is enabled.'
+  $description: 'Key to set another tiled window as the master.'
 
 - CaptureLayoutOnTile: true
   $name: '[Tiling] Capture Layout On Tile'
-  $description: Use current window sizes as layout weights when tiling (useful when auto-retile is disabled)
+  $description: Use current window sizes as layout weights when manually tiling
 
 - TilingModifier: alt
   $name: '[Tiling] Modifier'
@@ -274,13 +267,12 @@ static volatile bool g_stopHotkeyThread = false;
 enum HotkeyIds {
   HK_TILE = 1,
   HK_LAYOUT = 2,
-  HK_RETILE_TOGGLE = 3,
-  HK_SWAP_MASTER = 4, 
-  HK_TILENEWWIN_TOGGLE = 5,
+  HK_SWAP_MASTER = 3,
+  HK_TILENEWWIN_TOGGLE = 4,
 };
 
 // Messages to hotkey thread
-constexpr UINT WM_APP_RETILE_ON_MOVE_SIZE = WM_APP + 1;
+constexpr UINT WM_APP_MOVE_SIZE_END = WM_APP + 1;
 constexpr UINT WM_APP_WINDOW_EVENT = WM_APP + 2;
 constexpr UINT WM_APP_VIRTUAL_DESKTOP_CHANGED = WM_APP + 3;
 
@@ -297,7 +289,6 @@ static std::vector<PendingWorkspaceArrange> g_pendingDesktopArranges;
 static UINT g_tilingModifiers = MOD_ALT;
 static UINT g_tileKey = 'D';
 static UINT g_layoutKey = 'L';
-static UINT g_retileToggleKey = 'R';
 static UINT g_swapMasterKey = 'M';
 static UINT g_tileNewWinToggleKey = 'U';
 
@@ -311,10 +302,8 @@ enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, 
 static TileLayout g_defaultLayout = TileLayout::MasterStack;
 
 static bool g_enableTiling = true;
-static bool g_enableResizeRetile = true;
 static bool g_captureLayoutOnTile = true;
 static bool g_enableLayoutCycle = true;
-static bool g_retileSuspended = false;
 static bool g_enableTileNewWin = false;
 static bool g_tileNewWinSuspended = false;
 
@@ -360,17 +349,59 @@ struct SuspendedSlot {
   bool wasMaster = false;
 };
 
+enum class ManageState {
+  Tiled,
+  Floating,
+  Suspended,
+  Ignored,
+};
+
+enum class PlacementResult {
+  Success,
+  AdjustedByWindow,
+  AccessDenied,
+  Refused,
+  Dead,
+};
+
+struct WindowRecord {
+  HWND hwnd = nullptr;
+  DWORD pid = 0;
+  ManageState state = ManageState::Tiled;
+
+  // Capabilities are observations, not hard policy yet. They give later rule/
+  // constraint work somewhere stable to live without re-querying every branch.
+  bool canMove = true;
+  bool canResize = true;
+  bool topmost = false;
+
+  int placementFailures = 0;
+  PlacementResult lastPlacementResult = PlacementResult::Success;
+  RECT lastRequestedRect{};
+  RECT lastObservedRect{};
+
+  // Only meaningful while state == Suspended. It preserves the tiled logical
+  // position/weight across minimize, hide, and app-cloak transitions.
+  SuspendedSlot savedSlot{};
+  bool hasSavedSlot = false;
+};
+
 struct TilingState {
   TileLayout layout = TileLayout::MasterStack;
-  // Active, tile-participating windows in logical layout order.
+
+  // Active tiled participants only, in logical layout order. Membership/state
+  // for every known window lives in records; this vector is just the ordering
+  // consumed by the layout algorithms.
   std::vector<HWND> windows;
-  // Windows temporarily absent from placement (minimized/hidden/app-cloaked)
-  // keep their logical slot so restore doesn't reshuffle layout.
-  std::unordered_map<HWND, SuspendedSlot> suspendedSlots;
+  std::unordered_map<HWND, WindowRecord> records;
+
   double masterRatio = 0.5;
   std::vector<double> stackWeights;
   std::vector<double> gridWeights;
 };
+
+constexpr int kPlacementFailureLimit = 3;
+constexpr LONG kPlacementTolerancePx = 4;
 
 static std::unordered_map<DesktopMonitorKey, TilingState, DesktopMonitorKeyHash, DesktopMonitorKeyEqual>
     g_tilingStateMap;
@@ -533,6 +564,37 @@ bool ContainsWindow(const std::vector<HWND>& windows, HWND hwnd) {
     if (w == hwnd) return true;
   }
   return false;
+}
+
+static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState::Tiled) {
+  WindowRecord record;
+  record.hwnd = hwnd;
+  record.state = state;
+
+  if (hwnd) {
+    GetWindowThreadProcessId(hwnd, &record.pid);
+    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    record.canMove = (GetAncestor(hwnd, GA_ROOT) == hwnd) && !(style & WS_CHILD);
+    record.canResize = (style & WS_SIZEBOX) != 0;
+    record.topmost = (exStyle & WS_EX_TOPMOST) != 0;
+  }
+
+  return record;
+}
+
+static WindowRecord& EnsureWindowRecord(
+    TilingState& state, HWND hwnd, ManageState initialState = ManageState::Tiled) {
+  auto [it, inserted] = state.records.emplace(hwnd, MakeWindowRecord(hwnd, initialState));
+  if (!inserted) {
+    it->second.hwnd = hwnd;
+  }
+  return it->second;
+}
+
+static WindowRecord* FindWindowRecord(TilingState& state, HWND hwnd) {
+  auto it = state.records.find(hwnd);
+  return it == state.records.end() ? nullptr : &it->second;
 }
 
 HWND ResolveEquivalentWindow(HWND hwnd, const std::vector<HWND>& candidates) {
@@ -786,6 +848,11 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
       if (size < 1) size = 1;
       state.gridWeights.push_back(static_cast<double>(size));
     }
+  }
+
+  state.records.clear();
+  for (HWND hwnd : state.windows) {
+    state.records.emplace(hwnd, MakeWindowRecord(hwnd, ManageState::Tiled));
   }
 
   return state;
@@ -1360,8 +1427,7 @@ static bool IsWindowTrackedInAnyState(HWND hwnd) {
   AcquireSRWLockShared(&g_tilingStateLock);
   for (const auto& kv : g_tilingStateMap) {
     const TilingState& st = kv.second;
-    // Fast membership test (linear, but st.windows is small)
-    if (ContainsWindow(st.windows, hwnd) || st.suspendedSlots.find(hwnd) != st.suspendedSlots.end()) {
+    if (st.records.find(hwnd) != st.records.end()) {
       tracked = true;
       break;
     }
@@ -1422,25 +1488,69 @@ bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
          MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == targetMonitor;
 }
 
-void PlaceWindow(HWND hwnd, const RECT& targetRect) {
+static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = kPlacementTolerancePx) {
+  return !Differs(a.left, b.left, tolerance) &&
+         !Differs(a.top, b.top, tolerance) &&
+         !Differs(a.right, b.right, tolerance) &&
+         !Differs(a.bottom, b.bottom, tolerance);
+}
+
+static PlacementResult PlaceWindowChecked(WindowRecord& record, const RECT& targetRect) {
+  HWND hwnd = record.hwnd;
+  record.lastRequestedRect = targetRect;
+
+  auto finish = [&](PlacementResult result) {
+    record.lastPlacementResult = result;
+    return result;
+  };
+
+  if (!hwnd || !IsWindow(hwnd)) return finish(PlacementResult::Dead);
+  if (!record.canMove) return finish(PlacementResult::Refused);
+
   if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
 
-  RECT windowRect, extendedFrame;
+  RECT windowRect{}, extendedFrame{};
   LONG offsetLeft = 0, offsetTop = 0, offsetRight = 0, offsetBottom = 0;
 
   if (GetWindowRect(hwnd, &windowRect) &&
-      SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &extendedFrame, sizeof(extendedFrame)))) {
+      SUCCEEDED(DwmGetWindowAttribute(
+          hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &extendedFrame, sizeof(extendedFrame)))) {
     offsetLeft = extendedFrame.left - windowRect.left;
     offsetTop = extendedFrame.top - windowRect.top;
     offsetRight = windowRect.right - extendedFrame.right;
     offsetBottom = windowRect.bottom - extendedFrame.bottom;
   }
 
-  SetWindowPos(hwnd, nullptr, targetRect.left - offsetLeft, targetRect.top - offsetTop,
-               targetRect.right - targetRect.left + offsetLeft + offsetRight,
-               targetRect.bottom - targetRect.top + offsetTop + offsetBottom,
-               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING); 
+  SetLastError(ERROR_SUCCESS);
+  BOOL placed = SetWindowPos(
+      hwnd, nullptr,
+      targetRect.left - offsetLeft,
+      targetRect.top - offsetTop,
+      targetRect.right - targetRect.left + offsetLeft + offsetRight,
+      targetRect.bottom - targetRect.top + offsetTop + offsetBottom,
+      SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+
+  if (!placed) {
+    DWORD error = GetLastError();
+    return finish(error == ERROR_ACCESS_DENIED
+                      ? PlacementResult::AccessDenied
+                      : PlacementResult::Refused);
+  }
+
+  RECT observed{};
+  if (!GetWindowFrameRect(hwnd, &observed)) {
+    return finish(IsWindow(hwnd)
+                      ? PlacementResult::Refused
+                      : PlacementResult::Dead);
+  }
+
+  record.lastObservedRect = observed;
+  return finish(RectsNear(observed, targetRect)
+                    ? PlacementResult::Success
+                    : PlacementResult::AdjustedByWindow);
 }
+
+static void ArrangeWorkspace(const DesktopMonitorKey& key);
 
 void SwapMaster() {
   HWND fg = GetForegroundWindow();
@@ -1453,69 +1563,41 @@ void SwapMaster() {
   if (!GetWindowDesktopIdSafe(fg, &desktopId)) return;
 
   DesktopMonitorKey key{desktopId, mon};
-
-  bool didSwap  = false;
+  bool didSwap = false;
   HWND oldMaster = nullptr;
-  HWND resolved  = nullptr;
-  RECT rMaster{}, rResolved{};
-  bool lockHeld {false};
+  HWND resolved = nullptr;
 
-  // ---- critical section (state mutation) ----
   AcquireSRWLockExclusive(&g_tilingStateLock);
-  lockHeld = true;
-
-  {
-    auto it = g_tilingStateMap.find(key);
-    if (it == g_tilingStateMap.end() || it->second.windows.size() < 2) goto swap_cleanup;
-
-    TilingState& st = it->second;
-    if (st.layout != TileLayout::MasterStack && st.layout != TileLayout::MasterStackH
-      && st.layout != TileLayout::Columns && st.layout != TileLayout::Rows
-    ) goto swap_cleanup;
-
-    resolved = ResolveToTiledWindow(fg, st.windows);
-    if (!resolved) goto swap_cleanup;
-
-    size_t idx = (size_t)-1;
-    for (size_t i = 0; i < st.windows.size(); ++i) {
-      if (st.windows[i] == resolved) { idx = i; break; }
+  auto it = g_tilingStateMap.find(key);
+  if (it != g_tilingStateMap.end() && it->second.windows.size() >= 2) {
+    TilingState& state = it->second;
+    if (state.layout == TileLayout::MasterStack ||
+        state.layout == TileLayout::MasterStackH ||
+        state.layout == TileLayout::Columns ||
+        state.layout == TileLayout::Rows) {
+      resolved = ResolveToTiledWindow(fg, state.windows);
+      auto resolvedIt = std::find(state.windows.begin(), state.windows.end(), resolved);
+      if (resolved && resolvedIt != state.windows.end() && resolvedIt != state.windows.begin()) {
+        oldMaster = state.windows.front();
+        std::iter_swap(state.windows.begin(), resolvedIt);
+        didSwap = true;
+      }
     }
-    if (idx == (size_t)-1 || idx == 0) goto swap_cleanup;
-
-    oldMaster = st.windows[0];
-
-    // Capture current slot rects (frame bounds)
-    if (!GetWindowFrameRect(oldMaster, &rMaster)) goto swap_cleanup;
-    if (!GetWindowFrameRect(resolved,  &rResolved)) goto swap_cleanup;
-
-    // Persist slot swap
-    std::swap(st.windows[0], st.windows[idx]);
-    didSwap = true;
   }
+  ReleaseSRWLockExclusive(&g_tilingStateLock);
 
-swap_cleanup:
-  if (lockHeld) {
-    ReleaseSRWLockExclusive(&g_tilingStateLock);
-    lockHeld = false;
-  }
+  if (!didSwap) return;
 
-  // Apply swap visually. WinEvents are serialized onto the WM thread, so no
-  // global in-progress gate is needed.
-  if (didSwap) {
-    PlaceWindow(oldMaster, rResolved);
-    PlaceWindow(resolved,  rMaster);
+  // Purge user move/size samples for both windows, then render the new logical
+  // order through the same checked-placement path used by normal arrangements.
+  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+  g_moveSizeStartRects.erase(oldMaster);
+  g_moveSizeEndRects.erase(oldMaster);
+  g_moveSizeStartRects.erase(resolved);
+  g_moveSizeEndRects.erase(resolved);
+  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
-    // purge potential stale window rects after swapping  
-    AcquireSRWLockExclusive(&g_moveSizeRectsLock);
-    g_moveSizeStartRects.erase(oldMaster);
-    g_moveSizeEndRects.erase(oldMaster);
-    g_moveSizeStartRects.erase(resolved);
-    g_moveSizeEndRects.erase(resolved);
-    ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
-
-  }
-
-  return;
+  ArrangeWorkspace(key);
 }
 
 
@@ -1645,8 +1727,12 @@ static void RemoveActiveWindowAt(TilingState& state, size_t index, SuspendedSlot
 
 static size_t ActiveIndexToLogicalIndex(const TilingState& state, size_t activeIndex) {
   std::vector<size_t> suspendedIndices;
-  suspendedIndices.reserve(state.suspendedSlots.size());
-  for (const auto& kv : state.suspendedSlots) suspendedIndices.push_back(kv.second.index);
+  for (const auto& kv : state.records) {
+    const WindowRecord& record = kv.second;
+    if (record.state == ManageState::Suspended && record.hasSavedSlot) {
+      suspendedIndices.push_back(record.savedSlot.index);
+    }
+  }
   std::sort(suspendedIndices.begin(), suspendedIndices.end());
 
   size_t logicalIndex = activeIndex;
@@ -1657,60 +1743,114 @@ static size_t ActiveIndexToLogicalIndex(const TilingState& state, size_t activeI
   return logicalIndex;
 }
 
-static size_t LogicalIndexToActiveIndex(const TilingState& state, size_t logicalIndex, HWND restoringHwnd) {
+static size_t LogicalIndexToActiveIndex(
+    const TilingState& state, size_t logicalIndex, HWND restoringHwnd) {
   size_t suspendedBefore = 0;
-  for (const auto& kv : state.suspendedSlots) {
-    if (kv.first != restoringHwnd && kv.second.index < logicalIndex) ++suspendedBefore;
+  for (const auto& kv : state.records) {
+    const WindowRecord& record = kv.second;
+    if (kv.first != restoringHwnd &&
+        record.state == ManageState::Suspended &&
+        record.hasSavedSlot &&
+        record.savedSlot.index < logicalIndex) {
+      ++suspendedBefore;
+    }
   }
   return logicalIndex >= suspendedBefore ? logicalIndex - suspendedBefore : 0;
 }
 
-static void CloseLogicalGapAfterRemoval(TilingState& state, size_t removedLogicalIndex, HWND exceptHwnd = nullptr) {
-  for (auto& kv : state.suspendedSlots) {
-    if (kv.first != exceptHwnd && kv.second.index > removedLogicalIndex) --kv.second.index;
+static void CloseLogicalGapAfterRemoval(
+    TilingState& state, size_t removedLogicalIndex, HWND exceptHwnd = nullptr) {
+  for (auto& kv : state.records) {
+    WindowRecord& record = kv.second;
+    if (kv.first != exceptHwnd &&
+        record.state == ManageState::Suspended &&
+        record.hasSavedSlot &&
+        record.savedSlot.index > removedLogicalIndex) {
+      --record.savedSlot.index;
+    }
   }
 }
 
 static bool SuspendWindowInState(TilingState& state, HWND hwnd) {
   auto it = std::find(state.windows.begin(), state.windows.end(), hwnd);
   if (it == state.windows.end()) return false;
+
+  WindowRecord& record = EnsureWindowRecord(state, hwnd, ManageState::Tiled);
   SuspendedSlot slot{};
   size_t activeIndex = static_cast<size_t>(it - state.windows.begin());
   size_t logicalIndex = ActiveIndexToLogicalIndex(state, activeIndex);
   RemoveActiveWindowAt(state, activeIndex, &slot);
   slot.index = logicalIndex;
-  state.suspendedSlots[hwnd] = slot;
+
+  record.state = ManageState::Suspended;
+  record.savedSlot = slot;
+  record.hasSavedSlot = true;
   return true;
 }
 
 static bool RestoreWindowInState(TilingState& state, HWND hwnd) {
-  auto it = state.suspendedSlots.find(hwnd);
-  if (it == state.suspendedSlots.end()) return false;
+  WindowRecord* record = FindWindowRecord(state, hwnd);
+  if (!record || record->state != ManageState::Suspended || !record->hasSavedSlot) {
+    return false;
+  }
 
-  SuspendedSlot slot = it->second;
-  size_t index = std::min(LogicalIndexToActiveIndex(state, slot.index, hwnd), state.windows.size());
-  state.suspendedSlots.erase(it);
+  SuspendedSlot slot = record->savedSlot;
+  size_t index = std::min(
+      LogicalIndexToActiveIndex(state, slot.index, hwnd), state.windows.size());
   state.windows.insert(state.windows.begin() + index, hwnd);
 
   if (state.layout == TileLayout::Columns || state.layout == TileLayout::Rows) {
     if (state.gridWeights.size() + 1 == state.windows.size()) {
-      state.gridWeights.insert(state.gridWeights.begin() + std::min(index, state.gridWeights.size()),
-                               slot.hasWeight ? slot.weight : 1.0);
+      state.gridWeights.insert(
+          state.gridWeights.begin() + std::min(index, state.gridWeights.size()),
+          slot.hasWeight ? slot.weight : 1.0);
     }
-  } else if (state.layout == TileLayout::MasterStack || state.layout == TileLayout::MasterStackH) {
+  } else if (state.layout == TileLayout::MasterStack ||
+             state.layout == TileLayout::MasterStackH) {
     if (slot.wasMaster) {
       state.stackWeights.clear();
-    } else if (index > 0 && state.stackWeights.size() + 1 == state.windows.size() - 1) {
+    } else if (index > 0 &&
+               state.stackWeights.size() + 1 == state.windows.size() - 1) {
       size_t stackIndex = std::min(index - 1, state.stackWeights.size());
-      state.stackWeights.insert(state.stackWeights.begin() + stackIndex, slot.hasWeight ? slot.weight : 1.0);
+      state.stackWeights.insert(
+          state.stackWeights.begin() + stackIndex,
+          slot.hasWeight ? slot.weight : 1.0);
     }
   }
 
+  record->state = ManageState::Tiled;
+  record->savedSlot = {};
+  record->hasSavedSlot = false;
   EnsureSaneWeightVector(state);
   return true;
 }
 
-// Remove window from state. Also closes the logical gap.  
+static bool FloatWindowInState(TilingState& state, HWND hwnd) {
+  WindowRecord* existing = FindWindowRecord(state, hwnd);
+  if (existing && existing->state == ManageState::Floating) return false;
+
+  auto activeIt = std::find(state.windows.begin(), state.windows.end(), hwnd);
+  if (activeIt != state.windows.end()) {
+    size_t activeIndex = static_cast<size_t>(activeIt - state.windows.begin());
+    size_t logicalIndex = ActiveIndexToLogicalIndex(state, activeIndex);
+    RemoveActiveWindowAt(state, activeIndex, nullptr);
+    CloseLogicalGapAfterRemoval(state, logicalIndex);
+  } else if (existing &&
+             existing->state == ManageState::Suspended &&
+             existing->hasSavedSlot) {
+    CloseLogicalGapAfterRemoval(state, existing->savedSlot.index, hwnd);
+  }
+
+  WindowRecord& record = EnsureWindowRecord(state, hwnd, ManageState::Floating);
+  record.state = ManageState::Floating;
+  record.savedSlot = {};
+  record.hasSavedSlot = false;
+  EnsureSaneWeightVector(state);
+  return true;
+}
+
+// Remove a window from management entirely. Floating/ignored windows have no
+// logical tiled slot, while tiled/suspended windows close their layout gap.
 static bool ForgetWindowInState(TilingState& state, HWND hwnd) {
   auto activeIt = std::find(state.windows.begin(), state.windows.end(), hwnd);
   if (activeIt != state.windows.end()) {
@@ -1718,17 +1858,24 @@ static bool ForgetWindowInState(TilingState& state, HWND hwnd) {
     size_t logicalIndex = ActiveIndexToLogicalIndex(state, activeIndex);
     RemoveActiveWindowAt(state, activeIndex, nullptr);
     CloseLogicalGapAfterRemoval(state, logicalIndex);
+    state.records.erase(hwnd);
     return true;
   }
 
-  auto suspendedIt = state.suspendedSlots.find(hwnd);
-  if (suspendedIt != state.suspendedSlots.end()) {
-    size_t logicalIndex = suspendedIt->second.index;
-    state.suspendedSlots.erase(suspendedIt);
+  auto recordIt = state.records.find(hwnd);
+  if (recordIt == state.records.end()) return false;
+
+  if (recordIt->second.state == ManageState::Suspended &&
+      recordIt->second.hasSavedSlot) {
+    size_t logicalIndex = recordIt->second.savedSlot.index;
+    state.records.erase(recordIt);
     CloseLogicalGapAfterRemoval(state, logicalIndex);
-    return true;
+  } else {
+    state.records.erase(recordIt);
   }
-  return false;
+
+  EnsureSaneWeightVector(state);
+  return true;
 }
 
 static void ArrangeWorkspace(const DesktopMonitorKey& key) {
@@ -1738,7 +1885,10 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   GUID zeroGuid{};
   if (!IsEqualGUID(key.desktopId, zeroGuid)) {
     GUID currentDesktop{};
-    if (GetCurrentDesktopId(&currentDesktop) && !IsEqualGUID(currentDesktop, key.desktopId)) return;
+    if (GetCurrentDesktopId(&currentDesktop) &&
+        !IsEqualGUID(currentDesktop, key.desktopId)) {
+      return;
+    }
   }
 
   TilingState state;
@@ -1746,46 +1896,63 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
 
   RECT monitorWork{};
   if (!GetMonitorWorkArea(key.monitor, &monitorWork)) return;
-  RECT workArea = {monitorWork.left + g_tileMargin, monitorWork.top + g_tileMargin,
-                   monitorWork.right - g_tileMargin, monitorWork.bottom - g_tileMargin};
+  RECT workArea = {
+      monitorWork.left + g_tileMargin,
+      monitorWork.top + g_tileMargin,
+      monitorWork.right - g_tileMargin,
+      monitorWork.bottom - g_tileMargin};
   if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) return;
 
-  // The model is authoritative, but dead HWNDs can still exist if Windows drops a
-  // destroy notification. Repair those opportunistically without rebuilding order.
+  // Repair missed destroy events from the authoritative record table.
   std::vector<HWND> invalidWindows;
-  for (HWND hwnd : state.windows) {
-    if (!IsWindow(hwnd)) invalidWindows.push_back(hwnd);
-  }
-  for (const auto& kv : state.suspendedSlots) {
+  for (const auto& kv : state.records) {
     if (!IsWindow(kv.first)) invalidWindows.push_back(kv.first);
   }
-  for (HWND hwnd : invalidWindows) ForgetWindowInState(state, hwnd);
+  bool participationChanged = false;
+  for (HWND hwnd : invalidWindows) {
+    if (ForgetWindowInState(state, hwnd)) participationChanged = true;
+  }
 
-  // Do not infer lifecycle state here. In particular, cloaking is transitional
-  // during a virtual-desktop switch. Visibility/minimize/cloak membership is
-  // reconciled from a settled snapshot by ReconcileDeferredLifecycle().
+  // Defensive migration for state constructed by older helper paths: every active
+  // tiled participant must have a Tiled WindowRecord.
+  for (HWND hwnd : state.windows) {
+    WindowRecord& record = EnsureWindowRecord(state, hwnd, ManageState::Tiled);
+    if (record.state != ManageState::Tiled) {
+      record.state = ManageState::Tiled;
+      record.savedSlot = {};
+      record.hasSavedSlot = false;
+    }
+  }
+
   EnsureSaneWeightVector(state);
-  SaveTilingState(key, state);
 
-  // Floating is intentionally still a managed workspace. Lifecycle/order stays
-  // remembered, but the WM does not impose geometry.
-  if (state.layout == TileLayout::Floating || state.windows.empty()) return;
+  // Workspace-floating means records/order remain managed but geometry is wholly
+  // user-controlled. Individual Floating records are already excluded from
+  // state.windows and therefore don't consume layout slots.
+  if (state.layout == TileLayout::Floating || state.windows.empty()) {
+    SaveTilingState(key, state);
+    return;
+  }
 
   std::vector<RECT> windowRects(state.windows.size());
   switch (state.layout) {
     case TileLayout::MasterStack:
-      LayoutMasterStackWeighted(workArea, state.windows.size(), windowRects, false,
-                                ClampDouble(state.masterRatio, 0.1, 0.9), state.stackWeights);
+      LayoutMasterStackWeighted(
+          workArea, state.windows.size(), windowRects, false,
+          ClampDouble(state.masterRatio, 0.1, 0.9), state.stackWeights);
       break;
     case TileLayout::MasterStackH:
-      LayoutMasterStackWeighted(workArea, state.windows.size(), windowRects, true,
-                                ClampDouble(state.masterRatio, 0.1, 0.9), state.stackWeights);
+      LayoutMasterStackWeighted(
+          workArea, state.windows.size(), windowRects, true,
+          ClampDouble(state.masterRatio, 0.1, 0.9), state.stackWeights);
       break;
     case TileLayout::Columns:
-      LayoutGridWeighted(workArea, state.windows.size(), windowRects, false, state.gridWeights);
+      LayoutGridWeighted(
+          workArea, state.windows.size(), windowRects, false, state.gridWeights);
       break;
     case TileLayout::Rows:
-      LayoutGridWeighted(workArea, state.windows.size(), windowRects, true, state.gridWeights);
+      LayoutGridWeighted(
+          workArea, state.windows.size(), windowRects, true, state.gridWeights);
       break;
     case TileLayout::BSP:
       LayoutBSP(workArea, 0, state.windows.size(), 0, windowRects);
@@ -1795,16 +1962,70 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
       break;
     case TileLayout::Floating:
     case TileLayout::COUNT:
+      SaveTilingState(key, state);
       return;
   }
 
+  std::vector<HWND> toFloat;
+  std::vector<HWND> toForget;
+
   for (size_t i = 0; i < state.windows.size(); ++i) {
     HWND hwnd = state.windows[i];
-    // Rendering is defensive: if a window changes state after reconciliation,
-    // skip it for this pass without mutating the authoritative workspace model.
-    if (IsWindow(hwnd) && !IsIconic(hwnd) && IsWindowVisible(hwnd) && !IsWindowCloaked(hwnd)) {
-      PlaceWindow(hwnd, windowRects[i]);
+    if (!IsWindow(hwnd)) {
+      toForget.push_back(hwnd);
+      continue;
     }
+
+    // Rendering remains defensive against state transitions that occur after the
+    // settled reconciliation snapshot.
+    if (IsIconic(hwnd) || !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd)) {
+      continue;
+    }
+
+    WindowRecord& record = EnsureWindowRecord(state, hwnd, ManageState::Tiled);
+    PlacementResult result = PlaceWindowChecked(record, windowRects[i]);
+
+    switch (result) {
+      case PlacementResult::Success:
+        record.placementFailures = 0;
+        break;
+
+      case PlacementResult::AdjustedByWindow:
+      case PlacementResult::AccessDenied:
+      case PlacementResult::Refused:
+        ++record.placementFailures;
+        if (record.placementFailures >= kPlacementFailureLimit) {
+          toFloat.push_back(hwnd);
+        }
+        break;
+
+      case PlacementResult::Dead:
+        toForget.push_back(hwnd);
+        break;
+    }
+  }
+
+  for (HWND hwnd : toForget) {
+    if (ForgetWindowInState(state, hwnd)) participationChanged = true;
+  }
+
+  for (HWND hwnd : toFloat) {
+    WindowRecord* record = FindWindowRecord(state, hwnd);
+    if (!record || record->state != ManageState::Tiled) continue;
+
+    Wh_Log(L"Window %p failed checked placement %d times (last result=%d); switching it to Floating",
+           hwnd, record->placementFailures, static_cast<int>(record->lastPlacementResult));
+    if (FloatWindowInState(state, hwnd)) participationChanged = true;
+  }
+
+  EnsureSaneWeightVector(state);
+  SaveTilingState(key, state);
+
+  // Reflow exactly once after dead/non-compliant windows stop consuming tiled
+  // slots. The next pass cannot immediately float the same records because they
+  // have already left state.windows.
+  if (participationChanged && !state.windows.empty()) {
+    ArrangeWorkspace(key);
   }
 }
 
@@ -1831,34 +2052,66 @@ static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeome
     state.masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
   }
 
-  // Restore known temporarily absent windows which are visible again.
+  // Restore known temporarily absent tiled windows which are visible again.
   for (HWND w : snapshot) {
-    if (state.suspendedSlots.find(w) != state.suspendedSlots.end()) RestoreWindowInState(state, w);
+    WindowRecord* record = FindWindowRecord(state, w);
+    if (record && record->state == ManageState::Suspended) {
+      RestoreWindowInState(state, w);
+    }
   }
 
-  // Windows no longer in the visible snapshot are suspended rather than forgotten.
-  // SuspendWindowInState uses stable logical indices, so several minimized
-  // windows can restore in any order without changing the workspace order.
+  // Windows no longer in the visible snapshot are suspended rather than
+  // forgotten. Stable saved slots allow arbitrary restore order.
   std::vector<HWND> toSuspend;
   for (HWND w : state.windows) {
     if (!ContainsWindow(snapshot, w)) toSuspend.push_back(w);
   }
   for (HWND w : toSuspend) SuspendWindowInState(state, w);
 
-  // Preserve the logical order of known windows; append newly discovered ones.
-  for (HWND w : snapshot) {
-    if (!ContainsWindow(state.windows, w) && state.suspendedSlots.find(w) == state.suspendedSlots.end()) {
-      state.windows.push_back(w);
+  // Manual Tile explicitly re-adopts individually floated windows. Automatic
+  // reconciliation never does this, so a user drag exclusion remains stable.
+  if (adoptCurrentGeometry) {
+    for (HWND w : snapshot) {
+      WindowRecord* record = FindWindowRecord(state, w);
+      if (record && record->state == ManageState::Floating) {
+        record->state = ManageState::Tiled;
+        record->placementFailures = 0;
+        if (!ContainsWindow(state.windows, w)) state.windows.push_back(w);
+      }
     }
   }
 
-  // Geometry capture is now an explicit/manual operation only. Automatic
-  // lifecycle handling never rebuilds the model from transient rectangles.
-  if (adoptCurrentGeometry && g_captureLayoutOnTile && state.layout != TileLayout::Floating &&
-      state.suspendedSlots.empty() && SnapshotLooksTiled(snapshot, workArea)) {
+  // Preserve known membership/order and append truly new windows.
+  for (HWND w : snapshot) {
+    if (state.records.find(w) == state.records.end()) {
+      state.windows.push_back(w);
+      state.records.emplace(w, MakeWindowRecord(w, ManageState::Tiled));
+    }
+  }
+
+  bool hasSuspended = false;
+  for (const auto& kv : state.records) {
+    if (kv.second.state == ManageState::Suspended) {
+      hasSuspended = true;
+      break;
+    }
+  }
+
+  // Geometry capture remains explicit/manual. Rebuilding from current rectangles
+  // also resets placement-failure history for the freshly adopted tiled set.
+  if (adoptCurrentGeometry && g_captureLayoutOnTile &&
+      state.layout != TileLayout::Floating && !hasSuspended &&
+      SnapshotLooksTiled(state.windows, workArea)) {
     HWND preferredMaster = state.windows.empty() ? nullptr : state.windows.front();
-    TilingState captured = BuildStateFromWindows(state.layout, workArea, snapshot, monitor, preferredMaster);
-    captured.suspendedSlots = state.suspendedSlots;
+    TilingState captured =
+        BuildStateFromWindows(state.layout, workArea, state.windows, monitor, preferredMaster);
+
+    // Keep non-participating managed records which aren't in the visible snapshot.
+    for (const auto& kv : state.records) {
+      if (kv.second.state != ManageState::Tiled) {
+        captured.records[kv.first] = kv.second;
+      }
+    }
     state = std::move(captured);
   } else {
     EnsureSaneWeightVector(state);
@@ -1883,7 +2136,7 @@ static bool FindStateContainingWindow(HWND hwnd, DesktopMonitorKey* outKey, Tili
   bool found = false;
   AcquireSRWLockShared(&g_tilingStateLock);
   for (const auto& kv : g_tilingStateMap) {
-    if (ContainsWindow(kv.second.windows, hwnd) || kv.second.suspendedSlots.find(hwnd) != kv.second.suspendedSlots.end()) {
+    if (kv.second.records.find(hwnd) != kv.second.records.end()) {
       if (outKey) *outKey = kv.first;
       if (outState) *outState = kv.second;
       found = true;
@@ -1952,25 +2205,24 @@ static bool ReconcileSavedWindowsWithNewDesktop(
 
   bool changed = !hadState;
 
-  // Purge dead HWNDs here. ArrangeWorkspace doesn't have to mutate state. 
+  // Purge dead HWNDs from the authoritative record table.
   std::vector<HWND> deadWindows;
-  for (HWND w : state.windows) {
-    if (!IsWindow(w)) deadWindows.push_back(w);
-  }
-  for (const auto& kv : state.suspendedSlots) {
+  for (const auto& kv : state.records) {
     if (!IsWindow(kv.first)) deadWindows.push_back(kv.first);
   }
   for (HWND w : deadWindows) {
     if (ForgetWindowInState(state, w)) changed = true;
   }
 
-  // Windows that re-appeared in the new VD. Unsuspend them. 
+  // Visible snapshot members restore only if they were previously suspended.
+  // Floating/ignored records remain deliberately outside the tiled order.
   for (HWND w : snapshot) {
-    if (state.suspendedSlots.find(w) != state.suspendedSlots.end()) {
+    WindowRecord* record = FindWindowRecord(state, w);
+    if (record && record->state == ManageState::Suspended) {
       if (RestoreWindowInState(state, w)) changed = true;
     }
   }
-  // Vice versa. 
+
   std::vector<HWND> toSuspend;
   for (HWND w : state.windows) {
     if (!ContainsWindow(snapshot, w)) toSuspend.push_back(w);
@@ -1981,9 +2233,9 @@ static bool ReconcileSavedWindowsWithNewDesktop(
 
   if (discoverNew) {
     for (HWND w : snapshot) {
-      if (!ContainsWindow(state.windows, w) &&
-          state.suspendedSlots.find(w) == state.suspendedSlots.end()) {
+      if (state.records.find(w) == state.records.end()) {
         state.windows.push_back(w);
+        state.records.emplace(w, MakeWindowRecord(w, ManageState::Tiled));
         changed = true;
       }
     }
@@ -2207,10 +2459,13 @@ static void CycleCurrentWorkspaceLayout() {
   }
 
   state.layout = static_cast<TileLayout>((static_cast<int>(state.layout) + 1) % static_cast<int>(TileLayout::COUNT));
-  for (auto& kv : state.suspendedSlots) {
-    kv.second.weight = 1.0;
-    kv.second.hasWeight = false;
-    kv.second.wasMaster = false;
+  for (auto& kv : state.records) {
+    WindowRecord& record = kv.second;
+    if (record.state == ManageState::Suspended && record.hasSavedSlot) {
+      record.savedSlot.weight = 1.0;
+      record.savedSlot.hasWeight = false;
+      record.savedSlot.wasMaster = false;
+    }
   }
   EnsureSaneWeightVector(state);
   SaveTilingState(key, state);
@@ -2218,7 +2473,7 @@ static void CycleCurrentWorkspaceLayout() {
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.layout));
 }
 
-void RetileFromMoveSize(HWND hwnd) {
+void ApplyUserMoveSize(HWND hwnd) {
   if (!g_enableTiling || !IsWindow(hwnd)) return;
 
   HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
@@ -2261,14 +2516,17 @@ void RetileFromMoveSize(HWND hwnd) {
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
   if (change == RectChange::MoveOnly) {
-    if (ForgetWindowInState(state, resizedHwnd)) {
+    if (FloatWindowInState(state, resizedHwnd)) {
+      WindowRecord* record = FindWindowRecord(state, resizedHwnd);
+      if (record) record->placementFailures = 0;
       SaveTilingState(key, state);
       ArrangeWorkspace(key);
+      Wh_Log(L"User move floated managed window %p", resizedHwnd);
     }
     return;
   }
 
-  constexpr LONG kMinRetileSpan = 80;
+  constexpr LONG kMinLearnedSpan = 80;
   // Alter weight for resized window (MasterStacks)
   if (state.layout == TileLayout::MasterStack || state.layout == TileLayout::MasterStackH) {
     // MasterStackH splits top/bottom; MasterStack splits left/right.
@@ -2287,7 +2545,7 @@ void RetileFromMoveSize(HWND hwnd) {
     // Use the resized span along the master/stack split axis.
     LONG resizedSize = horizontal ? resizedRect.bottom - resizedRect.top : resizedRect.right - resizedRect.left;
     // Prevent the learned span from becoming impractically small.
-    resizedSize = std::max(resizedSize, kMinRetileSpan);
+    resizedSize = std::max(resizedSize, kMinLearnedSpan);
 
     // When the master was resized, its new span is directly observable.
     LONG masterSize = resizedSize;
@@ -2305,7 +2563,7 @@ void RetileFromMoveSize(HWND hwnd) {
         if (!GetWindowFrameRect(state.windows[0], &masterRect)) return;
         masterSize = horizontal ? masterRect.bottom - masterRect.top : masterRect.right - masterRect.left;
         // Apply the same minimum-span policy to the fallback measurement.
-        masterSize = std::max(masterSize, kMinRetileSpan);
+        masterSize = std::max(masterSize, kMinLearnedSpan);
       }
     }
 
@@ -2347,9 +2605,9 @@ void RetileFromMoveSize(HWND hwnd) {
 }
 
 void OnWindowMoveSizeEnd(HWND hwnd) {
-  if (!g_enableTiling || !g_enableResizeRetile || g_retileSuspended || !IsWindow(hwnd)) return;
+  if (!g_enableTiling || !IsWindow(hwnd)) return;
   if (!g_threadId) return;
-  if (!PostThreadMessage(g_threadId, WM_APP_RETILE_ON_MOVE_SIZE, reinterpret_cast<WPARAM>(hwnd), 0)) {
+  if (!PostThreadMessage(g_threadId, WM_APP_MOVE_SIZE_END, reinterpret_cast<WPARAM>(hwnd), 0)) {
     Wh_Log(L"Failed to queue resize event");
   }
 }
@@ -2392,15 +2650,16 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
     if (!tracked) return;
 
-    if (!(g_enableTileNewWin && !g_tileNewWinSuspended)) {
-      AcquireSRWLockExclusive(&g_moveSizeRectsLock);
-      RECT r{};
-      if (GetWindowFrameRect(hwnd, &r)) {
-        if (event == EVENT_SYSTEM_MOVESIZESTART) g_moveSizeStartRects[hwnd] = r;
-        else g_moveSizeEndRects[hwnd] = r;
+    AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+    RECT r{};
+    if (GetWindowFrameRect(hwnd, &r)) {
+      if (event == EVENT_SYSTEM_MOVESIZESTART) {
+        g_moveSizeStartRects[hwnd] = r;
+      } else {
+        g_moveSizeEndRects[hwnd] = r;
       }
-      ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
     }
+    ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
     if (event == EVENT_SYSTEM_MOVESIZEEND) OnWindowMoveSizeEnd(hwnd);
     return;
@@ -2529,18 +2788,15 @@ void LoadSettings() {
   Wh_FreeStringSetting(layout);
 
   g_enableTiling = Wh_GetIntSetting(L"EnableTiling") != 0;
-  g_enableResizeRetile = Wh_GetIntSetting(L"EnableResizeRetile") != 0;
   g_captureLayoutOnTile = Wh_GetIntSetting(L"CaptureLayoutOnTile") != 0;
   g_enableLayoutCycle = Wh_GetIntSetting(L"EnableLayoutCycle") != 0;
   // New! 
   g_enableTileNewWin = Wh_GetIntSetting(L"EnableTileNewWin") != 0;
-  g_retileSuspended = false;
   g_tileNewWinSuspended = false;
 
 
   g_tileKey = ReadStringSetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
   g_layoutKey = ReadStringSetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
-  g_retileToggleKey = ReadStringSetting(L"RetileToggleKey", ParseSingleCharKey, (UINT)'R');
   g_swapMasterKey = ReadStringSetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
   g_tileNewWinToggleKey = ReadStringSetting(L"TileNewWinToggleKey", ParseSingleCharKey, (UINT)'U');
 }
@@ -2574,9 +2830,6 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
     if (g_enableLayoutCycle) {
       RegisterHotKey(nullptr, HK_LAYOUT, g_tilingModifiers, g_layoutKey);
     }
-    if (g_enableResizeRetile) {
-      RegisterHotKey(nullptr, HK_RETILE_TOGGLE, g_tilingModifiers, g_retileToggleKey);
-    }
   }
   Wh_Log(L"Hotkeys registered");
 
@@ -2605,9 +2858,9 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
           case WM_QUIT: 
             goto cleanup;
           
-          case WM_APP_RETILE_ON_MOVE_SIZE: {
+          case WM_APP_MOVE_SIZE_END: {
             HWND resizedHwnd = reinterpret_cast<HWND>(msg.wParam);
-            RetileFromMoveSize(resizedHwnd);
+            ApplyUserMoveSize(resizedHwnd);
             continue;
           }
 
@@ -2666,16 +2919,6 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
                 continue;
               }
 
-              case HK_RETILE_TOGGLE:
-                if (g_enableResizeRetile) {
-                  g_retileSuspended = !g_retileSuspended;
-                  if (g_retileSuspended) {
-                    Wh_Log(L"Retile-on-resize suspended; workspace memory preserved");
-                  } else {
-                    Wh_Log(L"Retile-on-resize resumed");
-                  } 
-                }
-                continue;
             }
             continue;
           }
@@ -2707,9 +2950,6 @@ cleanup:
     UnregisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE);
     if (g_enableLayoutCycle) {
       UnregisterHotKey(nullptr, HK_LAYOUT);
-    }
-    if (g_enableResizeRetile) {
-      UnregisterHotKey(nullptr, HK_RETILE_TOGGLE);
     }
   }
 
