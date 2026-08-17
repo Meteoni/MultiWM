@@ -2,12 +2,12 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.1
+// @version         1.7.2
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lversion -lgdi32
+// @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lversion -lgdi32 -ladvapi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -26,7 +26,8 @@ resize-adjusted ratios per virtual desktop.
 - Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
 - Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
 - User move-only drags float that window without forgetting it
-- Notification-area icon shows the current workspace layout with generated geometric glyphs
+- Theme-aware notification-area text icon shows the current workspace layout (MV/MH/CL/RW/BS/MN/FL)
+- Compact Win32 layout flyout appears briefly when the layout is changed
 - Optional capture of current window sizes when manually tiling
 
 ## Default Hotkeys
@@ -1683,34 +1684,38 @@ static bool LoadTilingState(const DesktopMonitorKey& key, TilingState* state) {
 
 
 //=============================================================================
-// Notification-area layout indicator
+// Notification-area layout indicator + layout flyout
 //=============================================================================
 //
-// This subsystem is intentionally self-contained and Win32-only. It doesn't
-// hook Explorer or depend on XAML/WinUI. The seven glyphs below preserve the
-// exact pane topology of the approved layout diagrams; rendering may scale or
-// thicken strokes, but it never removes/merges dividers at smaller icon sizes.
+// UI boundary for the tool mod. This subsystem is Win32/GDI-only: no Explorer
+// hooks, XAML, WinUI, or Windows App SDK dependency. The tray uses two-letter
+// mode abbreviations that are fitted to the full icon canvas. The flyout is a
+// small non-activating card shown only after an explicit layout change.
 
 namespace TrayUi {
 
-constexpr wchar_t kWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
+//-----------------------------------------------------------------------------
+// Shared UI state / naming
+//-----------------------------------------------------------------------------
+
+constexpr wchar_t kTrayWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
+constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkTilingHelperLayoutFlyout";
 constexpr UINT kIconId = 1;
-constexpr int kGlyphCanvasSize = 32;
-constexpr int kGlyphForegroundThickness = 2;
-constexpr int kGlyphHaloThickness = 4;
+constexpr int kIconCanvasSize = 32;
+constexpr UINT_PTR kFlyoutTimerId = 1;
+constexpr DWORD kFlyoutHoldMs = 850;
+constexpr DWORD kFlyoutFadeMs = 180;
 
-struct GlyphLine {
-  int x1;
-  int y1;
-  int x2;
-  int y2;
-};
-
-static HWND g_window = nullptr;
-static ATOM g_windowClass = 0;
+static HWND g_trayWindow = nullptr;
+static HWND g_flyoutWindow = nullptr;
+static ATOM g_trayWindowClass = 0;
+static ATOM g_flyoutWindowClass = 0;
 static UINT g_taskbarCreatedMessage = 0;
 static bool g_iconAdded = false;
+static bool g_systemLightTheme = false;
 static TileLayout g_displayedLayout = TileLayout::COUNT;
+static TileLayout g_flyoutLayout = TileLayout::COUNT;
+static DWORD g_flyoutShownTick = 0;
 static NOTIFYICONDATAW g_notifyData{};
 static std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> g_icons{};
 
@@ -1736,168 +1741,84 @@ static const wchar_t* LayoutDisplayName(TileLayout layout) {
   }
 }
 
-static void AppendRect(std::vector<GlyphLine>& lines, int left, int top,
-                       int right, int bottom) {
-  lines.push_back({left, top, right, top});
-  lines.push_back({right, top, right, bottom});
-  lines.push_back({right, bottom, left, bottom});
-  lines.push_back({left, bottom, left, top});
-}
-
-static std::vector<GlyphLine> BuildGlyphLines(TileLayout layout) {
-  std::vector<GlyphLine> lines;
-  lines.reserve(12);
-
-  // Coordinates are percentages of one fixed logical canvas. These definitions
-  // mirror the approved ASCII topology directly:
-  //
-  // Master+Stack V: one large left pane + three stacked right panes.
-  // Master+Stack H: one large top pane + three columns along the bottom.
-  // Columns/Rows: three equal-ish divisions.
-  // BSP: left half, upper-right pane, two lower-right panes.
-  // Monocle: one full pane.
-  // Floating: rendered separately below because the front window occludes the
-  //           rear window rather than showing through it.
+static const wchar_t* LayoutTrayText(TileLayout layout) {
   switch (layout) {
     case TileLayout::MasterStack:
-      AppendRect(lines, 6, 14, 94, 86);
-      lines.push_back({61, 14, 61, 86});
-      lines.push_back({61, 38, 94, 38});
-      lines.push_back({61, 62, 94, 62});
-      break;
-
+      return L"MV";
     case TileLayout::MasterStackH:
-      AppendRect(lines, 6, 14, 94, 86);
-      lines.push_back({6, 45, 94, 45});
-      lines.push_back({35, 45, 35, 86});
-      lines.push_back({65, 45, 65, 86});
-      break;
-
+      return L"MH";
     case TileLayout::Columns:
-      AppendRect(lines, 6, 14, 94, 86);
-      lines.push_back({35, 14, 35, 86});
-      lines.push_back({65, 14, 65, 86});
-      break;
-
+      return L"CL";
     case TileLayout::Rows:
-      AppendRect(lines, 6, 14, 94, 86);
-      lines.push_back({6, 38, 94, 38});
-      lines.push_back({6, 62, 94, 62});
-      break;
-
+      return L"RW";
     case TileLayout::BSP:
-      AppendRect(lines, 6, 14, 94, 86);
-      lines.push_back({50, 14, 50, 86});
-      lines.push_back({50, 55, 94, 55});
-      lines.push_back({72, 55, 72, 86});
-      break;
-
+      return L"BS";
     case TileLayout::Monocle:
-      AppendRect(lines, 6, 14, 94, 86);
-      break;
-
+      return L"MN";
     case TileLayout::Floating:
+      return L"FL";
     case TileLayout::COUNT:
-      break;
-  }
-
-  return lines;
-}
-
-static int LogicalToPixel(int value) {
-  // Keep a small transparent margin so the shell has room to resample the icon.
-  constexpr int kMin = 2;
-  constexpr int kMax = kGlyphCanvasSize - 3;
-  return kMin + ((kMax - kMin) * value + 50) / 100;
-}
-
-static void PutPixel(uint32_t* pixels, int x, int y, uint32_t argb) {
-  if (!pixels || x < 0 || y < 0 || x >= kGlyphCanvasSize ||
-      y >= kGlyphCanvasSize) {
-    return;
-  }
-  pixels[y * kGlyphCanvasSize + x] = argb;
-}
-
-static void ClearPixelRect(uint32_t* pixels, int left, int top, int right,
-                           int bottom) {
-  if (!pixels) return;
-  left = std::max(0, left);
-  top = std::max(0, top);
-  right = std::min(kGlyphCanvasSize - 1, right);
-  bottom = std::min(kGlyphCanvasSize - 1, bottom);
-  for (int y = top; y <= bottom; ++y) {
-    for (int x = left; x <= right; ++x) {
-      PutPixel(pixels, x, y, 0x00000000u);
-    }
+    default:
+      return L"??";
   }
 }
 
-static void DrawAxisLine(uint32_t* pixels, const GlyphLine& logicalLine,
-                         int thickness, uint32_t argb) {
-  int x1 = LogicalToPixel(logicalLine.x1);
-  int y1 = LogicalToPixel(logicalLine.y1);
-  int x2 = LogicalToPixel(logicalLine.x2);
-  int y2 = LogicalToPixel(logicalLine.y2);
-
-  int halfLo = (thickness - 1) / 2;
-  int halfHi = thickness / 2;
-
-  if (y1 == y2) {
-    if (x2 < x1) std::swap(x1, x2);
-    for (int y = y1 - halfLo; y <= y1 + halfHi; ++y) {
-      for (int x = x1; x <= x2; ++x) PutPixel(pixels, x, y, argb);
-    }
-  } else if (x1 == x2) {
-    if (y2 < y1) std::swap(y1, y2);
-    for (int x = x1 - halfLo; x <= x1 + halfHi; ++x) {
-      for (int y = y1; y <= y2; ++y) PutPixel(pixels, x, y, argb);
-    }
+static const wchar_t* LayoutFlyoutText(TileLayout layout) {
+  switch (layout) {
+    case TileLayout::MasterStack:
+      return L"Master + Stack V";
+    case TileLayout::MasterStackH:
+      return L"Master + Stack H";
+    case TileLayout::Columns:
+      return L"Columns";
+    case TileLayout::Rows:
+      return L"Rows";
+    case TileLayout::BSP:
+      return L"BSP";
+    case TileLayout::Monocle:
+      return L"Monocle";
+    case TileLayout::Floating:
+      return L"Floating";
+    case TileLayout::COUNT:
+    default:
+      return L"Unknown";
   }
 }
 
-static void DrawLineSet(uint32_t* pixels, const std::vector<GlyphLine>& lines) {
-  // Dark halo + light core stays legible on both light and dark taskbars. The
-  // shell may resample the 32px source down to the current notification-area
-  // size, so deliberately thick strokes survive that compression.
-  for (const auto& line : lines) {
-    DrawAxisLine(pixels, line, kGlyphHaloThickness, 0xD0000000u);
-  }
-  for (const auto& line : lines) {
-    DrawAxisLine(pixels, line, kGlyphForegroundThickness, 0xFFFFFFFFu);
-  }
+static bool ReadSystemLightTheme() {
+  DWORD value = 0;
+  DWORD size = sizeof(value);
+  LSTATUS status = RegGetValueW(
+      HKEY_CURRENT_USER,
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+      L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
+  if (status == ERROR_SUCCESS) return value != 0;
+
+  COLORREF fallback = GetSysColor(COLOR_WINDOW);
+  return (GetRValue(fallback) + GetGValue(fallback) + GetBValue(fallback)) >= 384;
 }
 
-static void DrawFloatingGlyph(uint32_t* pixels) {
-  // Exact visual idea:
-  //
-  //   ┌──────┐
-  //   │ ┌──────┐
-  //   └─│      │
-  //     └──────┘
-  //
-  // Draw the rear window first, erase the area covered by the front window,
-  // then draw the front window. That prevents the rear outline from showing
-  // through the transparent foreground pane.
-  std::vector<GlyphLine> rear;
-  std::vector<GlyphLine> front;
-  AppendRect(rear, 5, 13, 67, 66);
-  AppendRect(front, 31, 34, 95, 87);
-  DrawLineSet(pixels, rear);
-
-  const int clearPad = kGlyphHaloThickness / 2 + 1;
-  ClearPixelRect(pixels, LogicalToPixel(31) - clearPad,
-                 LogicalToPixel(34) - clearPad,
-                 LogicalToPixel(95) + clearPad,
-                 LogicalToPixel(87) + clearPad);
-  DrawLineSet(pixels, front);
+static COLORREF TrayForegroundColor() {
+  return g_systemLightTheme ? RGB(24, 24, 24) : RGB(255, 255, 255);
 }
 
-static HICON CreateLayoutIcon(TileLayout layout) {
+static COLORREF FlyoutBackgroundColor() {
+  return g_systemLightTheme ? RGB(243, 243, 243) : RGB(36, 36, 36);
+}
+
+static COLORREF FlyoutForegroundColor() {
+  return g_systemLightTheme ? RGB(24, 24, 24) : RGB(255, 255, 255);
+}
+
+//-----------------------------------------------------------------------------
+// Theme-aware text tray icons
+//-----------------------------------------------------------------------------
+
+static HICON CreateTextIcon(TileLayout layout) {
   BITMAPINFO bmi{};
   bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-  bmi.bmiHeader.biWidth = kGlyphCanvasSize;
-  bmi.bmiHeader.biHeight = -kGlyphCanvasSize;  // top-down DIB
+  bmi.bmiHeader.biWidth = kIconCanvasSize;
+  bmi.bmiHeader.biHeight = -kIconCanvasSize;
   bmi.bmiHeader.biPlanes = 1;
   bmi.bmiHeader.biBitCount = 32;
   bmi.bmiHeader.biCompression = BI_RGB;
@@ -1910,20 +1831,89 @@ static HICON CreateLayoutIcon(TileLayout layout) {
     return nullptr;
   }
 
-  auto* pixels = static_cast<uint32_t*>(dibBits);
-  std::fill(pixels, pixels + kGlyphCanvasSize * kGlyphCanvasSize, 0u);
-
-  if (layout == TileLayout::Floating) {
-    DrawFloatingGlyph(pixels);
-  } else {
-    DrawLineSet(pixels, BuildGlyphLines(layout));
+  HDC dc = CreateCompatibleDC(nullptr);
+  if (!dc) {
+    DeleteObject(colorBitmap);
+    return nullptr;
   }
 
-  // 1bpp all-zero mask. The 32bpp color bitmap carries per-pixel alpha; the
-  // mask remains opaque for compatibility with older icon consumers.
-  constexpr int kMaskStride = ((kGlyphCanvasSize + 31) / 32) * 4;
-  std::array<BYTE, kMaskStride * kGlyphCanvasSize> maskBits{};
-  HBITMAP maskBitmap = CreateBitmap(kGlyphCanvasSize, kGlyphCanvasSize, 1, 1,
+  HGDIOBJ oldBitmap = SelectObject(dc, colorBitmap);
+  RECT canvas{0, 0, kIconCanvasSize, kIconCanvasSize};
+  HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
+  FillRect(dc, &canvas, black);
+  DeleteObject(black);
+
+  SetBkMode(dc, OPAQUE);
+  SetBkColor(dc, RGB(0, 0, 0));
+  SetTextColor(dc, RGB(255, 255, 255));
+
+  const wchar_t* text = LayoutTrayText(layout);
+  HFONT chosenFont = nullptr;
+  SIZE chosenSize{};
+
+  // Fit each two-letter abbreviation independently. Only one physical pixel is
+  // reserved on each side, so the text consumes essentially the whole 32px
+  // source canvas before Explorer downsamples it to the notification-area size.
+  for (int pixelHeight = kIconCanvasSize; pixelHeight >= 8; --pixelHeight) {
+    HFONT font = CreateFontW(-pixelHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    if (!font) continue;
+
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SIZE textSize{};
+    GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &textSize);
+    SelectObject(dc, oldFont);
+
+    if (textSize.cx <= kIconCanvasSize - 2 &&
+        textSize.cy <= kIconCanvasSize - 2) {
+      chosenFont = font;
+      chosenSize = textSize;
+      break;
+    }
+    DeleteObject(font);
+  }
+
+  if (!chosenFont) {
+    chosenFont = CreateFontW(-16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HGDIOBJ oldFont = SelectObject(dc, chosenFont);
+    GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &chosenSize);
+    SelectObject(dc, oldFont);
+  }
+
+  HGDIOBJ oldFont = SelectObject(dc, chosenFont);
+  int x = (kIconCanvasSize - chosenSize.cx) / 2;
+  int y = (kIconCanvasSize - chosenSize.cy) / 2;
+  TextOutW(dc, x, y, text, static_cast<int>(wcslen(text)));
+  SelectObject(dc, oldFont);
+  DeleteObject(chosenFont);
+
+  // GDI doesn't populate alpha in a 32bpp DIB. Render white-on-black, use the
+  // antialiased intensity as coverage, then recolor that coverage for the
+  // current taskbar theme. This preserves smooth edges with a transparent BG.
+  auto* pixels = static_cast<uint32_t*>(dibBits);
+  COLORREF foreground = TrayForegroundColor();
+  const uint32_t fr = GetRValue(foreground);
+  const uint32_t fg = GetGValue(foreground);
+  const uint32_t fb = GetBValue(foreground);
+  for (int i = 0; i < kIconCanvasSize * kIconCanvasSize; ++i) {
+    uint32_t pixel = pixels[i];
+    uint32_t coverage = std::max({pixel & 0xFFu,
+                                  (pixel >> 8) & 0xFFu,
+                                  (pixel >> 16) & 0xFFu});
+    pixels[i] = (coverage << 24) | (fr << 16) | (fg << 8) | fb;
+  }
+
+  SelectObject(dc, oldBitmap);
+  DeleteDC(dc);
+
+  constexpr int kMaskStride = ((kIconCanvasSize + 31) / 32) * 4;
+  std::array<BYTE, kMaskStride * kIconCanvasSize> maskBits{};
+  HBITMAP maskBitmap = CreateBitmap(kIconCanvasSize, kIconCanvasSize, 1, 1,
                                     maskBits.data());
   if (!maskBitmap) {
     DeleteObject(colorBitmap);
@@ -1947,6 +1937,16 @@ static HICON GetLayoutIcon(TileLayout layout) {
   return LoadIconW(nullptr, IDI_APPLICATION);
 }
 
+static void DestroyIconSet(
+    std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>& icons) {
+  for (HICON& icon : icons) {
+    if (icon) {
+      DestroyIcon(icon);
+      icon = nullptr;
+    }
+  }
+}
+
 static void SetTooltip(TileLayout layout) {
   std::wstring tooltip = L"Tiling Helper — ";
   tooltip += LayoutDisplayName(layout);
@@ -1955,12 +1955,12 @@ static void SetTooltip(TileLayout layout) {
 }
 
 static bool AddIconToShell() {
-  if (!g_window) return false;
+  if (!g_trayWindow) return false;
   if (g_displayedLayout == TileLayout::COUNT) g_displayedLayout = g_defaultLayout;
 
   g_notifyData = {};
   g_notifyData.cbSize = sizeof(g_notifyData);
-  g_notifyData.hWnd = g_window;
+  g_notifyData.hWnd = g_trayWindow;
   g_notifyData.uID = kIconId;
   g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
   g_notifyData.hIcon = GetLayoutIcon(g_displayedLayout);
@@ -1979,7 +1979,7 @@ static bool AddIconToShell() {
 }
 
 static void UpdateIcon(TileLayout layout) {
-  if (!g_window || layout == TileLayout::COUNT) return;
+  if (!g_trayWindow || layout == TileLayout::COUNT) return;
   g_displayedLayout = layout;
 
   if (!g_iconAdded) {
@@ -1991,12 +1991,140 @@ static void UpdateIcon(TileLayout layout) {
   g_notifyData.hIcon = GetLayoutIcon(layout);
   SetTooltip(layout);
   if (!Shell_NotifyIconW(NIM_MODIFY, &g_notifyData)) {
-    // Explorer may have restarted before TaskbarCreated reached us. Treat the
-    // icon as absent so the next refresh attempts a clean NIM_ADD.
     g_iconAdded = false;
     AddIconToShell();
   }
 }
+
+static void RebuildIconsForTheme() {
+  std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> newIcons{};
+  for (size_t i = 0; i < newIcons.size(); ++i) {
+    newIcons[i] = CreateTextIcon(static_cast<TileLayout>(i));
+  }
+
+  auto oldIcons = g_icons;
+  g_icons = newIcons;
+  if (g_displayedLayout != TileLayout::COUNT) UpdateIcon(g_displayedLayout);
+  DestroyIconSet(oldIcons);
+}
+
+//-----------------------------------------------------------------------------
+// Compact layout flyout
+//-----------------------------------------------------------------------------
+
+static int ScaleForDpi(int value, UINT dpi) {
+  return MulDiv(value, static_cast<int>(dpi ? dpi : 96), 96);
+}
+
+static HFONT CreateFlyoutFont(UINT dpi) {
+  return CreateFontW(-ScaleForDpi(14, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+                     FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                     DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+}
+
+static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
+                                         LPARAM lParam) {
+  switch (message) {
+    case WM_NCHITTEST:
+      return HTTRANSPARENT;
+
+    case WM_ERASEBKGND:
+      return 1;
+
+    case WM_PAINT: {
+      PAINTSTRUCT ps{};
+      HDC dc = BeginPaint(hwnd, &ps);
+      RECT client{};
+      GetClientRect(hwnd, &client);
+
+      HBRUSH background = CreateSolidBrush(FlyoutBackgroundColor());
+      FillRect(dc, &client, background);
+      DeleteObject(background);
+
+      UINT dpi = GetDpiForWindow(hwnd);
+      HFONT font = CreateFlyoutFont(dpi);
+      HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+      SetBkMode(dc, TRANSPARENT);
+      SetTextColor(dc, FlyoutForegroundColor());
+      DrawTextW(dc, LayoutFlyoutText(g_flyoutLayout), -1, &client,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+      if (oldFont) SelectObject(dc, oldFont);
+      if (font) DeleteObject(font);
+
+      EndPaint(hwnd, &ps);
+      return 0;
+    }
+
+    case WM_TIMER:
+      if (wParam == kFlyoutTimerId) {
+        DWORD elapsed = GetTickCount() - g_flyoutShownTick;
+        if (elapsed >= kFlyoutHoldMs + kFlyoutFadeMs) {
+          KillTimer(hwnd, kFlyoutTimerId);
+          ShowWindow(hwnd, SW_HIDE);
+          return 0;
+        }
+
+        BYTE alpha = 255;
+        if (elapsed > kFlyoutHoldMs) {
+          DWORD fadeElapsed = elapsed - kFlyoutHoldMs;
+          alpha = static_cast<BYTE>(255 -
+              std::min<DWORD>(255, (fadeElapsed * 255) / kFlyoutFadeMs));
+        }
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+        return 0;
+      }
+      break;
+  }
+  return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+static void ShowLayoutFlyout(TileLayout layout) {
+  if (!g_flyoutWindow || layout == TileLayout::COUNT) return;
+
+  HMONITOR monitor = GetTargetMonitor();
+  RECT workArea{};
+  if (!monitor || !GetMonitorWorkArea(monitor, &workArea)) return;
+
+  UINT dpi = GetDpiForWindow(g_flyoutWindow);
+  if (!dpi) dpi = 96;
+  HFONT font = CreateFlyoutFont(dpi);
+  HDC dc = GetDC(g_flyoutWindow);
+  HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+  SIZE textSize{};
+  const wchar_t* text = LayoutFlyoutText(layout);
+  GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &textSize);
+  if (oldFont) SelectObject(dc, oldFont);
+  if (font) DeleteObject(font);
+  ReleaseDC(g_flyoutWindow, dc);
+
+  const int horizontalPadding = ScaleForDpi(24, dpi);
+  const int width = std::max(ScaleForDpi(128, dpi),
+                             static_cast<int>(textSize.cx) + horizontalPadding * 2);
+  const int height = ScaleForDpi(48, dpi);
+  const int x = workArea.left + ((workArea.right - workArea.left) - width) / 2;
+  const int y = workArea.bottom - height - ScaleForDpi(16, dpi);
+
+  const int radius = ScaleForDpi(8, dpi);
+  HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
+                                   radius * 2, radius * 2);
+  if (region && !SetWindowRgn(g_flyoutWindow, region, TRUE)) {
+    DeleteObject(region);
+  }
+
+  g_flyoutLayout = layout;
+  g_flyoutShownTick = GetTickCount();
+  SetLayeredWindowAttributes(g_flyoutWindow, 0, 255, LWA_ALPHA);
+  SetWindowPos(g_flyoutWindow, HWND_TOPMOST, x, y, width, height,
+               SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  InvalidateRect(g_flyoutWindow, nullptr, TRUE);
+  UpdateWindow(g_flyoutWindow);
+  SetTimer(g_flyoutWindow, kFlyoutTimerId, 16, nullptr);
+}
+
+//-----------------------------------------------------------------------------
+// Tray/flyout lifecycle and shell/theme integration
+//-----------------------------------------------------------------------------
 
 static void RefreshForCurrentWorkspace() {
   TileLayout layout = g_defaultLayout;
@@ -2010,41 +2138,85 @@ static void RefreshForCurrentWorkspace() {
   UpdateIcon(layout);
 }
 
-static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam,
-                                   LPARAM lParam) {
+static void HandleThemeChanged() {
+  bool lightTheme = ReadSystemLightTheme();
+  if (lightTheme == g_systemLightTheme) return;
+
+  g_systemLightTheme = lightTheme;
+  RebuildIconsForTheme();
+  if (g_flyoutWindow && IsWindowVisible(g_flyoutWindow)) {
+    InvalidateRect(g_flyoutWindow, nullptr, TRUE);
+  }
+}
+
+static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
+                                       LPARAM lParam) {
   if (g_taskbarCreatedMessage && message == g_taskbarCreatedMessage) {
-    // Notification-area icons are owned by Explorer and disappear when the
-    // shell restarts. Re-add our last known layout without touching WM state.
     g_iconAdded = false;
     AddIconToShell();
     return 0;
+  }
+
+  switch (message) {
+    case WM_SETTINGCHANGE:
+    case WM_THEMECHANGED:
+    case WM_SYSCOLORCHANGE:
+      HandleThemeChanged();
+      return 0;
   }
   return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
 static bool Initialize() {
+  g_systemLightTheme = ReadSystemLightTheme();
   for (size_t i = 0; i < g_icons.size(); ++i) {
-    g_icons[i] = CreateLayoutIcon(static_cast<TileLayout>(i));
+    g_icons[i] = CreateTextIcon(static_cast<TileLayout>(i));
   }
 
   HINSTANCE instance = GetModuleHandleW(nullptr);
-  WNDCLASSW wc{};
-  wc.lpfnWndProc = WindowProc;
-  wc.hInstance = instance;
-  wc.lpszClassName = kWindowClassName;
-  g_windowClass = RegisterClassW(&wc);
-  if (!g_windowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+
+  WNDCLASSW trayClass{};
+  trayClass.lpfnWndProc = TrayWindowProc;
+  trayClass.hInstance = instance;
+  trayClass.lpszClassName = kTrayWindowClassName;
+  g_trayWindowClass = RegisterClassW(&trayClass);
+  if (!g_trayWindowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
     Wh_Log(L"Failed to register tiling tray window class: %lu", GetLastError());
     return false;
   }
 
-  // Hidden top-level window rather than HWND_MESSAGE: Explorer broadcasts the
-  // registered TaskbarCreated message to top-level windows after a shell restart.
-  g_window = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClassName, L"", WS_POPUP,
-                             0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
-  if (!g_window) {
+  WNDCLASSW flyoutClass{};
+  flyoutClass.lpfnWndProc = FlyoutWindowProc;
+  flyoutClass.hInstance = instance;
+  flyoutClass.lpszClassName = kFlyoutWindowClassName;
+  g_flyoutWindowClass = RegisterClassW(&flyoutClass);
+  bool flyoutClassAvailable = g_flyoutWindowClass != 0;
+  if (!flyoutClassAvailable) {
+    DWORD classError = GetLastError();
+    flyoutClassAvailable = classError == ERROR_CLASS_ALREADY_EXISTS;
+    if (!flyoutClassAvailable) {
+      Wh_Log(L"Failed to register tiling layout flyout class: %lu", classError);
+    }
+  }
+
+  // Hidden top-level owner: Explorer broadcasts TaskbarCreated to top-level
+  // windows after a shell restart, which lets us restore the notification icon.
+  g_trayWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayWindowClassName, L"",
+                                 WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
+                                 instance, nullptr);
+  if (!g_trayWindow) {
     Wh_Log(L"Failed to create tiling tray owner window: %lu", GetLastError());
     return false;
+  }
+
+  if (flyoutClassAvailable) {
+    g_flyoutWindow = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        kFlyoutWindowClassName, L"", WS_POPUP, 0, 0, 0, 0,
+        nullptr, nullptr, instance, nullptr);
+    if (!g_flyoutWindow) {
+      Wh_Log(L"Failed to create tiling layout flyout window: %lu", GetLastError());
+    }
   }
 
   g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
@@ -2054,31 +2226,37 @@ static bool Initialize() {
 }
 
 static void Shutdown() {
-  if (g_iconAdded && g_window) {
+  if (g_iconAdded && g_trayWindow) {
     g_notifyData.uFlags = 0;
     Shell_NotifyIconW(NIM_DELETE, &g_notifyData);
   }
   g_iconAdded = false;
 
-  if (g_window) {
-    DestroyWindow(g_window);
-    g_window = nullptr;
+  if (g_flyoutWindow) {
+    KillTimer(g_flyoutWindow, kFlyoutTimerId);
+    DestroyWindow(g_flyoutWindow);
+    g_flyoutWindow = nullptr;
+  }
+  if (g_trayWindow) {
+    DestroyWindow(g_trayWindow);
+    g_trayWindow = nullptr;
   }
 
-  for (HICON& icon : g_icons) {
-    if (icon) {
-      DestroyIcon(icon);
-      icon = nullptr;
-    }
-  }
+  DestroyIconSet(g_icons);
 
-  if (g_windowClass) {
-    UnregisterClassW(kWindowClassName, GetModuleHandleW(nullptr));
-    g_windowClass = 0;
+  HINSTANCE instance = GetModuleHandleW(nullptr);
+  if (g_flyoutWindowClass) {
+    UnregisterClassW(kFlyoutWindowClassName, instance);
+    g_flyoutWindowClass = 0;
+  }
+  if (g_trayWindowClass) {
+    UnregisterClassW(kTrayWindowClassName, instance);
+    g_trayWindowClass = 0;
   }
 
   g_taskbarCreatedMessage = 0;
   g_displayedLayout = TileLayout::COUNT;
+  g_flyoutLayout = TileLayout::COUNT;
   g_notifyData = {};
 }
 
@@ -2886,6 +3064,7 @@ static void CycleCurrentWorkspaceLayout() {
   SaveTilingState(key, state);
   ArrangeWorkspace(key);
   TrayUi::UpdateIcon(state.layout);
+  TrayUi::ShowLayoutFlyout(state.layout);
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.layout));
 }
 
