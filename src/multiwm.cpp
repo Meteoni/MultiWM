@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.11
+// @version         1.7.12
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -31,7 +31,7 @@ resize-adjusted ratios per virtual desktop.
 - Optional per-layout .ico overrides with generated text fallback
 - Compact Win32 layout flyout appears on layout/desktop changes with configurable position
 - Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
-- Global reconciliation repairs missed destroy/hide/minimize and virtual-desktop/monitor moves
+- Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate
 - Optional process/class/title exclusion rules keep user-selected windows out of management
 
 ## Default Hotkeys
@@ -2755,7 +2755,8 @@ static bool SnapshotLooksTiled(const std::vector<HWND>& windows, const RECT& wor
 
 static bool SameWorkspaceKey(const DesktopMonitorKey& a, const DesktopMonitorKey& b);
 static void ReconcileKnownWindows(
-    bool settleParticipation, std::vector<DesktopMonitorKey>* changedKeys);
+    bool settleParticipation, bool reconcileDesktop, bool reconcileMonitor,
+    std::vector<DesktopMonitorKey>* changedKeys, HWND onlyHwnd = nullptr);
 
 static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeometry) {
   DesktopMonitorKey key{};
@@ -2845,7 +2846,7 @@ void TileWindows() {
   if (!monitor) return;
 
   std::vector<DesktopMonitorKey> changedKeys;
-  ReconcileKnownWindows(true, &changedKeys);
+  ReconcileKnownWindows(true, true, true, &changedKeys);
 
   DesktopMonitorKey targetKey{};
   GetCurrentWorkspaceKey(monitor, &targetKey);
@@ -2959,46 +2960,61 @@ static bool MigrateManagedWindow(
 }
 
 static bool GetObservedWorkspaceKey(
-    HWND hwnd, const DesktopMonitorKey& fallback, DesktopMonitorKey* outKey) {
+    HWND hwnd, const DesktopMonitorKey& fallback, bool reconcileDesktop,
+    bool reconcileMonitor, DesktopMonitorKey* outKey) {
   if (!outKey) return false;
 
-  GUID desktopId{};
-  if (!GetWindowDesktopIdSafe(hwnd, &desktopId)) return false;
+  DesktopMonitorKey observed = fallback;
+  bool observedAnything = false;
 
-  HMONITOR monitor = nullptr;
-  RECT frame{};
-  if (GetWindowFrameRect(hwnd, &frame) &&
-      frame.right > frame.left && frame.bottom > frame.top) {
-    monitor = MonitorFromRect(&frame, MONITOR_DEFAULTTONULL);
+  if (reconcileDesktop) {
+    GUID desktopId{};
+    if (GetWindowDesktopIdSafe(hwnd, &desktopId)) {
+      observed.desktopId = desktopId;
+      observedAnything = true;
+    }
   }
-  if (!monitor) monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
-  if (!monitor) monitor = fallback.monitor;
-  if (!monitor) return false;
 
-  *outKey = {desktopId, monitor};
+  if (reconcileMonitor) {
+    HMONITOR monitor = nullptr;
+    RECT frame{};
+    if (GetWindowFrameRect(hwnd, &frame) &&
+        frame.right > frame.left && frame.bottom > frame.top) {
+      monitor = MonitorFromRect(&frame, MONITOR_DEFAULTTONULL);
+    }
+    if (!monitor) monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    if (monitor) {
+      observed.monitor = monitor;
+      observedAnything = true;
+    }
+  }
+
+  if (!observedAnything || !observed.monitor) return false;
+  *outKey = observed;
   return true;
 }
 
-// Dirty-check all known HWNDs, independent of the current virtual desktop.
-// Events only tell us that reality may have changed; this pass repairs the model
-// from actual liveness, exclusion policy, desktop/monitor ownership and (once
-// settled) visible/minimized participation.
+// Dirty-check all known HWNDs. Generic lifecycle signals repair only liveness,
+// exclusions and settled participation. Desktop and monitor ownership are
+// reconciled only when the caller has an authoritative reason to query them.
 static void ReconcileKnownWindows(
-    bool settleParticipation, std::vector<DesktopMonitorKey>* changedKeys) {
+    bool settleParticipation, bool reconcileDesktop, bool reconcileMonitor,
+    std::vector<DesktopMonitorKey>* changedKeys, HWND onlyHwnd) {
   std::vector<HWND> known;
 
-  AcquireSRWLockShared(&g_tilingStateLock);
-  for (const auto& kv : g_tilingStateMap) {
-    for (const auto& record : kv.second.records) {
-      if (std::find(known.begin(), known.end(), record.first) == known.end()) {
-        known.push_back(record.first);
+  if (onlyHwnd) {
+    known.push_back(onlyHwnd);
+  } else {
+    AcquireSRWLockShared(&g_tilingStateLock);
+    for (const auto& kv : g_tilingStateMap) {
+      for (const auto& record : kv.second.records) {
+        if (std::find(known.begin(), known.end(), record.first) == known.end()) {
+          known.push_back(record.first);
+        }
       }
     }
+    ReleaseSRWLockShared(&g_tilingStateLock);
   }
-  ReleaseSRWLockShared(&g_tilingStateLock);
-
-  GUID activeDesktop{};
-  bool haveActiveDesktop = settleParticipation && GetCurrentDesktopId(&activeDesktop);
 
   for (HWND hwnd : known) {
     DesktopMonitorKey currentKey{};
@@ -3015,7 +3031,9 @@ static void ReconcileKnownWindows(
     }
 
     DesktopMonitorKey observedKey{};
-    if (GetObservedWorkspaceKey(hwnd, currentKey, &observedKey) &&
+    if ((reconcileDesktop || reconcileMonitor) &&
+        GetObservedWorkspaceKey(
+            hwnd, currentKey, reconcileDesktop, reconcileMonitor, &observedKey) &&
         !SameWorkspaceKey(currentKey, observedKey)) {
       if (MigrateManagedWindow(hwnd, currentKey, observedKey)) {
         if (changedKeys) {
@@ -3032,13 +3050,10 @@ static void ReconcileKnownWindows(
     WindowRecord* record = FindWindowRecord(currentState, hwnd);
     if (!record) continue;
 
-    // Cloaking is non-participating only on the current desktop. Windows normally
-    // cloaks windows that belong to inactive VDs, and those must keep their slots.
-    bool currentDesktopCloak =
-        haveActiveDesktop && IsEqualGUID(currentKey.desktopId, activeDesktop) &&
-        IsWindowCloaked(hwnd);
-    bool participates = IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
-                        !currentDesktopCloak;
+    // DWM cloak is not a membership signal. Shell/VD transitions can cloak a
+    // perfectly valid window transiently; only settled hidden/minimized state
+    // changes participation.
+    bool participates = IsWindowVisible(hwnd) && !IsIconic(hwnd);
     bool changed = false;
     if (record->state == ManageState::Tiled && !participates) {
       changed = SuspendWindowInState(currentState, hwnd);
@@ -3179,10 +3194,11 @@ static void HandleVirtualDesktopChanged() {
     return;
   }
 
-  // Repair ownership immediately from desktop GUIDs, but defer visibility/minimize
-  // participation until the shell's cloak/show burst has settled.
+  // A native VD transition is an authoritative reason to repair desktop ownership.
+  // Do not infer monitor migration here; defer visibility/minimize participation
+  // until the shell's cloak/show burst has settled.
   std::vector<DesktopMonitorKey> changedKeys;
-  ReconcileKnownWindows(false, &changedKeys);
+  ReconcileKnownWindows(false, true, false, &changedKeys);
   for (const auto& key : changedKeys) {
     if (IsEqualGUID(key.desktopId, currentDesktop)) {
       AddPendingWorkspaceArrange(key.desktopId, key.monitor);
@@ -3211,8 +3227,8 @@ static void HandleVirtualDesktopChanged() {
   TrayUi::RefreshForCurrentWorkspace();
 }
 
-// Coalesce shell visibility bursts for discovery, VD fallback, and deferred placement.
-// Known-window lifecycle is dirty-checked globally when this timer settles.
+// Coalesce shell visibility bursts for discovery and deferred placement.
+// The settled lifecycle pass never performs VD/monitor ownership migration.
 static void ScheduleLifecycleReconcile(HWND hwnd) {
   // HotkeyThreadProc owns this vector/timer; no additional lock is required.
   if (hwnd && std::find(g_lifecycleDirtyWindows.begin(), g_lifecycleDirtyWindows.end(), hwnd) ==
@@ -3240,11 +3256,10 @@ static void ReconcileDeferredLifecycle() {
   std::vector<HWND> dirtyWindows;
   dirtyWindows.swap(g_lifecycleDirtyWindows);
 
-  // Known-window repair does not require the current desktop to be available:
-  // liveness, exclusions and settled visibility can still be repaired, while
-  // desktop migration simply stays unchanged if the VD query fails.
+  // Generic lifecycle noise must not migrate windows between desktops/monitors.
+  // It repairs liveness/exclusions and settled hidden/minimized participation only.
   std::vector<DesktopMonitorKey> globallyChanged;
-  ReconcileKnownWindows(true, &globallyChanged);
+  ReconcileKnownWindows(true, false, false, &globallyChanged);
 
   GUID currentDesktop{};
   if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&currentDesktop)) {
@@ -3346,8 +3361,8 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
     case EVENT_OBJECT_SHOW:
     case EVENT_OBJECT_CLOAKED:
     case EVENT_OBJECT_UNCLOAKED:
-      // These are dirty signals, not policy decisions. The settled global pass
-      // decides visibility participation and VD/monitor ownership from reality.
+      // These are dirty signals, not ownership decisions. The settled lifecycle
+      // pass may repair hidden/restored participation, but never migrates VD/monitor.
       ScheduleLifecycleReconcile(hwnd);
       break;
   }
@@ -3879,9 +3894,15 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
           
           case WM_APP_MOVE_SIZE_END: {
             HWND resizedHwnd = reinterpret_cast<HWND>(msg.wParam);
+
+            // MOVESIZEEND is an authoritative monitor-transition boundary. Repair
+            // monitor ownership before interpreting the final geometry, without
+            // re-querying virtual-desktop ownership for unrelated lifecycle noise.
+            std::vector<DesktopMonitorKey> changedKeys;
+            ReconcileKnownWindows(false, false, true, &changedKeys, resizedHwnd);
             ApplyUserMoveSize(resizedHwnd);
-            // A completed drag can also move a managed HWND between monitors.
-            // Let the same global ownership repair settle after the gesture.
+            for (const auto& key : changedKeys) ArrangeWorkspace(key);
+
             ScheduleLifecycleReconcile(resizedHwnd);
             continue;
           }
