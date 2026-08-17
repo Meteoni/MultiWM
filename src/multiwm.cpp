@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.5
+// @version         1.7.6
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -25,7 +25,8 @@ resize-adjusted ratios per virtual desktop.
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
 - Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
 - Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
-- User move-only drags float that window without forgetting it
+- Configurable mouse drag behavior: float the moved window or swap it with the tiled window under the pointer
+- Dedicated optional hotkey to float the focused tiled window
 - Theme-aware notification-area text icon shows the current workspace layout (MV/MH/CL/RW/BS/MN/FL)
 - Optional per-layout .ico overrides with generated text fallback
 - Compact Win32 layout flyout appears on layout/desktop changes with configurable position
@@ -34,6 +35,8 @@ resize-adjusted ratios per virtual desktop.
 ## Default Hotkeys
 - Tile windows: Alt + D
 - Cycle layout: Alt + L
+- Switch master window: Alt + M
+- Float focused window: unbound by default
 
 ## Notes
 - Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
@@ -65,11 +68,22 @@ resize-adjusted ratios per virtual desktop.
 
 - TileNewWinToggleKey: "U"
   $name: '[Tiling] Tile New Windows Toggle Key'
-  $description: 'Key to pause/resume Auto-tiling at runtime.'
+  $description: 'Key to pause/resume Auto-tiling at runtime. Leave blank to disable.'
 
 - SwapMasterKey: "M"
   $name: '[Tiling] Switch Master Window Key'
-  $description: 'Key to set another tiled window as the master.'
+  $description: 'Key to set another tiled window as the master. Leave blank to disable.'
+
+- FloatFocusedKey: ""
+  $name: '[Tiling] Float Focused Window Key'
+  $description: 'Key to float the focused tiled window. Leave blank to disable.'
+
+- MouseMoveBehavior: float
+  $name: '[Tiling] Mouse Drag Behavior'
+  $description: Action when a tiled window is moved without resizing
+  $options:
+    - float: Float moved window
+    - swap: Swap with tiled window under pointer
 
 - CaptureLayoutOnTile: true
   $name: '[Tiling] Capture Layout On Tile'
@@ -87,7 +101,7 @@ resize-adjusted ratios per virtual desktop.
 
 - TileKey: "D"
   $name: '[Tiling] Key'
-  $description: 'Key to tile all windows on the current monitor. Examples: D, T, Space, `, -'
+  $description: 'Key to tile all windows on the current monitor. Leave blank to disable. Examples: D, T, Space, `, -'
 
 - DefaultLayout: master_stack
   $name: '[Tiling] Default Layout'
@@ -119,7 +133,7 @@ resize-adjusted ratios per virtual desktop.
 
 - LayoutKey: "L"
   $name: '[Tiling] Layout Cycle Key'
-  $description: 'Key to cycle through tiling layouts. Examples: L, Tab, =, ], /'
+  $description: 'Key to cycle through tiling layouts. Leave blank to disable. Examples: L, Tab, =, ], /'
 
 - FlyoutPosition: bottom
   $name: '[UI] Flyout Position'
@@ -308,6 +322,7 @@ enum HotkeyIds {
   HK_LAYOUT = 2,
   HK_SWAP_MASTER = 3,
   HK_TILENEWWIN_TOGGLE = 4,
+  HK_FLOAT_FOCUSED = 5,
 };
 
 // Messages to hotkey thread
@@ -332,12 +347,16 @@ static UINT g_tileKey = 'D';
 static UINT g_layoutKey = 'L';
 static UINT g_swapMasterKey = 'M';
 static UINT g_tileNewWinToggleKey = 'U';
+static UINT g_floatFocusedKey = 0;
 
 static LONG g_tileMargin = 4;
 static LONG g_tileGap = 4;
 static LONG g_masterPercent = 50;
 
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
+enum class MouseMoveBehavior { Float, Swap };
+static MouseMoveBehavior g_mouseMoveBehavior = MouseMoveBehavior::Float;
+
 // Used only when a desktop+monitor workspace is first created. Each workspace
 // persists its own current layout in TilingState::layout.
 static TileLayout g_defaultLayout = TileLayout::MasterStack;
@@ -461,6 +480,7 @@ static HWINEVENTHOOK g_hForegroundHook = nullptr;
 
 static std::unordered_map<HWND, RECT> g_moveSizeStartRects;
 static std::unordered_map<HWND, RECT> g_moveSizeEndRects;
+static std::unordered_map<HWND, POINT> g_moveSizeEndPoints;
 
 
 //=============================================================================
@@ -548,8 +568,12 @@ int ParseWindowsVersion(PCWSTR str) {
 }
 
 template <typename T, typename Parser>
-T ReadStringSetting(PCWSTR name, Parser parser, T defaultVal) {
+T ReadHotkeySetting(PCWSTR name, Parser parser, T defaultVal) {
   PCWSTR str = Wh_GetStringSetting(name);
+  if (!str || !*str) {
+    Wh_FreeStringSetting(str);
+    return T{};  // Blank hotkey = unused.
+  }
   T result = parser(str);
   Wh_FreeStringSetting(str);
   return result ? result : defaultVal;
@@ -1635,8 +1659,10 @@ void SwapMaster() {
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   g_moveSizeStartRects.erase(oldMaster);
   g_moveSizeEndRects.erase(oldMaster);
+  g_moveSizeEndPoints.erase(oldMaster);
   g_moveSizeStartRects.erase(resolved);
   g_moveSizeEndRects.erase(resolved);
+  g_moveSizeEndPoints.erase(resolved);
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
   ArrangeWorkspace(key);
@@ -2400,6 +2426,29 @@ static bool FloatWindowInState(TilingState& state, HWND hwnd) {
   return true;
 }
 
+static void FloatFocusedWindow() {
+  HWND hwnd = GetForegroundWindow();
+  if (!hwnd) return;
+
+  HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+  GUID desktopId{};
+  if (!monitor || !GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
+
+  DesktopMonitorKey key{desktopId, monitor};
+  TilingState state;
+  if (!LoadTilingState(key, &state)) return;
+
+  HWND tiled = ResolveToTiledWindow(hwnd, state.windows);
+  if (!tiled || !FloatWindowInState(state, tiled)) return;
+
+  if (WindowRecord* record = FindWindowRecord(state, tiled)) {
+    record->placementFailures = 0;
+  }
+  SaveTilingState(key, state);
+  ArrangeWorkspace(key);
+  Wh_Log(L"Focused window floated %p", tiled);
+}
+
 // Remove a window from management entirely. Floating/ignored windows have no
 // logical tiled slot, while tiled/suspended windows close their layout gap.
 static bool ForgetWindowInState(TilingState& state, HWND hwnd) {
@@ -3062,24 +3111,62 @@ void ApplyUserMoveSize(HWND hwnd) {
   }
 
   RectChange change = RectChange::None;
+  POINT dropPoint{};
+  bool haveDropPoint = false;
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   auto startIt = g_moveSizeStartRects.find(hwnd);
   auto endIt = g_moveSizeEndRects.find(hwnd);
+  auto pointIt = g_moveSizeEndPoints.find(hwnd);
   if (startIt != g_moveSizeStartRects.end() && endIt != g_moveSizeEndRects.end()) {
     change = ClassifyRectChange(startIt->second, endIt->second, 1);
   }
+  if (pointIt != g_moveSizeEndPoints.end()) {
+    dropPoint = pointIt->second;
+    haveDropPoint = true;
+  }
   g_moveSizeStartRects.erase(hwnd);
   g_moveSizeEndRects.erase(hwnd);
+  g_moveSizeEndPoints.erase(hwnd);
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
   if (change == RectChange::MoveOnly) {
-    if (FloatWindowInState(state, resizedHwnd)) {
-      WindowRecord* record = FindWindowRecord(state, resizedHwnd);
-      if (record) record->placementFailures = 0;
-      SaveTilingState(key, state);
-      ArrangeWorkspace(key);
-      Wh_Log(L"User move floated managed window %p", resizedHwnd);
+    if (g_mouseMoveBehavior == MouseMoveBehavior::Float) {
+      if (FloatWindowInState(state, resizedHwnd)) {
+        if (WindowRecord* record = FindWindowRecord(state, resizedHwnd)) {
+          record->placementFailures = 0;
+        }
+        SaveTilingState(key, state);
+        ArrangeWorkspace(key);
+        Wh_Log(L"User move floated managed window %p", resizedHwnd);
+      }
+      return;
     }
+
+    // Swap mode: the pointer at drop time selects another tiled window's slot.
+    // Swapping logical order then arranging gives both windows exactly the
+    // opposite layout RECT while preserving all slot weights.
+    auto sourceIt = std::find(state.windows.begin(), state.windows.end(), resizedHwnd);
+    auto targetIt = state.windows.end();
+    if (sourceIt != state.windows.end() && haveDropPoint) {
+      for (auto it = state.windows.begin(); it != state.windows.end(); ++it) {
+        if (it == sourceIt) continue;
+        RECT rect{};
+        if (GetWindowFrameRect(*it, &rect) && PtInRect(&rect, dropPoint)) {
+          targetIt = it;
+          break;
+        }
+      }
+    }
+
+    if (sourceIt != state.windows.end() && targetIt != state.windows.end()) {
+      HWND target = *targetIt;
+      std::iter_swap(sourceIt, targetIt);
+      SaveTilingState(key, state);
+      Wh_Log(L"User move swapped managed windows %p and %p", resizedHwnd, target);
+    }
+
+    // If there is no target, snap the still-tiled source back to its slot.
+    ArrangeWorkspace(key);
     return;
   }
 
@@ -3222,6 +3309,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
         g_moveSizeStartRects[hwnd] = r;
       } else {
         g_moveSizeEndRects[hwnd] = r;
+        POINT pt{};
+        if (GetCursorPos(&pt)) g_moveSizeEndPoints[hwnd] = pt;
       }
     }
     ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
@@ -3363,6 +3452,12 @@ void LoadSettings() {
   g_defaultLayout = ParseLayoutSetting(layout);
   Wh_FreeStringSetting(layout);
 
+  PCWSTR mouseBehavior = Wh_GetStringSetting(L"MouseMoveBehavior");
+  g_mouseMoveBehavior = mouseBehavior && _wcsicmp(mouseBehavior, L"swap") == 0
+                            ? MouseMoveBehavior::Swap
+                            : MouseMoveBehavior::Float;
+  Wh_FreeStringSetting(mouseBehavior);
+
   g_enableTiling = Wh_GetIntSetting(L"EnableTiling") != 0;
   g_captureLayoutOnTile = Wh_GetIntSetting(L"CaptureLayoutOnTile") != 0;
   g_enableLayoutCycle = Wh_GetIntSetting(L"EnableLayoutCycle") != 0;
@@ -3371,10 +3466,11 @@ void LoadSettings() {
   g_tileNewWinSuspended = false;
 
 
-  g_tileKey = ReadStringSetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
-  g_layoutKey = ReadStringSetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
-  g_swapMasterKey = ReadStringSetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
-  g_tileNewWinToggleKey = ReadStringSetting(L"TileNewWinToggleKey", ParseSingleCharKey, (UINT)'U');
+  g_tileKey = ReadHotkeySetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
+  g_layoutKey = ReadHotkeySetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
+  g_swapMasterKey = ReadHotkeySetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
+  g_tileNewWinToggleKey = ReadHotkeySetting(L"TileNewWinToggleKey", ParseSingleCharKey, (UINT)'U');
+  g_floatFocusedKey = ReadHotkeySetting(L"FloatFocusedKey", ParseSingleCharKey, (UINT)'F');
 
   TrayUi::LoadSettings();
 }
@@ -3402,10 +3498,11 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   }
 
   if (g_enableTiling) {
-    RegisterHotKey(nullptr, HK_TILE, g_tilingModifiers, g_tileKey);
-    RegisterHotKey(nullptr, HK_SWAP_MASTER, g_tilingModifiers, g_swapMasterKey);
-    RegisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE, g_tilingModifiers, g_tileNewWinToggleKey);
-    if (g_enableLayoutCycle) {
+    if (g_tileKey) RegisterHotKey(nullptr, HK_TILE, g_tilingModifiers, g_tileKey);
+    if (g_swapMasterKey) RegisterHotKey(nullptr, HK_SWAP_MASTER, g_tilingModifiers, g_swapMasterKey);
+    if (g_tileNewWinToggleKey) RegisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE, g_tilingModifiers, g_tileNewWinToggleKey);
+    if (g_floatFocusedKey) RegisterHotKey(nullptr, HK_FLOAT_FOCUSED, g_tilingModifiers, g_floatFocusedKey);
+    if (g_enableLayoutCycle && g_layoutKey) {
       RegisterHotKey(nullptr, HK_LAYOUT, g_tilingModifiers, g_layoutKey);
     }
   }
@@ -3497,6 +3594,11 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
                 continue;
               }
 
+              case HK_FLOAT_FOCUSED: {
+                FloatFocusedWindow();
+                continue;
+              }
+
               case HK_TILENEWWIN_TOGGLE: {
                 if (g_enableTileNewWin) {
                   g_tileNewWinSuspended = !g_tileNewWinSuspended;
@@ -3542,9 +3644,8 @@ cleanup:
     UnregisterHotKey(nullptr, HK_TILE);
     UnregisterHotKey(nullptr, HK_SWAP_MASTER);
     UnregisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE);
-    if (g_enableLayoutCycle) {
-      UnregisterHotKey(nullptr, HK_LAYOUT);
-    }
+    UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
+    UnregisterHotKey(nullptr, HK_LAYOUT);
   }
 
   TrayUi::Shutdown();
