@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.3
+// @version         1.7.4
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -27,7 +27,8 @@ resize-adjusted ratios per virtual desktop.
 - Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
 - User move-only drags float that window without forgetting it
 - Theme-aware notification-area text icon shows the current workspace layout (MV/MH/CL/RW/BS/MN/FL)
-- Compact Win32 layout flyout appears briefly when the layout is changed
+- Optional per-layout .ico overrides with generated text fallback
+- Compact Win32 layout flyout appears on layout/desktop changes with configurable position
 - Optional capture of current window sizes when manually tiling
 
 ## Default Hotkeys
@@ -119,6 +120,37 @@ resize-adjusted ratios per virtual desktop.
 - LayoutKey: "L"
   $name: '[Tiling] Layout Cycle Key'
   $description: 'Key to cycle through tiling layouts. Examples: L, Tab, =, ], /'
+
+- FlyoutPosition: bottom
+  $name: '[UI] Flyout Position'
+  $description: Show layout feedback at the top or bottom center of the active monitor
+  $options:
+    - top: Top
+    - bottom: Bottom
+
+- FlyoutOffsetX: 0
+  $name: '[UI] Flyout X Offset'
+  $description: Horizontal offset in DPI-scaled pixels (positive moves right)
+
+- FlyoutOffsetY: 0
+  $name: '[UI] Flyout Y Offset'
+  $description: Vertical offset in DPI-scaled pixels (positive moves down)
+
+- CustomIcons:
+    - - Layout: master_stack
+        $name: Layout
+        $options:
+          - master_stack: Master + Stack (Vertical)
+          - master_stack_h: Master + Stack (Horizontal)
+          - columns: Columns
+          - rows: Rows
+          - bsp: BSP
+          - monocle: Monocle
+          - floating: Floating
+      - Path: ""
+        $name: Icon path (.ico)
+  $name: '[UI] Custom Tray Icons'
+  $description: Optional per-layout .ico overrides. Failed/empty paths use the generated text icon.
 */
 // ==/WindhawkModSettings==
 
@@ -1695,13 +1727,14 @@ static bool LoadTilingState(const DesktopMonitorKey& key, TilingState* state) {
 namespace TrayUi {
 
 //-----------------------------------------------------------------------------
-// Shared UI state / naming
+// Settings + naming
 //-----------------------------------------------------------------------------
 
 constexpr wchar_t kTrayWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
 constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkTilingHelperLayoutFlyout";
 constexpr UINT kIconId = 1;
 constexpr int kIconCanvasSize = 32;
+constexpr int kTrayFontHeight = 26;
 constexpr UINT_PTR kFlyoutTimerId = 1;
 constexpr DWORD kFlyoutHoldMs = 850;
 constexpr DWORD kFlyoutFadeMs = 180;
@@ -1713,6 +1746,9 @@ static ATOM g_flyoutWindowClass = 0;
 static UINT g_taskbarCreatedMessage = 0;
 static bool g_iconAdded = false;
 static bool g_systemLightTheme = false;
+static bool g_flyoutTop = false;
+static int g_flyoutOffsetX = 0;
+static int g_flyoutOffsetY = 0;
 static TileLayout g_displayedLayout = TileLayout::COUNT;
 static GUID g_displayedDesktopId{};
 static bool g_haveDisplayedDesktopId = false;
@@ -1720,101 +1756,93 @@ static TileLayout g_flyoutLayout = TileLayout::COUNT;
 static DWORD g_flyoutShownTick = 0;
 static NOTIFYICONDATAW g_notifyData{};
 static std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> g_icons{};
+static std::array<std::wstring, static_cast<size_t>(TileLayout::COUNT)>
+    g_customIconPaths{};
 
 static const wchar_t* LayoutDisplayName(TileLayout layout) {
   switch (layout) {
-    case TileLayout::MasterStack:
-      return L"Master + Stack (Vertical)";
-    case TileLayout::MasterStackH:
-      return L"Master + Stack (Horizontal)";
-    case TileLayout::Columns:
-      return L"Columns";
-    case TileLayout::Rows:
-      return L"Rows";
-    case TileLayout::BSP:
-      return L"BSP";
-    case TileLayout::Monocle:
-      return L"Monocle";
-    case TileLayout::Floating:
-      return L"Floating";
-    case TileLayout::COUNT:
-    default:
-      return L"Unknown";
+    case TileLayout::MasterStack: return L"Master + Stack (Vertical)";
+    case TileLayout::MasterStackH: return L"Master + Stack (Horizontal)";
+    case TileLayout::Columns: return L"Columns";
+    case TileLayout::Rows: return L"Rows";
+    case TileLayout::BSP: return L"BSP";
+    case TileLayout::Monocle: return L"Monocle";
+    case TileLayout::Floating: return L"Floating";
+    default: return L"Unknown";
   }
 }
 
 static const wchar_t* LayoutTrayText(TileLayout layout) {
   switch (layout) {
-    case TileLayout::MasterStack:
-      return L"M│";
-    case TileLayout::MasterStackH:
-      return L"M─";
-    case TileLayout::Columns:
-      return L"CL";
-    case TileLayout::Rows:
-      return L"RW";
-    case TileLayout::BSP:
-      return L"BS";
-    case TileLayout::Monocle:
-      return L"MN";
-    case TileLayout::Floating:
-      return L"FL";
-    case TileLayout::COUNT:
-    default:
-      return L"??";
+    case TileLayout::MasterStack: return L"MV";
+    case TileLayout::MasterStackH: return L"MH";
+    case TileLayout::Columns: return L"CL";
+    case TileLayout::Rows: return L"RW";
+    case TileLayout::BSP: return L"BS";
+    case TileLayout::Monocle: return L"MN";
+    case TileLayout::Floating: return L"FL";
+    default: return L"??";
   }
 }
 
 static const wchar_t* LayoutFlyoutText(TileLayout layout) {
   switch (layout) {
-    case TileLayout::MasterStack:
-      return L"Master + Stack V";
-    case TileLayout::MasterStackH:
-      return L"Master + Stack H";
-    case TileLayout::Columns:
-      return L"Columns";
-    case TileLayout::Rows:
-      return L"Rows";
-    case TileLayout::BSP:
-      return L"BSP";
-    case TileLayout::Monocle:
-      return L"Monocle";
-    case TileLayout::Floating:
-      return L"Floating";
-    case TileLayout::COUNT:
-    default:
-      return L"Unknown";
+    case TileLayout::MasterStack: return L"Master + Stack V";
+    case TileLayout::MasterStackH: return L"Master + Stack H";
+    case TileLayout::Columns: return L"Columns";
+    case TileLayout::Rows: return L"Rows";
+    case TileLayout::BSP: return L"BSP";
+    case TileLayout::Monocle: return L"Monocle";
+    case TileLayout::Floating: return L"Floating";
+    default: return L"Unknown";
   }
 }
+
+static void LoadSettings() {
+  using WindhawkUtils::StringSetting;
+  auto position = StringSetting::make(L"FlyoutPosition");
+  g_flyoutTop = _wcsicmp(position.get(), L"top") == 0;
+  g_flyoutOffsetX = Wh_GetIntSetting(L"FlyoutOffsetX");
+  g_flyoutOffsetY = Wh_GetIntSetting(L"FlyoutOffsetY");
+
+  for (auto& path : g_customIconPaths) path.clear();
+  for (int i = 0; i < 32; ++i) {
+    auto layoutName = StringSetting::make(L"CustomIcons[%d].Layout", i);
+    if (!*layoutName.get()) break;
+    auto path = StringSetting::make(L"CustomIcons[%d].Path", i);
+    size_t index = static_cast<size_t>(ParseLayoutSetting(layoutName.get()));
+    if (*path.get() && index < g_customIconPaths.size() &&
+        g_customIconPaths[index].empty()) {
+      g_customIconPaths[index] = path.get();
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Theme-aware tray icons
+//-----------------------------------------------------------------------------
 
 static bool ReadSystemLightTheme() {
   DWORD value = 0;
   DWORD size = sizeof(value);
-  LSTATUS status = RegGetValueW(
-      HKEY_CURRENT_USER,
-      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-      L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
-  if (status == ERROR_SUCCESS) return value != 0;
-
+  if (RegGetValueW(
+          HKEY_CURRENT_USER,
+          L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+          L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value,
+          &size) == ERROR_SUCCESS) {
+    return value != 0;
+  }
   COLORREF fallback = GetSysColor(COLOR_WINDOW);
-  return (GetRValue(fallback) + GetGValue(fallback) + GetBValue(fallback)) >= 384;
+  return GetRValue(fallback) + GetGValue(fallback) + GetBValue(fallback) >= 384;
 }
 
-static COLORREF TrayForegroundColor() {
+static COLORREF ForegroundColor() {
   return g_systemLightTheme ? RGB(24, 24, 24) : RGB(255, 255, 255);
 }
 
 static COLORREF FlyoutBackgroundColor() {
   return g_systemLightTheme ? RGB(243, 243, 243) : RGB(36, 36, 36);
 }
-
-static COLORREF FlyoutForegroundColor() {
-  return g_systemLightTheme ? RGB(24, 24, 24) : RGB(255, 255, 255);
-}
-
-//-----------------------------------------------------------------------------
-// Theme-aware text tray icons
-//-----------------------------------------------------------------------------
 
 static HICON CreateTextIcon(TileLayout layout) {
   BITMAPINFO bmi{};
@@ -1825,156 +1853,80 @@ static HICON CreateTextIcon(TileLayout layout) {
   bmi.bmiHeader.biBitCount = 32;
   bmi.bmiHeader.biCompression = BI_RGB;
 
-  void* dibBits = nullptr;
-  HBITMAP colorBitmap =
-      CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
-  if (!colorBitmap || !dibBits) {
-    if (colorBitmap) DeleteObject(colorBitmap);
+  void* bits = nullptr;
+  HBITMAP color = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits,
+                                   nullptr, 0);
+  HDC dc = color ? CreateCompatibleDC(nullptr) : nullptr;
+  if (!color || !dc || !bits) {
+    if (dc) DeleteDC(dc);
+    if (color) DeleteObject(color);
     return nullptr;
   }
 
-  HDC dc = CreateCompatibleDC(nullptr);
-  if (!dc) {
-    DeleteObject(colorBitmap);
-    return nullptr;
-  }
-
-  HGDIOBJ oldBitmap = SelectObject(dc, colorBitmap);
-  RECT canvas{0, 0, kIconCanvasSize, kIconCanvasSize};
-  HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
-  FillRect(dc, &canvas, black);
-  DeleteObject(black);
-
-  SetBkMode(dc, OPAQUE);
-  SetBkColor(dc, RGB(0, 0, 0));
+  HGDIOBJ oldBitmap = SelectObject(dc, color);
+  RECT rect{0, 0, kIconCanvasSize, kIconCanvasSize};
+  FillRect(dc, &rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+  HFONT font = CreateFontW(-kTrayFontHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE,
+                           FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                           FIXED_PITCH | FF_MODERN, L"Cascadia Mono");
+  HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+  SetBkMode(dc, TRANSPARENT);
   SetTextColor(dc, RGB(255, 255, 255));
+  DrawTextW(dc, LayoutTrayText(layout), -1, &rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+  if (oldFont) SelectObject(dc, oldFont);
+  if (font) DeleteObject(font);
 
-  const wchar_t* text = LayoutTrayText(layout);
-  const int textLength = static_cast<int>(wcslen(text));
-  constexpr int kTargetWidth = kIconCanvasSize - 2;
-  constexpr int kTargetHeight = kIconCanvasSize - 2;
-
-  HFONT chosenFont = nullptr;
-  SIZE naturalSize{};
-
-  // All modes use the same maximum cap-height. Width is normalized separately
-  // below, so wide pairs such as RW no longer force a smaller font than CL/FL.
-  for (int pixelHeight = kIconCanvasSize; pixelHeight >= 8; --pixelHeight) {
-    HFONT font = CreateFontW(-pixelHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    if (!font) continue;
-
-    HGDIOBJ oldFont = SelectObject(dc, font);
-    SIZE textSize{};
-    GetTextExtentPoint32W(dc, text, textLength, &textSize);
-    SelectObject(dc, oldFont);
-
-    if (textSize.cy <= kTargetHeight) {
-      chosenFont = font;
-      naturalSize = textSize;
-      break;
-    }
-    DeleteObject(font);
-  }
-
-  if (!chosenFont) {
-    chosenFont = CreateFontW(-16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    HGDIOBJ oldFont = SelectObject(dc, chosenFont);
-    GetTextExtentPoint32W(dc, text, textLength, &naturalSize);
-    SelectObject(dc, oldFont);
-  }
-
-  HGDIOBJ oldFont = SelectObject(dc, chosenFont);
-  int previousGraphicsMode = SetGraphicsMode(dc, GM_ADVANCED);
-
-  // Preserve one common vertical size, then normalize each label to the same
-  // visual width. The shell therefore receives consistently large tray glyphs
-  // instead of shrinking labels merely because one contains a W/M.
-  float xScale = naturalSize.cx > 0
-                     ? static_cast<float>(kTargetWidth) /
-                           static_cast<float>(naturalSize.cx)
-                     : 1.0f;
-  XFORM transform{xScale, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
-  bool transformed = previousGraphicsMode != 0 &&
-                     SetWorldTransform(dc, &transform) != FALSE;
-
-  int outputWidth = transformed
-                        ? kTargetWidth
-                        : std::min(kTargetWidth, static_cast<int>(naturalSize.cx));
-  int deviceX = (kIconCanvasSize - outputWidth) / 2;
-  int logicalX = transformed
-                     ? static_cast<int>(std::lround(deviceX / xScale))
-                     : deviceX;
-  int y = (kIconCanvasSize - naturalSize.cy) / 2;
-  TextOutW(dc, logicalX, y, text, textLength);
-
-  if (transformed) {
-    ModifyWorldTransform(dc, nullptr, MWT_IDENTITY);
-  }
-  if (previousGraphicsMode != 0) {
-    SetGraphicsMode(dc, previousGraphicsMode);
-  }
-  SelectObject(dc, oldFont);
-  DeleteObject(chosenFont);
-
-  // GDI doesn't populate alpha in a 32bpp DIB. Render white-on-black, use the
-  // antialiased intensity as coverage, then recolor that coverage for the
-  // current taskbar theme. This preserves smooth edges with a transparent BG.
-  auto* pixels = static_cast<uint32_t*>(dibBits);
-  COLORREF foreground = TrayForegroundColor();
-  const uint32_t fr = GetRValue(foreground);
-  const uint32_t fg = GetGValue(foreground);
-  const uint32_t fb = GetBValue(foreground);
+  auto* pixels = static_cast<uint32_t*>(bits);
+  COLORREF fg = ForegroundColor();
+  uint32_t r = GetRValue(fg), g = GetGValue(fg), b = GetBValue(fg);
   for (int i = 0; i < kIconCanvasSize * kIconCanvasSize; ++i) {
-    uint32_t pixel = pixels[i];
-    uint32_t coverage = std::max({pixel & 0xFFu,
-                                  (pixel >> 8) & 0xFFu,
-                                  (pixel >> 16) & 0xFFu});
-    pixels[i] = (coverage << 24) | (fr << 16) | (fg << 8) | fb;
+    uint32_t p = pixels[i];
+    uint32_t a = std::max({p & 0xFFu, (p >> 8) & 0xFFu,
+                           (p >> 16) & 0xFFu});
+    pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
   }
 
   SelectObject(dc, oldBitmap);
   DeleteDC(dc);
 
-  constexpr int kMaskStride = ((kIconCanvasSize + 31) / 32) * 4;
-  std::array<BYTE, kMaskStride * kIconCanvasSize> maskBits{};
-  HBITMAP maskBitmap = CreateBitmap(kIconCanvasSize, kIconCanvasSize, 1, 1,
-                                    maskBits.data());
-  if (!maskBitmap) {
-    DeleteObject(colorBitmap);
-    return nullptr;
-  }
-
-  ICONINFO iconInfo{};
-  iconInfo.fIcon = TRUE;
-  iconInfo.hbmColor = colorBitmap;
-  iconInfo.hbmMask = maskBitmap;
-  HICON icon = CreateIconIndirect(&iconInfo);
-
-  DeleteObject(maskBitmap);
-  DeleteObject(colorBitmap);
+  constexpr int maskStride = ((kIconCanvasSize + 31) / 32) * 4;
+  std::array<BYTE, maskStride * kIconCanvasSize> maskBits{};
+  HBITMAP mask = CreateBitmap(kIconCanvasSize, kIconCanvasSize, 1, 1,
+                              maskBits.data());
+  ICONINFO info{TRUE, 0, 0, mask, color};
+  HICON icon = mask ? CreateIconIndirect(&info) : nullptr;
+  if (mask) DeleteObject(mask);
+  DeleteObject(color);
   return icon;
+}
+
+static HICON CreateLayoutIcon(TileLayout layout) {
+  size_t index = static_cast<size_t>(layout);
+  if (index < g_customIconPaths.size() && !g_customIconPaths[index].empty()) {
+    HICON icon = static_cast<HICON>(LoadImageW(
+        nullptr, g_customIconPaths[index].c_str(), IMAGE_ICON,
+        kIconCanvasSize, kIconCanvasSize, LR_LOADFROMFILE));
+    if (icon) return icon;
+    Wh_Log(L"Failed to load custom tray icon, using text fallback: %s",
+           g_customIconPaths[index].c_str());
+  }
+  return CreateTextIcon(layout);
+}
+
+static void DestroyIconSet(
+    std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>& icons) {
+  for (HICON& icon : icons) {
+    if (icon) DestroyIcon(icon);
+    icon = nullptr;
+  }
 }
 
 static HICON GetLayoutIcon(TileLayout layout) {
   size_t index = static_cast<size_t>(layout);
   if (index < g_icons.size() && g_icons[index]) return g_icons[index];
   return LoadIconW(nullptr, IDI_APPLICATION);
-}
-
-static void DestroyIconSet(
-    std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>& icons) {
-  for (HICON& icon : icons) {
-    if (icon) {
-      DestroyIcon(icon);
-      icon = nullptr;
-    }
-  }
 }
 
 static void SetTooltip(TileLayout layout) {
@@ -1995,13 +1947,10 @@ static bool AddIconToShell() {
   g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
   g_notifyData.hIcon = GetLayoutIcon(g_displayedLayout);
   SetTooltip(g_displayedLayout);
-
   if (!Shell_NotifyIconW(NIM_ADD, &g_notifyData)) {
     g_iconAdded = false;
-    Wh_Log(L"Failed to add tiling layout tray icon: %lu", GetLastError());
     return false;
   }
-
   g_iconAdded = true;
   g_notifyData.uVersion = NOTIFYICON_VERSION_4;
   Shell_NotifyIconW(NIM_SETVERSION, &g_notifyData);
@@ -2011,12 +1960,10 @@ static bool AddIconToShell() {
 static void UpdateIcon(TileLayout layout) {
   if (!g_trayWindow || layout == TileLayout::COUNT) return;
   g_displayedLayout = layout;
-
   if (!g_iconAdded) {
     AddIconToShell();
     return;
   }
-
   g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
   g_notifyData.hIcon = GetLayoutIcon(layout);
   SetTooltip(layout);
@@ -2026,16 +1973,15 @@ static void UpdateIcon(TileLayout layout) {
   }
 }
 
-static void RebuildIconsForTheme() {
-  std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> newIcons{};
-  for (size_t i = 0; i < newIcons.size(); ++i) {
-    newIcons[i] = CreateTextIcon(static_cast<TileLayout>(i));
+static void RebuildIcons() {
+  std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> icons{};
+  for (size_t i = 0; i < icons.size(); ++i) {
+    icons[i] = CreateLayoutIcon(static_cast<TileLayout>(i));
   }
-
-  auto oldIcons = g_icons;
-  g_icons = newIcons;
+  auto old = g_icons;
+  g_icons = icons;
   if (g_displayedLayout != TileLayout::COUNT) UpdateIcon(g_displayedLayout);
-  DestroyIconSet(oldIcons);
+  DestroyIconSet(old);
 }
 
 //-----------------------------------------------------------------------------
@@ -2058,34 +2004,28 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
   switch (message) {
     case WM_NCHITTEST:
       return HTTRANSPARENT;
-
     case WM_ERASEBKGND:
       return 1;
-
     case WM_PAINT: {
       PAINTSTRUCT ps{};
       HDC dc = BeginPaint(hwnd, &ps);
       RECT client{};
       GetClientRect(hwnd, &client);
-
       HBRUSH background = CreateSolidBrush(FlyoutBackgroundColor());
       FillRect(dc, &client, background);
       DeleteObject(background);
 
-      UINT dpi = GetDpiForWindow(hwnd);
-      HFONT font = CreateFlyoutFont(dpi);
+      HFONT font = CreateFlyoutFont(GetDpiForWindow(hwnd));
       HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
       SetBkMode(dc, TRANSPARENT);
-      SetTextColor(dc, FlyoutForegroundColor());
+      SetTextColor(dc, ForegroundColor());
       DrawTextW(dc, LayoutFlyoutText(g_flyoutLayout), -1, &client,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
       if (oldFont) SelectObject(dc, oldFont);
       if (font) DeleteObject(font);
-
       EndPaint(hwnd, &ps);
       return 0;
     }
-
     case WM_TIMER:
       if (wParam == kFlyoutTimerId) {
         DWORD elapsed = GetTickCount() - g_flyoutShownTick;
@@ -2094,12 +2034,10 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
           ShowWindow(hwnd, SW_HIDE);
           return 0;
         }
-
         BYTE alpha = 255;
         if (elapsed > kFlyoutHoldMs) {
-          DWORD fadeElapsed = elapsed - kFlyoutHoldMs;
-          alpha = static_cast<BYTE>(255 -
-              std::min<DWORD>(255, (fadeElapsed * 255) / kFlyoutFadeMs));
+          alpha = static_cast<BYTE>(255 - std::min<DWORD>(
+              255, ((elapsed - kFlyoutHoldMs) * 255) / kFlyoutFadeMs));
         }
         SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
         return 0;
@@ -2111,7 +2049,6 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
 
 static void ShowLayoutFlyout(TileLayout layout) {
   if (!g_flyoutWindow || layout == TileLayout::COUNT) return;
-
   HMONITOR monitor = GetTargetMonitor();
   RECT workArea{};
   if (!monitor || !GetMonitorWorkArea(monitor, &workArea)) return;
@@ -2128,19 +2065,20 @@ static void ShowLayoutFlyout(TileLayout layout) {
   if (font) DeleteObject(font);
   ReleaseDC(g_flyoutWindow, dc);
 
-  const int horizontalPadding = ScaleForDpi(24, dpi);
-  const int width = std::max(ScaleForDpi(128, dpi),
-                             static_cast<int>(textSize.cx) + horizontalPadding * 2);
-  const int height = ScaleForDpi(48, dpi);
-  const int x = workArea.left + ((workArea.right - workArea.left) - width) / 2;
-  const int y = workArea.bottom - height - ScaleForDpi(16, dpi);
+  int width = std::max(ScaleForDpi(128, dpi),
+                       static_cast<int>(textSize.cx) + ScaleForDpi(48, dpi));
+  int height = ScaleForDpi(48, dpi);
+  int x = workArea.left + ((workArea.right - workArea.left) - width) / 2 +
+          ScaleForDpi(g_flyoutOffsetX, dpi);
+  int edgeGap = ScaleForDpi(16, dpi);
+  int y = g_flyoutTop ? workArea.top + edgeGap
+                      : workArea.bottom - height - edgeGap;
+  y += ScaleForDpi(g_flyoutOffsetY, dpi);
 
-  const int radius = ScaleForDpi(8, dpi);
+  int radius = ScaleForDpi(8, dpi);
   HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
                                    radius * 2, radius * 2);
-  if (region && !SetWindowRgn(g_flyoutWindow, region, TRUE)) {
-    DeleteObject(region);
-  }
+  if (region && !SetWindowRgn(g_flyoutWindow, region, TRUE)) DeleteObject(region);
 
   g_flyoutLayout = layout;
   g_flyoutShownTick = GetTickCount();
@@ -2153,7 +2091,7 @@ static void ShowLayoutFlyout(TileLayout layout) {
 }
 
 //-----------------------------------------------------------------------------
-// Tray/flyout lifecycle and shell/theme integration
+// Lifecycle / shell integration
 //-----------------------------------------------------------------------------
 
 static void RefreshForCurrentWorkspace() {
@@ -2161,31 +2099,24 @@ static void RefreshForCurrentWorkspace() {
   HMONITOR monitor = GetTargetMonitor();
   DesktopMonitorKey key{};
   TilingState state;
-  bool haveWorkspaceKey = monitor && GetCurrentWorkspaceKey(monitor, &key);
-  if (haveWorkspaceKey && LoadTilingState(key, &state)) {
-    layout = state.layout;
-  }
+  bool haveKey = monitor && GetCurrentWorkspaceKey(monitor, &key);
+  if (haveKey && LoadTilingState(key, &state)) layout = state.layout;
 
-  bool desktopChanged =
-      haveWorkspaceKey && g_haveDisplayedDesktopId &&
-      !IsEqualGUID(key.desktopId, g_displayedDesktopId);
-  if (haveWorkspaceKey) {
+  bool desktopChanged = haveKey && g_haveDisplayedDesktopId &&
+                        !IsEqualGUID(key.desktopId, g_displayedDesktopId);
+  if (haveKey) {
     g_displayedDesktopId = key.desktopId;
     g_haveDisplayedDesktopId = true;
   }
-
   UpdateIcon(layout);
-  if (desktopChanged) {
-    ShowLayoutFlyout(layout);
-  }
+  if (desktopChanged) ShowLayoutFlyout(layout);
 }
 
 static void HandleThemeChanged() {
-  bool lightTheme = ReadSystemLightTheme();
-  if (lightTheme == g_systemLightTheme) return;
-
-  g_systemLightTheme = lightTheme;
-  RebuildIconsForTheme();
+  bool light = ReadSystemLightTheme();
+  if (light == g_systemLightTheme) return;
+  g_systemLightTheme = light;
+  RebuildIcons();
   if (g_flyoutWindow && IsWindowVisible(g_flyoutWindow)) {
     InvalidateRect(g_flyoutWindow, nullptr, TRUE);
   }
@@ -2198,7 +2129,6 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
     AddIconToShell();
     return 0;
   }
-
   switch (message) {
     case WM_SETTINGCHANGE:
     case WM_THEMECHANGED:
@@ -2211,54 +2141,34 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
 
 static bool Initialize() {
   g_systemLightTheme = ReadSystemLightTheme();
-  for (size_t i = 0; i < g_icons.size(); ++i) {
-    g_icons[i] = CreateTextIcon(static_cast<TileLayout>(i));
-  }
+  RebuildIcons();
 
   HINSTANCE instance = GetModuleHandleW(nullptr);
-
   WNDCLASSW trayClass{};
   trayClass.lpfnWndProc = TrayWindowProc;
   trayClass.hInstance = instance;
   trayClass.lpszClassName = kTrayWindowClassName;
   g_trayWindowClass = RegisterClassW(&trayClass);
-  if (!g_trayWindowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-    Wh_Log(L"Failed to register tiling tray window class: %lu", GetLastError());
-    return false;
-  }
+  if (!g_trayWindowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
   WNDCLASSW flyoutClass{};
   flyoutClass.lpfnWndProc = FlyoutWindowProc;
   flyoutClass.hInstance = instance;
   flyoutClass.lpszClassName = kFlyoutWindowClassName;
   g_flyoutWindowClass = RegisterClassW(&flyoutClass);
-  bool flyoutClassAvailable = g_flyoutWindowClass != 0;
-  if (!flyoutClassAvailable) {
-    DWORD classError = GetLastError();
-    flyoutClassAvailable = classError == ERROR_CLASS_ALREADY_EXISTS;
-    if (!flyoutClassAvailable) {
-      Wh_Log(L"Failed to register tiling layout flyout class: %lu", classError);
-    }
-  }
+  bool haveFlyoutClass = g_flyoutWindowClass != 0 ||
+                         GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 
-  // Hidden top-level owner: Explorer broadcasts TaskbarCreated to top-level
-  // windows after a shell restart, which lets us restore the notification icon.
   g_trayWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayWindowClassName, L"",
                                  WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
                                  instance, nullptr);
-  if (!g_trayWindow) {
-    Wh_Log(L"Failed to create tiling tray owner window: %lu", GetLastError());
-    return false;
-  }
+  if (!g_trayWindow) return false;
 
-  if (flyoutClassAvailable) {
+  if (haveFlyoutClass) {
     g_flyoutWindow = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         kFlyoutWindowClassName, L"", WS_POPUP, 0, 0, 0, 0,
         nullptr, nullptr, instance, nullptr);
-    if (!g_flyoutWindow) {
-      Wh_Log(L"Failed to create tiling layout flyout window: %lu", GetLastError());
-    }
   }
 
   g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
@@ -2273,7 +2183,6 @@ static void Shutdown() {
     Shell_NotifyIconW(NIM_DELETE, &g_notifyData);
   }
   g_iconAdded = false;
-
   if (g_flyoutWindow) {
     KillTimer(g_flyoutWindow, kFlyoutTimerId);
     DestroyWindow(g_flyoutWindow);
@@ -2283,19 +2192,12 @@ static void Shutdown() {
     DestroyWindow(g_trayWindow);
     g_trayWindow = nullptr;
   }
-
   DestroyIconSet(g_icons);
 
   HINSTANCE instance = GetModuleHandleW(nullptr);
-  if (g_flyoutWindowClass) {
-    UnregisterClassW(kFlyoutWindowClassName, instance);
-    g_flyoutWindowClass = 0;
-  }
-  if (g_trayWindowClass) {
-    UnregisterClassW(kTrayWindowClassName, instance);
-    g_trayWindowClass = 0;
-  }
-
+  if (g_flyoutWindowClass) UnregisterClassW(kFlyoutWindowClassName, instance);
+  if (g_trayWindowClass) UnregisterClassW(kTrayWindowClassName, instance);
+  g_flyoutWindowClass = g_trayWindowClass = 0;
   g_taskbarCreatedMessage = 0;
   g_displayedLayout = TileLayout::COUNT;
   g_displayedDesktopId = {};
@@ -3457,6 +3359,8 @@ void LoadSettings() {
   g_layoutKey = ReadStringSetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
   g_swapMasterKey = ReadStringSetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
   g_tileNewWinToggleKey = ReadStringSetting(L"TileNewWinToggleKey", ParseSingleCharKey, (UINT)'U');
+
+  TrayUi::LoadSettings();
 }
 
 DWORD WINAPI HotkeyThreadProc(LPVOID) {
