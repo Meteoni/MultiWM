@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.7
+// @version         1.7.8
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -176,6 +176,7 @@ resize-adjusted ratios per virtual desktop.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cwchar>
 #include <cstring>
 #include <new>
@@ -484,33 +485,53 @@ static std::unordered_map<HWND, POINT> g_moveSizeEndPoints;
 
 
 
-enum class RectChange {
+enum class MoveSizeIntent {
     None,
-    MoveOnly,
-    ResizeOnly,
-    MoveAndResize
+    Move,
+    Resize,
 };
-
-static inline LONG RectW(const RECT& r) { return r.right - r.left; }
-static inline LONG RectH(const RECT& r) { return r.bottom - r.top; }
 
 static inline bool Differs(LONG a, LONG b, LONG tol = 1) {
     return (a > b) ? (a - b > tol) : (b - a > tol);
 }
 
-RectChange ClassifyRectChange(const RECT& before, const RECT& after, LONG tol = 1) {
-    bool xChanged = Differs(before.left,  after.left,  tol);
-    bool yChanged = Differs(before.top,   after.top,   tol);
-    bool wChanged = Differs(RectW(before), RectW(after), tol);
-    bool hChanged = Differs(RectH(before), RectH(after), tol);
+// Classify the user's *gesture*, not whether position and size both happened to
+// change. WinUI/DWM windows can perturb one frame edge slightly during a pure
+// move, while a legitimate top/left-edge resize necessarily changes position
+// and size together. Opposite edges moving together is therefore the stronger
+// signal for translation.
+MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LONG tol = 1) {
+    const LONG dl = after.left - before.left;
+    const LONG dr = after.right - before.right;
+    const LONG dt = after.top - before.top;
+    const LONG db = after.bottom - before.bottom;
 
-    bool posChanged  = xChanged || yChanged;
-    bool sizeChanged = wChanged || hChanged;
+    const LONG maxEdgeDelta = std::max(
+        std::max(std::abs(dl), std::abs(dr)),
+        std::max(std::abs(dt), std::abs(db)));
+    if (maxEdgeDelta <= tol) {
+        Wh_Log(L"Move/size intent: none");
+        return MoveSizeIntent::None;
+    }
 
-    if (!posChanged && !sizeChanged) {Wh_Log(L"None change"); return RectChange::None;}
-    if ( posChanged && !sizeChanged) {Wh_Log(L"Move-only change"); return RectChange::MoveOnly;}
-    if (!posChanged &&  sizeChanged) {Wh_Log(L"Resize-only change"); return RectChange::ResizeOnly;}
-    Wh_Log(L"Both changed"); return RectChange::MoveAndResize;
+    // Twice the center displacement versus actual width/height deformation.
+    // Use 64-bit intermediates so adding two LONG deltas cannot overflow.
+    const long long moveScore = std::max(
+        std::llabs(static_cast<long long>(dl) + dr),
+        std::llabs(static_cast<long long>(dt) + db));
+    const long long resizeScore = std::max(
+        std::llabs(static_cast<long long>(dr) - dl),
+        std::llabs(static_cast<long long>(db) - dt));
+
+    // A translation must dominate deformation by a healthy margin. A normal
+    // one-edge resize produces roughly equal scores, so it remains Resize.
+    if (moveScore > resizeScore * 2) {
+        Wh_Log(L"Move/size intent: move (move=%lld resize=%lld)", moveScore, resizeScore);
+        return MoveSizeIntent::Move;
+    }
+
+    Wh_Log(L"Move/size intent: resize (move=%lld resize=%lld)", moveScore, resizeScore);
+    return MoveSizeIntent::Resize;
 }
 
 
@@ -3104,7 +3125,7 @@ void ApplyUserMoveSize(HWND hwnd) {
     }
   }
 
-  RectChange change = RectChange::None;
+  MoveSizeIntent intent = MoveSizeIntent::None;
   POINT dropPoint{};
   bool haveDropPoint = false;
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
@@ -3112,7 +3133,7 @@ void ApplyUserMoveSize(HWND hwnd) {
   auto endIt = g_moveSizeEndRects.find(hwnd);
   auto pointIt = g_moveSizeEndPoints.find(hwnd);
   if (startIt != g_moveSizeStartRects.end() && endIt != g_moveSizeEndRects.end()) {
-    change = ClassifyRectChange(startIt->second, endIt->second, 1);
+    intent = ClassifyMoveSizeIntent(startIt->second, endIt->second, 1);
   }
   if (pointIt != g_moveSizeEndPoints.end()) {
     dropPoint = pointIt->second;
@@ -3123,7 +3144,13 @@ void ApplyUserMoveSize(HWND hwnd) {
   g_moveSizeEndPoints.erase(hwnd);
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
-  if (change == RectChange::MoveOnly) {
+  if (intent == MoveSizeIntent::None) {
+    // No meaningful gesture: put a tiled window back on its authoritative slot.
+    ArrangeWorkspace(key);
+    return;
+  }
+
+  if (intent == MoveSizeIntent::Move) {
     if (g_mouseMoveBehavior == MouseMoveBehavior::Float) {
       if (FloatWindowInState(state, resizedHwnd)) {
         if (WindowRecord* record = FindWindowRecord(state, resizedHwnd)) {
