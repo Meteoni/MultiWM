@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.8
+// @version         1.7.9
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -30,7 +30,7 @@ resize-adjusted ratios per virtual desktop.
 - Theme-aware notification-area text icon shows the current workspace layout (MV/MH/CL/RW/BS/MN/FL)
 - Optional per-layout .ico overrides with generated text fallback
 - Compact Win32 layout flyout appears on layout/desktop changes with configurable position
-- Optional capture of current window sizes when manually tiling
+- Manual Tile adopts the current tiled geometry when the full tiled set is visible
 
 ## Default Hotkeys
 - Tile windows: Alt + D
@@ -122,10 +122,6 @@ resize-adjusted ratios per virtual desktop.
 - MasterPercent: 50
   $name: '[Tiling] Master Size (%)'
   $description: Size percentage of the master window in Master+Stack layouts (1-99, only applies when tiling is enabled)
-
-- EnableLayoutCycle: true
-  $name: '[Tiling] Enable Layout Cycle'
-  $description: Enable hotkey to cycle through tiling layouts (only works when tiling hotkey is enabled)
 
 - LayoutKey: "L"
   $name: '[Tiling] Layout Cycle Key'
@@ -359,7 +355,6 @@ static MouseMoveBehavior g_mouseMoveBehavior = MouseMoveBehavior::Float;
 static TileLayout g_defaultLayout = TileLayout::MasterStack;
 
 static bool g_enableTiling = true;
-static bool g_enableLayoutCycle = true;
 static bool g_enableTileNewWin = false;
 static bool g_tileNewWinSuspended = false;
 
@@ -437,7 +432,7 @@ struct WindowRecord {
   RECT lastObservedRect{};
 
   // Only meaningful while state == Suspended. It preserves the tiled logical
-  // position/weight across minimize, hide, and app-cloak transitions.
+  // position/weight across explicit non-participating states such as minimize.
   SuspendedSlot savedSlot{};
   bool hasSavedSlot = false;
 };
@@ -2592,8 +2587,8 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
       continue;
     }
 
-    // Rendering remains defensive against state transitions that occur after the
-    // settled reconciliation snapshot.
+    // Renderability is deliberately separate from membership. A known tiled
+    // window that is temporarily hidden/cloaked keeps consuming its logical slot.
     if (IsIconic(hwnd) || !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd)) {
       continue;
     }
@@ -2668,21 +2663,15 @@ static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeome
     state.masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
   }
 
-  // Restore known temporarily absent tiled windows which are visible again.
+  // Manual Tile is an explicit repair/adoption operation. A visible suspended
+  // record can be restored here if its state event was missed, but absence from
+  // this discovery snapshot never ejects a known tiled window.
   for (HWND w : snapshot) {
     WindowRecord* record = FindWindowRecord(state, w);
     if (record && record->state == ManageState::Suspended) {
       RestoreWindowInState(state, w);
     }
   }
-
-  // Windows no longer in the visible snapshot are suspended rather than
-  // forgotten. Stable saved slots allow arbitrary restore order.
-  std::vector<HWND> toSuspend;
-  for (HWND w : state.windows) {
-    if (!ContainsWindow(snapshot, w)) toSuspend.push_back(w);
-  }
-  for (HWND w : toSuspend) SuspendWindowInState(state, w);
 
   // Manual Tile explicitly re-adopts individually floated windows. Automatic
   // reconciliation never does this, so a user drag exclusion remains stable.
@@ -2713,10 +2702,14 @@ static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeome
     }
   }
 
-  // Geometry capture remains explicit/manual. Rebuilding from current rectangles
-  // also resets placement-failure history for the freshly adopted tiled set.
+  bool allTiledVisible = std::all_of(
+      state.windows.begin(), state.windows.end(),
+      [&](HWND w) { return ContainsWindow(snapshot, w); });
+
+  // Geometry capture remains explicit/manual. Only learn from a complete visible
+  // tiled set; a temporarily hidden/cloaked known window keeps its slot instead.
   if (adoptCurrentGeometry && state.layout != TileLayout::Floating &&
-      !hasSuspended &&
+      !hasSuspended && allTiledVisible &&
       SnapshotLooksTiled(state.windows, workArea)) {
     HWND preferredMaster = state.windows.empty() ? nullptr : state.windows.front();
     TilingState captured =
@@ -2800,10 +2793,10 @@ static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) 
 
 static void ScheduleLifecycleReconcile(HWND hwnd);
 
-// Reconcile one desktop+monitor workspace from a supplied participation snapshot.
-// The caller controls whether that snapshot is cloak-sensitive (settled lifecycle)
-// or cloak-insensitive (authoritative virtual-desktop transition).
-static bool ReconcileSavedWindowsWithNewDesktop(
+// Refresh one desktop+monitor workspace. WindowRecord state is authoritative:
+// the snapshot can discover new windows, but it never suspends/restores known
+// records merely because shell visibility/cloak/frame observations changed.
+static bool ReconcileWorkspaceRecords(
     HMONITOR monitor, const GUID& desktopId, const std::vector<HWND>& snapshot,
     bool discoverNew, DesktopMonitorKey* outKey) {
   if (!monitor) return false;
@@ -2821,30 +2814,15 @@ static bool ReconcileSavedWindowsWithNewDesktop(
 
   bool changed = !hadState;
 
-  // Purge dead HWNDs from the authoritative record table.
+  // Destruction is the only observation-based reason to erase a known record.
+  // Minimize/restore membership transitions are handled directly from their
+  // semantic WinEvents rather than inferred from eligibility snapshots.
   std::vector<HWND> deadWindows;
   for (const auto& kv : state.records) {
     if (!IsWindow(kv.first)) deadWindows.push_back(kv.first);
   }
   for (HWND w : deadWindows) {
     if (ForgetWindowInState(state, w)) changed = true;
-  }
-
-  // Visible snapshot members restore only if they were previously suspended.
-  // Floating/ignored records remain deliberately outside the tiled order.
-  for (HWND w : snapshot) {
-    WindowRecord* record = FindWindowRecord(state, w);
-    if (record && record->state == ManageState::Suspended) {
-      if (RestoreWindowInState(state, w)) changed = true;
-    }
-  }
-
-  std::vector<HWND> toSuspend;
-  for (HWND w : state.windows) {
-    if (!ContainsWindow(snapshot, w)) toSuspend.push_back(w);
-  }
-  for (HWND w : toSuspend) {
-    if (SuspendWindowInState(state, w)) changed = true;
   }
 
   if (discoverNew) {
@@ -2921,9 +2899,8 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
 }
 
 // Native CurrentVirtualDesktopChanged is the authoritative workspace transition
-// signal. Reconcile membership immediately by desktop GUID while deliberately
-// ignoring DWM cloak state, then let the existing settle timer make one final
-// cloak-sensitive pass after Windows finishes its per-HWND visibility burst.
+// signal. The cloak-insensitive snapshot is used only to discover new incoming
+// windows; known WindowRecord membership is never rebuilt from shell visibility.
 static void HandleVirtualDesktopChanged() {
   InterlockedExchange(&g_virtualDesktopChangeQueued, 0);
 
@@ -2941,7 +2918,7 @@ static void HandleVirtualDesktopChanged() {
   for (HMONITOR monitor : monitors) {
     std::vector<HWND> snapshot = GetTileWindowsAfterDesktopSwitch(monitor, currentDesktop);
     DesktopMonitorKey key{};
-    if (ReconcileSavedWindowsWithNewDesktop(
+    if (ReconcileWorkspaceRecords(
             monitor, currentDesktop, snapshot, discoverNew, &key)) {
       // Do not place yet: the notification can precede the final UNCLOAK events.
       // Remember only workspaces whose model actually changed; an ordinary switch
@@ -2950,14 +2927,14 @@ static void HandleVirtualDesktopChanged() {
     }
   }
 
-  // Short safety pass that distinguishes genuine current-desktop cloaks from the transient
-  // shell cloaking that accompanies the already-known switch.
+  // Coalesce the remaining shell burst for discovery/fallback and any deferred
+  // placement. It cannot suspend a known window.
   ScheduleLifecycleReconcile(nullptr);
   TrayUi::RefreshForCurrentWorkspace();
 }
 
-// For this desktop, schedule a window lifecycle (suspended? active? dead?) 
-// reconciliation pass
+// Coalesce shell visibility bursts for discovery, VD fallback, and deferred placement.
+// Known-window membership is not decided by this timer.
 static void ScheduleLifecycleReconcile(HWND hwnd) {
   // HotkeyThreadProc owns this vector/timer; no additional lock is required.
   if (hwnd && std::find(g_lifecycleDirtyWindows.begin(), g_lifecycleDirtyWindows.end(), hwnd) ==
@@ -2995,8 +2972,8 @@ static void ReconcileDeferredLifecycle() {
 
   std::vector<HMONITOR> monitors;
 
-  // FancyWM refreshes the current desktop as a unit. Do the same for every
-  // monitor for which this mod already has current-desktop state.
+  // Refresh every current-desktop workspace as a unit. This pass may purge dead
+  // handles or discover new ones, but never infers known membership from visibility.
   AcquireSRWLockShared(&g_tilingStateLock);
   for (const auto& kv : g_tilingStateMap) {
     if (IsEqualGUID(kv.first.desktopId, currentDesktop)) {
@@ -3005,8 +2982,8 @@ static void ReconcileDeferredLifecycle() {
   }
   ReleaseSRWLockShared(&g_tilingStateLock);
 
-  // Also include monitors containing newly visible/untracked windows so auto
-  // management can seed an unseen desktop+monitor workspace after the burst.
+  // Also include monitors implicated by the shell burst so full-auto discovery
+  // can seed a new desktop+monitor workspace.
   for (HWND hwnd : dirtyWindows) {
     if (!hwnd || !IsWindow(hwnd)) continue;
     GUID windowDesktop{};
@@ -3021,7 +2998,7 @@ static void ReconcileDeferredLifecycle() {
   for (HMONITOR monitor : monitors) {
     DesktopMonitorKey key{};
     std::vector<HWND> snapshot = CollectTileWindows(monitor);
-    bool changed = ReconcileSavedWindowsWithNewDesktop(
+    bool changed = ReconcileWorkspaceRecords(
         monitor, currentDesktop, snapshot, discoverNew, &key);
     bool pendingArrange = std::any_of(
         g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
@@ -3045,22 +3022,40 @@ static void ReconcileDeferredLifecycle() {
   TrayUi::RefreshForCurrentWorkspace();
 }
 
+static void SetManagedWindowSuspended(HWND hwnd, bool suspended) {
+  DesktopMonitorKey key{};
+  TilingState state;
+  if (!FindStateContainingWindow(hwnd, &key, &state)) return;
+
+  bool changed = suspended ? SuspendWindowInState(state, hwnd)
+                           : RestoreWindowInState(state, hwnd);
+  if (!changed) return;
+  SaveTilingState(key, state);
+  ArrangeWorkspace(key);
+}
+
 static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
   switch (event) {
     case EVENT_OBJECT_DESTROY:
-      // Destruction is final and should not wait for the visibility settle timer.
       ForgetManagedWindow(hwnd);
+      break;
+
+    case EVENT_SYSTEM_MINIMIZESTART:
+      // Explicit window state transition: stop consuming a tile and save its slot.
+      SetManagedWindowSuspended(hwnd, true);
+      break;
+
+    case EVENT_SYSTEM_MINIMIZEEND:
+      // Explicit restore: put the window back into its saved logical slot.
+      SetManagedWindowSuspended(hwnd, false);
       break;
 
     case EVENT_OBJECT_HIDE:
     case EVENT_OBJECT_SHOW:
     case EVENT_OBJECT_CLOAKED:
     case EVENT_OBJECT_UNCLOAKED:
-    case EVENT_SYSTEM_MINIMIZESTART:
-    case EVENT_SYSTEM_MINIMIZEEND:
-      // These remain generic visibility invalidations. Native VD notifications
-      // identify workspace switches explicitly; this settle pass is still needed
-      // for genuine hide/minimize/app-cloak transitions and as an API fallback.
+      // Shell/framework visibility is not membership. Keep HIDE/CLOAK as cheap
+      // discovery/VD-fallback signals only; known records remain untouched.
       ScheduleLifecycleReconcile(hwnd);
       break;
   }
@@ -3480,7 +3475,6 @@ void LoadSettings() {
   Wh_FreeStringSetting(mouseBehavior);
 
   g_enableTiling = Wh_GetIntSetting(L"EnableTiling") != 0;
-  g_enableLayoutCycle = Wh_GetIntSetting(L"EnableLayoutCycle") != 0;
   // New! 
   g_enableTileNewWin = Wh_GetIntSetting(L"EnableTileNewWin") != 0;
   g_tileNewWinSuspended = false;
@@ -3522,9 +3516,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
     if (g_swapMasterKey) RegisterHotKey(nullptr, HK_SWAP_MASTER, g_tilingModifiers, g_swapMasterKey);
     if (g_tileNewWinToggleKey) RegisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE, g_tilingModifiers, g_tileNewWinToggleKey);
     if (g_floatFocusedKey) RegisterHotKey(nullptr, HK_FLOAT_FOCUSED, g_tilingModifiers, g_floatFocusedKey);
-    if (g_enableLayoutCycle && g_layoutKey) {
-      RegisterHotKey(nullptr, HK_LAYOUT, g_tilingModifiers, g_layoutKey);
-    }
+    if (g_layoutKey) RegisterHotKey(nullptr, HK_LAYOUT, g_tilingModifiers, g_layoutKey);
   }
   Wh_Log(L"Hotkeys registered");
 
