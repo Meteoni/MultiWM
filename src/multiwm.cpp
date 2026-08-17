@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.9
+// @version         1.7.10
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -3313,11 +3313,20 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     if (rootOwner && rootOwner != hwnd && IsWindowTrackedInAnyState(rootOwner)) hwnd = rootOwner;
   }
 
+  // Keep shell/framework noise out of the WM queue. Untracked HWNDs matter only
+  // when full-auto can discover them, and only once they resemble real windows.
+  if (!tracked) {
+    const bool discoveryEvent =
+        event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED;
+    if (!discoveryEvent || !g_enableTileNewWin || g_tileNewWinSuspended ||
+        !CouldBeTileEligible(hwnd)) {
+      return;
+    }
+  }
+
   // Cache user move/resize boundaries. The callback only records facts; model
   // mutation and layout work happen later on the WM thread.
   if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
-    if (!tracked) return;
-
     AcquireSRWLockExclusive(&g_moveSizeRectsLock);
     RECT r{};
     if (GetWindowFrameRect(hwnd, &r)) {
@@ -3335,8 +3344,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     return;
   }
 
-  // Lifecycle events are never dropped because another WM operation is active.
-  // PostThreadMessage gives us a serialized event queue owned by HotkeyThreadProc.
+  // Accepted lifecycle events are serialized on the WM thread.
+  // PostThreadMessage keeps model mutation out of the WinEvent callback.
   QueueWindowEvent(event, hwnd);
 }
 
