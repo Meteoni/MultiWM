@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.12
+// @version         1.7.13
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -32,6 +32,7 @@ resize-adjusted ratios per virtual desktop.
 - Compact Win32 layout flyout appears on layout/desktop changes with configurable position
 - Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
 - Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate
+- Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Optional process/class/title exclusion rules keep user-selected windows out of management
 
 ## Default Hotkeys
@@ -2401,9 +2402,14 @@ static void RemoveActiveWindowAt(TilingState& state, size_t index, SuspendedSlot
   } else if (state.layout == TileLayout::MasterStack || state.layout == TileLayout::MasterStackH) {
     if (index == 0) {
       slot.wasMaster = true;
-      // The temporary master has different stack semantics. Rebuild weights
-      // rather than pretending the old stack vector still maps 1:1.
-      state.stackWeights.clear();
+      // windows[1] becomes the temporary master, so only its former stack
+      // weight stops participating. Keep the remaining stack weights attached
+      // to the same windows instead of resetting the whole stack.
+      if (!state.stackWeights.empty()) {
+        slot.weight = state.stackWeights.front();
+        slot.hasWeight = true;
+        state.stackWeights.erase(state.stackWeights.begin());
+      }
     } else if (index - 1 < state.stackWeights.size()) {
       slot.weight = state.stackWeights[index - 1];
       slot.hasWeight = true;
@@ -2499,7 +2505,12 @@ static bool RestoreWindowInState(TilingState& state, HWND hwnd) {
   } else if (state.layout == TileLayout::MasterStack ||
              state.layout == TileLayout::MasterStackH) {
     if (slot.wasMaster) {
-      state.stackWeights.clear();
+      // The window which temporarily became master returns to stack index 0.
+      // Restore exactly the weight it had before the original master left.
+      if (state.stackWeights.size() + 1 == state.windows.size() - 1) {
+        state.stackWeights.insert(
+            state.stackWeights.begin(), slot.hasWeight ? slot.weight : 1.0);
+      }
     } else if (index > 0 &&
                state.stackWeights.size() + 1 == state.windows.size() - 1) {
       size_t stackIndex = std::min(index - 1, state.stackWeights.size());
@@ -2921,6 +2932,43 @@ static size_t LogicalWindowCount(const TilingState& state) {
   return count;
 }
 
+// Add a migrated tiled window at the logical end without disturbing the
+// destination workspace's existing resize weights. The new window alone gets
+// the neutral default weight where the layout has per-window stack/grid weights.
+static void AppendTiledWindowWithDefaultWeight(TilingState& state, HWND hwnd) {
+  EnsureSaneWeightVector(state);
+  const size_t oldCount = state.windows.size();
+  state.windows.push_back(hwnd);
+
+  if (state.layout == TileLayout::Columns || state.layout == TileLayout::Rows) {
+    state.gridWeights.push_back(1.0);
+  } else if ((state.layout == TileLayout::MasterStack ||
+              state.layout == TileLayout::MasterStackH) &&
+             oldCount > 0) {
+    state.stackWeights.push_back(1.0);
+  }
+}
+
+static SuspendedSlot MakeAppendedSuspendedSlot(const TilingState& state) {
+  SuspendedSlot slot{};
+  slot.index = LogicalWindowCount(state);
+
+  if (state.layout == TileLayout::Columns || state.layout == TileLayout::Rows) {
+    slot.weight = 1.0;
+    slot.hasWeight = true;
+  } else if (state.layout == TileLayout::MasterStack ||
+             state.layout == TileLayout::MasterStackH) {
+    if (slot.index == 0) {
+      slot.wasMaster = true;
+    } else {
+      slot.weight = 1.0;
+      slot.hasWeight = true;
+    }
+  }
+
+  return slot;
+}
+
 static bool MigrateManagedWindow(
     HWND hwnd, const DesktopMonitorKey& sourceKey, const DesktopMonitorKey& targetKey) {
   if (!hwnd || SameWorkspaceKey(sourceKey, targetKey)) return false;
@@ -2947,10 +2995,9 @@ static bool MigrateManagedWindow(
   if (record.state == ManageState::Tiled) {
     record.savedSlot = {};
     record.hasSavedSlot = false;
-    target.windows.push_back(hwnd);
+    AppendTiledWindowWithDefaultWeight(target, hwnd);
   } else if (record.state == ManageState::Suspended) {
-    record.savedSlot = {};
-    record.savedSlot.index = LogicalWindowCount(target);
+    record.savedSlot = MakeAppendedSuspendedSlot(target);
     record.hasSavedSlot = true;
   }
   target.records[hwnd] = record;
