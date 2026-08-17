@@ -2,12 +2,12 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.0
+// @version         1.7.1
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lversion
+// @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lversion -lgdi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -26,6 +26,7 @@ resize-adjusted ratios per virtual desktop.
 - Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
 - Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
 - User move-only drags float that window without forgetting it
+- Notification-area icon shows the current workspace layout with generated geometric glyphs
 - Optional capture of current window sizes when manually tiling
 
 ## Default Hotkeys
@@ -125,13 +126,18 @@ resize-adjusted ratios per virtual desktop.
 #include <objbase.h>
 #include <objectarray.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 #include <windhawk_utils.h>
 #include <windows.h>
 #include <winver.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cwchar>
 #include <cstring>
 #include <new>
+#include <array>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -275,6 +281,7 @@ enum HotkeyIds {
 constexpr UINT WM_APP_MOVE_SIZE_END = WM_APP + 1;
 constexpr UINT WM_APP_WINDOW_EVENT = WM_APP + 2;
 constexpr UINT WM_APP_VIRTUAL_DESKTOP_CHANGED = WM_APP + 3;
+constexpr UINT WM_APP_TRAY_REFRESH = WM_APP + 4;
 
 // Visibility/cloak state often changes in bursts, especially during virtual
 // desktop switches. Reconcile final state only after the burst has settled.
@@ -412,6 +419,7 @@ static HWINEVENTHOOK g_hMoveSizeHook = nullptr;
 static HWINEVENTHOOK g_hMinimizeHook = nullptr;
 static HWINEVENTHOOK g_hHideDestroyHook = nullptr;
 static HWINEVENTHOOK g_hCloakHook = nullptr;
+static HWINEVENTHOOK g_hForegroundHook = nullptr;
 
 //=============================================================================
 //Cache Rects
@@ -1674,6 +1682,409 @@ static bool LoadTilingState(const DesktopMonitorKey& key, TilingState* state) {
 }
 
 
+//=============================================================================
+// Notification-area layout indicator
+//=============================================================================
+//
+// This subsystem is intentionally self-contained and Win32-only. It doesn't
+// hook Explorer or depend on XAML/WinUI. The seven glyphs below preserve the
+// exact pane topology of the approved layout diagrams; rendering may scale or
+// thicken strokes, but it never removes/merges dividers at smaller icon sizes.
+
+namespace TrayUi {
+
+constexpr wchar_t kWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
+constexpr UINT kIconId = 1;
+constexpr int kGlyphCanvasSize = 32;
+constexpr int kGlyphForegroundThickness = 2;
+constexpr int kGlyphHaloThickness = 4;
+
+struct GlyphLine {
+  int x1;
+  int y1;
+  int x2;
+  int y2;
+};
+
+static HWND g_window = nullptr;
+static ATOM g_windowClass = 0;
+static UINT g_taskbarCreatedMessage = 0;
+static bool g_iconAdded = false;
+static TileLayout g_displayedLayout = TileLayout::COUNT;
+static NOTIFYICONDATAW g_notifyData{};
+static std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> g_icons{};
+
+static const wchar_t* LayoutDisplayName(TileLayout layout) {
+  switch (layout) {
+    case TileLayout::MasterStack:
+      return L"Master + Stack (Vertical)";
+    case TileLayout::MasterStackH:
+      return L"Master + Stack (Horizontal)";
+    case TileLayout::Columns:
+      return L"Columns";
+    case TileLayout::Rows:
+      return L"Rows";
+    case TileLayout::BSP:
+      return L"BSP";
+    case TileLayout::Monocle:
+      return L"Monocle";
+    case TileLayout::Floating:
+      return L"Floating";
+    case TileLayout::COUNT:
+    default:
+      return L"Unknown";
+  }
+}
+
+static void AppendRect(std::vector<GlyphLine>& lines, int left, int top,
+                       int right, int bottom) {
+  lines.push_back({left, top, right, top});
+  lines.push_back({right, top, right, bottom});
+  lines.push_back({right, bottom, left, bottom});
+  lines.push_back({left, bottom, left, top});
+}
+
+static std::vector<GlyphLine> BuildGlyphLines(TileLayout layout) {
+  std::vector<GlyphLine> lines;
+  lines.reserve(12);
+
+  // Coordinates are percentages of one fixed logical canvas. These definitions
+  // mirror the approved ASCII topology directly:
+  //
+  // Master+Stack V: one large left pane + three stacked right panes.
+  // Master+Stack H: one large top pane + three columns along the bottom.
+  // Columns/Rows: three equal-ish divisions.
+  // BSP: left half, upper-right pane, two lower-right panes.
+  // Monocle: one full pane.
+  // Floating: rendered separately below because the front window occludes the
+  //           rear window rather than showing through it.
+  switch (layout) {
+    case TileLayout::MasterStack:
+      AppendRect(lines, 6, 14, 94, 86);
+      lines.push_back({61, 14, 61, 86});
+      lines.push_back({61, 38, 94, 38});
+      lines.push_back({61, 62, 94, 62});
+      break;
+
+    case TileLayout::MasterStackH:
+      AppendRect(lines, 6, 14, 94, 86);
+      lines.push_back({6, 45, 94, 45});
+      lines.push_back({35, 45, 35, 86});
+      lines.push_back({65, 45, 65, 86});
+      break;
+
+    case TileLayout::Columns:
+      AppendRect(lines, 6, 14, 94, 86);
+      lines.push_back({35, 14, 35, 86});
+      lines.push_back({65, 14, 65, 86});
+      break;
+
+    case TileLayout::Rows:
+      AppendRect(lines, 6, 14, 94, 86);
+      lines.push_back({6, 38, 94, 38});
+      lines.push_back({6, 62, 94, 62});
+      break;
+
+    case TileLayout::BSP:
+      AppendRect(lines, 6, 14, 94, 86);
+      lines.push_back({50, 14, 50, 86});
+      lines.push_back({50, 55, 94, 55});
+      lines.push_back({72, 55, 72, 86});
+      break;
+
+    case TileLayout::Monocle:
+      AppendRect(lines, 6, 14, 94, 86);
+      break;
+
+    case TileLayout::Floating:
+    case TileLayout::COUNT:
+      break;
+  }
+
+  return lines;
+}
+
+static int LogicalToPixel(int value) {
+  // Keep a small transparent margin so the shell has room to resample the icon.
+  constexpr int kMin = 2;
+  constexpr int kMax = kGlyphCanvasSize - 3;
+  return kMin + ((kMax - kMin) * value + 50) / 100;
+}
+
+static void PutPixel(uint32_t* pixels, int x, int y, uint32_t argb) {
+  if (!pixels || x < 0 || y < 0 || x >= kGlyphCanvasSize ||
+      y >= kGlyphCanvasSize) {
+    return;
+  }
+  pixels[y * kGlyphCanvasSize + x] = argb;
+}
+
+static void ClearPixelRect(uint32_t* pixels, int left, int top, int right,
+                           int bottom) {
+  if (!pixels) return;
+  left = std::max(0, left);
+  top = std::max(0, top);
+  right = std::min(kGlyphCanvasSize - 1, right);
+  bottom = std::min(kGlyphCanvasSize - 1, bottom);
+  for (int y = top; y <= bottom; ++y) {
+    for (int x = left; x <= right; ++x) {
+      PutPixel(pixels, x, y, 0x00000000u);
+    }
+  }
+}
+
+static void DrawAxisLine(uint32_t* pixels, const GlyphLine& logicalLine,
+                         int thickness, uint32_t argb) {
+  int x1 = LogicalToPixel(logicalLine.x1);
+  int y1 = LogicalToPixel(logicalLine.y1);
+  int x2 = LogicalToPixel(logicalLine.x2);
+  int y2 = LogicalToPixel(logicalLine.y2);
+
+  int halfLo = (thickness - 1) / 2;
+  int halfHi = thickness / 2;
+
+  if (y1 == y2) {
+    if (x2 < x1) std::swap(x1, x2);
+    for (int y = y1 - halfLo; y <= y1 + halfHi; ++y) {
+      for (int x = x1; x <= x2; ++x) PutPixel(pixels, x, y, argb);
+    }
+  } else if (x1 == x2) {
+    if (y2 < y1) std::swap(y1, y2);
+    for (int x = x1 - halfLo; x <= x1 + halfHi; ++x) {
+      for (int y = y1; y <= y2; ++y) PutPixel(pixels, x, y, argb);
+    }
+  }
+}
+
+static void DrawLineSet(uint32_t* pixels, const std::vector<GlyphLine>& lines) {
+  // Dark halo + light core stays legible on both light and dark taskbars. The
+  // shell may resample the 32px source down to the current notification-area
+  // size, so deliberately thick strokes survive that compression.
+  for (const auto& line : lines) {
+    DrawAxisLine(pixels, line, kGlyphHaloThickness, 0xD0000000u);
+  }
+  for (const auto& line : lines) {
+    DrawAxisLine(pixels, line, kGlyphForegroundThickness, 0xFFFFFFFFu);
+  }
+}
+
+static void DrawFloatingGlyph(uint32_t* pixels) {
+  // Exact visual idea:
+  //
+  //   ┌──────┐
+  //   │ ┌──────┐
+  //   └─│      │
+  //     └──────┘
+  //
+  // Draw the rear window first, erase the area covered by the front window,
+  // then draw the front window. That prevents the rear outline from showing
+  // through the transparent foreground pane.
+  std::vector<GlyphLine> rear;
+  std::vector<GlyphLine> front;
+  AppendRect(rear, 5, 13, 67, 66);
+  AppendRect(front, 31, 34, 95, 87);
+  DrawLineSet(pixels, rear);
+
+  const int clearPad = kGlyphHaloThickness / 2 + 1;
+  ClearPixelRect(pixels, LogicalToPixel(31) - clearPad,
+                 LogicalToPixel(34) - clearPad,
+                 LogicalToPixel(95) + clearPad,
+                 LogicalToPixel(87) + clearPad);
+  DrawLineSet(pixels, front);
+}
+
+static HICON CreateLayoutIcon(TileLayout layout) {
+  BITMAPINFO bmi{};
+  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bmi.bmiHeader.biWidth = kGlyphCanvasSize;
+  bmi.bmiHeader.biHeight = -kGlyphCanvasSize;  // top-down DIB
+  bmi.bmiHeader.biPlanes = 1;
+  bmi.bmiHeader.biBitCount = 32;
+  bmi.bmiHeader.biCompression = BI_RGB;
+
+  void* dibBits = nullptr;
+  HBITMAP colorBitmap =
+      CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+  if (!colorBitmap || !dibBits) {
+    if (colorBitmap) DeleteObject(colorBitmap);
+    return nullptr;
+  }
+
+  auto* pixels = static_cast<uint32_t*>(dibBits);
+  std::fill(pixels, pixels + kGlyphCanvasSize * kGlyphCanvasSize, 0u);
+
+  if (layout == TileLayout::Floating) {
+    DrawFloatingGlyph(pixels);
+  } else {
+    DrawLineSet(pixels, BuildGlyphLines(layout));
+  }
+
+  // 1bpp all-zero mask. The 32bpp color bitmap carries per-pixel alpha; the
+  // mask remains opaque for compatibility with older icon consumers.
+  constexpr int kMaskStride = ((kGlyphCanvasSize + 31) / 32) * 4;
+  std::array<BYTE, kMaskStride * kGlyphCanvasSize> maskBits{};
+  HBITMAP maskBitmap = CreateBitmap(kGlyphCanvasSize, kGlyphCanvasSize, 1, 1,
+                                    maskBits.data());
+  if (!maskBitmap) {
+    DeleteObject(colorBitmap);
+    return nullptr;
+  }
+
+  ICONINFO iconInfo{};
+  iconInfo.fIcon = TRUE;
+  iconInfo.hbmColor = colorBitmap;
+  iconInfo.hbmMask = maskBitmap;
+  HICON icon = CreateIconIndirect(&iconInfo);
+
+  DeleteObject(maskBitmap);
+  DeleteObject(colorBitmap);
+  return icon;
+}
+
+static HICON GetLayoutIcon(TileLayout layout) {
+  size_t index = static_cast<size_t>(layout);
+  if (index < g_icons.size() && g_icons[index]) return g_icons[index];
+  return LoadIconW(nullptr, IDI_APPLICATION);
+}
+
+static void SetTooltip(TileLayout layout) {
+  std::wstring tooltip = L"Tiling Helper — ";
+  tooltip += LayoutDisplayName(layout);
+  wcsncpy(g_notifyData.szTip, tooltip.c_str(), ARRAYSIZE(g_notifyData.szTip) - 1);
+  g_notifyData.szTip[ARRAYSIZE(g_notifyData.szTip) - 1] = L'\0';
+}
+
+static bool AddIconToShell() {
+  if (!g_window) return false;
+  if (g_displayedLayout == TileLayout::COUNT) g_displayedLayout = g_defaultLayout;
+
+  g_notifyData = {};
+  g_notifyData.cbSize = sizeof(g_notifyData);
+  g_notifyData.hWnd = g_window;
+  g_notifyData.uID = kIconId;
+  g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+  g_notifyData.hIcon = GetLayoutIcon(g_displayedLayout);
+  SetTooltip(g_displayedLayout);
+
+  if (!Shell_NotifyIconW(NIM_ADD, &g_notifyData)) {
+    g_iconAdded = false;
+    Wh_Log(L"Failed to add tiling layout tray icon: %lu", GetLastError());
+    return false;
+  }
+
+  g_iconAdded = true;
+  g_notifyData.uVersion = NOTIFYICON_VERSION_4;
+  Shell_NotifyIconW(NIM_SETVERSION, &g_notifyData);
+  return true;
+}
+
+static void UpdateIcon(TileLayout layout) {
+  if (!g_window || layout == TileLayout::COUNT) return;
+  g_displayedLayout = layout;
+
+  if (!g_iconAdded) {
+    AddIconToShell();
+    return;
+  }
+
+  g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+  g_notifyData.hIcon = GetLayoutIcon(layout);
+  SetTooltip(layout);
+  if (!Shell_NotifyIconW(NIM_MODIFY, &g_notifyData)) {
+    // Explorer may have restarted before TaskbarCreated reached us. Treat the
+    // icon as absent so the next refresh attempts a clean NIM_ADD.
+    g_iconAdded = false;
+    AddIconToShell();
+  }
+}
+
+static void RefreshForCurrentWorkspace() {
+  TileLayout layout = g_defaultLayout;
+  HMONITOR monitor = GetTargetMonitor();
+  DesktopMonitorKey key{};
+  TilingState state;
+  if (monitor && GetCurrentWorkspaceKey(monitor, &key) &&
+      LoadTilingState(key, &state)) {
+    layout = state.layout;
+  }
+  UpdateIcon(layout);
+}
+
+static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam,
+                                   LPARAM lParam) {
+  if (g_taskbarCreatedMessage && message == g_taskbarCreatedMessage) {
+    // Notification-area icons are owned by Explorer and disappear when the
+    // shell restarts. Re-add our last known layout without touching WM state.
+    g_iconAdded = false;
+    AddIconToShell();
+    return 0;
+  }
+  return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+static bool Initialize() {
+  for (size_t i = 0; i < g_icons.size(); ++i) {
+    g_icons[i] = CreateLayoutIcon(static_cast<TileLayout>(i));
+  }
+
+  HINSTANCE instance = GetModuleHandleW(nullptr);
+  WNDCLASSW wc{};
+  wc.lpfnWndProc = WindowProc;
+  wc.hInstance = instance;
+  wc.lpszClassName = kWindowClassName;
+  g_windowClass = RegisterClassW(&wc);
+  if (!g_windowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    Wh_Log(L"Failed to register tiling tray window class: %lu", GetLastError());
+    return false;
+  }
+
+  // Hidden top-level window rather than HWND_MESSAGE: Explorer broadcasts the
+  // registered TaskbarCreated message to top-level windows after a shell restart.
+  g_window = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClassName, L"", WS_POPUP,
+                             0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+  if (!g_window) {
+    Wh_Log(L"Failed to create tiling tray owner window: %lu", GetLastError());
+    return false;
+  }
+
+  g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+  g_displayedLayout = g_defaultLayout;
+  RefreshForCurrentWorkspace();
+  return g_iconAdded;
+}
+
+static void Shutdown() {
+  if (g_iconAdded && g_window) {
+    g_notifyData.uFlags = 0;
+    Shell_NotifyIconW(NIM_DELETE, &g_notifyData);
+  }
+  g_iconAdded = false;
+
+  if (g_window) {
+    DestroyWindow(g_window);
+    g_window = nullptr;
+  }
+
+  for (HICON& icon : g_icons) {
+    if (icon) {
+      DestroyIcon(icon);
+      icon = nullptr;
+    }
+  }
+
+  if (g_windowClass) {
+    UnregisterClassW(kWindowClassName, GetModuleHandleW(nullptr));
+    g_windowClass = 0;
+  }
+
+  g_taskbarCreatedMessage = 0;
+  g_displayedLayout = TileLayout::COUNT;
+  g_notifyData = {};
+}
+
+}  // namespace TrayUi
+
+
 // Keep the active layout's weight vector aligned with its kind.
 // A size mismatch resets that layout's weights to equal shares.
 static void EnsureSaneWeightVector(TilingState& state) {
@@ -2129,6 +2540,7 @@ void TileWindows() {
   HMONITOR monitor = GetTargetMonitor();
   if (!monitor) return;
   if (!EnsureWorkspaceFromSnapshot(monitor, true)) return;
+  TrayUi::RefreshForCurrentWorkspace();
   Wh_Log(L"Manual tile/reconcile completed");
 }
 
@@ -2337,6 +2749,7 @@ static void HandleVirtualDesktopChanged() {
   // Short safety pass that distinguishes genuine current-desktop cloaks from the transient
   // shell cloaking that accompanies the already-known switch.
   ScheduleLifecycleReconcile(nullptr);
+  TrayUi::RefreshForCurrentWorkspace();
 }
 
 // For this desktop, schedule a window lifecycle (suspended? active? dead?) 
@@ -2424,6 +2837,8 @@ static void ReconcileDeferredLifecycle() {
             return IsEqualGUID(pending.desktopId, currentDesktop);
           }),
       g_pendingDesktopArranges.end());
+
+  TrayUi::RefreshForCurrentWorkspace();
 }
 
 static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
@@ -2470,6 +2885,7 @@ static void CycleCurrentWorkspaceLayout() {
   EnsureSaneWeightVector(state);
   SaveTilingState(key, state);
   ArrangeWorkspace(key);
+  TrayUi::UpdateIcon(state.layout);
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.layout));
 }
 
@@ -2622,6 +3038,7 @@ static void QueueWindowEvent(DWORD event, HWND hwnd) {
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
   switch (event) {
+    case EVENT_SYSTEM_FOREGROUND:
     case EVENT_SYSTEM_MOVESIZESTART:
     case EVENT_SYSTEM_MOVESIZEEND:
     case EVENT_SYSTEM_MINIMIZESTART:
@@ -2634,6 +3051,13 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
       break;
     default:
       return;
+  }
+
+  // Foreground changes only affect which per-monitor workspace the tray icon
+  // represents. Keep that UI refresh serialized on the WM thread as well.
+  if (event == EVENT_SYSTEM_FOREGROUND) {
+    if (g_threadId) PostThreadMessage(g_threadId, WM_APP_TRAY_REFRESH, 0, 0);
+    return;
   }
 
   // For window-level events only.
@@ -2671,6 +3095,13 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 }
 
 void InstallWinEventHooks() {
+  if (!g_hForegroundHook) {
+    g_hForegroundHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc,
+        0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!g_hForegroundHook) Wh_Log(L"Failed to install foreground hook");
+  }
+
   if (!g_hMoveSizeHook) {
     g_hMoveSizeHook = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
                                       nullptr, WinEventProc, 0, 0,
@@ -2705,6 +3136,10 @@ void InstallWinEventHooks() {
 }
 
 void RemoveWinEventHooks() {
+    if (g_hForegroundHook) {
+        UnhookWinEvent(g_hForegroundHook);
+        g_hForegroundHook = nullptr;
+    }
     if (g_hMoveSizeHook) {
         UnhookWinEvent(g_hMoveSizeHook);
         g_hMoveSizeHook = nullptr;
@@ -2848,6 +3283,12 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
       if (g_enableTileNewWin) Wh_Log(L"TileNewWin enabled: reconciled current workspace on startup");
   }
 
+  if (g_enableTiling) {
+    if (!TrayUi::Initialize()) {
+      Wh_Log(L"Tiling layout tray icon unavailable; window management remains active");
+    }
+  }
+
   while (!g_stopHotkeyThread) {
     DWORD waitResult = MsgWaitForMultipleObjects(0, nullptr, FALSE, INFINITE, QS_ALLINPUT);
 
@@ -2873,6 +3314,11 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
           case WM_APP_VIRTUAL_DESKTOP_CHANGED: {
             HandleVirtualDesktopChanged();
+            continue;
+          }
+
+          case WM_APP_TRAY_REFRESH: {
+            TrayUi::RefreshForCurrentWorkspace();
             continue;
           }
 
@@ -2953,6 +3399,7 @@ cleanup:
     }
   }
 
+  TrayUi::Shutdown();
   RemoveWinEventHooks();
 
   CleanupVirtualDesktopAPI();
