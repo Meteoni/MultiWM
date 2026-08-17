@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.10
+// @version         1.7.11
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -30,7 +30,9 @@ resize-adjusted ratios per virtual desktop.
 - Theme-aware notification-area text icon shows the current workspace layout (MV/MH/CL/RW/BS/MN/FL)
 - Optional per-layout .ico overrides with generated text fallback
 - Compact Win32 layout flyout appears on layout/desktop changes with configurable position
-- Manual Tile adopts the current tiled geometry when the full tiled set is visible
+- Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
+- Global reconciliation repairs missed destroy/hide/minimize and virtual-desktop/monitor moves
+- Optional process/class/title exclusion rules keep user-selected windows out of management
 
 ## Default Hotkeys
 - Tile windows: Alt + D
@@ -127,6 +129,22 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Tiling] Layout Cycle Key'
   $description: 'Key to cycle through tiling layouts. Leave blank to disable. Examples: L, Tab, =, ], /'
 
+- ReconcileDelayMs: 80
+  $name: '[Reliability] Reconcile Settle Delay (ms)'
+  $description: Delay before visibility/lifecycle changes are reconciled. Increase on slower systems. (20-2000 ms)
+
+- Exclusions:
+    - - Match: process
+        $name: Match by
+        $options:
+          - process: Process name
+          - class: Window class
+          - title: Window title contains
+      - Value: ""
+        $name: Value
+  $name: '[Rules] Window Exclusions'
+  $description: Optional exclusions. Process/class are case-insensitive exact matches; title is case-insensitive substring.
+
 - FlyoutPosition: bottom
   $name: '[UI] Flyout Position'
   $description: Show layout feedback at the top or bottom center of the active monitor
@@ -174,11 +192,13 @@ resize-adjusted ratios per virtual desktop.
 #include <cstdint>
 #include <cstdlib>
 #include <cwchar>
+#include <cwctype>
 #include <cstring>
 #include <new>
 #include <array>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #define SAFE_RELEASE(p) \
@@ -326,8 +346,8 @@ constexpr UINT WM_APP_TRAY_REFRESH = WM_APP + 4;
 constexpr UINT WM_APP_LAYOUT_CYCLE = WM_APP + 5;
 
 // Visibility/cloak state often changes in bursts, especially during virtual
-// desktop switches. Reconcile final state only after the burst has settled.
-constexpr UINT kLifecycleReconcileDelayMs = 80;
+// desktop switches. Reconcile final state only after the configurable settle delay.
+static UINT g_reconcileDelayMs = 80;
 static UINT_PTR g_lifecycleReconcileTimer = 0;
 static std::vector<HWND> g_lifecycleDirtyWindows;
 // Native VD transitions may create/change a workspace while its windows are
@@ -357,6 +377,13 @@ static TileLayout g_defaultLayout = TileLayout::MasterStack;
 static bool g_enableTiling = true;
 static bool g_enableTileNewWin = false;
 static bool g_tileNewWinSuspended = false;
+
+enum class ExclusionMatch { Process, Class, Title };
+struct ExclusionRule {
+  ExclusionMatch match = ExclusionMatch::Process;
+  std::wstring value;
+};
+static std::vector<ExclusionRule> g_exclusionRules;
 
 // Per-desktop + monitor state
 struct GuidHash {
@@ -1514,8 +1541,84 @@ static bool IsWindowTrackedInAnyState(HWND hwnd) {
   return tracked;
 }
 
+static bool EqualsInsensitive(const std::wstring& a, const std::wstring& b) {
+  return _wcsicmp(a.c_str(), b.c_str()) == 0;
+}
+
+static bool ContainsInsensitive(const std::wstring& text, const std::wstring& needle) {
+  if (needle.empty()) return false;
+  return std::search(
+             text.begin(), text.end(), needle.begin(), needle.end(),
+             [](wchar_t a, wchar_t b) { return std::towlower(a) == std::towlower(b); }) != text.end();
+}
+
+static std::wstring GetWindowProcessName(HWND hwnd) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (!pid) return {};
+
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process) return {};
+
+  wchar_t path[32768]{};
+  DWORD chars = ARRAYSIZE(path);
+  std::wstring result;
+  if (QueryFullProcessImageNameW(process, 0, path, &chars) && chars) {
+    const wchar_t* base = path;
+    for (DWORD i = 0; i < chars; ++i) {
+      if (path[i] == L'\\' || path[i] == L'/') base = path + i + 1;
+    }
+    result.assign(base, static_cast<size_t>((path + chars) - base));
+  }
+  CloseHandle(process);
+  return result;
+}
+
+static bool IsWindowExcludedByRules(HWND hwnd) {
+  if (!hwnd || g_exclusionRules.empty()) return false;
+
+  std::wstring processName;
+  std::wstring className;
+  std::wstring title;
+  bool haveProcess = false;
+  bool haveClass = false;
+  bool haveTitle = false;
+
+  for (const auto& rule : g_exclusionRules) {
+    switch (rule.match) {
+      case ExclusionMatch::Process:
+        if (!haveProcess) {
+          processName = GetWindowProcessName(hwnd);
+          haveProcess = true;
+        }
+        if (!processName.empty() && EqualsInsensitive(processName, rule.value)) return true;
+        break;
+
+      case ExclusionMatch::Class:
+        if (!haveClass) {
+          wchar_t buffer[256]{};
+          if (GetClassNameW(hwnd, buffer, ARRAYSIZE(buffer))) className = buffer;
+          haveClass = true;
+        }
+        if (!className.empty() && EqualsInsensitive(className, rule.value)) return true;
+        break;
+
+      case ExclusionMatch::Title:
+        if (!haveTitle) {
+          wchar_t buffer[512]{};
+          if (GetWindowTextW(hwnd, buffer, ARRAYSIZE(buffer))) title = buffer;
+          haveTitle = true;
+        }
+        if (!title.empty() && ContainsInsensitive(title, rule.value)) return true;
+        break;
+    }
+  }
+  return false;
+}
+
 static bool CouldBeTileEligible(HWND hwnd) {
   if (!hwnd) return false;
+  if (IsWindowExcludedByRules(hwnd)) return false;
 
   if (GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindow(hwnd, GW_OWNER)) return false;
 
@@ -2650,6 +2753,10 @@ static bool SnapshotLooksTiled(const std::vector<HWND>& windows, const RECT& wor
   return sumArea >= lo && sumArea <= hi;
 }
 
+static bool SameWorkspaceKey(const DesktopMonitorKey& a, const DesktopMonitorKey& b);
+static void ReconcileKnownWindows(
+    bool settleParticipation, std::vector<DesktopMonitorKey>* changedKeys);
+
 static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeometry) {
   DesktopMonitorKey key{};
   RECT workArea{};
@@ -2736,9 +2843,23 @@ static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeome
 void TileWindows() {
   HMONITOR monitor = GetTargetMonitor();
   if (!monitor) return;
+
+  std::vector<DesktopMonitorKey> changedKeys;
+  ReconcileKnownWindows(true, &changedKeys);
+
+  DesktopMonitorKey targetKey{};
+  GetCurrentWorkspaceKey(monitor, &targetKey);
   if (!EnsureWorkspaceFromSnapshot(monitor, true)) return;
+
+  // Ensure other affected current workspaces also lose stale slots. Keep the
+  // target workspace until after geometry adoption so Alt+D does not overwrite
+  // the user's geometry before capturing it.
+  for (const auto& key : changedKeys) {
+    if (!SameWorkspaceKey(key, targetKey)) ArrangeWorkspace(key);
+  }
+
   TrayUi::RefreshForCurrentWorkspace();
-  Wh_Log(L"Manual tile/reconcile completed");
+  Wh_Log(L"Manual tile/global reconcile completed");
 }
 
 static bool FindStateContainingWindow(HWND hwnd, DesktopMonitorKey* outKey, TilingState* outState) {
@@ -2756,6 +2877,14 @@ static bool FindStateContainingWindow(HWND hwnd, DesktopMonitorKey* outKey, Tili
   return found;
 }
 
+static void ClearMoveSizeSamples(HWND hwnd) {
+  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+  g_moveSizeStartRects.erase(hwnd);
+  g_moveSizeEndRects.erase(hwnd);
+  g_moveSizeEndPoints.erase(hwnd);
+  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+}
+
 static void ForgetManagedWindow(HWND hwnd) {
   DesktopMonitorKey key{};
   TilingState state;
@@ -2765,10 +2894,163 @@ static void ForgetManagedWindow(HWND hwnd) {
     ArrangeWorkspace(key);
   }
 
-  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
-  g_moveSizeStartRects.erase(hwnd);
-  g_moveSizeEndRects.erase(hwnd);
-  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+  ClearMoveSizeSamples(hwnd);
+}
+
+static bool SameWorkspaceKey(const DesktopMonitorKey& a, const DesktopMonitorKey& b) {
+  return a.monitor == b.monitor && IsEqualGUID(a.desktopId, b.desktopId);
+}
+
+static void AddUniqueWorkspaceKey(
+    std::vector<DesktopMonitorKey>& keys, const DesktopMonitorKey& key) {
+  if (!key.monitor) return;
+  if (std::none_of(keys.begin(), keys.end(),
+                   [&](const DesktopMonitorKey& existing) {
+                     return SameWorkspaceKey(existing, key);
+                   })) {
+    keys.push_back(key);
+  }
+}
+
+static size_t LogicalWindowCount(const TilingState& state) {
+  size_t count = state.windows.size();
+  for (const auto& kv : state.records) {
+    if (kv.second.state == ManageState::Suspended && kv.second.hasSavedSlot) ++count;
+  }
+  return count;
+}
+
+static bool MigrateManagedWindow(
+    HWND hwnd, const DesktopMonitorKey& sourceKey, const DesktopMonitorKey& targetKey) {
+  if (!hwnd || SameWorkspaceKey(sourceKey, targetKey)) return false;
+
+  TilingState source;
+  if (!LoadTilingState(sourceKey, &source)) return false;
+  auto sourceRecord = source.records.find(hwnd);
+  if (sourceRecord == source.records.end()) return false;
+
+  WindowRecord record = sourceRecord->second;
+  if (!ForgetWindowInState(source, hwnd)) return false;
+  SaveTilingState(sourceKey, source);
+
+  TilingState target;
+  if (!LoadTilingState(targetKey, &target)) {
+    target.layout = g_defaultLayout;
+    target.masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
+  }
+
+  // Defensive duplicate cleanup if an older reconciliation path left the HWND
+  // registered in both workspaces.
+  ForgetWindowInState(target, hwnd);
+
+  if (record.state == ManageState::Tiled) {
+    record.savedSlot = {};
+    record.hasSavedSlot = false;
+    target.windows.push_back(hwnd);
+  } else if (record.state == ManageState::Suspended) {
+    record.savedSlot = {};
+    record.savedSlot.index = LogicalWindowCount(target);
+    record.hasSavedSlot = true;
+  }
+  target.records[hwnd] = record;
+  EnsureSaneWeightVector(target);
+  SaveTilingState(targetKey, target);
+  return true;
+}
+
+static bool GetObservedWorkspaceKey(
+    HWND hwnd, const DesktopMonitorKey& fallback, DesktopMonitorKey* outKey) {
+  if (!outKey) return false;
+
+  GUID desktopId{};
+  if (!GetWindowDesktopIdSafe(hwnd, &desktopId)) return false;
+
+  HMONITOR monitor = nullptr;
+  RECT frame{};
+  if (GetWindowFrameRect(hwnd, &frame) &&
+      frame.right > frame.left && frame.bottom > frame.top) {
+    monitor = MonitorFromRect(&frame, MONITOR_DEFAULTTONULL);
+  }
+  if (!monitor) monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+  if (!monitor) monitor = fallback.monitor;
+  if (!monitor) return false;
+
+  *outKey = {desktopId, monitor};
+  return true;
+}
+
+// Dirty-check all known HWNDs, independent of the current virtual desktop.
+// Events only tell us that reality may have changed; this pass repairs the model
+// from actual liveness, exclusion policy, desktop/monitor ownership and (once
+// settled) visible/minimized participation.
+static void ReconcileKnownWindows(
+    bool settleParticipation, std::vector<DesktopMonitorKey>* changedKeys) {
+  std::vector<HWND> known;
+
+  AcquireSRWLockShared(&g_tilingStateLock);
+  for (const auto& kv : g_tilingStateMap) {
+    for (const auto& record : kv.second.records) {
+      if (std::find(known.begin(), known.end(), record.first) == known.end()) {
+        known.push_back(record.first);
+      }
+    }
+  }
+  ReleaseSRWLockShared(&g_tilingStateLock);
+
+  GUID activeDesktop{};
+  bool haveActiveDesktop = settleParticipation && GetCurrentDesktopId(&activeDesktop);
+
+  for (HWND hwnd : known) {
+    DesktopMonitorKey currentKey{};
+    TilingState currentState;
+    if (!FindStateContainingWindow(hwnd, &currentKey, &currentState)) continue;
+
+    if (!IsWindow(hwnd) || IsWindowExcludedByRules(hwnd)) {
+      if (ForgetWindowInState(currentState, hwnd)) {
+        SaveTilingState(currentKey, currentState);
+        ClearMoveSizeSamples(hwnd);
+        if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, currentKey);
+      }
+      continue;
+    }
+
+    DesktopMonitorKey observedKey{};
+    if (GetObservedWorkspaceKey(hwnd, currentKey, &observedKey) &&
+        !SameWorkspaceKey(currentKey, observedKey)) {
+      if (MigrateManagedWindow(hwnd, currentKey, observedKey)) {
+        if (changedKeys) {
+          AddUniqueWorkspaceKey(*changedKeys, currentKey);
+          AddUniqueWorkspaceKey(*changedKeys, observedKey);
+        }
+        currentKey = observedKey;
+        if (!LoadTilingState(currentKey, &currentState)) continue;
+      }
+    }
+
+    if (!settleParticipation) continue;
+
+    WindowRecord* record = FindWindowRecord(currentState, hwnd);
+    if (!record) continue;
+
+    // Cloaking is non-participating only on the current desktop. Windows normally
+    // cloaks windows that belong to inactive VDs, and those must keep their slots.
+    bool currentDesktopCloak =
+        haveActiveDesktop && IsEqualGUID(currentKey.desktopId, activeDesktop) &&
+        IsWindowCloaked(hwnd);
+    bool participates = IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
+                        !currentDesktopCloak;
+    bool changed = false;
+    if (record->state == ManageState::Tiled && !participates) {
+      changed = SuspendWindowInState(currentState, hwnd);
+    } else if (record->state == ManageState::Suspended && participates) {
+      changed = RestoreWindowInState(currentState, hwnd);
+    }
+
+    if (changed) {
+      SaveTilingState(currentKey, currentState);
+      if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, currentKey);
+    }
+  }
 }
 
 // If monit
@@ -2793,10 +3075,9 @@ static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) 
 
 static void ScheduleLifecycleReconcile(HWND hwnd);
 
-// Refresh one desktop+monitor workspace. WindowRecord state is authoritative:
-// the snapshot can discover new windows, but it never suspends/restores known
-// records merely because shell visibility/cloak/frame observations changed.
-static bool ReconcileWorkspaceRecords(
+// Discovery is intentionally one-way: this snapshot may admit new windows but
+// never decides whether an existing record still belongs to a workspace.
+static bool DiscoverWorkspaceWindows(
     HMONITOR monitor, const GUID& desktopId, const std::vector<HWND>& snapshot,
     bool discoverNew, DesktopMonitorKey* outKey) {
   if (!monitor) return false;
@@ -2813,18 +3094,6 @@ static bool ReconcileWorkspaceRecords(
   }
 
   bool changed = !hadState;
-
-  // Destruction is the only observation-based reason to erase a known record.
-  // Minimize/restore membership transitions are handled directly from their
-  // semantic WinEvents rather than inferred from eligibility snapshots.
-  std::vector<HWND> deadWindows;
-  for (const auto& kv : state.records) {
-    if (!IsWindow(kv.first)) deadWindows.push_back(kv.first);
-  }
-  for (HWND w : deadWindows) {
-    if (ForgetWindowInState(state, w)) changed = true;
-  }
-
   if (discoverNew) {
     for (HWND w : snapshot) {
       if (state.records.find(w) == state.records.end()) {
@@ -2836,7 +3105,6 @@ static bool ReconcileWorkspaceRecords(
   }
 
   if (!changed) return false;
-
   EnsureSaneWeightVector(state);
   SaveTilingState(key, state);
   return true;
@@ -2911,6 +3179,16 @@ static void HandleVirtualDesktopChanged() {
     return;
   }
 
+  // Repair ownership immediately from desktop GUIDs, but defer visibility/minimize
+  // participation until the shell's cloak/show burst has settled.
+  std::vector<DesktopMonitorKey> changedKeys;
+  ReconcileKnownWindows(false, &changedKeys);
+  for (const auto& key : changedKeys) {
+    if (IsEqualGUID(key.desktopId, currentDesktop)) {
+      AddPendingWorkspaceArrange(key.desktopId, key.monitor);
+    }
+  }
+
   std::vector<HMONITOR> monitors;
   EnumerateCurrentMonitors(monitors);
 
@@ -2918,7 +3196,7 @@ static void HandleVirtualDesktopChanged() {
   for (HMONITOR monitor : monitors) {
     std::vector<HWND> snapshot = GetTileWindowsAfterDesktopSwitch(monitor, currentDesktop);
     DesktopMonitorKey key{};
-    if (ReconcileWorkspaceRecords(
+    if (DiscoverWorkspaceWindows(
             monitor, currentDesktop, snapshot, discoverNew, &key)) {
       // Do not place yet: the notification can precede the final UNCLOAK events.
       // Remember only workspaces whose model actually changed; an ordinary switch
@@ -2928,13 +3206,13 @@ static void HandleVirtualDesktopChanged() {
   }
 
   // Coalesce the remaining shell burst for discovery/fallback and any deferred
-  // placement. It cannot suspend a known window.
+  // placement. The settled pass may repair hidden/minimized participation from physical state.
   ScheduleLifecycleReconcile(nullptr);
   TrayUi::RefreshForCurrentWorkspace();
 }
 
 // Coalesce shell visibility bursts for discovery, VD fallback, and deferred placement.
-// Known-window membership is not decided by this timer.
+// Known-window lifecycle is dirty-checked globally when this timer settles.
 static void ScheduleLifecycleReconcile(HWND hwnd) {
   // HotkeyThreadProc owns this vector/timer; no additional lock is required.
   if (hwnd && std::find(g_lifecycleDirtyWindows.begin(), g_lifecycleDirtyWindows.end(), hwnd) ==
@@ -2947,7 +3225,7 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
     g_lifecycleReconcileTimer = 0;
   }
 
-  g_lifecycleReconcileTimer = SetTimer(nullptr, 0, kLifecycleReconcileDelayMs, nullptr);
+  g_lifecycleReconcileTimer = SetTimer(nullptr, 0, g_reconcileDelayMs, nullptr);
   if (!g_lifecycleReconcileTimer) {
     Wh_Log(L"Failed to schedule lifecycle reconciliation");
   }
@@ -2962,18 +3240,21 @@ static void ReconcileDeferredLifecycle() {
   std::vector<HWND> dirtyWindows;
   dirtyWindows.swap(g_lifecycleDirtyWindows);
 
+  // Known-window repair does not require the current desktop to be available:
+  // liveness, exclusions and settled visibility can still be repaired, while
+  // desktop migration simply stays unchanged if the VD query fails.
+  std::vector<DesktopMonitorKey> globallyChanged;
+  ReconcileKnownWindows(true, &globallyChanged);
+
   GUID currentDesktop{};
   if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&currentDesktop)) {
-    // Leave the authoritative model unchanged if the private VD API is unstable.
-    // A later lifecycle event/manual reconcile will repair it.
-    Wh_Log(L"Lifecycle reconcile skipped: current virtual desktop unavailable");
+    Wh_Log(L"Lifecycle discovery skipped: current virtual desktop unavailable");
     return;
   }
 
   std::vector<HMONITOR> monitors;
 
-  // Refresh every current-desktop workspace as a unit. This pass may purge dead
-  // handles or discover new ones, but never infers known membership from visibility.
+  // Discover only on the current desktop after global known-window repair.
   AcquireSRWLockShared(&g_tilingStateLock);
   for (const auto& kv : g_tilingStateMap) {
     if (IsEqualGUID(kv.first.desktopId, currentDesktop)) {
@@ -2994,11 +3275,12 @@ static void ReconcileDeferredLifecycle() {
     AddUniqueMonitor(monitors, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL));
   }
 
+  std::vector<DesktopMonitorKey> arrangedKeys;
   const bool discoverNew = g_enableTileNewWin && !g_tileNewWinSuspended;
   for (HMONITOR monitor : monitors) {
     DesktopMonitorKey key{};
     std::vector<HWND> snapshot = CollectTileWindows(monitor);
-    bool changed = ReconcileWorkspaceRecords(
+    bool changed = DiscoverWorkspaceWindows(
         monitor, currentDesktop, snapshot, discoverNew, &key);
     bool pendingArrange = std::any_of(
         g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
@@ -3007,6 +3289,16 @@ static void ReconcileDeferredLifecycle() {
                  IsEqualGUID(pending.desktopId, currentDesktop);
         });
     if (changed || pendingArrange) {
+      ArrangeWorkspace(key);
+      AddUniqueWorkspaceKey(arrangedKeys, key);
+    }
+  }
+
+  for (const auto& key : globallyChanged) {
+    if (std::none_of(arrangedKeys.begin(), arrangedKeys.end(),
+                     [&](const DesktopMonitorKey& arranged) {
+                       return SameWorkspaceKey(arranged, key);
+                     })) {
       ArrangeWorkspace(key);
     }
   }
@@ -3054,8 +3346,8 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
     case EVENT_OBJECT_SHOW:
     case EVENT_OBJECT_CLOAKED:
     case EVENT_OBJECT_UNCLOAKED:
-      // Shell/framework visibility is not membership. Keep HIDE/CLOAK as cheap
-      // discovery/VD-fallback signals only; known records remain untouched.
+      // These are dirty signals, not policy decisions. The settled global pass
+      // decides visibility participation and VD/monitor ownership from reality.
       ScheduleLifecycleReconcile(hwnd);
       break;
   }
@@ -3484,10 +3776,32 @@ void LoadSettings() {
   Wh_FreeStringSetting(mouseBehavior);
 
   g_enableTiling = Wh_GetIntSetting(L"EnableTiling") != 0;
-  // New! 
   g_enableTileNewWin = Wh_GetIntSetting(L"EnableTileNewWin") != 0;
   g_tileNewWinSuspended = false;
 
+  int reconcileDelay = Wh_GetIntSetting(L"ReconcileDelayMs");
+  if (reconcileDelay < 20 || reconcileDelay > 2000) reconcileDelay = 80;
+  g_reconcileDelayMs = static_cast<UINT>(reconcileDelay);
+
+  g_exclusionRules.clear();
+  using WindhawkUtils::StringSetting;
+  for (int i = 0; i < 64; ++i) {
+    auto match = StringSetting::make(L"Exclusions[%d].Match", i);
+    auto value = StringSetting::make(L"Exclusions[%d].Value", i);
+    if (!*match.get() && !*value.get()) break;
+    if (!*value.get()) continue;
+
+    ExclusionRule rule;
+    if (_wcsicmp(match.get(), L"class") == 0) {
+      rule.match = ExclusionMatch::Class;
+    } else if (_wcsicmp(match.get(), L"title") == 0) {
+      rule.match = ExclusionMatch::Title;
+    } else {
+      rule.match = ExclusionMatch::Process;
+    }
+    rule.value = value.get();
+    g_exclusionRules.push_back(std::move(rule));
+  }
 
   g_tileKey = ReadHotkeySetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
   g_layoutKey = ReadHotkeySetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
@@ -3518,6 +3832,9 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
   if (g_enableTiling) {
     InstallWinEventHooks();
+    // Also apply changed exclusion rules and repair any stale model left from
+    // before a settings/thread restart.
+    ScheduleLifecycleReconcile(nullptr);
   }
 
   if (g_enableTiling) {
@@ -3563,6 +3880,9 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
           case WM_APP_MOVE_SIZE_END: {
             HWND resizedHwnd = reinterpret_cast<HWND>(msg.wParam);
             ApplyUserMoveSize(resizedHwnd);
+            // A completed drag can also move a managed HWND between monitors.
+            // Let the same global ownership repair settle after the gesture.
+            ScheduleLifecycleReconcile(resizedHwnd);
             continue;
           }
 
