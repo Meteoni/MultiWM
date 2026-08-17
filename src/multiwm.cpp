@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.2
+// @version         1.7.3
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -1714,6 +1714,8 @@ static UINT g_taskbarCreatedMessage = 0;
 static bool g_iconAdded = false;
 static bool g_systemLightTheme = false;
 static TileLayout g_displayedLayout = TileLayout::COUNT;
+static GUID g_displayedDesktopId{};
+static bool g_haveDisplayedDesktopId = false;
 static TileLayout g_flyoutLayout = TileLayout::COUNT;
 static DWORD g_flyoutShownTick = 0;
 static NOTIFYICONDATAW g_notifyData{};
@@ -1744,9 +1746,9 @@ static const wchar_t* LayoutDisplayName(TileLayout layout) {
 static const wchar_t* LayoutTrayText(TileLayout layout) {
   switch (layout) {
     case TileLayout::MasterStack:
-      return L"MV";
+      return L"M│";
     case TileLayout::MasterStackH:
-      return L"MH";
+      return L"M─";
     case TileLayout::Columns:
       return L"CL";
     case TileLayout::Rows:
@@ -1848,12 +1850,15 @@ static HICON CreateTextIcon(TileLayout layout) {
   SetTextColor(dc, RGB(255, 255, 255));
 
   const wchar_t* text = LayoutTrayText(layout);
-  HFONT chosenFont = nullptr;
-  SIZE chosenSize{};
+  const int textLength = static_cast<int>(wcslen(text));
+  constexpr int kTargetWidth = kIconCanvasSize - 2;
+  constexpr int kTargetHeight = kIconCanvasSize - 2;
 
-  // Fit each two-letter abbreviation independently. Only one physical pixel is
-  // reserved on each side, so the text consumes essentially the whole 32px
-  // source canvas before Explorer downsamples it to the notification-area size.
+  HFONT chosenFont = nullptr;
+  SIZE naturalSize{};
+
+  // All modes use the same maximum cap-height. Width is normalized separately
+  // below, so wide pairs such as RW no longer force a smaller font than CL/FL.
   for (int pixelHeight = kIconCanvasSize; pixelHeight >= 8; --pixelHeight) {
     HFONT font = CreateFontW(-pixelHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
@@ -1863,13 +1868,12 @@ static HICON CreateTextIcon(TileLayout layout) {
 
     HGDIOBJ oldFont = SelectObject(dc, font);
     SIZE textSize{};
-    GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &textSize);
+    GetTextExtentPoint32W(dc, text, textLength, &textSize);
     SelectObject(dc, oldFont);
 
-    if (textSize.cx <= kIconCanvasSize - 2 &&
-        textSize.cy <= kIconCanvasSize - 2) {
+    if (textSize.cy <= kTargetHeight) {
       chosenFont = font;
-      chosenSize = textSize;
+      naturalSize = textSize;
       break;
     }
     DeleteObject(font);
@@ -1881,14 +1885,40 @@ static HICON CreateTextIcon(TileLayout layout) {
                              CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     HGDIOBJ oldFont = SelectObject(dc, chosenFont);
-    GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &chosenSize);
+    GetTextExtentPoint32W(dc, text, textLength, &naturalSize);
     SelectObject(dc, oldFont);
   }
 
   HGDIOBJ oldFont = SelectObject(dc, chosenFont);
-  int x = (kIconCanvasSize - chosenSize.cx) / 2;
-  int y = (kIconCanvasSize - chosenSize.cy) / 2;
-  TextOutW(dc, x, y, text, static_cast<int>(wcslen(text)));
+  int previousGraphicsMode = SetGraphicsMode(dc, GM_ADVANCED);
+
+  // Preserve one common vertical size, then normalize each label to the same
+  // visual width. The shell therefore receives consistently large tray glyphs
+  // instead of shrinking labels merely because one contains a W/M.
+  float xScale = naturalSize.cx > 0
+                     ? static_cast<float>(kTargetWidth) /
+                           static_cast<float>(naturalSize.cx)
+                     : 1.0f;
+  XFORM transform{xScale, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+  bool transformed = previousGraphicsMode != 0 &&
+                     SetWorldTransform(dc, &transform) != FALSE;
+
+  int outputWidth = transformed
+                        ? kTargetWidth
+                        : std::min(kTargetWidth, static_cast<int>(naturalSize.cx));
+  int deviceX = (kIconCanvasSize - outputWidth) / 2;
+  int logicalX = transformed
+                     ? static_cast<int>(std::lround(deviceX / xScale))
+                     : deviceX;
+  int y = (kIconCanvasSize - naturalSize.cy) / 2;
+  TextOutW(dc, logicalX, y, text, textLength);
+
+  if (transformed) {
+    ModifyWorldTransform(dc, nullptr, MWT_IDENTITY);
+  }
+  if (previousGraphicsMode != 0) {
+    SetGraphicsMode(dc, previousGraphicsMode);
+  }
   SelectObject(dc, oldFont);
   DeleteObject(chosenFont);
 
@@ -2131,11 +2161,23 @@ static void RefreshForCurrentWorkspace() {
   HMONITOR monitor = GetTargetMonitor();
   DesktopMonitorKey key{};
   TilingState state;
-  if (monitor && GetCurrentWorkspaceKey(monitor, &key) &&
-      LoadTilingState(key, &state)) {
+  bool haveWorkspaceKey = monitor && GetCurrentWorkspaceKey(monitor, &key);
+  if (haveWorkspaceKey && LoadTilingState(key, &state)) {
     layout = state.layout;
   }
+
+  bool desktopChanged =
+      haveWorkspaceKey && g_haveDisplayedDesktopId &&
+      !IsEqualGUID(key.desktopId, g_displayedDesktopId);
+  if (haveWorkspaceKey) {
+    g_displayedDesktopId = key.desktopId;
+    g_haveDisplayedDesktopId = true;
+  }
+
   UpdateIcon(layout);
+  if (desktopChanged) {
+    ShowLayoutFlyout(layout);
+  }
 }
 
 static void HandleThemeChanged() {
@@ -2256,6 +2298,8 @@ static void Shutdown() {
 
   g_taskbarCreatedMessage = 0;
   g_displayedLayout = TileLayout::COUNT;
+  g_displayedDesktopId = {};
+  g_haveDisplayedDesktopId = false;
   g_flyoutLayout = TileLayout::COUNT;
   g_notifyData = {};
 }
