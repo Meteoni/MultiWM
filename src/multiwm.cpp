@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.6
+// @version         1.7.7
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -84,10 +84,6 @@ resize-adjusted ratios per virtual desktop.
   $options:
     - float: Float moved window
     - swap: Swap with tiled window under pointer
-
-- CaptureLayoutOnTile: true
-  $name: '[Tiling] Capture Layout On Tile'
-  $description: Use current window sizes as layout weights when manually tiling
 
 - TilingModifier: alt
   $name: '[Tiling] Modifier'
@@ -362,7 +358,6 @@ static MouseMoveBehavior g_mouseMoveBehavior = MouseMoveBehavior::Float;
 static TileLayout g_defaultLayout = TileLayout::MasterStack;
 
 static bool g_enableTiling = true;
-static bool g_captureLayoutOnTile = true;
 static bool g_enableLayoutCycle = true;
 static bool g_enableTileNewWin = false;
 static bool g_tileNewWinSuspended = false;
@@ -2699,8 +2694,8 @@ static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeome
 
   // Geometry capture remains explicit/manual. Rebuilding from current rectangles
   // also resets placement-failure history for the freshly adopted tiled set.
-  if (adoptCurrentGeometry && g_captureLayoutOnTile &&
-      state.layout != TileLayout::Floating && !hasSuspended &&
+  if (adoptCurrentGeometry && state.layout != TileLayout::Floating &&
+      !hasSuspended &&
       SnapshotLooksTiled(state.windows, workArea)) {
     HWND preferredMaster = state.windows.empty() ? nullptr : state.windows.front();
     TilingState captured =
@@ -2722,9 +2717,8 @@ static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeome
   return true;
 }
 
-// Manual tile: reconcile membership and, when CaptureLayoutOnTile is enabled,
-// explicitly adopt the user's current geometry. Automatic events never call this
-// with adoptCurrentGeometry=true.
+// Manual tile: reconcile membership and explicitly adopt the user's current
+// geometry. Automatic events never call this with adoptCurrentGeometry=true.
 void TileWindows() {
   HMONITOR monitor = GetTargetMonitor();
   if (!monitor) return;
@@ -3459,7 +3453,6 @@ void LoadSettings() {
   Wh_FreeStringSetting(mouseBehavior);
 
   g_enableTiling = Wh_GetIntSetting(L"EnableTiling") != 0;
-  g_captureLayoutOnTile = Wh_GetIntSetting(L"CaptureLayoutOnTile") != 0;
   g_enableLayoutCycle = Wh_GetIntSetting(L"EnableLayoutCycle") != 0;
   // New! 
   g_enableTileNewWin = Wh_GetIntSetting(L"EnableTileNewWin") != 0;
