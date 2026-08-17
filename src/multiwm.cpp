@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.6.2
+// @version         1.6.3
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -608,53 +608,6 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
         if (IsTileEligible(hwnd, ctx->targetMonitor)) {
-          ctx->windowList->push_back(hwnd);
-        }
-        return TRUE;
-      },
-      reinterpret_cast<LPARAM>(&context));
-
-  return windows;
-}
-
-
-// Desktop-switch reconciliation must not use DWM cloaking as membership truth:
-// Windows cloaks/uncloaks the incoming/outgoing desktop one HWND at a time. This
-// snapshot instead keys membership by the authoritative desktop GUID and ignores
-// only the transient cloak bit. A later settled lifecycle reconcile classifies
-// genuine app/shell cloaks on the now-current desktop.
-static std::vector<HWND> CollectTileWindowsForDesktop(
-    HMONITOR monitor, const GUID& desktopId) {
-  std::vector<HWND> windows;
-  if (!monitor) return windows;
-
-  struct EnumContext {
-    HMONITOR targetMonitor;
-    GUID desktopId;
-    std::vector<HWND>* windowList;
-  } context = {monitor, desktopId, &windows};
-
-  EnumWindows(
-      [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
-        auto* ctx = reinterpret_cast<EnumContext*>(lParam);
-
-        if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
-        if (!CouldBeTileEligible(hwnd)) return TRUE;
-        if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
-
-        GUID windowDesktop{};
-        if (!GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
-            !IsEqualGUID(windowDesktop, ctx->desktopId)) {
-          return TRUE;
-        }
-
-        RECT frameRect{};
-        if (!GetWindowFrameRect(hwnd, &frameRect) ||
-            frameRect.right <= frameRect.left || frameRect.bottom <= frameRect.top) {
-          return TRUE;
-        }
-
-        if (MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == ctx->targetMonitor) {
           ctx->windowList->push_back(hwnd);
         }
         return TRUE;
@@ -1641,7 +1594,7 @@ static bool LoadTilingState(const DesktopMonitorKey& key, TilingState* state) {
 
 // Keep the active layout's weight vector aligned with its kind.
 // A size mismatch resets that layout's weights to equal shares.
-static void EnsureWeightVectorsAreSane(TilingState& state) {
+static void EnsureSaneWeightVector(TilingState& state) {
   if (state.layout == TileLayout::MasterStack || state.layout == TileLayout::MasterStackH) {
     // windows[0] is the master and is sized by masterRatio. Remaining
     // windows are in the stack. N - 1 weights.
@@ -1687,7 +1640,7 @@ static void RemoveActiveWindowAt(TilingState& state, size_t index, SuspendedSlot
 
   state.windows.erase(state.windows.begin() + index);
   if (saved) *saved = slot;
-  EnsureWeightVectorsAreSane(state);
+  EnsureSaneWeightVector(state);
 }
 
 static size_t ActiveIndexToLogicalIndex(const TilingState& state, size_t activeIndex) {
@@ -1753,10 +1706,11 @@ static bool RestoreWindowInState(TilingState& state, HWND hwnd) {
     }
   }
 
-  EnsureWeightVectorsAreSane(state);
+  EnsureSaneWeightVector(state);
   return true;
 }
 
+// Remove window from state. Also closes the logical gap.  
 static bool ForgetWindowInState(TilingState& state, HWND hwnd) {
   auto activeIt = std::find(state.windows.begin(), state.windows.end(), hwnd);
   if (activeIt != state.windows.end()) {
@@ -1810,7 +1764,7 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   // Do not infer lifecycle state here. In particular, cloaking is transitional
   // during a virtual-desktop switch. Visibility/minimize/cloak membership is
   // reconciled from a settled snapshot by ReconcileDeferredLifecycle().
-  EnsureWeightVectorsAreSane(state);
+  EnsureSaneWeightVector(state);
   SaveTilingState(key, state);
 
   // Floating is intentionally still a managed workspace. Lifecycle/order stays
@@ -1907,7 +1861,7 @@ static bool EnsureWorkspaceFromSnapshot(HMONITOR monitor, bool adoptCurrentGeome
     captured.suspendedSlots = state.suspendedSlots;
     state = std::move(captured);
   } else {
-    EnsureWeightVectorsAreSane(state);
+    EnsureSaneWeightVector(state);
   }
 
   SaveTilingState(key, state);
@@ -1955,6 +1909,7 @@ static void ForgetManagedWindow(HWND hwnd) {
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 }
 
+// If monit
 static void AddUniqueMonitor(std::vector<HMONITOR>& monitors, HMONITOR monitor) {
   if (monitor && std::find(monitors.begin(), monitors.end(), monitor) == monitors.end()) {
     monitors.push_back(monitor);
@@ -1963,6 +1918,7 @@ static void AddUniqueMonitor(std::vector<HMONITOR>& monitors, HMONITOR monitor) 
 
 static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) {
   if (!monitor) return;
+  // Only if not scheduled already
   auto it = std::find_if(
       g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
       [&](const PendingWorkspaceArrange& pending) {
@@ -1978,7 +1934,7 @@ static void ScheduleLifecycleReconcile(HWND hwnd);
 // Reconcile one desktop+monitor workspace from a supplied participation snapshot.
 // The caller controls whether that snapshot is cloak-sensitive (settled lifecycle)
 // or cloak-insensitive (authoritative virtual-desktop transition).
-static bool ReconcileWorkspaceMembershipFromSnapshot(
+static bool ReconcileSavedWindowsWithNewDesktop(
     HMONITOR monitor, const GUID& desktopId, const std::vector<HWND>& snapshot,
     bool discoverNew, DesktopMonitorKey* outKey) {
   if (!monitor) return false;
@@ -1996,7 +1952,7 @@ static bool ReconcileWorkspaceMembershipFromSnapshot(
 
   bool changed = !hadState;
 
-  // Repair dead HWNDs here instead of teaching ArrangeWorkspace lifecycle rules.
+  // Purge dead HWNDs here. ArrangeWorkspace doesn't have to mutate state. 
   std::vector<HWND> deadWindows;
   for (HWND w : state.windows) {
     if (!IsWindow(w)) deadWindows.push_back(w);
@@ -2008,12 +1964,13 @@ static bool ReconcileWorkspaceMembershipFromSnapshot(
     if (ForgetWindowInState(state, w)) changed = true;
   }
 
+  // Windows that re-appeared in the new VD. Unsuspend them. 
   for (HWND w : snapshot) {
     if (state.suspendedSlots.find(w) != state.suspendedSlots.end()) {
       if (RestoreWindowInState(state, w)) changed = true;
     }
   }
-
+  // Vice versa. 
   std::vector<HWND> toSuspend;
   for (HWND w : state.windows) {
     if (!ContainsWindow(snapshot, w)) toSuspend.push_back(w);
@@ -2034,7 +1991,7 @@ static bool ReconcileWorkspaceMembershipFromSnapshot(
 
   if (!changed) return false;
 
-  EnsureWeightVectorsAreSane(state);
+  EnsureSaneWeightVector(state);
   SaveTilingState(key, state);
   return true;
 }
@@ -2048,6 +2005,51 @@ static void EnumerateCurrentMonitors(std::vector<HMONITOR>& monitors) {
         return TRUE;
       },
       reinterpret_cast<LPARAM>(&monitors));
+}
+
+// DWM cloaking happens to all windows on VD switch. 
+// Windows cloaks/uncloaks the incoming/outgoing desktop one HWND at a time. This
+// Snapshot all eligible windows by desktop GUID, but ignores only the transient cloak bit. 
+// Genuine app/shell cloaks will be handled later on the now-current desktop.
+static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
+    HMONITOR monitor, const GUID& desktopId) {
+  std::vector<HWND> windows;
+  if (!monitor) return windows;
+
+  struct EnumContext {
+    HMONITOR targetMonitor;
+    GUID desktopId;
+    std::vector<HWND>* windowList;
+  } context = {monitor, desktopId, &windows};
+
+  EnumWindows(
+      [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        auto* ctx = reinterpret_cast<EnumContext*>(lParam);
+
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+        if (!CouldBeTileEligible(hwnd)) return TRUE;
+        if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
+
+        GUID windowDesktop{};
+        if (!GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+            !IsEqualGUID(windowDesktop, ctx->desktopId)) {
+          return TRUE;
+        }
+
+        RECT frameRect{};
+        if (!GetWindowFrameRect(hwnd, &frameRect) ||
+            frameRect.right <= frameRect.left || frameRect.bottom <= frameRect.top) {
+          return TRUE;
+        }
+
+        if (MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == ctx->targetMonitor) {
+          ctx->windowList->push_back(hwnd);
+        }
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&context));
+
+  return windows;
 }
 
 // Native CurrentVirtualDesktopChanged is the authoritative workspace transition
@@ -2069,9 +2071,9 @@ static void HandleVirtualDesktopChanged() {
 
   const bool discoverNew = g_enableTileNewWin && !g_tileNewWinSuspended;
   for (HMONITOR monitor : monitors) {
-    std::vector<HWND> snapshot = CollectTileWindowsForDesktop(monitor, currentDesktop);
+    std::vector<HWND> snapshot = GetTileWindowsAfterDesktopSwitch(monitor, currentDesktop);
     DesktopMonitorKey key{};
-    if (ReconcileWorkspaceMembershipFromSnapshot(
+    if (ReconcileSavedWindowsWithNewDesktop(
             monitor, currentDesktop, snapshot, discoverNew, &key)) {
       // Do not place yet: the notification can precede the final UNCLOAK events.
       // Remember only workspaces whose model actually changed; an ordinary switch
@@ -2080,12 +2082,13 @@ static void HandleVirtualDesktopChanged() {
     }
   }
 
-  // This is not how we *detect* a desktop switch anymore. It is a short safety
-  // pass that distinguishes genuine current-desktop cloaks from the transient
+  // Short safety pass that distinguishes genuine current-desktop cloaks from the transient
   // shell cloaking that accompanies the already-known switch.
   ScheduleLifecycleReconcile(nullptr);
 }
 
+// For this desktop, schedule a window lifecycle (suspended? active? dead?) 
+// reconciliation pass
 static void ScheduleLifecycleReconcile(HWND hwnd) {
   // HotkeyThreadProc owns this vector/timer; no additional lock is required.
   if (hwnd && std::find(g_lifecycleDirtyWindows.begin(), g_lifecycleDirtyWindows.end(), hwnd) ==
@@ -2149,7 +2152,7 @@ static void ReconcileDeferredLifecycle() {
   for (HMONITOR monitor : monitors) {
     DesktopMonitorKey key{};
     std::vector<HWND> snapshot = CollectTileWindows(monitor);
-    bool changed = ReconcileWorkspaceMembershipFromSnapshot(
+    bool changed = ReconcileSavedWindowsWithNewDesktop(
         monitor, currentDesktop, snapshot, discoverNew, &key);
     bool pendingArrange = std::any_of(
         g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
@@ -2209,7 +2212,7 @@ static void CycleCurrentWorkspaceLayout() {
     kv.second.hasWeight = false;
     kv.second.wasMaster = false;
   }
-  EnsureWeightVectorsAreSane(state);
+  EnsureSaneWeightVector(state);
   SaveTilingState(key, state);
   ArrangeWorkspace(key);
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.layout));
@@ -2338,7 +2341,7 @@ void RetileFromMoveSize(HWND hwnd) {
     return;
   }
 
-  EnsureWeightVectorsAreSane(state);
+  EnsureSaneWeightVector(state);
   SaveTilingState(key, state);
   ArrangeWorkspace(key);
 }
@@ -2677,6 +2680,14 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
             continue;
           }
         }
+
+        // This is an STA COM apartment. Messages for COM's hidden
+        // OleMainThreadWndClass must be dispatched, not merely removed from
+        // the queue, or cross-apartment callbacks (including virtual desktop
+        // notifications) can be silently lost. Our own thread messages use
+        // `continue` above and never reach this point.
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
       }
     }
   }
