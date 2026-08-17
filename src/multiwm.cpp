@@ -2,11 +2,12 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.6.1
+// @version         1.6.2
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
-// @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi
+// @architecture    x86-64
+// @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lversion
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -22,7 +23,7 @@ resize-adjusted ratios per virtual desktop.
 - 7 per-workspace modes: Master+Stack (Vertical/Horizontal), Columns, Rows, BSP, Monocle, Floating
 - Adjustable margin, gap, and master size
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
-- Coalesces visibility/cloak bursts before reconciling virtual-desktop membership
+- Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
 - Optional capture of current window sizes when tiling (useful if auto-retile is off)
 
 ## Default Hotkeys
@@ -33,6 +34,7 @@ resize-adjusted ratios per virtual desktop.
 ## Notes
 - Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
 - Floating is a first-class workspace mode: windows remain managed but are not repositioned.
+- Native virtual-desktop notifications are selected from the actual Explorer build/revision; unsupported builds fall back to settled WinEvent reconciliation.
 - If Virtual Desktop APIs are unavailable, tiling still works but per-desktop memory is disabled.
 */
 // ==/WindhawkModReadme==
@@ -132,8 +134,11 @@ resize-adjusted ratios per virtual desktop.
 #include <shobjidl.h>
 #include <windhawk_utils.h>
 #include <windows.h>
+#include <winver.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <new>
 #include <unordered_map>
 #include <vector>
 
@@ -154,6 +159,24 @@ static const CLSID CLSID_ImmersiveShell = {
 
 static const CLSID CLSID_VirtualDesktopManagerInternal = {
     0xC5E0CDCA, 0x7B6E, 0x41B2, {0x9F, 0xC4, 0xD9, 0x39, 0x75, 0xCC, 0x46, 0x7B}};
+
+// Private shell service used for virtual-desktop change notifications.
+// These identifiers and ABI generations mirror Windhawk's Taskbar Desktop
+// Indicator, while the WM consumes them through its own message queue.
+static const GUID SID_VirtualDesktopNotificationService = {
+    0xA501FDEC, 0x4A09, 0x464C, {0xAE, 0x4E, 0x1B, 0x9C, 0x21, 0xB8, 0x49, 0x18}};
+
+static const IID IID_IVirtualDesktopNotificationService = {
+    0x0CD45E71, 0xD927, 0x4F15, {0x8B, 0x0A, 0x8F, 0xEF, 0x52, 0x53, 0x37, 0xBF}};
+
+static const IID IID_IVirtualDesktopNotification_Old = {
+    0xCD403E52, 0xDEED, 0x4C13, {0xB4, 0x37, 0xB9, 0x83, 0x80, 0xF2, 0xB1, 0xE8}};
+
+static const IID IID_IVirtualDesktopNotification_Intermediate = {
+    0xB287FA1C, 0x7771, 0x471A, {0xA2, 0xDF, 0x9B, 0x6B, 0x21, 0xF0, 0xD6, 0x75}};
+
+static const IID IID_IVirtualDesktopNotification_Current = {
+    0xB9E5E94D, 0x233E, 0x49AB, {0xAF, 0x5C, 0x2B, 0x45, 0x41, 0xC3, 0xAA, 0xDE}};
 
 //=============================================================================
 // Windows Version-Specific Interface IDs
@@ -203,12 +226,43 @@ struct IVirtualDesktop : public IUnknown {
 
 struct IVirtualDesktopManagerInternal : public IUnknown {};
 
+MIDL_INTERFACE("0CD45E71-D927-4F15-8B0A-8FEF525337BF")
+IVirtualDesktopNotificationService : public IUnknown {
+ public:
+  virtual HRESULT STDMETHODCALLTYPE Register(IUnknown* notification, DWORD* cookie) = 0;
+  virtual HRESULT STDMETHODCALLTYPE Unregister(DWORD cookie) = 0;
+};
+
+struct NotificationInterfaceConfig {
+  IID iid{};
+  int methodCount = 0;
+  int currentChangedIndex = -1;
+  bool currentChangedHasMonitors = false;
+};
+
+struct VirtualDesktopNotificationObject {
+  void** vtable = nullptr;
+  LONG refCount = 1;
+};
+
+struct PendingWorkspaceArrange {
+  GUID desktopId{};
+  HMONITOR monitor = nullptr;
+};
+
 //=============================================================================
 // Global State
 //=============================================================================
 static IServiceProvider* g_pServiceProvider = nullptr;
 static IVirtualDesktopManagerInternal* g_pDesktopManagerInternal = nullptr;
 static IVirtualDesktopManager* g_pDesktopManager = nullptr;
+static IVirtualDesktopNotificationService* g_pDesktopNotificationService = nullptr;
+static VirtualDesktopNotificationObject* g_virtualDesktopNotificationObject = nullptr;
+static DWORD g_virtualDesktopNotificationCookie = 0;
+static bool g_virtualDesktopNotificationsRegistered = false;
+static DWORD g_explorerBuildNumber = 0;
+static DWORD g_explorerRevisionNumber = 0;
+static LONG g_virtualDesktopChangeQueued = 0;
 static bool g_bInitialized = false;
 
 static HANDLE g_hThread = nullptr;
@@ -228,12 +282,17 @@ enum HotkeyIds {
 // Messages to hotkey thread
 constexpr UINT WM_APP_RETILE_ON_MOVE_SIZE = WM_APP + 1;
 constexpr UINT WM_APP_WINDOW_EVENT = WM_APP + 2;
+constexpr UINT WM_APP_VIRTUAL_DESKTOP_CHANGED = WM_APP + 3;
 
 // Visibility/cloak state often changes in bursts, especially during virtual
 // desktop switches. Reconcile final state only after the burst has settled.
 constexpr UINT kLifecycleReconcileDelayMs = 80;
 static UINT_PTR g_lifecycleReconcileTimer = 0;
 static std::vector<HWND> g_lifecycleDirtyWindows;
+// Native VD transitions may create/change a workspace while its windows are
+// still shell-cloaked. Defer placement for only those monitors until the final
+// settled visibility pass.
+static std::vector<PendingWorkspaceArrange> g_pendingDesktopArranges;
 
 static UINT g_tilingModifiers = MOD_ALT;
 static UINT g_tileKey = 'D';
@@ -305,8 +364,8 @@ struct TilingState {
   TileLayout layout = TileLayout::MasterStack;
   // Active, tile-participating windows in logical layout order.
   std::vector<HWND> windows;
-  // Windows temporarily absent from placement (minimized/hidden during a VD
-  // switch, etc.) keep their logical slot so restore doesn't reshuffle layout.
+  // Windows temporarily absent from placement (minimized/hidden/app-cloaked)
+  // keep their logical slot so restore doesn't reshuffle layout.
   std::unordered_map<HWND, SuspendedSlot> suspendedSlots;
   double masterRatio = 0.5;
   std::vector<double> stackWeights;
@@ -465,6 +524,9 @@ std::vector<double> DefaultWeights(size_t count) {
 }
 
 bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor);
+static bool CouldBeTileEligible(HWND hwnd);
+static bool IsWindowTrackedInAnyState(HWND hwnd);
+bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid);
 
 bool ContainsWindow(const std::vector<HWND>& windows, HWND hwnd) {
   for (HWND w : windows) {
@@ -546,6 +608,53 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
         if (IsTileEligible(hwnd, ctx->targetMonitor)) {
+          ctx->windowList->push_back(hwnd);
+        }
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&context));
+
+  return windows;
+}
+
+
+// Desktop-switch reconciliation must not use DWM cloaking as membership truth:
+// Windows cloaks/uncloaks the incoming/outgoing desktop one HWND at a time. This
+// snapshot instead keys membership by the authoritative desktop GUID and ignores
+// only the transient cloak bit. A later settled lifecycle reconcile classifies
+// genuine app/shell cloaks on the now-current desktop.
+static std::vector<HWND> CollectTileWindowsForDesktop(
+    HMONITOR monitor, const GUID& desktopId) {
+  std::vector<HWND> windows;
+  if (!monitor) return windows;
+
+  struct EnumContext {
+    HMONITOR targetMonitor;
+    GUID desktopId;
+    std::vector<HWND>* windowList;
+  } context = {monitor, desktopId, &windows};
+
+  EnumWindows(
+      [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        auto* ctx = reinterpret_cast<EnumContext*>(lParam);
+
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+        if (!CouldBeTileEligible(hwnd)) return TRUE;
+        if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
+
+        GUID windowDesktop{};
+        if (!GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+            !IsEqualGUID(windowDesktop, ctx->desktopId)) {
+          return TRUE;
+        }
+
+        RECT frameRect{};
+        if (!GetWindowFrameRect(hwnd, &frameRect) ||
+            frameRect.right <= frameRect.left || frameRect.bottom <= frameRect.top) {
+          return TRUE;
+        }
+
+        if (MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == ctx->targetMonitor) {
           ctx->windowList->push_back(hwnd);
         }
         return TRUE;
@@ -908,10 +1017,253 @@ void LayoutBSP(const RECT& area, size_t startIndex, size_t count, int depth, std
 }
 
 //=============================================================================
-// Virtual Desktop API (minimal for per-desktop memory)
+// Virtual Desktop API + native change notifications
 //=============================================================================
 
 static const int VTABLE_GET_CURRENT_DESKTOP = 6;
+
+static NotificationInterfaceConfig GetNotificationInterfaceConfig() {
+  if (g_explorerBuildNumber < 22000) return {};
+
+  // Mirrors Windhawk's Taskbar Desktop Indicator ABI table. The private
+  // notification interface changed both IID and callback layout within the
+  // Windows 11 22H2/23H2 servicing lifetime, so build number alone is not enough.
+  if (g_explorerBuildNumber < 22483 ||
+      (g_explorerBuildNumber == 22621 && g_explorerRevisionNumber < 2215)) {
+    return {IID_IVirtualDesktopNotification_Old, 13, 11, true};
+  }
+
+  if (g_explorerBuildNumber < 22631 ||
+      (g_explorerBuildNumber == 22631 && g_explorerRevisionNumber < 3085)) {
+    return {IID_IVirtualDesktopNotification_Intermediate, 14, 10, false};
+  }
+
+  return {IID_IVirtualDesktopNotification_Current, 14, 10, false};
+}
+
+static bool ReadExplorerVersion() {
+  wchar_t explorerPath[MAX_PATH]{};
+  UINT length = GetWindowsDirectoryW(explorerPath, ARRAYSIZE(explorerPath));
+  static constexpr wchar_t suffix[] = L"\\explorer.exe";
+  if (!length || length >= ARRAYSIZE(explorerPath) ||
+      length + ARRAYSIZE(suffix) > ARRAYSIZE(explorerPath)) {
+    Wh_Log(L"Failed to resolve explorer.exe path for VD notification ABI detection");
+    return false;
+  }
+  memcpy(explorerPath + length, suffix, sizeof(suffix));
+
+  DWORD ignored = 0;
+  DWORD versionSize = GetFileVersionInfoSizeW(explorerPath, &ignored);
+  if (!versionSize) {
+    Wh_Log(L"GetFileVersionInfoSize(explorer.exe) failed: %lu", GetLastError());
+    return false;
+  }
+
+  std::vector<BYTE> versionData(versionSize);
+  if (!GetFileVersionInfoW(explorerPath, 0, versionSize, versionData.data())) {
+    Wh_Log(L"GetFileVersionInfo(explorer.exe) failed: %lu", GetLastError());
+    return false;
+  }
+
+  VS_FIXEDFILEINFO* fixedInfo = nullptr;
+  UINT fixedInfoSize = 0;
+  if (!VerQueryValueW(versionData.data(), L"\\", reinterpret_cast<void**>(&fixedInfo),
+                      &fixedInfoSize) || !fixedInfo || fixedInfoSize < sizeof(*fixedInfo)) {
+    Wh_Log(L"VerQueryValue(explorer.exe) failed");
+    return false;
+  }
+
+  g_explorerBuildNumber = HIWORD(fixedInfo->dwFileVersionLS);
+  g_explorerRevisionNumber = LOWORD(fixedInfo->dwFileVersionLS);
+  Wh_Log(L"Explorer version for VD notifications: build=%lu revision=%lu",
+         g_explorerBuildNumber, g_explorerRevisionNumber);
+  return true;
+}
+
+static bool IsCurrentNotificationInterface(REFIID riid) {
+  NotificationInterfaceConfig config = GetNotificationInterfaceConfig();
+  return config.methodCount > 0 && InlineIsEqualGUID(riid, config.iid);
+}
+
+static void QueueVirtualDesktopChangedNotification() {
+  if (!g_threadId || g_stopHotkeyThread) return;
+
+  // COM can emit redundant desktop notifications. Collapse them before they
+  // reach the WM core, just as FancyWM coalesces layout invalidations.
+  if (InterlockedExchange(&g_virtualDesktopChangeQueued, 1) != 0) return;
+
+  if (!PostThreadMessage(g_threadId, WM_APP_VIRTUAL_DESKTOP_CHANGED, 0, 0)) {
+    InterlockedExchange(&g_virtualDesktopChangeQueued, 0);
+    Wh_Log(L"Failed to queue virtual desktop changed notification: %lu", GetLastError());
+  }
+}
+
+static HRESULT STDMETHODCALLTYPE VirtualDesktopNotification_QueryInterface(
+    VirtualDesktopNotificationObject* self, REFIID riid, void** object) {
+  if (!object) return E_POINTER;
+  *object = nullptr;
+
+  if (InlineIsEqualGUID(riid, IID_IUnknown) || IsCurrentNotificationInterface(riid)) {
+    *object = self;
+    InterlockedIncrement(&self->refCount);
+    return S_OK;
+  }
+  return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE VirtualDesktopNotification_AddRef(
+    VirtualDesktopNotificationObject* self) {
+  return static_cast<ULONG>(InterlockedIncrement(&self->refCount));
+}
+
+static ULONG STDMETHODCALLTYPE VirtualDesktopNotification_Release(
+    VirtualDesktopNotificationObject* self) {
+  LONG refCount = InterlockedDecrement(&self->refCount);
+  if (refCount == 0) {
+    delete[] self->vtable;
+    delete self;
+  }
+  return static_cast<ULONG>(std::max<LONG>(refCount, 0));
+}
+
+static HRESULT STDMETHODCALLTYPE VirtualDesktopNotification_NoOp() {
+  return S_OK;
+}
+
+// Newer notification ABIs pass old/new IVirtualDesktop pointers after `self`.
+// We deliberately don't consume those private-interface parameters here: the
+// callback is the authoritative *signal*, then the WM thread queries the current
+// GUID through its already-versioned manager interface. This follows Windhawk's
+// compatibility pattern and avoids COM lifetime/cross-thread pointer hazards.
+static HRESULT STDMETHODCALLTYPE VirtualDesktopNotification_CurrentChanged(
+    VirtualDesktopNotificationObject*) {
+  QueueVirtualDesktopChangedNotification();
+  return S_OK;
+}
+
+// The oldest supported Windows 11 notification ABI inserts a monitor collection
+// before old/new desktop arguments. The values are callback-owned COM inputs and
+// are intentionally ignored rather than AddRef/Release'd.
+static HRESULT STDMETHODCALLTYPE VirtualDesktopNotification_CurrentChangedWithMonitors(
+    VirtualDesktopNotificationObject*, void*, void*, void*) {
+  QueueVirtualDesktopChangedNotification();
+  return S_OK;
+}
+
+static VirtualDesktopNotificationObject* CreateVirtualDesktopNotificationObject() {
+  NotificationInterfaceConfig config = GetNotificationInterfaceConfig();
+  if (config.methodCount <= 0 || config.currentChangedIndex < 3 ||
+      config.currentChangedIndex >= config.methodCount) {
+    return nullptr;
+  }
+
+  auto* object = new (std::nothrow) VirtualDesktopNotificationObject();
+  if (!object) return nullptr;
+
+  object->vtable = new (std::nothrow) void*[config.methodCount];
+  if (!object->vtable) {
+    delete object;
+    return nullptr;
+  }
+
+  for (int i = 0; i < config.methodCount; ++i) {
+    object->vtable[i] = reinterpret_cast<void*>(&VirtualDesktopNotification_NoOp);
+  }
+  object->vtable[0] = reinterpret_cast<void*>(&VirtualDesktopNotification_QueryInterface);
+  object->vtable[1] = reinterpret_cast<void*>(&VirtualDesktopNotification_AddRef);
+  object->vtable[2] = reinterpret_cast<void*>(&VirtualDesktopNotification_Release);
+  if (config.currentChangedHasMonitors) {
+    object->vtable[config.currentChangedIndex] =
+        reinterpret_cast<void*>(&VirtualDesktopNotification_CurrentChangedWithMonitors);
+  } else {
+    object->vtable[config.currentChangedIndex] =
+        reinterpret_cast<void*>(&VirtualDesktopNotification_CurrentChanged);
+  }
+  return object;
+}
+
+static void ClearVirtualDesktopNotificationState(bool unregisterFromShell) {
+  g_virtualDesktopNotificationsRegistered = false;
+  InterlockedExchange(&g_virtualDesktopChangeQueued, 0);
+
+  if (g_pDesktopNotificationService) {
+    if (unregisterFromShell && g_virtualDesktopNotificationCookie) {
+      HRESULT hr = g_pDesktopNotificationService->Unregister(g_virtualDesktopNotificationCookie);
+      if (FAILED(hr)) {
+        Wh_Log(L"Virtual desktop notification Unregister failed: 0x%08X", hr);
+      }
+    }
+
+    if (unregisterFromShell) {
+      g_pDesktopNotificationService->Release();
+    }
+    // If Explorer is unavailable, avoid a potentially blocking COM call/release.
+    // The old server is going away; importantly, discard its cookie *before* a
+    // new registration so a reused cookie can never unregister the new sink.
+    g_pDesktopNotificationService = nullptr;
+  }
+
+  if (g_virtualDesktopNotificationObject) {
+    VirtualDesktopNotification_Release(g_virtualDesktopNotificationObject);
+    g_virtualDesktopNotificationObject = nullptr;
+  }
+
+  g_virtualDesktopNotificationCookie = 0;
+}
+
+static bool RegisterVirtualDesktopNotifications() {
+  if (g_virtualDesktopNotificationsRegistered) return true;
+  if (!g_pServiceProvider) return false;
+  if (!ReadExplorerVersion()) return false;
+
+  NotificationInterfaceConfig config = GetNotificationInterfaceConfig();
+  if (config.methodCount == 0) {
+    Wh_Log(L"Native VD notifications unavailable for Explorer build %lu.%lu; using WinEvent settle fallback",
+           g_explorerBuildNumber, g_explorerRevisionNumber);
+    return false;
+  }
+
+  // Never carry an old cookie/sink into a new shell registration. Explorer can
+  // reuse notification cookies after a restart. Normal reinitialization already
+  // clears this state; this is a defensive cleanup for partial/stale attempts.
+  if (g_pDesktopNotificationService || g_virtualDesktopNotificationObject ||
+      g_virtualDesktopNotificationCookie) {
+    HWND shell = GetShellWindow();
+    ClearVirtualDesktopNotificationState(shell && IsWindow(shell));
+  }
+
+  HRESULT hr = g_pServiceProvider->QueryService(
+      SID_VirtualDesktopNotificationService, IID_IVirtualDesktopNotificationService,
+      reinterpret_cast<void**>(&g_pDesktopNotificationService));
+  if (FAILED(hr) || !g_pDesktopNotificationService) {
+    Wh_Log(L"Failed to get VirtualDesktopNotificationService: 0x%08X", hr);
+    g_pDesktopNotificationService = nullptr;
+    return false;
+  }
+
+  g_virtualDesktopNotificationObject = CreateVirtualDesktopNotificationObject();
+  if (!g_virtualDesktopNotificationObject) {
+    Wh_Log(L"Failed to create virtual desktop notification sink");
+    SAFE_RELEASE(g_pDesktopNotificationService);
+    return false;
+  }
+
+  DWORD cookie = 0;
+  hr = g_pDesktopNotificationService->Register(
+      reinterpret_cast<IUnknown*>(g_virtualDesktopNotificationObject), &cookie);
+  if (FAILED(hr) || cookie == 0) {
+    Wh_Log(L"Virtual desktop notification Register failed: 0x%08X cookie=%lu", hr, cookie);
+    VirtualDesktopNotification_Release(g_virtualDesktopNotificationObject);
+    g_virtualDesktopNotificationObject = nullptr;
+    SAFE_RELEASE(g_pDesktopNotificationService);
+    return false;
+  }
+
+  g_virtualDesktopNotificationCookie = cookie;
+  g_virtualDesktopNotificationsRegistered = true;
+  Wh_Log(L"Native virtual desktop notifications registered (cookie=%lu)", cookie);
+  return true;
+}
 
 bool InitializeVirtualDesktopAPIOnce() {
   HRESULT hr = CoCreateInstance(CLSID_ImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
@@ -944,7 +1296,11 @@ bool InitializeVirtualDesktopAPIOnce() {
 
 void CleanupVirtualDesktopAPI() {
   HWND hShell = GetShellWindow();
-  if (!hShell || !IsWindow(hShell)) {
+  const bool shellAvailable = hShell && IsWindow(hShell);
+
+  ClearVirtualDesktopNotificationState(shellAvailable);
+
+  if (!shellAvailable) {
     Wh_Log(L"Explorer not available, skipping COM cleanup to avoid hang");
     g_pDesktopManager = nullptr;
     g_pDesktopManagerInternal = nullptr;
@@ -970,7 +1326,9 @@ bool InitializeVirtualDesktopAPI() {
 
 bool ReinitializeVirtualDesktopAPI() {
   CleanupVirtualDesktopAPI();
-  return InitializeVirtualDesktopAPI();
+  if (!InitializeVirtualDesktopAPI()) return false;
+  if (g_enableTiling) RegisterVirtualDesktopNotifications();
+  return true;
 }
 
 template <typename TResult>
@@ -1603,17 +1961,31 @@ static void AddUniqueMonitor(std::vector<HMONITOR>& monitors, HMONITOR monitor) 
   }
 }
 
-// Reconcile one current-desktop monitor from a final, settled visibility snapshot.
-// This intentionally does not adopt window geometry. It only updates membership.
-static bool ReconcileCurrentWorkspaceMembership(HMONITOR monitor, bool discoverNew,
-                                                DesktopMonitorKey* outKey) {
+static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) {
+  if (!monitor) return;
+  auto it = std::find_if(
+      g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
+      [&](const PendingWorkspaceArrange& pending) {
+        return pending.monitor == monitor && IsEqualGUID(pending.desktopId, desktopId);
+      });
+  if (it == g_pendingDesktopArranges.end()) {
+    g_pendingDesktopArranges.push_back({desktopId, monitor});
+  }
+}
+
+static void ScheduleLifecycleReconcile(HWND hwnd);
+
+// Reconcile one desktop+monitor workspace from a supplied participation snapshot.
+// The caller controls whether that snapshot is cloak-sensitive (settled lifecycle)
+// or cloak-insensitive (authoritative virtual-desktop transition).
+static bool ReconcileWorkspaceMembershipFromSnapshot(
+    HMONITOR monitor, const GUID& desktopId, const std::vector<HWND>& snapshot,
+    bool discoverNew, DesktopMonitorKey* outKey) {
   if (!monitor) return false;
 
-  DesktopMonitorKey key{};
-  if (!GetCurrentWorkspaceKey(monitor, &key)) return false;
+  DesktopMonitorKey key{desktopId, monitor};
   if (outKey) *outKey = key;
 
-  std::vector<HWND> snapshot = CollectTileWindows(monitor);
   TilingState state;
   bool hadState = LoadTilingState(key, &state);
   if (!hadState) {
@@ -1636,17 +2008,12 @@ static bool ReconcileCurrentWorkspaceMembership(HMONITOR monitor, bool discoverN
     if (ForgetWindowInState(state, w)) changed = true;
   }
 
-  // Snapshot contains only windows that are visible, restored, uncloaked, on the
-  // settled current VD, and on this monitor. Restore all known members together.
   for (HWND w : snapshot) {
     if (state.suspendedSlots.find(w) != state.suspendedSlots.end()) {
       if (RestoreWindowInState(state, w)) changed = true;
     }
   }
 
-  // Anything still absent from the settled snapshot is genuinely not
-  // participating on the current desktop (hidden, minimized, app/shell-cloaked,
-  // moved away, etc.). Suspend all such members before arranging once.
   std::vector<HWND> toSuspend;
   for (HWND w : state.windows) {
     if (!ContainsWindow(snapshot, w)) toSuspend.push_back(w);
@@ -1655,8 +2022,6 @@ static bool ReconcileCurrentWorkspaceMembership(HMONITOR monitor, bool discoverN
     if (SuspendWindowInState(state, w)) changed = true;
   }
 
-  // Automatic management may discover several windows in one burst. Append them
-  // all now and perform only one layout pass afterward.
   if (discoverNew) {
     for (HWND w : snapshot) {
       if (!ContainsWindow(state.windows, w) &&
@@ -1672,6 +2037,53 @@ static bool ReconcileCurrentWorkspaceMembership(HMONITOR monitor, bool discoverN
   EnsureWeightVectorsAreSane(state);
   SaveTilingState(key, state);
   return true;
+}
+
+static void EnumerateCurrentMonitors(std::vector<HMONITOR>& monitors) {
+  EnumDisplayMonitors(
+      nullptr, nullptr,
+      [](HMONITOR monitor, HDC, LPRECT, LPARAM lParam) WINAPI -> BOOL {
+        auto* list = reinterpret_cast<std::vector<HMONITOR>*>(lParam);
+        AddUniqueMonitor(*list, monitor);
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&monitors));
+}
+
+// Native CurrentVirtualDesktopChanged is the authoritative workspace transition
+// signal. Reconcile membership immediately by desktop GUID while deliberately
+// ignoring DWM cloak state, then let the existing settle timer make one final
+// cloak-sensitive pass after Windows finishes its per-HWND visibility burst.
+static void HandleVirtualDesktopChanged() {
+  InterlockedExchange(&g_virtualDesktopChangeQueued, 0);
+
+  GUID currentDesktop{};
+  if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&currentDesktop)) {
+    Wh_Log(L"Native VD change received but current desktop query failed");
+    ScheduleLifecycleReconcile(nullptr);
+    return;
+  }
+
+  std::vector<HMONITOR> monitors;
+  EnumerateCurrentMonitors(monitors);
+
+  const bool discoverNew = g_enableTileNewWin && !g_tileNewWinSuspended;
+  for (HMONITOR monitor : monitors) {
+    std::vector<HWND> snapshot = CollectTileWindowsForDesktop(monitor, currentDesktop);
+    DesktopMonitorKey key{};
+    if (ReconcileWorkspaceMembershipFromSnapshot(
+            monitor, currentDesktop, snapshot, discoverNew, &key)) {
+      // Do not place yet: the notification can precede the final UNCLOAK events.
+      // Remember only workspaces whose model actually changed; an ordinary switch
+      // between already-known desktops therefore performs zero placement work.
+      AddPendingWorkspaceArrange(currentDesktop, monitor);
+    }
+  }
+
+  // This is not how we *detect* a desktop switch anymore. It is a short safety
+  // pass that distinguishes genuine current-desktop cloaks from the transient
+  // shell cloaking that accompanies the already-known switch.
+  ScheduleLifecycleReconcile(nullptr);
 }
 
 static void ScheduleLifecycleReconcile(HWND hwnd) {
@@ -1736,10 +2148,27 @@ static void ReconcileDeferredLifecycle() {
   const bool discoverNew = g_enableTileNewWin && !g_tileNewWinSuspended;
   for (HMONITOR monitor : monitors) {
     DesktopMonitorKey key{};
-    if (ReconcileCurrentWorkspaceMembership(monitor, discoverNew, &key)) {
+    std::vector<HWND> snapshot = CollectTileWindows(monitor);
+    bool changed = ReconcileWorkspaceMembershipFromSnapshot(
+        monitor, currentDesktop, snapshot, discoverNew, &key);
+    bool pendingArrange = std::any_of(
+        g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
+        [&](const PendingWorkspaceArrange& pending) {
+          return pending.monitor == monitor &&
+                 IsEqualGUID(pending.desktopId, currentDesktop);
+        });
+    if (changed || pendingArrange) {
       ArrangeWorkspace(key);
     }
   }
+
+  g_pendingDesktopArranges.erase(
+      std::remove_if(
+          g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
+          [&](const PendingWorkspaceArrange& pending) {
+            return IsEqualGUID(pending.desktopId, currentDesktop);
+          }),
+      g_pendingDesktopArranges.end());
 }
 
 static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
@@ -1755,9 +2184,9 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
     case EVENT_OBJECT_UNCLOAKED:
     case EVENT_SYSTEM_MINIMIZESTART:
     case EVENT_SYSTEM_MINIMIZEEND:
-      // Visibility/state transitions can arrive in correlated bursts. Treat them
-      // as invalidation signals and reconcile the final current-desktop snapshot
-      // once, analogous to FancyWM's Refresh()+InvalidateLayout() separation.
+      // These remain generic visibility invalidations. Native VD notifications
+      // identify workspace switches explicitly; this settle pass is still needed
+      // for genuine hide/minimize/app-cloak transitions and as an API fallback.
       ScheduleLifecycleReconcile(hwnd);
       break;
   }
@@ -2122,6 +2551,13 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
   MSG msg;
   PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
+
+  if (g_enableTiling && SUCCEEDED(coHr) && InitializeVirtualDesktopAPI()) {
+    if (!RegisterVirtualDesktopNotifications()) {
+      Wh_Log(L"Using settled WinEvent reconciliation for virtual desktop changes");
+    }
+  }
+
   SetEvent(g_hReadyEvent);
 
   if (g_enableTiling) {
@@ -2176,6 +2612,11 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
             DWORD event = static_cast<DWORD>(msg.wParam);
             HWND hwnd = reinterpret_cast<HWND>(msg.lParam);
             ProcessWindowLifecycleEvent(event, hwnd);
+            continue;
+          }
+
+          case WM_APP_VIRTUAL_DESKTOP_CHANGED: {
+            HandleVirtualDesktopChanged();
             continue;
           }
 
@@ -2246,6 +2687,8 @@ cleanup:
     g_lifecycleReconcileTimer = 0;
   }
   g_lifecycleDirtyWindows.clear();
+  g_pendingDesktopArranges.clear();
+  InterlockedExchange(&g_virtualDesktopChangeQueued, 0);
 
   if (g_enableTiling) {
     UnregisterHotKey(nullptr, HK_TILE);
