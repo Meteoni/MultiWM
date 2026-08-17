@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.4
+// @version         1.7.5
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -315,6 +315,7 @@ constexpr UINT WM_APP_MOVE_SIZE_END = WM_APP + 1;
 constexpr UINT WM_APP_WINDOW_EVENT = WM_APP + 2;
 constexpr UINT WM_APP_VIRTUAL_DESKTOP_CHANGED = WM_APP + 3;
 constexpr UINT WM_APP_TRAY_REFRESH = WM_APP + 4;
+constexpr UINT WM_APP_LAYOUT_CYCLE = WM_APP + 5;
 
 // Visibility/cloak state often changes in bursts, especially during virtual
 // desktop switches. Reconcile final state only after the burst has settled.
@@ -1732,6 +1733,7 @@ namespace TrayUi {
 
 constexpr wchar_t kTrayWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
 constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkTilingHelperLayoutFlyout";
+constexpr UINT kTrayCallbackMessage = WM_APP + 20;
 constexpr UINT kIconId = 1;
 constexpr int kIconCanvasSize = 32;
 constexpr int kTrayFontHeight = 26;
@@ -1944,7 +1946,8 @@ static bool AddIconToShell() {
   g_notifyData.cbSize = sizeof(g_notifyData);
   g_notifyData.hWnd = g_trayWindow;
   g_notifyData.uID = kIconId;
-  g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+  g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
+  g_notifyData.uCallbackMessage = kTrayCallbackMessage;
   g_notifyData.hIcon = GetLayoutIcon(g_displayedLayout);
   SetTooltip(g_displayedLayout);
   if (!Shell_NotifyIconW(NIM_ADD, &g_notifyData)) {
@@ -2129,6 +2132,19 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
     AddIconToShell();
     return 0;
   }
+
+  if (message == kTrayCallbackMessage) {
+    const UINT event = LOWORD(lParam);
+    const UINT iconId = HIWORD(lParam);
+    if (iconId == kIconId &&
+        (event == NIN_SELECT || event == NIN_KEYSELECT)) {
+      // Emit the exact same action as the layout hotkey; layout mutation stays
+      // serialized on the WM thread and is implemented in one place only.
+      if (g_threadId) PostThreadMessageW(g_threadId, WM_APP_LAYOUT_CYCLE, 0, 0);
+    }
+    return 0;
+  }
+
   switch (message) {
     case WM_SETTINGCHANGE:
     case WM_THEMECHANGED:
@@ -3446,6 +3462,11 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
           case WM_APP_TRAY_REFRESH: {
             TrayUi::RefreshForCurrentWorkspace();
+            continue;
+          }
+
+          case WM_APP_LAYOUT_CYCLE: {
+            CycleCurrentWorkspaceLayout();
             continue;
           }
 
