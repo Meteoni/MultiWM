@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.18
+// @version         1.7.19
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -36,7 +36,7 @@ resize-adjusted ratios per virtual desktop.
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
-- Diagnostic bookkeeping dump can snapshot all workspace/window records and audit ownership invariants without mutating state
+- Diagnostic bookkeeping dump prints a deterministic, formatted snapshot of every saved workspace/window record without mutating state
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
 
@@ -4099,235 +4099,274 @@ static std::wstring DiagnosticGuidString(const GUID& guid) {
   return L"{GUID_FORMAT_FAILED}";
 }
 
-static void DumpSavedBookkeeping() {
-  // Take one coherent copy under the state lock. Everything below is emitted
-  // from this copy only: no live HWND queries, VD API calls, reconciliation, or
-  // repair. The dump must remain observational so it cannot hide the bug being
-  // diagnosed.
-  decltype(g_tilingStateMap) snapshot;
-  AcquireSRWLockShared(&g_tilingStateLock);
-  snapshot = g_tilingStateMap;
-  ReleaseSRWLockShared(&g_tilingStateLock);
+static std::wstring DiagnosticRectString(const RECT& rect) {
+  wchar_t buffer[128]{};
+  swprintf(
+      buffer, ARRAYSIZE(buffer), L"[%ld,%ld,%ld,%ld] (%ldx%ld)",
+      rect.left, rect.top, rect.right, rect.bottom,
+      rect.right - rect.left, rect.bottom - rect.top);
+  return buffer;
+}
 
-  Wh_Log(L"================ BOOKKEEPING_DUMP_BEGIN ================");
-  Wh_Log(L"savedWorkspaceCount=%zu", snapshot.size());
+static std::wstring DiagnosticWeightsString(const std::vector<double>& weights) {
+  std::wstring result = L"[";
+  for (size_t i = 0; i < weights.size(); ++i) {
+    wchar_t buffer[64]{};
+    swprintf(buffer, ARRAYSIZE(buffer), L"%.9g", weights[i]);
+    if (i) result += L", ";
+    result += buffer;
+  }
+  result += L"]";
+  return result;
+}
 
-  // Build a read-only global owner index from the snapshot. v1.7.15's model
-  // invariant is one HWND -> one DesktopMonitorKey; reporting violations here
-  // makes Alt+I a regression detector for the duplicate/ghost-slot bug.
-  std::unordered_map<HWND, std::vector<size_t>> ownerWorkspaceIndices;
-  size_t ownerWorkspaceIndex = 0;
-  for (const auto& kv : snapshot) {
-    for (const auto& recordKv : kv.second.records) {
-      ownerWorkspaceIndices[recordKv.first].push_back(ownerWorkspaceIndex);
-    }
-    ++ownerWorkspaceIndex;
+static size_t DiagnosticActiveIndex(const TilingState& state, HWND hwnd) {
+  auto it = std::find(state.windows.begin(), state.windows.end(), hwnd);
+  return it == state.windows.end()
+             ? static_cast<size_t>(-1)
+             : static_cast<size_t>(it - state.windows.begin());
+}
+
+static size_t DiagnosticLogicalIndex(const TilingState& state, HWND hwnd, const WindowRecord& record) {
+  if (record.state == ManageState::Suspended && record.hasSavedSlot) {
+    return record.savedSlot.index;
   }
 
-  size_t workspaceIndex = 0;
-  size_t localInvariantIssueCount = 0;
-  for (const auto& kv : snapshot) {
-    const DesktopMonitorKey& key = kv.first;
-    const TilingState& state = kv.second;
-    std::wstring desktopId = DiagnosticGuidString(key.desktopId);
-
-    Wh_Log(
-        L"WORKSPACE[%zu] desktopId=%s monitor=%p layout=%d(%s) masterRatio=%.17g "
-        L"activeWindowCount=%zu recordCount=%zu stackWeightCount=%zu gridWeightCount=%zu",
-        workspaceIndex,
-        desktopId.c_str(),
-        reinterpret_cast<void*>(key.monitor),
-        static_cast<int>(state.layout),
-        DiagnosticLayoutName(state.layout),
-        state.masterRatio,
-        state.windows.size(),
-        state.records.size(),
-        state.stackWeights.size(),
-        state.gridWeights.size());
-
-    std::unordered_map<HWND, size_t> activeCounts;
-    for (size_t i = 0; i < state.windows.size(); ++i) {
-      HWND hwnd = state.windows[i];
-      ++activeCounts[hwnd];
-      Wh_Log(L"WORKSPACE[%zu].windows[%zu]=%p",
-             workspaceIndex, i, reinterpret_cast<void*>(hwnd));
-
-      auto recordIt = state.records.find(hwnd);
-      if (recordIt == state.records.end()) {
-        ++localInvariantIssueCount;
-        Wh_Log(
-            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=active_without_record "
-            L"hwnd=%p",
-            workspaceIndex, reinterpret_cast<void*>(hwnd));
-      } else if (recordIt->second.state != ManageState::Tiled) {
-        ++localInvariantIssueCount;
-        Wh_Log(
-            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=active_not_tiled "
-            L"hwnd=%p state=%d(%s)",
-            workspaceIndex, reinterpret_cast<void*>(hwnd),
-            static_cast<int>(recordIt->second.state),
-            DiagnosticManageStateName(recordIt->second.state));
-      }
+  if (record.state == ManageState::Tiled) {
+    size_t activeIndex = DiagnosticActiveIndex(state, hwnd);
+    if (activeIndex != static_cast<size_t>(-1)) {
+      return ActiveIndexToLogicalIndex(state, activeIndex);
     }
-
-    for (const auto& activeKv : activeCounts) {
-      if (activeKv.second > 1) {
-        ++localInvariantIssueCount;
-        Wh_Log(
-            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=duplicate_active_hwnd "
-            L"hwnd=%p count=%zu",
-            workspaceIndex, reinterpret_cast<void*>(activeKv.first), activeKv.second);
-      }
-    }
-
-    size_t recordIndex = 0;
-    for (const auto& recordKv : state.records) {
-      const HWND mapHwnd = recordKv.first;
-      const WindowRecord& record = recordKv.second;
-
-      Wh_Log(
-          L"WORKSPACE[%zu].records[%zu] mapHwnd=%p record.hwnd=%p pid=%lu "
-          L"state=%d(%s) suspensionReason=%d(%s) canMove=%d canResize=%d topmost=%d "
-          L"placementFailures=%d lastPlacementResult=%d(%s) hasSavedSlot=%d",
-          workspaceIndex,
-          recordIndex,
-          reinterpret_cast<void*>(mapHwnd),
-          reinterpret_cast<void*>(record.hwnd),
-          record.pid,
-          static_cast<int>(record.state),
-          DiagnosticManageStateName(record.state),
-          static_cast<int>(record.suspensionReason),
-          DiagnosticSuspensionReasonName(record.suspensionReason),
-          record.canMove ? 1 : 0,
-          record.canResize ? 1 : 0,
-          record.topmost ? 1 : 0,
-          record.placementFailures,
-          static_cast<int>(record.lastPlacementResult),
-          DiagnosticPlacementResultName(record.lastPlacementResult),
-          record.hasSavedSlot ? 1 : 0);
-
-      Wh_Log(
-          L"WORKSPACE[%zu].records[%zu].lastRequestedRect=[%ld,%ld,%ld,%ld]",
-          workspaceIndex, recordIndex,
-          record.lastRequestedRect.left, record.lastRequestedRect.top,
-          record.lastRequestedRect.right, record.lastRequestedRect.bottom);
-
-      Wh_Log(
-          L"WORKSPACE[%zu].records[%zu].lastObservedRect=[%ld,%ld,%ld,%ld]",
-          workspaceIndex, recordIndex,
-          record.lastObservedRect.left, record.lastObservedRect.top,
-          record.lastObservedRect.right, record.lastObservedRect.bottom);
-
-      Wh_Log(
-          L"WORKSPACE[%zu].records[%zu].savedSlot index=%zu weight=%.17g "
-          L"hasWeight=%d wasMaster=%d",
-          workspaceIndex, recordIndex,
-          record.savedSlot.index,
-          record.savedSlot.weight,
-          record.savedSlot.hasWeight ? 1 : 0,
-          record.savedSlot.wasMaster ? 1 : 0);
-
-      if (record.hwnd != mapHwnd) {
-        ++localInvariantIssueCount;
-        Wh_Log(
-            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=record_key_mismatch "
-            L"mapHwnd=%p recordHwnd=%p",
-            workspaceIndex, reinterpret_cast<void*>(mapHwnd),
-            reinterpret_cast<void*>(record.hwnd));
-      }
-
-      const bool active = activeCounts.find(mapHwnd) != activeCounts.end();
-      if (record.state == ManageState::Tiled && !active) {
-        ++localInvariantIssueCount;
-        Wh_Log(
-            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=tiled_record_not_active "
-            L"hwnd=%p",
-            workspaceIndex, reinterpret_cast<void*>(mapHwnd));
-      } else if (record.state != ManageState::Tiled && active) {
-        ++localInvariantIssueCount;
-        Wh_Log(
-            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=non_tiled_record_active "
-            L"hwnd=%p state=%d(%s)",
-            workspaceIndex, reinterpret_cast<void*>(mapHwnd),
-            static_cast<int>(record.state),
-            DiagnosticManageStateName(record.state));
-      }
-
-      if (record.state == ManageState::Suspended &&
-          record.suspensionReason == SuspensionReason::None) {
-        ++localInvariantIssueCount;
-        Wh_Log(
-            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=suspended_without_reason hwnd=%p",
-            workspaceIndex, reinterpret_cast<void*>(mapHwnd));
-      } else if (record.state != ManageState::Suspended &&
-                 record.suspensionReason != SuspensionReason::None) {
-        ++localInvariantIssueCount;
-        Wh_Log(
-            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=reason_on_non_suspended "
-            L"hwnd=%p reason=%d(%s)",
-            workspaceIndex, reinterpret_cast<void*>(mapHwnd),
-            static_cast<int>(record.suspensionReason),
-            DiagnosticSuspensionReasonName(record.suspensionReason));
-      }
-
-      ++recordIndex;
-    }
-
-    for (size_t i = 0; i < state.stackWeights.size(); ++i) {
-      Wh_Log(L"WORKSPACE[%zu].stackWeights[%zu]=%.17g",
-             workspaceIndex, i, state.stackWeights[i]);
-    }
-
-    for (size_t i = 0; i < state.gridWeights.size(); ++i) {
-      Wh_Log(L"WORKSPACE[%zu].gridWeights[%zu]=%.17g",
-             workspaceIndex, i, state.gridWeights[i]);
-    }
-
-    Wh_Log(L"WORKSPACE[%zu]_END", workspaceIndex);
-    ++workspaceIndex;
   }
 
-  size_t duplicateOwnerHwndCount = 0;
-  for (const auto& ownerKv : ownerWorkspaceIndices) {
-    if (ownerKv.second.size() <= 1) continue;
+  return static_cast<size_t>(-1);
+}
 
-    ++duplicateOwnerHwndCount;
+static void DiagnosticDumpWindowRecord(
+    const TilingState& state, HWND mapHwnd, const WindowRecord& record,
+    const wchar_t* prefix, size_t ordinal) {
+  const size_t activeIndex = DiagnosticActiveIndex(state, mapHwnd);
+  const size_t logicalIndex = DiagnosticLogicalIndex(state, mapHwnd, record);
+  const bool hasActiveIndex = activeIndex != static_cast<size_t>(-1);
+  const bool hasLogicalIndex = logicalIndex != static_cast<size_t>(-1);
+
+  if (hasLogicalIndex && hasActiveIndex) {
     Wh_Log(
-        L"BOOKKEEPING_DUPLICATE_OWNER hwnd=%p ownerCount=%zu",
-        reinterpret_cast<void*>(ownerKv.first), ownerKv.second.size());
-
-    size_t ownerIndex = 0;
-    size_t candidateWorkspaceIndex = 0;
-    for (const auto& workspaceKv : snapshot) {
-      auto recordIt = workspaceKv.second.records.find(ownerKv.first);
-      if (recordIt != workspaceKv.second.records.end()) {
-        std::wstring desktopId = DiagnosticGuidString(workspaceKv.first.desktopId);
-        Wh_Log(
-            L"BOOKKEEPING_DUPLICATE_OWNER hwnd=%p owner[%zu] workspace=%zu "
-            L"desktopId=%s monitor=%p state=%d(%s) suspensionReason=%d(%s) active=%d",
-            reinterpret_cast<void*>(ownerKv.first), ownerIndex,
-            candidateWorkspaceIndex, desktopId.c_str(),
-            reinterpret_cast<void*>(workspaceKv.first.monitor),
-            static_cast<int>(recordIt->second.state),
-            DiagnosticManageStateName(recordIt->second.state),
-            static_cast<int>(recordIt->second.suspensionReason),
-            DiagnosticSuspensionReasonName(recordIt->second.suspensionReason),
-            ContainsWindow(workspaceKv.second.windows, ownerKv.first) ? 1 : 0);
-        ++ownerIndex;
-      }
-      ++candidateWorkspaceIndex;
-    }
+        L"  %s[%zu] logicalIndex=%zu activeIndex=%zu hwnd=%p",
+        prefix, ordinal, logicalIndex, activeIndex,
+        reinterpret_cast<void*>(mapHwnd));
+  } else if (hasLogicalIndex) {
+    Wh_Log(
+        L"  %s[%zu] logicalIndex=%zu activeIndex=- hwnd=%p",
+        prefix, ordinal, logicalIndex,
+        reinterpret_cast<void*>(mapHwnd));
+  } else if (hasActiveIndex) {
+    Wh_Log(
+        L"  %s[%zu] logicalIndex=- activeIndex=%zu hwnd=%p",
+        prefix, ordinal, activeIndex,
+        reinterpret_cast<void*>(mapHwnd));
+  } else {
+    Wh_Log(
+        L"  %s[%zu] logicalIndex=- activeIndex=- hwnd=%p",
+        prefix, ordinal, reinterpret_cast<void*>(mapHwnd));
   }
 
   Wh_Log(
-      L"BOOKKEEPING_AUDIT duplicateOwnerHwndCount=%zu localInvariantIssueCount=%zu "
-      L"status=%s",
-      duplicateOwnerHwndCount, localInvariantIssueCount,
-      (duplicateOwnerHwndCount == 0 && localInvariantIssueCount == 0)
-          ? L"OK"
-          : L"VIOLATION");
+      L"      recordHwnd=%p pid=%lu state=%s suspension=%s",
+      reinterpret_cast<void*>(record.hwnd), record.pid,
+      DiagnosticManageStateName(record.state),
+      DiagnosticSuspensionReasonName(record.suspensionReason));
 
-  Wh_Log(L"================= BOOKKEEPING_DUMP_END =================");
+  Wh_Log(
+      L"      capabilities: move=%d resize=%d topmost=%d",
+      record.canMove ? 1 : 0,
+      record.canResize ? 1 : 0,
+      record.topmost ? 1 : 0);
+
+  Wh_Log(
+      L"      placement: result=%s failures=%d",
+      DiagnosticPlacementResultName(record.lastPlacementResult),
+      record.placementFailures);
+
+  std::wstring requested = DiagnosticRectString(record.lastRequestedRect);
+  std::wstring observed = DiagnosticRectString(record.lastObservedRect);
+  Wh_Log(L"      lastRequested=%s", requested.c_str());
+  Wh_Log(L"      lastObserved =%s", observed.c_str());
+
+  if (record.hasSavedSlot) {
+    Wh_Log(
+        L"      savedSlot: index=%zu weight=%.9g hasWeight=%d wasMaster=%d",
+        record.savedSlot.index,
+        record.savedSlot.weight,
+        record.savedSlot.hasWeight ? 1 : 0,
+        record.savedSlot.wasMaster ? 1 : 0);
+  } else {
+    Wh_Log(L"      savedSlot: none");
+  }
+}
+
+static void DumpSavedBookkeeping() {
+  // Copy the persistent model once. The diagnostic dump intentionally reports
+  // only what the WM itself has remembered: no live HWND/VD queries and no
+  // reconciliation or repair that could alter the state being inspected.
+  std::vector<std::pair<DesktopMonitorKey, TilingState>> workspaces;
+  AcquireSRWLockShared(&g_tilingStateLock);
+  workspaces.reserve(g_tilingStateMap.size());
+  for (const auto& kv : g_tilingStateMap) {
+    workspaces.push_back(kv);
+  }
+  ReleaseSRWLockShared(&g_tilingStateLock);
+
+  // g_tilingStateMap is unordered. Give repeated dumps a stable order so diffs
+  // are useful: desktop GUID first, monitor handle second.
+  std::sort(
+      workspaces.begin(), workspaces.end(),
+      [](const auto& a, const auto& b) {
+        std::wstring aDesktop = DiagnosticGuidString(a.first.desktopId);
+        std::wstring bDesktop = DiagnosticGuidString(b.first.desktopId);
+        if (aDesktop != bDesktop) return aDesktop < bDesktop;
+        return reinterpret_cast<uintptr_t>(a.first.monitor) <
+               reinterpret_cast<uintptr_t>(b.first.monitor);
+      });
+
+  Wh_Log(L"");
+  Wh_Log(L"==================== TILING BOOKKEEPING ====================");
+  Wh_Log(L"workspaceCount: %zu", workspaces.size());
+  Wh_Log(L"pendingReinforcementCount: %zu", g_pendingDesktopArranges.size());
+  Wh_Log(L"lifecycleDirtyWindowCount: %zu", g_lifecycleDirtyWindows.size());
+
+  for (size_t workspaceIndex = 0; workspaceIndex < workspaces.size(); ++workspaceIndex) {
+    const DesktopMonitorKey& key = workspaces[workspaceIndex].first;
+    const TilingState& state = workspaces[workspaceIndex].second;
+    std::wstring desktopId = DiagnosticGuidString(key.desktopId);
+
+    size_t tiledCount = 0;
+    size_t floatingCount = 0;
+    size_t suspendedCount = 0;
+    size_t ignoredCount = 0;
+    for (const auto& recordKv : state.records) {
+      switch (recordKv.second.state) {
+        case ManageState::Tiled: ++tiledCount; break;
+        case ManageState::Floating: ++floatingCount; break;
+        case ManageState::Suspended: ++suspendedCount; break;
+        case ManageState::Ignored: ++ignoredCount; break;
+      }
+    }
+
+    const bool pendingReinforcement = std::any_of(
+        g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
+        [&](const PendingWorkspaceArrange& pending) {
+          return pending.monitor == key.monitor &&
+                 IsEqualGUID(pending.desktopId, key.desktopId);
+        });
+
+    Wh_Log(L"");
+    Wh_Log(
+        L"---------------- Workspace %zu / %zu ----------------",
+        workspaceIndex + 1, workspaces.size());
+    Wh_Log(L"desktopId: %s", desktopId.c_str());
+    Wh_Log(L"monitor:   %p", reinterpret_cast<void*>(key.monitor));
+    Wh_Log(
+        L"layout:    %s (%d)",
+        DiagnosticLayoutName(state.layout), static_cast<int>(state.layout));
+    Wh_Log(L"masterRatio: %.9g", state.masterRatio);
+    Wh_Log(
+        L"counts: active=%zu records=%zu tiled=%zu suspended=%zu floating=%zu ignored=%zu",
+        state.windows.size(), state.records.size(), tiledCount, suspendedCount,
+        floatingCount, ignoredCount);
+    Wh_Log(L"pendingReinforcement: %d", pendingReinforcement ? 1 : 0);
+
+    std::wstring stackWeights = DiagnosticWeightsString(state.stackWeights);
+    std::wstring gridWeights = DiagnosticWeightsString(state.gridWeights);
+    Wh_Log(L"stackWeights: %s", stackWeights.c_str());
+    Wh_Log(L"gridWeights:  %s", gridWeights.c_str());
+
+    // Print tiled + suspended records in their reconstructed logical order. This
+    // makes the saved slot relationship visible directly instead of forcing the
+    // reader to correlate an unordered records{} dump with windows[].
+    struct LogicalRecordRef {
+      size_t logicalIndex;
+      HWND hwnd;
+      const WindowRecord* record;
+    };
+    std::vector<LogicalRecordRef> logicalRecords;
+    std::vector<std::pair<HWND, const WindowRecord*>> otherRecords;
+
+    logicalRecords.reserve(state.records.size());
+    otherRecords.reserve(state.records.size());
+    for (const auto& recordKv : state.records) {
+      const WindowRecord& record = recordKv.second;
+      size_t logicalIndex = DiagnosticLogicalIndex(state, recordKv.first, record);
+      if ((record.state == ManageState::Tiled || record.state == ManageState::Suspended) &&
+          logicalIndex != static_cast<size_t>(-1)) {
+        logicalRecords.push_back({logicalIndex, recordKv.first, &record});
+      } else {
+        otherRecords.push_back({recordKv.first, &record});
+      }
+    }
+
+    std::sort(
+        logicalRecords.begin(), logicalRecords.end(),
+        [](const LogicalRecordRef& a, const LogicalRecordRef& b) {
+          if (a.logicalIndex != b.logicalIndex) return a.logicalIndex < b.logicalIndex;
+          return reinterpret_cast<uintptr_t>(a.hwnd) < reinterpret_cast<uintptr_t>(b.hwnd);
+        });
+    std::sort(
+        otherRecords.begin(), otherRecords.end(),
+        [](const auto& a, const auto& b) {
+          if (a.second->state != b.second->state) {
+            return static_cast<int>(a.second->state) < static_cast<int>(b.second->state);
+          }
+          return reinterpret_cast<uintptr_t>(a.first) < reinterpret_cast<uintptr_t>(b.first);
+        });
+
+    Wh_Log(L"  logicalTiledOrder: %zu", logicalRecords.size());
+    if (logicalRecords.empty()) {
+      Wh_Log(L"    (none)");
+    } else {
+      for (size_t i = 0; i < logicalRecords.size(); ++i) {
+        DiagnosticDumpWindowRecord(
+            state, logicalRecords[i].hwnd, *logicalRecords[i].record,
+            L"window", i);
+      }
+    }
+
+    Wh_Log(L"  nonLayoutRecords: %zu", otherRecords.size());
+    if (otherRecords.empty()) {
+      Wh_Log(L"    (none)");
+    } else {
+      for (size_t i = 0; i < otherRecords.size(); ++i) {
+        DiagnosticDumpWindowRecord(
+            state, otherRecords[i].first, *otherRecords[i].second,
+            L"record", i);
+      }
+    }
+  }
+
+  if (!g_lifecycleDirtyWindows.empty()) {
+    Wh_Log(L"");
+    Wh_Log(L"pendingLifecycleWindows:");
+    for (size_t i = 0; i < g_lifecycleDirtyWindows.size(); ++i) {
+      Wh_Log(
+          L"  [%zu] hwnd=%p",
+          i, reinterpret_cast<void*>(g_lifecycleDirtyWindows[i]));
+    }
+  }
+
+  if (!g_pendingDesktopArranges.empty()) {
+    Wh_Log(L"");
+    Wh_Log(L"pendingWorkspaceReinforcements:");
+    for (size_t i = 0; i < g_pendingDesktopArranges.size(); ++i) {
+      std::wstring desktopId = DiagnosticGuidString(g_pendingDesktopArranges[i].desktopId);
+      Wh_Log(
+          L"  [%zu] desktopId=%s monitor=%p",
+          i, desktopId.c_str(),
+          reinterpret_cast<void*>(g_pendingDesktopArranges[i].monitor));
+    }
+  }
+
+  Wh_Log(L"============================================================");
+  Wh_Log(L"");
 }
 
 //=============================================================================
