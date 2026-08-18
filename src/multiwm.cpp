@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.16
+// @version         1.7.17
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -36,6 +36,8 @@ resize-adjusted ratios per virtual desktop.
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
 - Diagnostic bookkeeping dump can snapshot all workspace/window records and audit ownership invariants without mutating state
+- Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
+- Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
 
 ## Default Hotkeys
 - Tile windows: Alt + D
@@ -444,6 +446,16 @@ enum class ManageState {
   Ignored,
 };
 
+// Why a logically managed tiled window is temporarily absent from the active
+// layout. This mirrors FancyWM's Restored vs Minimized/Maximized state boundary,
+// while retaining Hidden for close-to-tray behavior.
+enum class SuspensionReason {
+  None,
+  Hidden,
+  Minimized,
+  Maximized,
+};
+
 enum class PlacementResult {
   Success,
   AdjustedByWindow,
@@ -469,8 +481,8 @@ struct WindowRecord {
   RECT lastObservedRect{};
 
   // Only meaningful while state == Suspended. It preserves the tiled logical
-  // position/weight across non-participating states such as minimize or a
-  // settled app hide/close-to-tray.
+  // position/weight across non-participating physical states.
+  SuspensionReason suspensionReason = SuspensionReason::None;
   SuspendedSlot savedSlot{};
   bool hasSavedSlot = false;
 };
@@ -501,6 +513,7 @@ static HWINEVENTHOOK g_hMoveSizeHook = nullptr;
 static HWINEVENTHOOK g_hMinimizeHook = nullptr;
 static HWINEVENTHOOK g_hHideDestroyHook = nullptr;
 static HWINEVENTHOOK g_hCloakHook = nullptr;
+static HWINEVENTHOOK g_hStateHook = nullptr;
 static HWINEVENTHOOK g_hForegroundHook = nullptr;
 
 //=============================================================================
@@ -1656,7 +1669,9 @@ bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
   // (example: VSCode unstaged commit dialog)
   if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return false;
 
-  if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+  // FancyWM only tiles windows in the Restored state. Maximized windows remain
+  // managed logically but do not participate until Windows reports Restored.
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return false;
   if (!CouldBeTileEligible(hwnd)) return false;
   if (IsWindowCloaked(hwnd)) return false;
 
@@ -1696,8 +1711,18 @@ static PlacementResult PlaceWindowChecked(WindowRecord& record, const RECT& targ
   if (!hwnd || !IsWindow(hwnd)) return finish(PlacementResult::Dead);
   if (!record.canMove) return finish(PlacementResult::Refused);
 
-  if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+  // Soft reinforcement should be a no-op when Windows already matches the
+  // authoritative layout, just like FancyWM skips unchanged reposition targets.
+  RECT currentFrame{};
+  if (GetWindowFrameRect(hwnd, &currentFrame)) {
+    record.lastObservedRect = currentFrame;
+    if (RectsNear(currentFrame, targetRect)) {
+      return finish(PlacementResult::Success);
+    }
+  }
 
+  // Window state transitions are policy, not placement. A maximized window must
+  // never be silently restored merely because a layout pass ran.
   RECT windowRect{}, extendedFrame{};
   LONG offsetLeft = 0, offsetTop = 0, offsetRight = 0, offsetBottom = 0;
 
@@ -2476,7 +2501,15 @@ static void CloseLogicalGapAfterRemoval(
   }
 }
 
-static bool SuspendWindowInState(TilingState& state, HWND hwnd) {
+static bool SuspendWindowInState(
+    TilingState& state, HWND hwnd, SuspensionReason reason) {
+  WindowRecord* existing = FindWindowRecord(state, hwnd);
+  if (existing && existing->state == ManageState::Suspended) {
+    if (existing->suspensionReason == reason) return false;
+    existing->suspensionReason = reason;
+    return true;
+  }
+
   auto it = std::find(state.windows.begin(), state.windows.end(), hwnd);
   if (it == state.windows.end()) return false;
 
@@ -2488,9 +2521,18 @@ static bool SuspendWindowInState(TilingState& state, HWND hwnd) {
   slot.index = logicalIndex;
 
   record.state = ManageState::Suspended;
+  record.suspensionReason = reason;
   record.savedSlot = slot;
   record.hasSavedSlot = true;
   return true;
+}
+
+static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
+  if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
+  if (IsIconic(hwnd)) return SuspensionReason::Minimized;
+  if (!IsWindowVisible(hwnd)) return SuspensionReason::Hidden;
+  if (IsZoomed(hwnd)) return SuspensionReason::Maximized;
+  return SuspensionReason::None;
 }
 
 static bool RestoreWindowInState(TilingState& state, HWND hwnd) {
@@ -2529,6 +2571,7 @@ static bool RestoreWindowInState(TilingState& state, HWND hwnd) {
   }
 
   record->state = ManageState::Tiled;
+  record->suspensionReason = SuspensionReason::None;
   record->savedSlot = {};
   record->hasSavedSlot = false;
   EnsureSaneWeightVector(state);
@@ -2553,6 +2596,7 @@ static bool FloatWindowInState(TilingState& state, HWND hwnd) {
 
   WindowRecord& record = EnsureWindowRecord(state, hwnd, ManageState::Floating);
   record.state = ManageState::Floating;
+  record.suspensionReason = SuspensionReason::None;
   record.savedSlot = {};
   record.hasSavedSlot = false;
   EnsureSaneWeightVector(state);
@@ -2711,7 +2755,8 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
 
     // Renderability is deliberately separate from membership. A known tiled
     // window that is temporarily hidden/cloaked keeps consuming its logical slot.
-    if (IsIconic(hwnd) || !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd)) {
+    if (IsIconic(hwnd) || !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd) ||
+        IsZoomed(hwnd)) {
       continue;
     }
 
@@ -3021,6 +3066,7 @@ static bool MigrateManagedWindow(
   ForgetWindowInState(target, hwnd);
 
   if (record.state == ManageState::Tiled) {
+    record.suspensionReason = SuspensionReason::None;
     record.savedSlot = {};
     record.hasSavedSlot = false;
     AppendTiledWindowWithDefaultWeight(target, hwnd);
@@ -3178,10 +3224,11 @@ static void ReconcileKnownWindows(
 
     if (!settleParticipation) continue;
 
-    // Participation is a physical property of the HWND. Apply it to every
-    // logical copy defensively so even a pre-1.7.15 duplicate cannot reserve a
-    // hidden tile while ownership repair is temporarily unable to resolve a VD.
-    const bool participates = IsWindowVisible(hwnd) && !IsIconic(hwnd);
+    // Participation is a queried physical state, not an interpretation of the
+    // raw WinEvent. DWM cloak remains deliberately irrelevant: VD transitions
+    // can cloak a perfectly valid managed window without changing its logical
+    // membership. Hidden, minimized, and maximized windows preserve their slot.
+    const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
     for (const auto& ownerKey : ownerKeys) {
       TilingState ownerState;
       if (!LoadTilingState(ownerKey, &ownerState)) continue;
@@ -3189,14 +3236,19 @@ static void ReconcileKnownWindows(
       WindowRecord* record = FindWindowRecord(ownerState, hwnd);
       if (!record) continue;
 
-      // DWM cloak is not a membership signal. Shell/VD transitions can cloak a
-      // perfectly valid window transiently; only settled hidden/minimized state
-      // changes participation.
       bool changed = false;
-      if (record->state == ManageState::Tiled && !participates) {
-        changed = SuspendWindowInState(ownerState, hwnd);
-      } else if (record->state == ManageState::Suspended && participates) {
-        changed = RestoreWindowInState(ownerState, hwnd);
+      if (record->state == ManageState::Tiled &&
+          reason != SuspensionReason::None) {
+        changed = SuspendWindowInState(ownerState, hwnd, reason);
+      } else if (record->state == ManageState::Suspended) {
+        if (reason == SuspensionReason::None) {
+          changed = RestoreWindowInState(ownerState, hwnd);
+        } else {
+          // State transitions can arrive repeatedly or in quick succession
+          // (e.g. Hidden -> Maximized). Keep the saved slot, update only why it
+          // is currently non-participating.
+          changed = SuspendWindowInState(ownerState, hwnd, reason);
+        }
       }
 
       if (changed) {
@@ -3323,7 +3375,7 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
 
-        if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return TRUE;
         if (!CouldBeTileEligible(hwnd)) return TRUE;
         if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
 
@@ -3363,7 +3415,7 @@ static void HandleVirtualDesktopChanged() {
   }
 
   // A native VD transition is an authoritative reason to repair desktop ownership.
-  // Do not infer monitor migration here; defer visibility/minimize participation
+  // Do not infer monitor migration here; defer visibility/window-state participation
   // until the shell's cloak/show burst has settled.
   std::vector<DesktopMonitorKey> changedKeys;
   ReconcileKnownWindows(false, true, false, &changedKeys);
@@ -3376,21 +3428,31 @@ static void HandleVirtualDesktopChanged() {
   std::vector<HMONITOR> monitors;
   EnumerateCurrentMonitors(monitors);
 
+  // FancyWM refreshes ownership and then unconditionally invalidates the incoming
+  // desktop layout. Do the equivalent here, but defer actual placement until the
+  // shell's cloak/uncloak burst settles. Existing workspaces are reinforced even
+  // when their bookkeeping did not change.
+  for (HMONITOR monitor : monitors) {
+    DesktopMonitorKey knownKey{currentDesktop, monitor};
+    TilingState knownState;
+    if (LoadTilingState(knownKey, &knownState)) {
+      AddPendingWorkspaceArrange(currentDesktop, monitor);
+    }
+  }
+
   const bool discoverNew = g_enableTileNewWin && !g_tileNewWinSuspended;
   for (HMONITOR monitor : monitors) {
     std::vector<HWND> snapshot = GetTileWindowsAfterDesktopSwitch(monitor, currentDesktop);
     DesktopMonitorKey key{};
     if (DiscoverWorkspaceWindows(
             monitor, currentDesktop, snapshot, discoverNew, &key)) {
-      // Do not place yet: the notification can precede the final UNCLOAK events.
-      // Remember only workspaces whose model actually changed; an ordinary switch
-      // between already-known desktops therefore performs zero placement work.
+      // New/migrated membership is also reinforced by the same settled pass.
       AddPendingWorkspaceArrange(currentDesktop, monitor);
     }
   }
 
-  // Coalesce the remaining shell burst for discovery/fallback and any deferred
-  // placement. The settled pass may repair hidden/minimized participation from physical state.
+  // Coalesce the remaining shell burst for discovery/fallback and the unconditional
+  // incoming-desktop reinforcement. The settled pass may also repair physical state.
   ScheduleLifecycleReconcile(nullptr);
   TrayUi::RefreshForCurrentWorkspace();
 }
@@ -3426,7 +3488,7 @@ static void ReconcileDeferredLifecycle() {
   std::vector<HWND> dirtyWindows;
   dirtyWindows.swap(g_lifecycleDirtyWindows);
 
-  // First repair liveness/exclusions and settled hidden/minimized participation
+  // First repair liveness/exclusions and settled hidden/minimized/maximized participation
   // globally. This also suspends every stale logical copy defensively if an old
   // version already duplicated an HWND.
   std::vector<DesktopMonitorKey> globallyChanged;
@@ -3516,18 +3578,10 @@ static void ReconcileDeferredLifecycle() {
   TrayUi::RefreshForCurrentWorkspace();
 }
 
-static void SetManagedWindowSuspended(HWND hwnd, bool suspended) {
-  std::vector<DesktopMonitorKey> keys = FindWorkspaceKeysContainingWindow(hwnd);
-  for (const auto& key : keys) {
-    TilingState state;
-    if (!LoadTilingState(key, &state)) continue;
-
-    bool changed = suspended ? SuspendWindowInState(state, hwnd)
-                             : RestoreWindowInState(state, hwnd);
-    if (!changed) continue;
-    SaveTilingState(key, state);
-    ArrangeWorkspace(key);
-  }
+static void ReconcileManagedWindowStateNow(HWND hwnd) {
+  std::vector<DesktopMonitorKey> changedKeys;
+  ReconcileKnownWindows(true, false, false, &changedKeys, hwnd);
+  for (const auto& key : changedKeys) ArrangeWorkspace(key);
 }
 
 static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
@@ -3537,13 +3591,14 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
       break;
 
     case EVENT_SYSTEM_MINIMIZESTART:
-      // Explicit window state transition: stop consuming a tile and save its slot.
-      SetManagedWindowSuspended(hwnd, true);
-      break;
-
     case EVENT_SYSTEM_MINIMIZEEND:
-      // Explicit restore: put the window back into its saved logical slot.
-      SetManagedWindowSuspended(hwnd, false);
+    case EVENT_OBJECT_STATECHANGE:
+      // FancyWM treats these as prompts to query the actual window state. Do the
+      // same: the event says "dirty", while IsIconic/IsZoomed/visibility decide
+      // whether the saved logical slot participates. Run once immediately for a
+      // responsive reflow and once after settle to cover transition races.
+      ReconcileManagedWindowStateNow(hwnd);
+      ScheduleLifecycleReconcile(hwnd);
       break;
 
     case EVENT_OBJECT_HIDE:
@@ -3587,6 +3642,18 @@ static void CycleCurrentWorkspaceLayout() {
 
 void ApplyUserMoveSize(HWND hwnd) {
   if (!g_enableTiling || !IsWindow(hwnd)) return;
+
+  // Maximize/minimize transitions can generate geometry churn that must not be
+  // learned as a user resize or interpreted as a drag. State reconciliation owns
+  // those transitions; discard any gesture samples here.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+    AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+    g_moveSizeStartRects.erase(hwnd);
+    g_moveSizeEndRects.erase(hwnd);
+    g_moveSizeEndPoints.erase(hwnd);
+    ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+    return;
+  }
 
   HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
   RECT monitorWork{};
@@ -3783,6 +3850,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_SYSTEM_MOVESIZEEND:
     case EVENT_SYSTEM_MINIMIZESTART:
     case EVENT_SYSTEM_MINIMIZEEND:
+    case EVENT_OBJECT_STATECHANGE:
     case EVENT_OBJECT_DESTROY:
     case EVENT_OBJECT_SHOW:
     case EVENT_OBJECT_HIDE:
@@ -3809,9 +3877,13 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // when full-auto can discover them, and only once they resemble real windows.
   if (!tracked) {
     const bool discoveryEvent =
-        event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED;
-    if (!discoveryEvent || !g_enableTileNewWin || g_tileNewWinSuspended ||
-        !CouldBeTileEligible(hwnd)) {
+        event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED ||
+        event == EVENT_OBJECT_STATECHANGE;
+    const bool restoredCandidate =
+        event != EVENT_OBJECT_STATECHANGE ||
+        (IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsZoomed(hwnd));
+    if (!discoveryEvent || !restoredCandidate || !g_enableTileNewWin ||
+        g_tileNewWinSuspended || !CouldBeTileEligible(hwnd)) {
       return;
     }
   }
@@ -3880,6 +3952,14 @@ void InstallWinEventHooks() {
     );
     if (!g_hCloakHook) Wh_Log(L"Failed to install uncloak hook");
   }
+
+  if (!g_hStateHook) {
+    g_hStateHook = SetWinEventHook(
+        EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE,
+        nullptr, WinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!g_hStateHook) Wh_Log(L"Failed to install state-change hook");
+  }
 }
 
 void RemoveWinEventHooks() {
@@ -3902,6 +3982,10 @@ void RemoveWinEventHooks() {
     if (g_hCloakHook) {
         UnhookWinEvent(g_hCloakHook);
         g_hCloakHook = nullptr;
+    }
+    if (g_hStateHook) {
+        UnhookWinEvent(g_hStateHook);
+        g_hStateHook = nullptr;
     }
 }
 
@@ -3935,6 +4019,16 @@ static const wchar_t* DiagnosticManageStateName(ManageState state) {
     case ManageState::Floating: return L"Floating";
     case ManageState::Suspended: return L"Suspended";
     case ManageState::Ignored: return L"Ignored";
+    default: return L"Unknown";
+  }
+}
+
+static const wchar_t* DiagnosticSuspensionReasonName(SuspensionReason reason) {
+  switch (reason) {
+    case SuspensionReason::None: return L"None";
+    case SuspensionReason::Hidden: return L"Hidden";
+    case SuspensionReason::Minimized: return L"Minimized";
+    case SuspensionReason::Maximized: return L"Maximized";
     default: return L"Unknown";
   }
 }
@@ -4046,8 +4140,8 @@ static void DumpSavedBookkeeping() {
 
       Wh_Log(
           L"WORKSPACE[%zu].records[%zu] mapHwnd=%p record.hwnd=%p pid=%lu "
-          L"state=%d(%s) canMove=%d canResize=%d topmost=%d placementFailures=%d "
-          L"lastPlacementResult=%d(%s) hasSavedSlot=%d",
+          L"state=%d(%s) suspensionReason=%d(%s) canMove=%d canResize=%d topmost=%d "
+          L"placementFailures=%d lastPlacementResult=%d(%s) hasSavedSlot=%d",
           workspaceIndex,
           recordIndex,
           reinterpret_cast<void*>(mapHwnd),
@@ -4055,6 +4149,8 @@ static void DumpSavedBookkeeping() {
           record.pid,
           static_cast<int>(record.state),
           DiagnosticManageStateName(record.state),
+          static_cast<int>(record.suspensionReason),
+          DiagnosticSuspensionReasonName(record.suspensionReason),
           record.canMove ? 1 : 0,
           record.canResize ? 1 : 0,
           record.topmost ? 1 : 0,
@@ -4110,6 +4206,23 @@ static void DumpSavedBookkeeping() {
             DiagnosticManageStateName(record.state));
       }
 
+      if (record.state == ManageState::Suspended &&
+          record.suspensionReason == SuspensionReason::None) {
+        ++localInvariantIssueCount;
+        Wh_Log(
+            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=suspended_without_reason hwnd=%p",
+            workspaceIndex, reinterpret_cast<void*>(mapHwnd));
+      } else if (record.state != ManageState::Suspended &&
+                 record.suspensionReason != SuspensionReason::None) {
+        ++localInvariantIssueCount;
+        Wh_Log(
+            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=reason_on_non_suspended "
+            L"hwnd=%p reason=%d(%s)",
+            workspaceIndex, reinterpret_cast<void*>(mapHwnd),
+            static_cast<int>(record.suspensionReason),
+            DiagnosticSuspensionReasonName(record.suspensionReason));
+      }
+
       ++recordIndex;
     }
 
@@ -4144,12 +4257,14 @@ static void DumpSavedBookkeeping() {
         std::wstring desktopId = DiagnosticGuidString(workspaceKv.first.desktopId);
         Wh_Log(
             L"BOOKKEEPING_DUPLICATE_OWNER hwnd=%p owner[%zu] workspace=%zu "
-            L"desktopId=%s monitor=%p state=%d(%s) active=%d",
+            L"desktopId=%s monitor=%p state=%d(%s) suspensionReason=%d(%s) active=%d",
             reinterpret_cast<void*>(ownerKv.first), ownerIndex,
             candidateWorkspaceIndex, desktopId.c_str(),
             reinterpret_cast<void*>(workspaceKv.first.monitor),
             static_cast<int>(recordIt->second.state),
             DiagnosticManageStateName(recordIt->second.state),
+            static_cast<int>(recordIt->second.suspensionReason),
+            DiagnosticSuspensionReasonName(recordIt->second.suspensionReason),
             ContainsWindow(workspaceKv.second.windows, ownerKv.first) ? 1 : 0);
         ++ownerIndex;
       }
