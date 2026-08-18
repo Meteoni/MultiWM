@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.22
+// @version         1.7.23
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -32,6 +32,7 @@ resize-adjusted ratios per virtual desktop.
 - Compact Win32 layout flyout appears on layout/desktop changes with configurable position
 - Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
 - Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate
+- Workspace model changes on inactive virtual desktops queue their reflow until that desktop becomes current
 - Maximized windows preserve their saved tile and use a targeted location-change fallback to detect restore transitions reliably
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
@@ -363,9 +364,10 @@ constexpr UINT WM_APP_LAYOUT_CYCLE = WM_APP + 5;
 static UINT g_reconcileDelayMs = 80;
 static UINT_PTR g_lifecycleReconcileTimer = 0;
 static std::vector<HWND> g_lifecycleDirtyWindows;
-// Native VD transitions may create/change a workspace while its windows are
-// still shell-cloaked. Defer placement for only those monitors until the final
-// settled visibility pass.
+// Placement can be temporarily impossible because a workspace is inactive, or
+// because a native VD transition arrives before the shell's cloak/uncloak burst
+// has settled. Keep those reflows pending until that desktop is current and the
+// settled lifecycle pass can safely render it.
 static std::vector<PendingWorkspaceArrange> g_pendingDesktopArranges;
 
 static UINT g_tilingModifiers = MOD_ALT;
@@ -3725,12 +3727,25 @@ static void ReconcileDeferredLifecycle() {
     }
   }
 
+  // A model mutation can target an inactive VD (for example, moving a window
+  // away from that desktop without switching to it). ArrangeWorkspace deliberately
+  // refuses to drive inactive desktops, so don't discard that required reflow.
+  // Persist it and consume it the next time this desktop becomes current.
+  GUID zeroGuid{};
   for (const auto& key : globallyChanged) {
-    if (std::none_of(arrangedKeys.begin(), arrangedKeys.end(),
-                     [&](const DesktopMonitorKey& arranged) {
-                       return SameWorkspaceKey(arranged, key);
-                     })) {
+    if (std::any_of(arrangedKeys.begin(), arrangedKeys.end(),
+                    [&](const DesktopMonitorKey& arranged) {
+                      return SameWorkspaceKey(arranged, key);
+                    })) {
+      continue;
+    }
+
+    if (IsEqualGUID(key.desktopId, zeroGuid) ||
+        IsEqualGUID(key.desktopId, currentDesktop)) {
       ArrangeWorkspace(key);
+      AddUniqueWorkspaceKey(arrangedKeys, key);
+    } else {
+      AddPendingWorkspaceArrange(key.desktopId, key.monitor);
     }
   }
 
