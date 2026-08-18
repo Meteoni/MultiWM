@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.11.3
+// @version         1.11.4
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -83,21 +83,9 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Workspace] Window Gap (pixels)'
   $description: Gap between adjacent tiled windows (0-100).
 
-- WorkspaceInsetLeft: 4
-  $name: '[Workspace] Left Inset (pixels)'
-  $description: Reserved space inside the monitor work area on the left edge (0-500).
-
-- WorkspaceInsetTop: 4
-  $name: '[Workspace] Top Inset (pixels)'
-  $description: Reserved space inside the monitor work area on the top edge (0-500).
-
-- WorkspaceInsetRight: 4
-  $name: '[Workspace] Right Inset (pixels)'
-  $description: Reserved space inside the monitor work area on the right edge (0-500).
-
-- WorkspaceInsetBottom: 4
-  $name: '[Workspace] Bottom Inset (pixels)'
-  $description: Reserved space inside the monitor work area on the bottom edge (0-500).
+- WorkspaceInsets: "4, 4, 4, 4"
+  $name: '[Workspace] Insets (pixels)'
+  $description: 'Left, Top, Right, Bottom. Positive values inset the workspace from that edge; each value must be 0-500. Example: 4, 4, 4, 4'
 
 - MasterPercent: 50
   $name: '[Workspace] Master Size (%)'

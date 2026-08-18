@@ -38,6 +38,35 @@ UINT ParseSingleCharKey(PCWSTR str) {
   return 0;
 }
 
+static bool ParseWorkspaceInsetsSetting(PCWSTR text, WorkspaceInsets* outInsets) {
+  if (!text || !outInsets) return false;
+
+  LONG values[4]{};
+  const wchar_t* cursor = text;
+
+  for (size_t i = 0; i < 4; ++i) {
+    while (*cursor && std::iswspace(*cursor)) ++cursor;
+
+    wchar_t* end = nullptr;
+    long value = std::wcstol(cursor, &end, 10);
+    if (end == cursor || value < 0 || value > 500) return false;
+    values[i] = static_cast<LONG>(value);
+    cursor = end;
+
+    while (*cursor && std::iswspace(*cursor)) ++cursor;
+    if (i < 3) {
+      if (*cursor != L',') return false;
+      ++cursor;
+    }
+  }
+
+  while (*cursor && std::iswspace(*cursor)) ++cursor;
+  if (*cursor != L'\0') return false;
+
+  *outInsets = {values[0], values[1], values[2], values[3]};
+  return true;
+}
+
 void LoadSettings() {
   PCWSTR version = Wh_GetStringSetting(L"WindowsVersion");
   g_settings.windowsVersionIndex = ParseWindowsVersion(version);
@@ -45,14 +74,15 @@ void LoadSettings() {
 
   g_settings.tilingModifiers = ReadModifierSetting(L"TilingModifier", MOD_ALT);
 
-  auto readInset = [](PCWSTR name) -> LONG {
-    int value = Wh_GetIntSetting(name);
-    return (value >= 0 && value <= 500) ? static_cast<LONG>(value) : 4;
-  };
-  g_settings.insets.left = readInset(L"WorkspaceInsetLeft");
-  g_settings.insets.top = readInset(L"WorkspaceInsetTop");
-  g_settings.insets.right = readInset(L"WorkspaceInsetRight");
-  g_settings.insets.bottom = readInset(L"WorkspaceInsetBottom");
+  PCWSTR insets = Wh_GetStringSetting(L"WorkspaceInsets");
+  WorkspaceInsets parsedInsets{};
+  if (ParseWorkspaceInsetsSetting(insets, &parsedInsets)) {
+    g_settings.insets = parsedInsets;
+  } else {
+    g_settings.insets = {};
+    Wh_Log(L"Invalid WorkspaceInsets setting; using 4, 4, 4, 4");
+  }
+  Wh_FreeStringSetting(insets);
   g_settings.gap = Wh_GetIntSetting(L"TileGap");
   if (g_settings.gap < 0 || g_settings.gap > 100) g_settings.gap = 4;
   g_settings.masterPercent = Wh_GetIntSetting(L"MasterPercent");
