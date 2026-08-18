@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.9.0
+// @version         1.9.1
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -1897,6 +1897,8 @@ static PlacementResult PlaceWindowChecked(WindowRecord& record, const RECT& targ
 
 static void ArrangeWorkspace(const DesktopMonitorKey& key);
 static void ClearMoveSizeSamples(HWND hwnd);
+static void SaveWorkspaceState(const DesktopMonitorKey& key, const WorkspaceState& state);
+static bool LoadWorkspaceState(const DesktopMonitorKey& key, WorkspaceState* state);
 
 // Promotes the foreground window, or its tiled owner, to the master slot, then
 // clears stale gesture samples for both windows and reflows the workspace.
@@ -4672,7 +4674,6 @@ static void Shutdown() {
   g_displayedLayout = TileLayout::COUNT;
   g_displayedDesktopId = {};
   g_haveDisplayedDesktopId = false;
-  g_flyoutLayout = TileLayout::COUNT;
   g_notifyData = {};
 }
 
