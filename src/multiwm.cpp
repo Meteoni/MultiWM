@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.21
+// @version         1.7.22
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -3854,12 +3854,18 @@ void ApplyUserMoveSize(HWND hwnd) {
   MoveSizeIntent intent = MoveSizeIntent::None;
   POINT dropPoint{};
   bool haveDropPoint = false;
+  RECT gestureStart{};
+  RECT gestureEnd{};
+  bool haveGestureRects = false;
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   auto startIt = g_moveSizeStartRects.find(hwnd);
   auto endIt = g_moveSizeEndRects.find(hwnd);
   auto pointIt = g_moveSizeEndPoints.find(hwnd);
   if (startIt != g_moveSizeStartRects.end() && endIt != g_moveSizeEndRects.end()) {
-    intent = ClassifyMoveSizeIntent(startIt->second, endIt->second, 1);
+    gestureStart = startIt->second;
+    gestureEnd = endIt->second;
+    haveGestureRects = true;
+    intent = ClassifyMoveSizeIntent(gestureStart, gestureEnd, 1);
   }
   if (pointIt != g_moveSizeEndPoints.end()) {
     dropPoint = pointIt->second;
@@ -3917,81 +3923,182 @@ void ApplyUserMoveSize(HWND hwnd) {
     return;
   }
 
-  constexpr LONG kMinLearnedSpan = 80;
-  // Alter weight for resized window (MasterStacks)
-  if (state.layout == TileLayout::MasterStack || state.layout == TileLayout::MasterStackH) {
-    // MasterStackH splits top/bottom; MasterStack splits left/right.
+  // Resize learning is local and delta-based. The logical layout remains the
+  // source of truth: an edge drag transfers span only across the divider touched
+  // by that edge. Never rebuild every weight from sibling live HWND geometry;
+  // transient geometry in an unrelated window must not become durable state.
+  if (!haveGestureRects) {
+    ArrangeWorkspace(key);
+    return;
+  }
+
+  auto resizedIt = std::find(state.windows.begin(), state.windows.end(), resizedHwnd);
+  if (resizedIt == state.windows.end()) {
+    ArrangeWorkspace(key);
+    return;
+  }
+  const size_t resizedIndex = static_cast<size_t>(resizedIt - state.windows.begin());
+
+  constexpr LONG kEdgeDeltaTolerance = 1;
+  constexpr LONG kMinResizeSpan = 80;
+
+  auto meaningfulDelta = [&](LONG delta) {
+    return std::abs(delta) > kEdgeDeltaTolerance;
+  };
+
+  // Transfer a physical divider delta between two adjacent logical weights.
+  // Positive delta grows the first slot and shrinks the second; their combined
+  // weight is conserved. Expected layout rectangles, not live sibling HWNDs,
+  // supply the pre-drag pair spans.
+  auto transferPairDelta = [&](std::vector<double>& weights, size_t firstWeight,
+                               const RECT& firstRect, const RECT& secondRect,
+                               bool verticalAxis, LONG delta) -> bool {
+    if (!meaningfulDelta(delta) || firstWeight + 1 >= weights.size()) return false;
+
+    const LONG firstSpan = verticalAxis ? firstRect.bottom - firstRect.top
+                                        : firstRect.right - firstRect.left;
+    const LONG secondSpan = verticalAxis ? secondRect.bottom - secondRect.top
+                                         : secondRect.right - secondRect.left;
+    const LONG pairSpan = firstSpan + secondSpan;
+    if (firstSpan < 1 || secondSpan < 1 || pairSpan <= 1) return false;
+
+    // Keep both sides usable. For very small pairs, reduce the floor so the
+    // constraint remains satisfiable instead of forcing an impossible 80+80.
+    const LONG minSpan = std::min<LONG>(
+        kMinResizeSpan, std::max<LONG>(1, (pairSpan - 1) / 2));
+    const LONG maxFirstSpan = pairSpan - minSpan;
+    const LONG newFirstSpan =
+        std::clamp<LONG>(firstSpan + delta, minSpan, maxFirstSpan);
+    if (newFirstSpan == firstSpan) return false;
+
+    double pairWeight = weights[firstWeight] + weights[firstWeight + 1];
+    if (!(pairWeight > 0.0) || !std::isfinite(pairWeight)) pairWeight = 2.0;
+
+    const double firstFraction =
+        static_cast<double>(newFirstSpan) / static_cast<double>(pairSpan);
+    weights[firstWeight] = pairWeight * firstFraction;
+    weights[firstWeight + 1] = pairWeight - weights[firstWeight];
+    return true;
+  };
+
+  EnsureSaneWeightVector(state);
+  bool changed = false;
+
+  if (state.layout == TileLayout::MasterStack ||
+      state.layout == TileLayout::MasterStackH) {
+    // MasterStack: left master + vertical stack.
+    // MasterStackH: top master + horizontal stack.
     const bool horizontal = state.layout == TileLayout::MasterStackH;
-    const LONG totalSize = horizontal ? workArea.bottom - workArea.top : workArea.right - workArea.left;
-    if (totalSize <= g_tileGap + 1) return;
+    std::vector<RECT> expectedRects;
+    LayoutMasterStackWeighted(
+        workArea, state.windows.size(), expectedRects, horizontal,
+        ClampDouble(state.masterRatio, 0.1, 0.9), state.stackWeights);
 
-    // Index zero identifies the master; later indices identify stack windows.
-    auto resizedIt = std::find(state.windows.begin(), state.windows.end(), resizedHwnd);
-    const size_t resizedIndex = static_cast<size_t>(resizedIt - state.windows.begin());
+    if (expectedRects.size() != state.windows.size()) {
+      ArrangeWorkspace(key);
+      return;
+    }
 
-    // Read the geometry produced by the user's resize operation.
-    RECT resizedRect{};
-    if (!GetWindowFrameRect(resizedHwnd, &resizedRect)) return;
+    // The main master/stack divider is the master's trailing edge and every
+    // stack window's leading edge. Only movement of that edge changes ratio.
+    const LONG mainDelta = horizontal
+        ? (resizedIndex == 0 ? gestureEnd.bottom - gestureStart.bottom
+                             : gestureEnd.top - gestureStart.top)
+        : (resizedIndex == 0 ? gestureEnd.right - gestureStart.right
+                             : gestureEnd.left - gestureStart.left);
 
-    // Use the resized span along the master/stack split axis.
-    LONG resizedSize = horizontal ? resizedRect.bottom - resizedRect.top : resizedRect.right - resizedRect.left;
-    // Prevent the learned span from becoming impractically small.
-    resizedSize = std::max(resizedSize, kMinLearnedSpan);
-
-    // When the master was resized, its new span is directly observable.
-    LONG masterSize = resizedSize;
-    if (resizedIndex != 0) {
-      // A stack window's leading edge reveals the master boundary.
-      const LONG candidateSize = horizontal ? resizedRect.top - workArea.top - g_tileGap
-                                            : resizedRect.left - workArea.left - g_tileGap;
-      // The candidate must leave at least one pixel for the stack.
-      const LONG maxMaster = totalSize - g_tileGap - 1;
-      if (candidateSize >= 1 && candidateSize <= maxMaster) {
-        masterSize = candidateSize;
-      } else {
-        // Fall back to the current master span when the boundary is unusable.
-        RECT masterRect{};
-        if (!GetWindowFrameRect(state.windows[0], &masterRect)) return;
-        masterSize = horizontal ? masterRect.bottom - masterRect.top : masterRect.right - masterRect.left;
-        // Apply the same minimum-span policy to the fallback measurement.
-        masterSize = std::max(masterSize, kMinLearnedSpan);
+    if (state.windows.size() > 1 && meaningfulDelta(mainDelta)) {
+      const LONG totalSize = horizontal ? workArea.bottom - workArea.top
+                                        : workArea.right - workArea.left;
+      const LONG usableSize = totalSize - g_tileGap;
+      if (usableSize > 1) {
+        LONG oldMasterSpan = horizontal
+            ? expectedRects[0].bottom - expectedRects[0].top
+            : expectedRects[0].right - expectedRects[0].left;
+        LONG newMasterSpan = std::clamp<LONG>(
+            oldMasterSpan + mainDelta, 1, usableSize - 1);
+        double newRatio = ClampDouble(
+            static_cast<double>(newMasterSpan) / static_cast<double>(usableSize),
+            0.1, 0.9);
+        if (std::abs(newRatio - state.masterRatio) > 1e-9) {
+          state.masterRatio = newRatio;
+          changed = true;
+        }
       }
     }
 
-    state.masterRatio = ClampDouble(
-        static_cast<double>(masterSize) / static_cast<double>(totalSize - g_tileGap), 0.1, 0.9);
+    // A stack-window drag along the stack axis transfers span only to/from the
+    // immediate sibling across the moved divider. The master and all unrelated
+    // stack weights remain unchanged.
+    if (resizedIndex > 0 && state.stackWeights.size() + 1 == state.windows.size()) {
+      const size_t stackIndex = resizedIndex - 1;
+      const LONG leadingDelta = horizontal
+          ? gestureEnd.left - gestureStart.left
+          : gestureEnd.top - gestureStart.top;
+      const LONG trailingDelta = horizontal
+          ? gestureEnd.right - gestureStart.right
+          : gestureEnd.bottom - gestureStart.bottom;
 
-    state.stackWeights.clear();
-    state.stackWeights.reserve(state.windows.size() - 1);
-    for (size_t i = 1; i < state.windows.size(); ++i) {
-      RECT rect{};
-      if (!GetWindowFrameRect(state.windows[i], &rect)) {
-        state.stackWeights.push_back(1.0);
-        continue;
+      if (stackIndex > 0) {
+        // Leading edge moved toward the current window: previous grows, current shrinks.
+        changed |= transferPairDelta(
+            state.stackWeights, stackIndex - 1,
+            expectedRects[resizedIndex - 1], expectedRects[resizedIndex],
+            !horizontal, leadingDelta);
       }
-      LONG size = horizontal ? rect.right - rect.left : rect.bottom - rect.top;
-      state.stackWeights.push_back(static_cast<double>(std::max<LONG>(size, 1)));
+      if (stackIndex + 1 < state.stackWeights.size()) {
+        // Trailing edge moved outward: current grows, next shrinks.
+        changed |= transferPairDelta(
+            state.stackWeights, stackIndex,
+            expectedRects[resizedIndex], expectedRects[resizedIndex + 1],
+            !horizontal, trailingDelta);
+      }
     }
-  } else if (state.layout == TileLayout::Columns || state.layout == TileLayout::Rows) {
+  } else if (state.layout == TileLayout::Columns ||
+             state.layout == TileLayout::Rows) {
     const bool horizontal = state.layout == TileLayout::Rows;
+    std::vector<RECT> expectedRects;
+    LayoutGridWeighted(
+        workArea, state.windows.size(), expectedRects, horizontal, state.gridWeights);
 
-    state.gridWeights.clear();
-    state.gridWeights.reserve(state.windows.size());
-    for (HWND window : state.windows) {
-      RECT rect{};
-      if (!GetWindowFrameRect(window, &rect)) {
-        state.gridWeights.push_back(1.0);
-        continue;
-      }
-      LONG size = horizontal ? rect.bottom - rect.top : rect.right - rect.left;
-      state.gridWeights.push_back(static_cast<double>(std::max<LONG>(size, 1)));
+    if (expectedRects.size() != state.windows.size()) {
+      ArrangeWorkspace(key);
+      return;
+    }
+
+    const LONG leadingDelta = horizontal
+        ? gestureEnd.top - gestureStart.top
+        : gestureEnd.left - gestureStart.left;
+    const LONG trailingDelta = horizontal
+        ? gestureEnd.bottom - gestureStart.bottom
+        : gestureEnd.right - gestureStart.right;
+
+    if (resizedIndex > 0) {
+      // Leading edge transfers span between the previous slot and this slot.
+      changed |= transferPairDelta(
+          state.gridWeights, resizedIndex - 1,
+          expectedRects[resizedIndex - 1], expectedRects[resizedIndex],
+          horizontal, leadingDelta);
+    }
+    if (resizedIndex + 1 < state.windows.size()) {
+      // Trailing edge transfers span between this slot and the next slot.
+      changed |= transferPairDelta(
+          state.gridWeights, resizedIndex,
+          expectedRects[resizedIndex], expectedRects[resizedIndex + 1],
+          horizontal, trailingDelta);
     }
   } else if (state.layout == TileLayout::COUNT) {
     return;
   }
 
-  EnsureSaneWeightVector(state);
-  SaveTilingState(key, state);
+  if (changed) {
+    EnsureSaneWeightVector(state);
+    SaveTilingState(key, state);
+    Wh_Log(L"User resize updated local divider state for %p", resizedHwnd);
+  }
+
+  // Unsupported outer-edge drags and clamped moves simply snap back. The normal
+  // arrangement path renders the newly mutated logical state when one changed.
   ArrangeWorkspace(key);
 }
 
