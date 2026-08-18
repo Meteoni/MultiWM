@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.15
+// @version         1.7.16
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -35,12 +35,14 @@ resize-adjusted ratios per virtual desktop.
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
+- Diagnostic bookkeeping dump can snapshot all workspace/window records and audit ownership invariants without mutating state
 
 ## Default Hotkeys
 - Tile windows: Alt + D
 - Cycle layout: Alt + L
 - Switch master window: Alt + M
 - Float focused window: unbound by default
+- Dump saved bookkeeping: Alt + I
 
 ## Notes
 - Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
@@ -81,6 +83,10 @@ resize-adjusted ratios per virtual desktop.
 - FloatFocusedKey: ""
   $name: '[Tiling] Float Focused Window Key'
   $description: 'Key to float the focused tiled window. Leave blank to disable.'
+
+- DiagnosticDumpKey: "I"
+  $name: '[Diagnostics] Dump Saved Bookkeeping Key'
+  $description: 'Dump the complete saved per-VD/per-monitor tiling state and invariant audit to the Windhawk log. Uses the Tiling Modifier. Leave blank to disable.'
 
 - MouseMoveBehavior: float
   $name: '[Tiling] Mouse Drag Behavior'
@@ -338,6 +344,7 @@ enum HotkeyIds {
   HK_SWAP_MASTER = 3,
   HK_TILENEWWIN_TOGGLE = 4,
   HK_FLOAT_FOCUSED = 5,
+  HK_DIAGNOSTIC_DUMP = 6,
 };
 
 // Messages to hotkey thread
@@ -363,6 +370,7 @@ static UINT g_layoutKey = 'L';
 static UINT g_swapMasterKey = 'M';
 static UINT g_tileNewWinToggleKey = 'U';
 static UINT g_floatFocusedKey = 0;
+static UINT g_diagnosticDumpKey = 'I';
 
 static LONG g_tileMargin = 4;
 static LONG g_tileGap = 4;
@@ -3904,6 +3912,263 @@ void ResetTilingStateMemory() {
 }
 
 //=============================================================================
+// Diagnostic bookkeeping dump
+//=============================================================================
+
+static const wchar_t* DiagnosticLayoutName(TileLayout layout) {
+  switch (layout) {
+    case TileLayout::MasterStack: return L"MasterStack";
+    case TileLayout::Columns: return L"Columns";
+    case TileLayout::Rows: return L"Rows";
+    case TileLayout::MasterStackH: return L"MasterStackH";
+    case TileLayout::BSP: return L"BSP";
+    case TileLayout::Monocle: return L"Monocle";
+    case TileLayout::Floating: return L"Floating";
+    case TileLayout::COUNT: return L"COUNT";
+    default: return L"Unknown";
+  }
+}
+
+static const wchar_t* DiagnosticManageStateName(ManageState state) {
+  switch (state) {
+    case ManageState::Tiled: return L"Tiled";
+    case ManageState::Floating: return L"Floating";
+    case ManageState::Suspended: return L"Suspended";
+    case ManageState::Ignored: return L"Ignored";
+    default: return L"Unknown";
+  }
+}
+
+static const wchar_t* DiagnosticPlacementResultName(PlacementResult result) {
+  switch (result) {
+    case PlacementResult::Success: return L"Success";
+    case PlacementResult::AdjustedByWindow: return L"AdjustedByWindow";
+    case PlacementResult::AccessDenied: return L"AccessDenied";
+    case PlacementResult::Refused: return L"Refused";
+    case PlacementResult::Dead: return L"Dead";
+    default: return L"Unknown";
+  }
+}
+
+static std::wstring DiagnosticGuidString(const GUID& guid) {
+  wchar_t buffer[64]{};
+  if (StringFromGUID2(guid, buffer, ARRAYSIZE(buffer)) > 0) {
+    return buffer;
+  }
+  return L"{GUID_FORMAT_FAILED}";
+}
+
+static void DumpSavedBookkeeping() {
+  // Take one coherent copy under the state lock. Everything below is emitted
+  // from this copy only: no live HWND queries, VD API calls, reconciliation, or
+  // repair. The dump must remain observational so it cannot hide the bug being
+  // diagnosed.
+  decltype(g_tilingStateMap) snapshot;
+  AcquireSRWLockShared(&g_tilingStateLock);
+  snapshot = g_tilingStateMap;
+  ReleaseSRWLockShared(&g_tilingStateLock);
+
+  Wh_Log(L"================ BOOKKEEPING_DUMP_BEGIN ================");
+  Wh_Log(L"savedWorkspaceCount=%zu", snapshot.size());
+
+  // Build a read-only global owner index from the snapshot. v1.7.15's model
+  // invariant is one HWND -> one DesktopMonitorKey; reporting violations here
+  // makes Alt+I a regression detector for the duplicate/ghost-slot bug.
+  std::unordered_map<HWND, std::vector<size_t>> ownerWorkspaceIndices;
+  size_t ownerWorkspaceIndex = 0;
+  for (const auto& kv : snapshot) {
+    for (const auto& recordKv : kv.second.records) {
+      ownerWorkspaceIndices[recordKv.first].push_back(ownerWorkspaceIndex);
+    }
+    ++ownerWorkspaceIndex;
+  }
+
+  size_t workspaceIndex = 0;
+  size_t localInvariantIssueCount = 0;
+  for (const auto& kv : snapshot) {
+    const DesktopMonitorKey& key = kv.first;
+    const TilingState& state = kv.second;
+    std::wstring desktopId = DiagnosticGuidString(key.desktopId);
+
+    Wh_Log(
+        L"WORKSPACE[%zu] desktopId=%s monitor=%p layout=%d(%s) masterRatio=%.17g "
+        L"activeWindowCount=%zu recordCount=%zu stackWeightCount=%zu gridWeightCount=%zu",
+        workspaceIndex,
+        desktopId.c_str(),
+        reinterpret_cast<void*>(key.monitor),
+        static_cast<int>(state.layout),
+        DiagnosticLayoutName(state.layout),
+        state.masterRatio,
+        state.windows.size(),
+        state.records.size(),
+        state.stackWeights.size(),
+        state.gridWeights.size());
+
+    std::unordered_map<HWND, size_t> activeCounts;
+    for (size_t i = 0; i < state.windows.size(); ++i) {
+      HWND hwnd = state.windows[i];
+      ++activeCounts[hwnd];
+      Wh_Log(L"WORKSPACE[%zu].windows[%zu]=%p",
+             workspaceIndex, i, reinterpret_cast<void*>(hwnd));
+
+      auto recordIt = state.records.find(hwnd);
+      if (recordIt == state.records.end()) {
+        ++localInvariantIssueCount;
+        Wh_Log(
+            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=active_without_record "
+            L"hwnd=%p",
+            workspaceIndex, reinterpret_cast<void*>(hwnd));
+      } else if (recordIt->second.state != ManageState::Tiled) {
+        ++localInvariantIssueCount;
+        Wh_Log(
+            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=active_not_tiled "
+            L"hwnd=%p state=%d(%s)",
+            workspaceIndex, reinterpret_cast<void*>(hwnd),
+            static_cast<int>(recordIt->second.state),
+            DiagnosticManageStateName(recordIt->second.state));
+      }
+    }
+
+    for (const auto& activeKv : activeCounts) {
+      if (activeKv.second > 1) {
+        ++localInvariantIssueCount;
+        Wh_Log(
+            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=duplicate_active_hwnd "
+            L"hwnd=%p count=%zu",
+            workspaceIndex, reinterpret_cast<void*>(activeKv.first), activeKv.second);
+      }
+    }
+
+    size_t recordIndex = 0;
+    for (const auto& recordKv : state.records) {
+      const HWND mapHwnd = recordKv.first;
+      const WindowRecord& record = recordKv.second;
+
+      Wh_Log(
+          L"WORKSPACE[%zu].records[%zu] mapHwnd=%p record.hwnd=%p pid=%lu "
+          L"state=%d(%s) canMove=%d canResize=%d topmost=%d placementFailures=%d "
+          L"lastPlacementResult=%d(%s) hasSavedSlot=%d",
+          workspaceIndex,
+          recordIndex,
+          reinterpret_cast<void*>(mapHwnd),
+          reinterpret_cast<void*>(record.hwnd),
+          record.pid,
+          static_cast<int>(record.state),
+          DiagnosticManageStateName(record.state),
+          record.canMove ? 1 : 0,
+          record.canResize ? 1 : 0,
+          record.topmost ? 1 : 0,
+          record.placementFailures,
+          static_cast<int>(record.lastPlacementResult),
+          DiagnosticPlacementResultName(record.lastPlacementResult),
+          record.hasSavedSlot ? 1 : 0);
+
+      Wh_Log(
+          L"WORKSPACE[%zu].records[%zu].lastRequestedRect=[%ld,%ld,%ld,%ld]",
+          workspaceIndex, recordIndex,
+          record.lastRequestedRect.left, record.lastRequestedRect.top,
+          record.lastRequestedRect.right, record.lastRequestedRect.bottom);
+
+      Wh_Log(
+          L"WORKSPACE[%zu].records[%zu].lastObservedRect=[%ld,%ld,%ld,%ld]",
+          workspaceIndex, recordIndex,
+          record.lastObservedRect.left, record.lastObservedRect.top,
+          record.lastObservedRect.right, record.lastObservedRect.bottom);
+
+      Wh_Log(
+          L"WORKSPACE[%zu].records[%zu].savedSlot index=%zu weight=%.17g "
+          L"hasWeight=%d wasMaster=%d",
+          workspaceIndex, recordIndex,
+          record.savedSlot.index,
+          record.savedSlot.weight,
+          record.savedSlot.hasWeight ? 1 : 0,
+          record.savedSlot.wasMaster ? 1 : 0);
+
+      if (record.hwnd != mapHwnd) {
+        ++localInvariantIssueCount;
+        Wh_Log(
+            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=record_key_mismatch "
+            L"mapHwnd=%p recordHwnd=%p",
+            workspaceIndex, reinterpret_cast<void*>(mapHwnd),
+            reinterpret_cast<void*>(record.hwnd));
+      }
+
+      const bool active = activeCounts.find(mapHwnd) != activeCounts.end();
+      if (record.state == ManageState::Tiled && !active) {
+        ++localInvariantIssueCount;
+        Wh_Log(
+            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=tiled_record_not_active "
+            L"hwnd=%p",
+            workspaceIndex, reinterpret_cast<void*>(mapHwnd));
+      } else if (record.state != ManageState::Tiled && active) {
+        ++localInvariantIssueCount;
+        Wh_Log(
+            L"BOOKKEEPING_INVARIANT_VIOLATION workspace=%zu type=non_tiled_record_active "
+            L"hwnd=%p state=%d(%s)",
+            workspaceIndex, reinterpret_cast<void*>(mapHwnd),
+            static_cast<int>(record.state),
+            DiagnosticManageStateName(record.state));
+      }
+
+      ++recordIndex;
+    }
+
+    for (size_t i = 0; i < state.stackWeights.size(); ++i) {
+      Wh_Log(L"WORKSPACE[%zu].stackWeights[%zu]=%.17g",
+             workspaceIndex, i, state.stackWeights[i]);
+    }
+
+    for (size_t i = 0; i < state.gridWeights.size(); ++i) {
+      Wh_Log(L"WORKSPACE[%zu].gridWeights[%zu]=%.17g",
+             workspaceIndex, i, state.gridWeights[i]);
+    }
+
+    Wh_Log(L"WORKSPACE[%zu]_END", workspaceIndex);
+    ++workspaceIndex;
+  }
+
+  size_t duplicateOwnerHwndCount = 0;
+  for (const auto& ownerKv : ownerWorkspaceIndices) {
+    if (ownerKv.second.size() <= 1) continue;
+
+    ++duplicateOwnerHwndCount;
+    Wh_Log(
+        L"BOOKKEEPING_DUPLICATE_OWNER hwnd=%p ownerCount=%zu",
+        reinterpret_cast<void*>(ownerKv.first), ownerKv.second.size());
+
+    size_t ownerIndex = 0;
+    size_t candidateWorkspaceIndex = 0;
+    for (const auto& workspaceKv : snapshot) {
+      auto recordIt = workspaceKv.second.records.find(ownerKv.first);
+      if (recordIt != workspaceKv.second.records.end()) {
+        std::wstring desktopId = DiagnosticGuidString(workspaceKv.first.desktopId);
+        Wh_Log(
+            L"BOOKKEEPING_DUPLICATE_OWNER hwnd=%p owner[%zu] workspace=%zu "
+            L"desktopId=%s monitor=%p state=%d(%s) active=%d",
+            reinterpret_cast<void*>(ownerKv.first), ownerIndex,
+            candidateWorkspaceIndex, desktopId.c_str(),
+            reinterpret_cast<void*>(workspaceKv.first.monitor),
+            static_cast<int>(recordIt->second.state),
+            DiagnosticManageStateName(recordIt->second.state),
+            ContainsWindow(workspaceKv.second.windows, ownerKv.first) ? 1 : 0);
+        ++ownerIndex;
+      }
+      ++candidateWorkspaceIndex;
+    }
+  }
+
+  Wh_Log(
+      L"BOOKKEEPING_AUDIT duplicateOwnerHwndCount=%zu localInvariantIssueCount=%zu "
+      L"status=%s",
+      duplicateOwnerHwndCount, localInvariantIssueCount,
+      (duplicateOwnerHwndCount == 0 && localInvariantIssueCount == 0)
+          ? L"OK"
+          : L"VIOLATION");
+
+  Wh_Log(L"================= BOOKKEEPING_DUMP_END =================");
+}
+
+//=============================================================================
 // Hotkey Thread
 //=============================================================================
 
@@ -4000,6 +4265,7 @@ void LoadSettings() {
   g_swapMasterKey = ReadHotkeySetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
   g_tileNewWinToggleKey = ReadHotkeySetting(L"TileNewWinToggleKey", ParseSingleCharKey, (UINT)'U');
   g_floatFocusedKey = ReadHotkeySetting(L"FloatFocusedKey", ParseSingleCharKey, (UINT)'F');
+  g_diagnosticDumpKey = ReadHotkeySetting(L"DiagnosticDumpKey", ParseSingleCharKey, (UINT)'I');
 
   TrayUi::LoadSettings();
 }
@@ -4035,6 +4301,9 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
     if (g_tileNewWinToggleKey) RegisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE, g_tilingModifiers, g_tileNewWinToggleKey);
     if (g_floatFocusedKey) RegisterHotKey(nullptr, HK_FLOAT_FOCUSED, g_tilingModifiers, g_floatFocusedKey);
     if (g_layoutKey) RegisterHotKey(nullptr, HK_LAYOUT, g_tilingModifiers, g_layoutKey);
+  }
+  if (g_diagnosticDumpKey) {
+    RegisterHotKey(nullptr, HK_DIAGNOSTIC_DUMP, g_tilingModifiers, g_diagnosticDumpKey);
   }
   Wh_Log(L"Hotkeys registered");
 
@@ -4138,6 +4407,11 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
                 continue;
               }
 
+              case HK_DIAGNOSTIC_DUMP: {
+                DumpSavedBookkeeping();
+                continue;
+              }
+
               case HK_TILENEWWIN_TOGGLE: {
                 if (g_enableTileNewWin) {
                   g_tileNewWinSuspended = !g_tileNewWinSuspended;
@@ -4186,6 +4460,7 @@ cleanup:
     UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
     UnregisterHotKey(nullptr, HK_LAYOUT);
   }
+  UnregisterHotKey(nullptr, HK_DIAGNOSTIC_DUMP);
 
   TrayUi::Shutdown();
   RemoveWinEventHooks();
