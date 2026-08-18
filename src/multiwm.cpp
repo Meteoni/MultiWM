@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.17
+// @version         1.7.18
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -32,6 +32,7 @@ resize-adjusted ratios per virtual desktop.
 - Compact Win32 layout flyout appears on layout/desktop changes with configurable position
 - Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
 - Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate
+- Maximized windows preserve their saved tile and use a targeted location-change fallback to detect restore transitions reliably
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
@@ -515,6 +516,7 @@ static HWINEVENTHOOK g_hHideDestroyHook = nullptr;
 static HWINEVENTHOOK g_hCloakHook = nullptr;
 static HWINEVENTHOOK g_hStateHook = nullptr;
 static HWINEVENTHOOK g_hForegroundHook = nullptr;
+static HWINEVENTHOOK g_hLocationChangeHook = nullptr;
 
 //=============================================================================
 //Cache Rects
@@ -2535,6 +2537,28 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   return SuspensionReason::None;
 }
 
+// EVENT_OBJECT_LOCATIONCHANGE is extremely noisy for ordinary tiled windows,
+// including changes caused by our own SetWindowPos calls. We only need it as a
+// missing-state-event fallback while a managed window is logically detached for
+// maximization; at that point ArrangeWorkspace does not move the HWND itself.
+static bool IsWindowSuspendedMaximized(HWND hwnd) {
+  if (!hwnd) return false;
+
+  bool suspendedMaximized = false;
+  AcquireSRWLockShared(&g_tilingStateLock);
+  for (const auto& kv : g_tilingStateMap) {
+    auto it = kv.second.records.find(hwnd);
+    if (it != kv.second.records.end() &&
+        it->second.state == ManageState::Suspended &&
+        it->second.suspensionReason == SuspensionReason::Maximized) {
+      suspendedMaximized = true;
+      break;
+    }
+  }
+  ReleaseSRWLockShared(&g_tilingStateLock);
+  return suspendedMaximized;
+}
+
 static bool RestoreWindowInState(TilingState& state, HWND hwnd) {
   WindowRecord* record = FindWindowRecord(state, hwnd);
   if (!record || record->state != ManageState::Suspended || !record->hasSavedSlot) {
@@ -3593,7 +3617,8 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
     case EVENT_SYSTEM_MINIMIZESTART:
     case EVENT_SYSTEM_MINIMIZEEND:
     case EVENT_OBJECT_STATECHANGE:
-      // FancyWM treats these as prompts to query the actual window state. Do the
+    case EVENT_OBJECT_LOCATIONCHANGE:
+      // FancyWM/WinMan treat these as prompts to query the actual window state. Do the
       // same: the event says "dirty", while IsIconic/IsZoomed/visibility decide
       // whether the saved logical slot participates. Run once immediately for a
       // responsive reflow and once after settle to cover transition races.
@@ -3851,6 +3876,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_SYSTEM_MINIMIZESTART:
     case EVENT_SYSTEM_MINIMIZEEND:
     case EVENT_OBJECT_STATECHANGE:
+    case EVENT_OBJECT_LOCATIONCHANGE:
     case EVENT_OBJECT_DESTROY:
     case EVENT_OBJECT_SHOW:
     case EVENT_OBJECT_HIDE:
@@ -3872,6 +3898,16 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
 
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
+
+  // WinMan uses location changes as one of its dirty-check signals. Do not mirror
+  // that broadly here: normal layout placement itself produces LOCATIONCHANGE.
+  // The event is only needed to catch a maximized managed HWND becoming restored
+  // on Windows/apps that don't deliver a useful OBJECT_STATECHANGE at that edge.
+  if (event == EVENT_OBJECT_LOCATIONCHANGE) {
+    if (!tracked || !IsWindowSuspendedMaximized(hwnd)) return;
+    QueueWindowEvent(event, hwnd);
+    return;
+  }
 
   // Keep shell/framework noise out of the WM queue. Untracked HWNDs matter only
   // when full-auto can discover them, and only once they resemble real windows.
@@ -3921,6 +3957,13 @@ void InstallWinEventHooks() {
     if (!g_hForegroundHook) Wh_Log(L"Failed to install foreground hook");
   }
 
+  if (!g_hLocationChangeHook) {
+    g_hLocationChangeHook = SetWinEventHook(
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr, WinEventProc,
+        0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!g_hLocationChangeHook) Wh_Log(L"Failed to install location-change hook");
+  }
+
   if (!g_hMoveSizeHook) {
     g_hMoveSizeHook = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
                                       nullptr, WinEventProc, 0, 0,
@@ -3966,6 +4009,10 @@ void RemoveWinEventHooks() {
     if (g_hForegroundHook) {
         UnhookWinEvent(g_hForegroundHook);
         g_hForegroundHook = nullptr;
+    }
+    if (g_hLocationChangeHook) {
+        UnhookWinEvent(g_hLocationChangeHook);
+        g_hLocationChangeHook = nullptr;
     }
     if (g_hMoveSizeHook) {
         UnhookWinEvent(g_hMoveSizeHook);
