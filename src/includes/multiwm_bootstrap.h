@@ -68,8 +68,6 @@ void LoadSettings() {
                             : MouseMoveBehavior::Float;
   Wh_FreeStringSetting(mouseBehavior);
 
-  g_settings.enabled = Wh_GetIntSetting(L"EnableTiling") != 0;
-
   PCWSTR managementMode = Wh_GetStringSetting(L"DefaultWindowManagementMode");
   g_wm.managementMode =
       managementMode && _wcsicmp(managementMode, L"automatic") == 0
@@ -112,28 +110,26 @@ void LoadSettings() {
 }
 
 static void RegisterConfiguredHotkeys() {
-  if (g_settings.enabled) {
-    if (g_settings.tileKey) {
-      RegisterHotKey(nullptr, HK_TILE, g_settings.tilingModifiers, g_settings.tileKey);
-    }
-    if (g_settings.swapMasterKey) {
-      RegisterHotKey(
-          nullptr, HK_SWAP_MASTER, g_settings.tilingModifiers,
-          g_settings.swapMasterKey);
-    }
-    if (g_settings.managementModeToggleKey) {
-      RegisterHotKey(
-          nullptr, HK_MANAGEMENT_MODE_TOGGLE, g_settings.tilingModifiers,
-          g_settings.managementModeToggleKey);
-    }
-    if (g_settings.floatFocusedKey) {
-      RegisterHotKey(
-          nullptr, HK_FLOAT_FOCUSED, g_settings.tilingModifiers,
-          g_settings.floatFocusedKey);
-    }
-    if (g_settings.layoutKey) {
-      RegisterHotKey(nullptr, HK_LAYOUT, g_settings.tilingModifiers, g_settings.layoutKey);
-    }
+  if (g_settings.tileKey) {
+    RegisterHotKey(nullptr, HK_TILE, g_settings.tilingModifiers, g_settings.tileKey);
+  }
+  if (g_settings.swapMasterKey) {
+    RegisterHotKey(
+        nullptr, HK_SWAP_MASTER, g_settings.tilingModifiers,
+        g_settings.swapMasterKey);
+  }
+  if (g_settings.managementModeToggleKey) {
+    RegisterHotKey(
+        nullptr, HK_MANAGEMENT_MODE_TOGGLE, g_settings.tilingModifiers,
+        g_settings.managementModeToggleKey);
+  }
+  if (g_settings.floatFocusedKey) {
+    RegisterHotKey(
+        nullptr, HK_FLOAT_FOCUSED, g_settings.tilingModifiers,
+        g_settings.floatFocusedKey);
+  }
+  if (g_settings.layoutKey) {
+    RegisterHotKey(nullptr, HK_LAYOUT, g_settings.tilingModifiers, g_settings.layoutKey);
   }
 
   if (g_settings.diagnosticDumpKey) {
@@ -145,19 +141,15 @@ static void RegisterConfiguredHotkeys() {
 }
 
 static void UnregisterConfiguredHotkeys() {
-  if (g_settings.enabled) {
-    UnregisterHotKey(nullptr, HK_TILE);
-    UnregisterHotKey(nullptr, HK_SWAP_MASTER);
-    UnregisterHotKey(nullptr, HK_MANAGEMENT_MODE_TOGGLE);
-    UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
-    UnregisterHotKey(nullptr, HK_LAYOUT);
-  }
+  UnregisterHotKey(nullptr, HK_TILE);
+  UnregisterHotKey(nullptr, HK_SWAP_MASTER);
+  UnregisterHotKey(nullptr, HK_MANAGEMENT_MODE_TOGGLE);
+  UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
+  UnregisterHotKey(nullptr, HK_LAYOUT);
   UnregisterHotKey(nullptr, HK_DIAGNOSTIC_DUMP);
 }
 
 static void InitializeCurrentWorkspace() {
-  if (!g_settings.enabled) return;
-
   HMONITOR monitor = GetTargetMonitor();
   if (monitor) {
     DesktopMonitorKey key{};
@@ -328,7 +320,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   MSG msg{};
   PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
 
-  if (g_settings.enabled && SUCCEEDED(coHr) && InitializeVirtualDesktopAPI()) {
+  if (SUCCEEDED(coHr) && InitializeVirtualDesktopAPI()) {
     if (!RegisterVirtualDesktopNotifications()) {
       Wh_Log(L"Using settled WinEvent reconciliation for virtual desktop changes");
     }
@@ -336,14 +328,12 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
   SetEvent(g_wm.readyEvent);
 
-  if (g_settings.enabled) {
-    Platform::WindowEvents::InstallWinEventHooks();
-    Reconcile::ScheduleLifecycleReconcile(nullptr);
-  }
+  Platform::WindowEvents::InstallWinEventHooks();
+  Reconcile::ScheduleLifecycleReconcile(nullptr);
   RegisterConfiguredHotkeys();
   InitializeCurrentWorkspace();
 
-  if (g_settings.enabled && !TrayUi::Initialize()) {
+  if (!TrayUi::Initialize()) {
     Wh_Log(L"Tiling layout tray icon unavailable; window management remains active");
   }
 

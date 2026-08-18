@@ -4,7 +4,7 @@
 namespace Platform::WindowEvents {
 
 void OnWindowMoveSizeEnd(HWND hwnd) {
-  if (!g_settings.enabled || !IsWindow(hwnd)) return;
+  if (!IsWindow(hwnd)) return;
   if (!g_wm.threadId) return;
   if (!PostThreadMessage(g_wm.threadId, WM_APP_MOVE_SIZE_END, reinterpret_cast<WPARAM>(hwnd), 0)) {
     Wh_Log(L"Failed to queue resize event");

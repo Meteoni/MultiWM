@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.11.2
+// @version         1.11.3
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -60,10 +60,6 @@ resize-adjusted ratios per virtual desktop.
 
 // ==WindhawkModSettings==
 /*
-- EnableTiling: true
-  $name: '[General] Enable Window Manager'
-  $description: Enable workspace management, tiling, and related hotkeys.
-
 - DefaultWindowManagementMode: manual
   $name: '[General] Default Window Management Mode'
   $description: 'Choose membership policy after startup. Manual keeps Alt+D groups inert: new windows are not admitted, minimizing releases membership, and moving a managed window to another virtual desktop does not carry it into that desktop. Maximized windows still preserve their slot. Automatic continuously discovers and migrates managed windows.'

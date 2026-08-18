@@ -176,7 +176,6 @@ struct SettingsState {
 
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
   TileLayout defaultLayout = TileLayout::MasterStack;
-  bool enabled = true;
   std::vector<ExclusionRule> exclusionRules;
 };
 

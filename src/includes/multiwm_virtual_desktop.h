@@ -434,7 +434,7 @@ bool InitializeVirtualDesktopAPI() {
 bool ReinitializeVirtualDesktopAPI() {
   CleanupVirtualDesktopAPI();
   if (!InitializeVirtualDesktopAPI()) return false;
-  if (g_settings.enabled) RegisterVirtualDesktopNotifications();
+  RegisterVirtualDesktopNotifications();
   return true;
 }
 

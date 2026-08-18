@@ -176,7 +176,7 @@ static void HandleUserResize(
 // Consumes one completed user gesture and routes it to the move or resize policy.
 // The top-level handler deliberately contains no layout-specific math.
 void ApplyUserMoveSize(HWND hwnd) {
-  if (!g_settings.enabled || !IsWindow(hwnd)) return;
+  if (!IsWindow(hwnd)) return;
 
   if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     ClearMoveSizeSamples(hwnd);
