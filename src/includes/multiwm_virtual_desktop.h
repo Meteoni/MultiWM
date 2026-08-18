@@ -314,7 +314,7 @@ static void ClearVirtualDesktopNotificationState(bool unregisterFromShell) {
   g_vd.notificationCookie = 0;
 }
 
-static bool RegisterVirtualDesktopNotifications() {
+bool RegisterVirtualDesktopNotifications() {
   if (g_vd.notificationsRegistered) return true;
   if (!g_vd.serviceProvider) return false;
   if (!ReadExplorerVersion()) return false;

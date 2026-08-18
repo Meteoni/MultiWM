@@ -72,8 +72,11 @@
 // 6. A managed HWND has exactly one desktop+monitor workspace owner.
 // 7. Visibility/cloak events are dirty signals; ownership comes from explicit
 //    desktop/monitor queries, not from cloak state.
-// 8. Automatic vs Manual mode changes only admission of previously unknown HWNDs;
-//    all already-managed reconciliation and retile behavior remains active.
+// 8. Management mode controls group membership policy, not the core WM pipeline:
+//    Automatic admits unknown HWNDs and migrates managed HWNDs between workspaces;
+//    Manual admits only through explicit commands, forgets minimized members, and
+//    releases membership when a managed HWND moves to another virtual desktop.
+//    Maximized members remain suspended so restoring preserves their exact slot.
 //
 // If a change cannot be explained in terms of those invariants, it probably
 // belongs in the observation/reconciliation layer rather than layout code.
@@ -139,6 +142,7 @@ constexpr UINT WM_APP_LAYOUT_CYCLE = WM_APP + 5;
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
 enum class MouseMoveBehavior { Float, Swap };
 enum class ExclusionMatch { Process, Class, Title };
+enum class ManagementMode { Manual, Automatic };
 
 struct ExclusionRule {
   ExclusionMatch match = ExclusionMatch::Process;
@@ -192,8 +196,9 @@ struct VirtualDesktopRuntime {
   bool initialized = false;
 };
 
-// Serialized actor/thread state. Manual mode is represented only by
-// autoDiscoverySuspended; the rest of the WM pipeline remains live.
+// Serialized actor/thread state. Management mode affects admission/retention
+// policy only; observation, reconciliation, resize learning, and arrangement
+// remain live in both modes.
 struct WmRuntime {
   HANDLE thread = nullptr;
   DWORD threadId = 0;
@@ -203,12 +208,20 @@ struct WmRuntime {
   UINT_PTR lifecycleTimer = 0;
   std::vector<HWND> lifecycleDirtyWindows;
   std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
-  bool autoDiscoverySuspended = true;
+  ManagementMode managementMode = ManagementMode::Manual;
 };
 
 static SettingsState g_settings;
 static VirtualDesktopRuntime g_vd;
 static WmRuntime g_wm;
+
+static bool IsManualMode() {
+  return g_wm.managementMode == ManagementMode::Manual;
+}
+
+static bool IsAutomaticMode() {
+  return g_wm.managementMode == ManagementMode::Automatic;
+}
 
 struct MoveSizeGesture;
 

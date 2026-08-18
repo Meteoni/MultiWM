@@ -717,7 +717,7 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
     case PlacementResult::Refused:
       ++record->placementFailures;
       DebugValidateMutation(L"Workspace::ApplyPlacementObservation");
-      return record->placementFailures >= kPlacementFailureLimit
+      return record->placementFailures >= Model::kPlacementFailureLimit
                  ? PlacementAction::Float
                  : PlacementAction::None;
 

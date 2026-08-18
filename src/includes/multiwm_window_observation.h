@@ -282,7 +282,7 @@ bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor) {
          MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == targetMonitor;
 }
 
-static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = kPlacementTolerancePx) {
+static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPlacementTolerancePx) {
   return !Differs(a.left, b.left, tolerance) &&
          !Differs(a.top, b.top, tolerance) &&
          !Differs(a.right, b.right, tolerance) &&

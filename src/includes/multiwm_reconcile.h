@@ -326,6 +326,19 @@ static std::vector<DesktopMonitorKey> ReconcileWindowOwnership(
 
   DesktopMonitorKey observedKey{};
   if (GetObservedWorkspaceKey(hwnd, ownerKeys.front(), ownershipScope, &observedKey)) {
+    const bool desktopChanged =
+        HasReconcileScope(ownershipScope, ReconcileScope::Desktop) &&
+        !IsEqualGUID(ownerKeys.front().desktopId, observedKey.desktopId);
+
+    // Manual groups are deliberately inert. Moving a member to another virtual
+    // desktop breaks its membership instead of transplanting it into that
+    // desktop's workspace. Monitor-only moves retain the existing migration
+    // behavior; Automatic mode continues to migrate across both dimensions.
+    if (IsManualMode() && desktopChanged) {
+      ForgetWindowFromOwners(hwnd, ownerKeys, changedKeys);
+      return {};
+    }
+
     EnsureUniqueWindowOwnership(hwnd, observedKey, changedKeys);
     ownerKeys = g_workspaces.OwnersOf(hwnd);
   }
@@ -336,6 +349,16 @@ static void ReconcileWindowParticipation(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
   const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
+
+  // In Manual mode, minimizing is an explicit departure from the Alt+D group.
+  // Forget the logical member entirely; restoring the HWND won't re-admit it
+  // because Manual discovery remains closed. Maximization is intentionally
+  // different: suspend it so restore returns to the exact saved slot/weight.
+  if (IsManualMode() && reason == SuspensionReason::Minimized) {
+    ForgetWindowFromOwners(hwnd, ownerKeys, changedKeys);
+    return;
+  }
+
   for (const auto& ownerKey : ownerKeys) {
     Workspace workspace;
     if (!g_workspaces.Load(ownerKey, &workspace)) continue;
@@ -344,7 +367,8 @@ static void ReconcileWindowParticipation(
     if (!record) continue;
 
     bool changed = false;
-    if (record->state == ManageState::Tiled && reason != SuspensionReason::None) {
+    if (record->state == ManageState::Tiled &&
+        reason != SuspensionReason::None) {
       changed = workspace.Suspend(hwnd, reason);
     } else if (record->state == ManageState::Suspended) {
       changed = reason == SuspensionReason::None
@@ -411,8 +435,8 @@ static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) 
 static void ScheduleLifecycleReconcile(HWND hwnd);
 
 // Current-desktop discovery has two separate jobs: reconcile already-managed
-// HWND ownership to the observed workspace, and optionally admit truly new
-// windows while Automatic mode is active.
+// HWND ownership according to the active management policy, and optionally admit
+// truly new windows while Automatic mode is active.
 static bool DiscoverWorkspaceWindows(
     HMONITOR monitor, const GUID& desktopId, const std::vector<HWND>& snapshot,
     DesktopMonitorKey* outKey,
@@ -424,7 +448,7 @@ static bool DiscoverWorkspaceWindows(
 
   Workspace workspace;
   const bool workspaceExisted = g_workspaces.Load(key, &workspace);
-  const bool admitUntracked = !g_wm.autoDiscoverySuspended;
+  const bool admitUntracked = IsAutomaticMode();
   const bool initializing = !workspaceExisted && admitUntracked;
   const std::vector<HWND> initialSnapshot = initializing
       ? CollectWorkspaceWindowsForInitialization(monitor, desktopId)
@@ -452,8 +476,8 @@ static bool DiscoverWorkspaceWindows(
 }
 
 // Runs the normal discovery path for one monitor. The pipeline is always active;
-// DiscoverWorkspaceWindows() alone decides whether untracked HWND admission is
-// currently suspended by Manual mode.
+// DiscoverWorkspaceWindows() alone decides whether unknown HWNDs may be admitted;
+// Manual-mode retention decisions are handled by the reconciliation policy.
 static bool DiscoverCurrentWorkspaceOnMonitor(HMONITOR monitor) {
   if (!monitor) return false;
 
@@ -713,13 +737,23 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
       break;
 
     case EVENT_SYSTEM_MINIMIZESTART:
+      if (IsManualMode()) {
+        // Minimize is an explicit exit from an inert Manual Alt+D group. Act on
+        // the event itself so a very fast minimize/restore cannot outrun the
+        // settled IsIconic() check and accidentally retain membership.
+        ForgetManagedWindow(hwnd);
+      } else {
+        ReconcileManagedWindowStateNow(hwnd);
+        ScheduleLifecycleReconcile(hwnd);
+      }
+      break;
+
     case EVENT_SYSTEM_MINIMIZEEND:
     case EVENT_OBJECT_STATECHANGE:
     case EVENT_OBJECT_LOCATIONCHANGE:
-      // FancyWM/WinMan treat these as prompts to query the actual window state. Do the
-      // same: the event says "dirty", while IsIconic/IsZoomed/visibility decide
-      // whether the saved logical slot participates. Run once immediately for a
-      // responsive reflow and once after settle to cover transition races.
+      // These are prompts to query actual physical state. In Automatic mode,
+      // minimize/restore preserves membership; in both modes maximize/restore
+      // preserves the saved logical slot. Run immediately and after settle.
       ReconcileManagedWindowStateNow(hwnd);
       ScheduleLifecycleReconcile(hwnd);
       break;

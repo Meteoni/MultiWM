@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.11.0
+// @version         1.11.1
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -25,7 +25,7 @@ resize-adjusted ratios per virtual desktop.
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
 - Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
 - Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
-- Manual or automatic new-window discovery, switchable at runtime without disabling management of existing windows
+- Manual or Automatic management modes: Manual keeps Alt+D groups inert, while Automatic continuously discovers and migrates windows
 - Configurable mouse drag behavior: float the moved window or swap it with the tiled window under the pointer
 - Dedicated optional hotkey to float the focused tiled window
 - Theme-aware notification-area text icon shows the current workspace layout (MV/MH/CL/RW/BS/MN/FL)
@@ -66,7 +66,7 @@ resize-adjusted ratios per virtual desktop.
 
 - DefaultWindowManagementMode: manual
   $name: '[General] Default Window Management Mode'
-  $description: Choose whether eligible new windows are discovered automatically after startup. Manual starts automatic discovery paused; already-managed windows are still maintained.
+  $description: Choose membership policy after startup. Manual keeps Alt+D groups inert: new windows are not admitted, minimizing releases membership, and moving a managed window to another virtual desktop does not carry it into that desktop. Maximized windows still preserve their slot. Automatic continuously discovers and migrates managed windows.
   $options:
     - manual: Manual
     - automatic: Automatic

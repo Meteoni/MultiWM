@@ -71,8 +71,10 @@ void LoadSettings() {
   g_settings.enabled = Wh_GetIntSetting(L"EnableTiling") != 0;
 
   PCWSTR managementMode = Wh_GetStringSetting(L"DefaultWindowManagementMode");
-  g_wm.autoDiscoverySuspended =
-      !managementMode || _wcsicmp(managementMode, L"automatic") != 0;
+  g_wm.managementMode =
+      managementMode && _wcsicmp(managementMode, L"automatic") == 0
+          ? ManagementMode::Automatic
+          : ManagementMode::Manual;
   Wh_FreeStringSetting(managementMode);
 
   int reconcileDelay = Wh_GetIntSetting(L"ReconcileDelayMs");
@@ -170,17 +172,18 @@ static void InitializeCurrentWorkspace() {
 
   Wh_Log(
       L"Window management mode at startup: %s",
-      g_wm.autoDiscoverySuspended ? L"Manual" : L"Automatic");
+      IsManualMode() ? L"Manual" : L"Automatic");
 }
 
 static void ToggleWindowManagementMode() {
-  g_wm.autoDiscoverySuspended = !g_wm.autoDiscoverySuspended;
-  const bool automatic = !g_wm.autoDiscoverySuspended;
+  g_wm.managementMode =
+      IsAutomaticMode() ? ManagementMode::Manual : ManagementMode::Automatic;
+  const bool automatic = IsAutomaticMode();
   Wh_Log(L"Window management mode: %s", automatic ? L"Automatic" : L"Manual");
   TrayUi::ShowManagementModeFlyout(automatic);
 
-  // Reopening admission runs the normal discovery path for every monitor. Known
-  // Floating records remain managed-but-excluded and are never re-adopted here.
+  // Entering Automatic mode runs the normal discovery path for every monitor.
+  // Known Floating records remain managed-but-excluded and are never re-adopted.
   if (automatic) {
     std::vector<HMONITOR> monitors;
     Reconcile::EnumerateCurrentMonitors(monitors);
