@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.19
+// @version         1.7.20
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -36,7 +36,7 @@ resize-adjusted ratios per virtual desktop.
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
-- Diagnostic bookkeeping dump prints a deterministic, formatted snapshot of every saved workspace/window record without mutating state
+- Diagnostic bookkeeping dump prints a deterministic, formatted snapshot of every saved workspace/window record with live window/process identity, without mutating state
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
 
@@ -4120,6 +4120,71 @@ static std::wstring DiagnosticWeightsString(const std::vector<double>& weights) 
   return result;
 }
 
+static std::wstring DiagnosticSanitizeText(const wchar_t* text) {
+  if (!text || !*text) return L"";
+
+  std::wstring result = text;
+  for (wchar_t& ch : result) {
+    if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+  }
+  return result;
+}
+
+struct DiagnosticWindowIdentity {
+  bool hwndAlive = false;
+  DWORD livePid = 0;
+  bool pidMatchesRecord = false;
+  std::wstring processName;
+  std::wstring imagePath;
+  std::wstring className;
+  std::wstring title;
+};
+
+static DiagnosticWindowIdentity DiagnosticReadWindowIdentity(
+    HWND hwnd, DWORD recordPid) {
+  DiagnosticWindowIdentity identity;
+  identity.hwndAlive = hwnd && IsWindow(hwnd);
+
+  if (identity.hwndAlive) {
+    GetWindowThreadProcessId(hwnd, &identity.livePid);
+    identity.pidMatchesRecord = recordPid != 0 && identity.livePid == recordPid;
+
+    wchar_t className[256]{};
+    if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) > 0) {
+      identity.className = DiagnosticSanitizeText(className);
+    }
+
+    wchar_t title[512]{};
+    if (GetWindowTextW(hwnd, title, ARRAYSIZE(title)) > 0) {
+      identity.title = DiagnosticSanitizeText(title);
+    }
+  }
+
+  // Prefer the PID currently attached to the exact HWND. If the HWND has already
+  // disappeared, the saved PID is still useful for best-effort identification,
+  // but the dump keeps that distinction visible through hwndAlive/pidMatchesRecord.
+  DWORD queryPid = identity.livePid ? identity.livePid : recordPid;
+  if (queryPid) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, queryPid);
+    if (process) {
+      std::vector<wchar_t> path(32768);
+      DWORD chars = static_cast<DWORD>(path.size());
+      if (QueryFullProcessImageNameW(process, 0, path.data(), &chars) && chars > 0) {
+        identity.imagePath.assign(path.data(), chars);
+        const wchar_t* base = wcsrchr(identity.imagePath.c_str(), L'\\');
+        identity.processName = base ? base + 1 : identity.imagePath;
+      }
+      CloseHandle(process);
+    }
+  }
+
+  return identity;
+}
+
+static const wchar_t* DiagnosticDisplayText(const std::wstring& text) {
+  return text.empty() ? L"<unavailable>" : text.c_str();
+}
+
 static size_t DiagnosticActiveIndex(const TilingState& state, HWND hwnd) {
   auto it = std::find(state.windows.begin(), state.windows.end(), hwnd);
   return it == state.windows.end()
@@ -4177,6 +4242,16 @@ static void DiagnosticDumpWindowRecord(
       DiagnosticManageStateName(record.state),
       DiagnosticSuspensionReasonName(record.suspensionReason));
 
+  DiagnosticWindowIdentity identity = DiagnosticReadWindowIdentity(mapHwnd, record.pid);
+  Wh_Log(
+      L"      identity: hwndAlive=%d livePid=%lu pidMatchesRecord=%d process=%s",
+      identity.hwndAlive ? 1 : 0, identity.livePid,
+      identity.pidMatchesRecord ? 1 : 0,
+      DiagnosticDisplayText(identity.processName));
+  Wh_Log(L"      image: %s", DiagnosticDisplayText(identity.imagePath));
+  Wh_Log(L"      class: %s", DiagnosticDisplayText(identity.className));
+  Wh_Log(L"      title: \"%s\"", DiagnosticDisplayText(identity.title));
+
   Wh_Log(
       L"      capabilities: move=%d resize=%d topmost=%d",
       record.canMove ? 1 : 0,
@@ -4206,9 +4281,10 @@ static void DiagnosticDumpWindowRecord(
 }
 
 static void DumpSavedBookkeeping() {
-  // Copy the persistent model once. The diagnostic dump intentionally reports
-  // only what the WM itself has remembered: no live HWND/VD queries and no
-  // reconciliation or repair that could alter the state being inspected.
+  // Copy the persistent model once. Everything structural below comes from that
+  // immutable snapshot. Per-record title/class/process identity is queried later
+  // only for human readability; those lookups are observational and never trigger
+  // reconciliation, placement, ownership repair, or any model mutation.
   std::vector<std::pair<DesktopMonitorKey, TilingState>> workspaces;
   AcquireSRWLockShared(&g_tilingStateLock);
   workspaces.reserve(g_tilingStateMap.size());
