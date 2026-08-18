@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.20
+// @version         1.7.21
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -37,6 +37,7 @@ resize-adjusted ratios per virtual desktop.
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
 - Diagnostic bookkeeping dump prints a deterministic, formatted snapshot of every saved workspace/window record with live window/process identity, without mutating state
+- New-workspace initialization discovers visible minimized/maximized windows as suspended logical members instead of losing them
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
 
@@ -2537,6 +2538,108 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   return SuspensionReason::None;
 }
 
+
+// Workspace initialization needs a broader physical snapshot than normal layout
+// participation. A visible top-level window can already belong to this workspace
+// while minimized or maximized, even though CollectTileWindows correctly excludes
+// it from placement. Enumerate that broader set only when creating a workspace.
+static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
+    HMONITOR monitor, const GUID& desktopId) {
+  std::vector<HWND> windows;
+  if (!monitor) return windows;
+
+  struct EnumContext {
+    HMONITOR targetMonitor;
+    GUID desktopId;
+    std::vector<HWND>* windowList;
+  } context = {monitor, desktopId, &windows};
+
+  EnumWindows(
+      [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        auto* ctx = reinterpret_cast<EnumContext*>(lParam);
+
+        // Hidden/close-to-tray HWNDs are not safe to admit from a one-shot scan.
+        // Minimized and maximized windows normally retain WS_VISIBLE and are the
+        // non-participating states this initialization pass is intended to find.
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        if (!CouldBeTileEligible(hwnd)) return TRUE;
+        if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
+
+        GUID windowDesktop{};
+        if (!GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+            !IsEqualGUID(windowDesktop, ctx->desktopId)) {
+          return TRUE;
+        }
+
+        // Do not reject DWMWA_CLOAKED here. A brand-new incoming VD can still
+        // be shell-cloaked while its exact desktop GUID is already authoritative.
+        // Normal arrangement still refuses to place cloaked HWNDs after settle.
+
+        // MonitorFromWindow deliberately uses the pre-minimize rectangle for a
+        // minimized HWND, so it is safer here than inspecting minimized geometry.
+        if (MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) != ctx->targetMonitor) {
+          return TRUE;
+        }
+
+        ctx->windowList->push_back(hwnd);
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&context));
+
+  return windows;
+}
+
+static size_t InitialLogicalWindowCount(const TilingState& state) {
+  size_t count = state.windows.size();
+  for (const auto& kv : state.records) {
+    if (kv.second.state == ManageState::Suspended && kv.second.hasSavedSlot) ++count;
+  }
+  return count;
+}
+
+// Add one previously unknown HWND while creating a workspace. Restored windows
+// participate immediately; minimized/maximized windows receive a neutral saved
+// logical slot and stay out of state.windows until their normal restore event.
+static bool AddInitialWorkspaceWindow(TilingState& state, HWND hwnd) {
+  if (!hwnd || !IsWindow(hwnd) || state.records.find(hwnd) != state.records.end() ||
+      IsWindowTrackedInAnyState(hwnd)) {
+    return false;
+  }
+
+  SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
+  if (reason == SuspensionReason::Hidden) return false;
+
+  WindowRecord record = MakeWindowRecord(
+      hwnd, reason == SuspensionReason::None ? ManageState::Tiled
+                                             : ManageState::Suspended);
+
+  if (reason == SuspensionReason::None) {
+    state.windows.push_back(hwnd);
+  } else {
+    const size_t logicalIndex = InitialLogicalWindowCount(state);
+    record.suspensionReason = reason;
+    record.savedSlot.index = logicalIndex;
+
+    if (state.layout == TileLayout::Columns || state.layout == TileLayout::Rows) {
+      record.savedSlot.weight = 1.0;
+      record.savedSlot.hasWeight = true;
+    } else if (state.layout == TileLayout::MasterStack ||
+               state.layout == TileLayout::MasterStackH) {
+      if (logicalIndex == 0) {
+        record.savedSlot.wasMaster = true;
+      } else {
+        record.savedSlot.weight = 1.0;
+        record.savedSlot.hasWeight = true;
+      }
+    }
+
+    record.hasSavedSlot = true;
+  }
+
+  state.records.emplace(hwnd, record);
+  return true;
+}
+
 // EVENT_OBJECT_LOCATIONCHANGE is extremely noisy for ordinary tiled windows,
 // including changes caused by our own SetWindowPos calls. We only need it as a
 // missing-state-event fallback while a managed window is logically detached for
@@ -2858,20 +2961,39 @@ static bool EnsureWorkspaceFromSnapshot(
 
   std::vector<HWND> snapshot = CollectTileWindows(monitor);
 
-  // A current-desktop snapshot is authoritative for the workspace of windows
-  // that are actually present in it. Reconcile tracked HWNDs before touching
-  // the local state so discovery can never create a second logical owner.
-  for (HWND w : snapshot) {
+  // Decide whether this is genuine workspace initialization before ownership
+  // repair can migrate an existing record here and implicitly create the state.
+  TilingState state;
+  const bool workspaceExisted = LoadTilingState(key, &state);
+  std::vector<HWND> initialSnapshot;
+  if (!workspaceExisted) {
+    initialSnapshot = CollectWorkspaceWindowsForInitialization(monitor, key.desktopId);
+  }
+
+  // For an existing workspace, the active snapshot remains the authoritative
+  // ownership signal. During first creation use the broader initialization set
+  // so tracked minimized/maximized HWNDs can migrate without being duplicated.
+  const std::vector<HWND>& ownershipSnapshot =
+      workspaceExisted ? snapshot : initialSnapshot;
+  for (HWND w : ownershipSnapshot) {
     if (IsWindowTrackedInAnyState(w)) {
       EnsureUniqueWindowOwnership(w, key, ownershipChangedKeys);
     }
   }
 
-  TilingState state;
+  // Ownership migration above may have created/changed this workspace, so reload
+  // before making local edits. workspaceExisted still records whether this call
+  // is the initialization boundary.
   bool hadState = LoadTilingState(key, &state);
   if (!hadState) {
     state.layout = g_defaultLayout;
     state.masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
+  }
+
+  if (!workspaceExisted) {
+    for (HWND w : initialSnapshot) {
+      AddInitialWorkspaceWindow(state, w);
+    }
   }
 
   // Manual Tile is an explicit repair/adoption operation. A visible suspended
@@ -3317,21 +3439,42 @@ static bool DiscoverWorkspaceWindows(
   DesktopMonitorKey key{desktopId, monitor};
   if (outKey) *outKey = key;
 
+  TilingState state;
+  const bool workspaceExisted = LoadTilingState(key, &state);
+  const bool initializing = !workspaceExisted && discoverNew;
+  std::vector<HWND> initialSnapshot;
+  if (initializing) {
+    initialSnapshot = CollectWorkspaceWindowsForInitialization(monitor, desktopId);
+  }
+
   // Reconcile all tracked HWNDs first, before making any unsaved local edits.
-  // This prevents a migration reload from discarding a newly discovered window.
+  // A brand-new workspace uses the broader initialization set so a minimized or
+  // maximized tracked HWND can migrate even though it is not an active tile.
   bool changed = false;
-  for (HWND w : snapshot) {
+  const std::vector<HWND>& ownershipSnapshot =
+      initializing ? initialSnapshot : snapshot;
+  for (HWND w : ownershipSnapshot) {
     if (IsWindowTrackedInAnyState(w) &&
         EnsureUniqueWindowOwnership(w, key, ownershipChangedKeys)) {
       changed = true;
     }
   }
 
-  TilingState state;
+  // Migration may have created the destination workspace; reload after ownership
+  // reconciliation, then seed only truly untracked initialization candidates.
   bool hasState = LoadTilingState(key, &state);
   if (!hasState) {
     state.layout = g_defaultLayout;
     state.masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
+  }
+
+  if (initializing) {
+    for (HWND w : initialSnapshot) {
+      if (AddInitialWorkspaceWindow(state, w)) {
+        hasState = true;
+        changed = true;
+      }
+    }
   }
 
   // Reconcile already-managed windows independently of full-auto discovery.
