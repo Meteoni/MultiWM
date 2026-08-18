@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.23
+// @version         1.8.0
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -21,18 +21,18 @@ resize-adjusted ratios per virtual desktop.
 - Manual tiling hotkey
 - Layout cycle hotkey
 - 7 per-workspace modes: Master+Stack (Vertical/Horizontal), Columns, Rows, BSP, Monocle, Floating
-- Adjustable margin, gap, and master size
+- Independent workspace insets, window gap, and master size
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
 - Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
 - Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
+- Manual or automatic new-window discovery, switchable at runtime without disabling management of existing windows
 - Configurable mouse drag behavior: float the moved window or swap it with the tiled window under the pointer
 - Dedicated optional hotkey to float the focused tiled window
 - Theme-aware notification-area text icon shows the current workspace layout (MV/MH/CL/RW/BS/MN/FL)
 - Optional per-layout .ico overrides with generated text fallback
-- Compact Win32 layout flyout appears on layout/desktop changes with configurable position
+- Compact Win32 status flyout appears on layout/desktop changes and Automatic/Manual mode switches
 - Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
 - Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate
-- Workspace model changes on inactive virtual desktops queue their reflow until that desktop becomes current
 - Maximized windows preserve their saved tile and use a targeted location-change fallback to detect restore transitions reliably
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
@@ -47,6 +47,7 @@ resize-adjusted ratios per virtual desktop.
 - Cycle layout: Alt + L
 - Switch master window: Alt + M
 - Float focused window: unbound by default
+- Toggle Automatic/Manual mode: Alt + U
 - Dump saved bookkeeping: Alt + I
 
 ## Notes
@@ -59,64 +60,20 @@ resize-adjusted ratios per virtual desktop.
 
 // ==WindhawkModSettings==
 /*
-- WindowsVersion: win11_26100
-  $name: Windows Version
-  $description: Select your Windows version for correct COM interface IDs. Run "winver" to check your build number.
-  $options:
-    - win10_old: Windows 10 (Build < 20348)
-    - win10_20348: Windows 10 (Build 20348 - 21999)
-    - win11_22000: Windows 11 (Build 22000 - 22482)
-    - win11_22621: Windows 11 (Build 22621/22631/23H2)
-    - win11_26100: Windows 11 (Build 26100+ / 24H2)
-
 - EnableTiling: true
-  $name: '[Tiling] Enable'
-  $description: Enable hotkey to tile windows on current monitor
+  $name: '[General] Enable Window Manager'
+  $description: Enable workspace management, tiling, and related hotkeys.
 
-- EnableTileNewWin: false
-  $name: '[Tiling] Full-auto Tiling'
-  $description: Automatically retile when a new window is created (only applies when tiling is enabled)
-
-- TileNewWinToggleKey: "U"
-  $name: '[Tiling] Tile New Windows Toggle Key'
-  $description: 'Key to pause/resume Auto-tiling at runtime. Leave blank to disable.'
-
-- SwapMasterKey: "M"
-  $name: '[Tiling] Switch Master Window Key'
-  $description: 'Key to set another tiled window as the master. Leave blank to disable.'
-
-- FloatFocusedKey: ""
-  $name: '[Tiling] Float Focused Window Key'
-  $description: 'Key to float the focused tiled window. Leave blank to disable.'
-
-- DiagnosticDumpKey: "I"
-  $name: '[Diagnostics] Dump Saved Bookkeeping Key'
-  $description: 'Dump the complete saved per-VD/per-monitor tiling state and invariant audit to the Windhawk log. Uses the Tiling Modifier. Leave blank to disable.'
-
-- MouseMoveBehavior: float
-  $name: '[Tiling] Mouse Drag Behavior'
-  $description: Action when a tiled window is moved without resizing
+- DefaultWindowManagementMode: manual
+  $name: '[General] Default Window Management Mode'
+  $description: Choose whether eligible new windows are discovered automatically after startup. Manual starts automatic discovery paused; already-managed windows are still maintained.
   $options:
-    - float: Float moved window
-    - swap: Swap with tiled window under pointer
-
-- TilingModifier: alt
-  $name: '[Tiling] Modifier'
-  $description: Modifier keys for tiling hotkeys
-  $options:
-    - alt: Alt
-    - ctrl: Ctrl
-    - alt+shift: Alt + Shift
-    - ctrl+alt: Ctrl + Alt
-    - ctrl+shift: Ctrl + Shift
-
-- TileKey: "D"
-  $name: '[Tiling] Key'
-  $description: 'Key to tile all windows on the current monitor. Leave blank to disable. Examples: D, T, Space, `, -'
+    - manual: Manual
+    - automatic: Automatic
 
 - DefaultLayout: master_stack
-  $name: '[Tiling] Default Layout'
-  $description: The initial tiling layout when the mod starts (only applies when tiling is enabled)
+  $name: '[General] Default Workspace Layout'
+  $description: Initial layout used when a new desktop + monitor workspace is created.
   $options:
     - master_stack: Master + Stack (Vertical)
     - master_stack_h: Master + Stack (Horizontal)
@@ -126,25 +83,36 @@ resize-adjusted ratios per virtual desktop.
     - monocle: Monocle (Fullscreen)
     - floating: Floating (managed, no automatic placement)
 
-- TileMargin: 4
-  $name: '[Tiling] Margin (pixels)'
-  $description: Gap between tiled windows and screen edges (0-100, only applies when tiling is enabled)
-
 - TileGap: 4
-  $name: '[Tiling] Gap (pixels)'
-  $description: Gap between adjacent tiled windows (0-100, only applies when tiling is enabled)
+  $name: '[Workspace] Window Gap (pixels)'
+  $description: Gap between adjacent tiled windows (0-100).
+
+- WorkspaceInsetLeft: 4
+  $name: '[Workspace] Left Inset (pixels)'
+  $description: Reserved space inside the monitor work area on the left edge (0-500).
+
+- WorkspaceInsetTop: 4
+  $name: '[Workspace] Top Inset (pixels)'
+  $description: Reserved space inside the monitor work area on the top edge (0-500).
+
+- WorkspaceInsetRight: 4
+  $name: '[Workspace] Right Inset (pixels)'
+  $description: Reserved space inside the monitor work area on the right edge (0-500).
+
+- WorkspaceInsetBottom: 4
+  $name: '[Workspace] Bottom Inset (pixels)'
+  $description: Reserved space inside the monitor work area on the bottom edge (0-500).
 
 - MasterPercent: 50
-  $name: '[Tiling] Master Size (%)'
-  $description: Size percentage of the master window in Master+Stack layouts (1-99, only applies when tiling is enabled)
+  $name: '[Workspace] Master Size (%)'
+  $description: Default master share in Master + Stack layouts (1-99).
 
-- LayoutKey: "L"
-  $name: '[Tiling] Layout Cycle Key'
-  $description: 'Key to cycle through tiling layouts. Leave blank to disable. Examples: L, Tab, =, ], /'
-
-- ReconcileDelayMs: 80
-  $name: '[Reliability] Reconcile Settle Delay (ms)'
-  $description: Delay before visibility/lifecycle changes are reconciled. Increase on slower systems. (20-2000 ms)
+- MouseMoveBehavior: float
+  $name: '[Window Behavior] Tiled Window Drag Action'
+  $description: Action when a tiled window is moved without resizing.
+  $options:
+    - float: Float moved window
+    - swap: Swap with tiled window under pointer
 
 - Exclusions:
     - - Match: process
@@ -155,23 +123,53 @@ resize-adjusted ratios per virtual desktop.
           - title: Window title contains
       - Value: ""
         $name: Value
-  $name: '[Rules] Window Exclusions'
-  $description: Optional exclusions. Process/class are case-insensitive exact matches; title is case-insensitive substring.
+  $name: '[Window Rules] Window Exclusions'
+  $description: Optional exclusions. Process/class are case-insensitive exact matches; title is a case-insensitive substring.
+
+- TilingModifier: alt
+  $name: '[Hotkeys] Modifier'
+  $description: Modifier used by all window-manager hotkeys.
+  $options:
+    - alt: Alt
+    - ctrl: Ctrl
+    - alt+shift: Alt + Shift
+    - ctrl+alt: Ctrl + Alt
+    - ctrl+shift: Ctrl + Shift
+
+- TileKey: "D"
+  $name: '[Hotkeys] Tile Workspace'
+  $description: 'Reconcile and tile windows on the current monitor. Leave blank to disable. Examples: D, T, Space, `, -'
+
+- LayoutKey: "L"
+  $name: '[Hotkeys] Cycle Layout'
+  $description: 'Cycle the current workspace layout. Leave blank to disable. Examples: L, Tab, =, ], /'
+
+- SwapMasterKey: "M"
+  $name: '[Hotkeys] Set Master Window'
+  $description: 'Set another tiled window as the master. Leave blank to disable.'
+
+- ManagementModeToggleKey: "U"
+  $name: '[Hotkeys] Toggle Window Management Mode'
+  $description: 'Switch between Automatic and Manual modes at runtime. Leave blank to disable.'
+
+- FloatFocusedKey: ""
+  $name: '[Hotkeys] Float Focused Window'
+  $description: 'Float the focused tiled window. Leave blank to disable.'
 
 - FlyoutPosition: bottom
-  $name: '[UI] Flyout Position'
-  $description: Show layout feedback at the top or bottom center of the active monitor
+  $name: '[Appearance] Status Flyout Position'
+  $description: Show layout and mode feedback at the top or bottom center of the active monitor.
   $options:
     - top: Top
     - bottom: Bottom
 
 - FlyoutOffsetX: 0
-  $name: '[UI] Flyout X Offset'
-  $description: Horizontal offset in DPI-scaled pixels (positive moves right)
+  $name: '[Appearance] Status Flyout X Offset'
+  $description: Horizontal offset in DPI-scaled pixels (positive moves right).
 
 - FlyoutOffsetY: 0
-  $name: '[UI] Flyout Y Offset'
-  $description: Vertical offset in DPI-scaled pixels (positive moves down)
+  $name: '[Appearance] Status Flyout Y Offset'
+  $description: Vertical offset in DPI-scaled pixels (positive moves down).
 
 - CustomIcons:
     - - Layout: master_stack
@@ -186,8 +184,26 @@ resize-adjusted ratios per virtual desktop.
           - floating: Floating
       - Path: ""
         $name: Icon path (.ico)
-  $name: '[UI] Custom Tray Icons'
-  $description: Optional per-layout .ico overrides. Failed/empty paths use the generated text icon.
+  $name: '[Appearance] Custom Tray Layout Icons'
+  $description: Optional per-layout .ico overrides. Failed or empty paths use the generated text icon.
+
+- WindowsVersion: win11_26100
+  $name: '[Advanced] Windows Version'
+  $description: Select your Windows version for private virtual-desktop interface IDs. Run "winver" to check your build number.
+  $options:
+    - win10_old: Windows 10 (Build < 20348)
+    - win10_20348: Windows 10 (Build 20348 - 21999)
+    - win11_22000: Windows 11 (Build 22000 - 22482)
+    - win11_22621: Windows 11 (Build 22621/22631/23H2)
+    - win11_26100: Windows 11 (Build 26100+ / 24H2)
+
+- ReconcileDelayMs: 80
+  $name: '[Advanced] Lifecycle Settle Delay (ms)'
+  $description: Delay before visibility/lifecycle bursts are reconciled. Increase only if shell transitions are unusually slow (20-2000 ms).
+
+- DiagnosticDumpKey: "I"
+  $name: '[Diagnostics] Dump Workspace State'
+  $description: 'Dump the complete saved workspace/window state and invariant audit to the Windhawk log. Uses the configured modifier. Leave blank to disable.'
 */
 // ==/WindhawkModSettings==
 
@@ -347,7 +363,7 @@ enum HotkeyIds {
   HK_TILE = 1,
   HK_LAYOUT = 2,
   HK_SWAP_MASTER = 3,
-  HK_TILENEWWIN_TOGGLE = 4,
+  HK_MANAGEMENT_MODE_TOGGLE = 4,
   HK_FLOAT_FOCUSED = 5,
   HK_DIAGNOSTIC_DUMP = 6,
 };
@@ -364,21 +380,23 @@ constexpr UINT WM_APP_LAYOUT_CYCLE = WM_APP + 5;
 static UINT g_reconcileDelayMs = 80;
 static UINT_PTR g_lifecycleReconcileTimer = 0;
 static std::vector<HWND> g_lifecycleDirtyWindows;
-// Placement can be temporarily impossible because a workspace is inactive, or
-// because a native VD transition arrives before the shell's cloak/uncloak burst
-// has settled. Keep those reflows pending until that desktop is current and the
-// settled lifecycle pass can safely render it.
+// Native VD transitions may create/change a workspace while its windows are
+// still shell-cloaked. Defer placement for only those monitors until the final
+// settled visibility pass.
 static std::vector<PendingWorkspaceArrange> g_pendingDesktopArranges;
 
 static UINT g_tilingModifiers = MOD_ALT;
 static UINT g_tileKey = 'D';
 static UINT g_layoutKey = 'L';
 static UINT g_swapMasterKey = 'M';
-static UINT g_tileNewWinToggleKey = 'U';
+static UINT g_managementModeToggleKey = 'U';
 static UINT g_floatFocusedKey = 0;
 static UINT g_diagnosticDumpKey = 'I';
 
-static LONG g_tileMargin = 4;
+static LONG g_workspaceInsetLeft = 4;
+static LONG g_workspaceInsetTop = 4;
+static LONG g_workspaceInsetRight = 4;
+static LONG g_workspaceInsetBottom = 4;
 static LONG g_tileGap = 4;
 static LONG g_masterPercent = 50;
 
@@ -391,8 +409,7 @@ static MouseMoveBehavior g_mouseMoveBehavior = MouseMoveBehavior::Float;
 static TileLayout g_defaultLayout = TileLayout::MasterStack;
 
 static bool g_enableTiling = true;
-static bool g_enableTileNewWin = false;
-static bool g_tileNewWinSuspended = false;
+static bool g_autoDiscoverySuspended = true;
 
 enum class ExclusionMatch { Process, Class, Title };
 struct ExclusionRule {
@@ -687,8 +704,8 @@ std::vector<double> DefaultWeights(size_t count) {
   return std::vector<double>(count, 1.0);
 }
 
-bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor);
-static bool CouldBeTileEligible(HWND hwnd);
+bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor);
+static bool WindowCanBeManaged(HWND hwnd);
 static bool IsWindowTrackedInAnyState(HWND hwnd);
 bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid);
 
@@ -730,6 +747,9 @@ static WindowRecord* FindWindowRecord(TilingState& state, HWND hwnd) {
   return it == state.records.end() ? nullptr : &it->second;
 }
 
+// Best-effort bridge for apps that replace one top-level HWND with another.
+// Candidates must share the PID and class; an exact title match wins, otherwise
+// the first PID/class match is returned from the caller's scoped candidate set.
 HWND ResolveEquivalentWindow(HWND hwnd, const std::vector<HWND>& candidates) {
   if (!hwnd || !IsWindow(hwnd)) return nullptr;
 
@@ -767,6 +787,8 @@ HWND ResolveEquivalentWindow(HWND hwnd, const std::vector<HWND>& candidates) {
   return bestMatch;
 }
 
+// Maps an event or foreground HWND to its active tile, preferring exact and
+// ownership relationships before falling back to the looser equivalence check.
 HWND ResolveToTiledWindow(HWND hwnd, const std::vector<HWND>& candidates) {
   if (!hwnd || !IsWindow(hwnd)) return nullptr;
 
@@ -802,7 +824,7 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
-        if (IsTileEligible(hwnd, ctx->targetMonitor)) {
+        if (IsCurrentlyManagedWindow(hwnd, ctx->targetMonitor)) {
           ctx->windowList->push_back(hwnd);
         }
         return TRUE;
@@ -812,6 +834,9 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
   return windows;
 }
 
+// Adopts the supplied windows' current geometry as authoritative workspace state.
+// Master/grid layouts infer ordering and resize weights from frame bounds; every
+// supplied HWND is rebuilt as an active tiled record.
 TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const std::vector<HWND>& windows,
                                   HMONITOR monitor, HWND preferredFirstWin = nullptr) {
   TilingState state;
@@ -1175,6 +1200,8 @@ void LayoutBSP(const RECT& area, size_t startIndex, size_t count, int depth, std
 
 static const int VTABLE_GET_CURRENT_DESKTOP = 6;
 
+// Selects the private notification IID and vtable shape for this Explorer build.
+// An empty result means the ABI is unknown and native notifications are unsafe.
 static NotificationInterfaceConfig GetNotificationInterfaceConfig() {
   if (g_explorerBuildNumber < 22000) return {};
 
@@ -1303,6 +1330,8 @@ static HRESULT STDMETHODCALLTYPE VirtualDesktopNotification_CurrentChangedWithMo
   return S_OK;
 }
 
+// Builds the minimal COM sink required by the selected private ABI: IUnknown,
+// one desktop-change callback, and no-op implementations for unrelated slots.
 static VirtualDesktopNotificationObject* CreateVirtualDesktopNotificationObject() {
   NotificationInterfaceConfig config = GetNotificationInterfaceConfig();
   if (config.methodCount <= 0 || config.currentChangedIndex < 3 ||
@@ -1335,6 +1364,9 @@ static VirtualDesktopNotificationObject* CreateVirtualDesktopNotificationObject(
   return object;
 }
 
+// Clears local notification ownership and, when Explorer is responsive, also
+// unregisters and releases the shell service. Teardown still discards the stale
+// cookie when COM calls are deliberately skipped to avoid an Explorer hang.
 static void ClearVirtualDesktopNotificationState(bool unregisterFromShell) {
   g_virtualDesktopNotificationsRegistered = false;
   InterlockedExchange(&g_virtualDesktopChangeQueued, 0);
@@ -1418,6 +1450,8 @@ static bool RegisterVirtualDesktopNotifications() {
   return true;
 }
 
+// Acquires the COM interfaces needed for virtual-desktop queries. The outer
+// lifecycle wrapper owns the initialized flag and notification registration.
 bool InitializeVirtualDesktopAPIOnce() {
   HRESULT hr = CoCreateInstance(CLSID_ImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
                                 (void**)&g_pServiceProvider);
@@ -1447,6 +1481,8 @@ bool InitializeVirtualDesktopAPIOnce() {
   return true;
 }
 
+// Releases virtual-desktop COM state while Explorer is responsive. During shell
+// teardown, pointers are intentionally dropped without Release to avoid hangs.
 void CleanupVirtualDesktopAPI() {
   HWND hShell = GetShellWindow();
   const bool shellAvailable = hShell && IsWindow(hShell);
@@ -1484,6 +1520,8 @@ bool ReinitializeVirtualDesktopAPI() {
   return true;
 }
 
+// Invokes a private manager slot using the Windows-version-specific signature.
+// A failed call forces one API reinitialization and retry before being returned.
 template <typename TResult>
 HRESULT CallManagerInternal(int vtableIndex, TResult* outResult) {
   if (UsesHMonitorParameter()) {
@@ -1643,7 +1681,10 @@ static bool IsWindowExcludedByRules(HWND hwnd) {
   return false;
 }
 
-static bool CouldBeTileEligible(HWND hwnd) {
+// Applies stable structural and exclusion policy only; visibility, show state,
+// desktop, and monitor participation are checked separately. Tracked windows
+// tolerate a temporarily missing resize style so transient app UI cannot evict them.
+static bool WindowCanBeManaged(HWND hwnd) {
   if (!hwnd) return false;
   if (IsWindowExcludedByRules(hwnd)) return false;
 
@@ -1669,7 +1710,10 @@ static bool CouldBeTileEligible(HWND hwnd) {
   return true;
 }
 
-bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
+// Determines whether an HWND can actively participate on targetMonitor now.
+// Participation requires restored, visible, uncloaked current-desktop geometry,
+// while structural eligibility remains tolerant of already-tracked windows.
+bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor) {
   // window might become temporarily disabled
   // (example: VSCode unstaged commit dialog)
   if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return false;
@@ -1677,7 +1721,7 @@ bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
   // FancyWM only tiles windows in the Restored state. Maximized windows remain
   // managed logically but do not participate until Windows reports Restored.
   if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return false;
-  if (!CouldBeTileEligible(hwnd)) return false;
+  if (!WindowCanBeManaged(hwnd)) return false;
   if (IsWindowCloaked(hwnd)) return false;
 
   // Virtual desktop filter: other desktops' windows may not yet be cloaked
@@ -1704,6 +1748,8 @@ static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = kPlacementT
          !Differs(a.bottom, b.bottom, tolerance);
 }
 
+// Positions the visible DWM frame without changing activation, Z-order, or show
+// state, then records whether Windows accepted or adjusted the requested geometry.
 static PlacementResult PlaceWindowChecked(WindowRecord& record, const RECT& targetRect) {
   HWND hwnd = record.hwnd;
   record.lastRequestedRect = targetRect;
@@ -1771,6 +1817,8 @@ static PlacementResult PlaceWindowChecked(WindowRecord& record, const RECT& targ
 
 static void ArrangeWorkspace(const DesktopMonitorKey& key);
 
+// Promotes the foreground window, or its tiled owner, to the master slot, then
+// clears stale gesture samples for both windows and reflows the workspace.
 void SwapMaster() {
   HWND fg = GetForegroundWindow();
   if (!fg) return;
@@ -1790,10 +1838,7 @@ void SwapMaster() {
   auto it = g_tilingStateMap.find(key);
   if (it != g_tilingStateMap.end() && it->second.windows.size() >= 2) {
     TilingState& state = it->second;
-    if (state.layout == TileLayout::MasterStack ||
-        state.layout == TileLayout::MasterStackH ||
-        state.layout == TileLayout::Columns ||
-        state.layout == TileLayout::Rows) {
+    if (state.layout != TileLayout::Floating) {
       resolved = ResolveToTiledWindow(fg, state.windows);
       auto resolvedIt = std::find(state.windows.begin(), state.windows.end(), resolved);
       if (resolved && resolvedIt != state.windows.end() && resolvedIt != state.windows.begin()) {
@@ -1853,25 +1898,34 @@ static HMONITOR GetTargetMonitor() {
   return monitor;
 }
 
+static bool GetWorkspaceWorkArea(HMONITOR monitor, RECT* outWorkArea) {
+  if (!monitor || !outWorkArea) return false;
+  RECT monitorWork{};
+  if (!GetMonitorWorkArea(monitor, &monitorWork)) return false;
+
+  *outWorkArea = {
+      monitorWork.left + g_workspaceInsetLeft,
+      monitorWork.top + g_workspaceInsetTop,
+      monitorWork.right - g_workspaceInsetRight,
+      monitorWork.bottom - g_workspaceInsetBottom};
+  return outWorkArea->right > outWorkArea->left &&
+         outWorkArea->bottom > outWorkArea->top;
+}
+
+// Resolves a monitor on the current virtual desktop to its workspace key and,
+// when requested, returns the configured workspace-inset work area.
 static bool GetCurrentWorkspaceKey(HMONITOR monitor, DesktopMonitorKey* outKey, RECT* outWorkArea = nullptr) {
   if (!monitor || !outKey) return false;
   GUID desktopId{};
-  // Keep a zero-GUID fallback so manual tiling still works if the private
-  // virtual-desktop API is temporarily unavailable. In that degraded mode,
-  // desktop-specific separation is unavailable but the WM remains usable.
+  // Never collapse separate desktops into a zero-GUID workspace when the
+  // private API is temporarily unavailable; let the caller retry after recovery.
   if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&desktopId)) {
     return false;
   }
   outKey->desktopId = desktopId;
   outKey->monitor = monitor;
 
-  if (outWorkArea) {
-    RECT monitorWork{};
-    if (!GetMonitorWorkArea(monitor, &monitorWork)) return false;
-    *outWorkArea = {monitorWork.left + g_tileMargin, monitorWork.top + g_tileMargin,
-                    monitorWork.right - g_tileMargin, monitorWork.bottom - g_tileMargin};
-    if (outWorkArea->right <= outWorkArea->left || outWorkArea->bottom <= outWorkArea->top) return false;
-  }
+  if (outWorkArea && !GetWorkspaceWorkArea(monitor, outWorkArea)) return false;
   return true;
 }
 
@@ -1911,7 +1965,7 @@ namespace TrayUi {
 //-----------------------------------------------------------------------------
 
 constexpr wchar_t kTrayWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
-constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkTilingHelperLayoutFlyout";
+constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkTilingHelperStatusFlyout";
 constexpr UINT kTrayCallbackMessage = WM_APP + 20;
 constexpr UINT kIconId = 1;
 constexpr int kIconCanvasSize = 32;
@@ -1933,7 +1987,7 @@ static int g_flyoutOffsetY = 0;
 static TileLayout g_displayedLayout = TileLayout::COUNT;
 static GUID g_displayedDesktopId{};
 static bool g_haveDisplayedDesktopId = false;
-static TileLayout g_flyoutLayout = TileLayout::COUNT;
+static std::wstring g_flyoutText;
 static DWORD g_flyoutShownTick = 0;
 static NOTIFYICONDATAW g_notifyData{};
 static std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> g_icons{};
@@ -2083,6 +2137,8 @@ static HICON CreateTextIcon(TileLayout layout) {
   return icon;
 }
 
+// Returns an owned icon, preferring the configured file and falling back to
+// generated text. The icon must eventually be released with DestroyIcon.
 static HICON CreateLayoutIcon(TileLayout layout) {
   size_t index = static_cast<size_t>(layout);
   if (index < g_customIconPaths.size() && !g_customIconPaths[index].empty()) {
@@ -2111,7 +2167,7 @@ static HICON GetLayoutIcon(TileLayout layout) {
 }
 
 static void SetTooltip(TileLayout layout) {
-  std::wstring tooltip = L"Tiling Helper — ";
+  std::wstring tooltip = L"Tiling Helper - ";
   tooltip += LayoutDisplayName(layout);
   wcsncpy(g_notifyData.szTip, tooltip.c_str(), ARRAYSIZE(g_notifyData.szTip) - 1);
   g_notifyData.szTip[ARRAYSIZE(g_notifyData.szTip) - 1] = L'\0';
@@ -2155,6 +2211,8 @@ static void UpdateIcon(TileLayout layout) {
   }
 }
 
+// Repoints the live tray entry to a complete new icon set before destroying the
+// old handles, so the shell never observes an HICON after it has been released.
 static void RebuildIcons() {
   std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> icons{};
   for (size_t i = 0; i < icons.size(); ++i) {
@@ -2201,7 +2259,7 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
       HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
       SetBkMode(dc, TRANSPARENT);
       SetTextColor(dc, ForegroundColor());
-      DrawTextW(dc, LayoutFlyoutText(g_flyoutLayout), -1, &client,
+      DrawTextW(dc, g_flyoutText.c_str(), -1, &client,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
       if (oldFont) SelectObject(dc, oldFont);
       if (font) DeleteObject(font);
@@ -2229,11 +2287,13 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
   return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-static void ShowLayoutFlyout(TileLayout layout) {
-  if (!g_flyoutWindow || layout == TileLayout::COUNT) return;
+static void ShowStatusFlyout(const wchar_t* text) {
+  if (!g_flyoutWindow || !text || !*text) return;
   HMONITOR monitor = GetTargetMonitor();
   RECT workArea{};
   if (!monitor || !GetMonitorWorkArea(monitor, &workArea)) return;
+
+  g_flyoutText = text;
 
   UINT dpi = GetDpiForWindow(g_flyoutWindow);
   if (!dpi) dpi = 96;
@@ -2241,8 +2301,8 @@ static void ShowLayoutFlyout(TileLayout layout) {
   HDC dc = GetDC(g_flyoutWindow);
   HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
   SIZE textSize{};
-  const wchar_t* text = LayoutFlyoutText(layout);
-  GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &textSize);
+  GetTextExtentPoint32W(dc, g_flyoutText.c_str(),
+                        static_cast<int>(g_flyoutText.size()), &textSize);
   if (oldFont) SelectObject(dc, oldFont);
   if (font) DeleteObject(font);
   ReleaseDC(g_flyoutWindow, dc);
@@ -2262,7 +2322,6 @@ static void ShowLayoutFlyout(TileLayout layout) {
                                    radius * 2, radius * 2);
   if (region && !SetWindowRgn(g_flyoutWindow, region, TRUE)) DeleteObject(region);
 
-  g_flyoutLayout = layout;
   g_flyoutShownTick = GetTickCount();
   SetLayeredWindowAttributes(g_flyoutWindow, 0, 255, LWA_ALPHA);
   SetWindowPos(g_flyoutWindow, HWND_TOPMOST, x, y, width, height,
@@ -2272,10 +2331,21 @@ static void ShowLayoutFlyout(TileLayout layout) {
   SetTimer(g_flyoutWindow, kFlyoutTimerId, 16, nullptr);
 }
 
+static void ShowLayoutFlyout(TileLayout layout) {
+  if (layout == TileLayout::COUNT) return;
+  ShowStatusFlyout(LayoutFlyoutText(layout));
+}
+
+static void ShowManagementModeFlyout(bool automatic) {
+  ShowStatusFlyout(automatic ? L"Automatic Mode" : L"Manual Mode");
+}
+
 //-----------------------------------------------------------------------------
 // Lifecycle / shell integration
 //-----------------------------------------------------------------------------
 
+// Synchronizes the tray with the target workspace and shows the flyout only when
+// the refresh observes a transition between known virtual desktops.
 static void RefreshForCurrentWorkspace() {
   TileLayout layout = g_defaultLayout;
   HMONITOR monitor = GetTargetMonitor();
@@ -2426,6 +2496,8 @@ static void EnsureSaneWeightVector(TilingState& state) {
   }
 }
 
+// Removes an active tile and its layout-specific weight, optionally capturing
+// the slot metadata needed to restore its order and proportions later.
 static void RemoveActiveWindowAt(TilingState& state, size_t index, SuspendedSlot* saved = nullptr) {
   if (index >= state.windows.size()) return;
   SuspendedSlot slot{};
@@ -2460,6 +2532,8 @@ static void RemoveActiveWindowAt(TilingState& state, size_t index, SuspendedSlot
   EnsureSaneWeightVector(state);
 }
 
+// Maps an active-vector index into persistent logical order by accounting for
+// the saved positions of all currently suspended windows.
 static size_t ActiveIndexToLogicalIndex(const TilingState& state, size_t activeIndex) {
   std::vector<size_t> suspendedIndices;
   for (const auto& kv : state.records) {
@@ -2478,6 +2552,8 @@ static size_t ActiveIndexToLogicalIndex(const TilingState& state, size_t activeI
   return logicalIndex;
 }
 
+// Maps a saved logical slot back into the active vector while excluding the
+// suspended record currently being restored.
 static size_t LogicalIndexToActiveIndex(
     const TilingState& state, size_t logicalIndex, HWND restoringHwnd) {
   size_t suspendedBefore = 0;
@@ -2506,6 +2582,8 @@ static void CloseLogicalGapAfterRemoval(
   }
 }
 
+// Removes a tiled window from active placement while preserving its logical slot
+// and weight. Repeated suspension changes only the physical-state reason.
 static bool SuspendWindowInState(
     TilingState& state, HWND hwnd, SuspensionReason reason) {
   WindowRecord* existing = FindWindowRecord(state, hwnd);
@@ -2564,7 +2642,7 @@ static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
         // Minimized and maximized windows normally retain WS_VISIBLE and are the
         // non-participating states this initialization pass is intended to find.
         if (!IsWindowVisible(hwnd)) return TRUE;
-        if (!CouldBeTileEligible(hwnd)) return TRUE;
+        if (!WindowCanBeManaged(hwnd)) return TRUE;
         if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
 
         GUID windowDesktop{};
@@ -2664,6 +2742,8 @@ static bool IsWindowSuspendedMaximized(HWND hwnd) {
   return suspendedMaximized;
 }
 
+// Re-inserts a suspended window at its saved logical slot and restores the
+// layout-specific weight and master bookkeeping captured on suspension.
 static bool RestoreWindowInState(TilingState& state, HWND hwnd) {
   WindowRecord* record = FindWindowRecord(state, hwnd);
   if (!record || record->state != ManageState::Suspended || !record->hasSavedSlot) {
@@ -2707,6 +2787,8 @@ static bool RestoreWindowInState(TilingState& state, HWND hwnd) {
   return true;
 }
 
+// Removes a tiled or suspended window's logical slot while retaining its record
+// as individually floating and renumbering later suspended slots.
 static bool FloatWindowInState(TilingState& state, HWND hwnd) {
   WindowRecord* existing = FindWindowRecord(state, hwnd);
   if (existing && existing->state == ManageState::Floating) return false;
@@ -2784,6 +2866,8 @@ static bool ForgetWindowInState(TilingState& state, HWND hwnd) {
   return true;
 }
 
+// Applies the saved layout for one desktop/monitor workspace, repairing stale
+// participants and reflowing around windows that can no longer be tiled.
 static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   // Never drive windows on an inactive virtual desktop. During a VD switch,
   // the inactive workspace keeps its logical membership unchanged; settled
@@ -2800,14 +2884,8 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   TilingState state;
   if (!LoadTilingState(key, &state)) return;
 
-  RECT monitorWork{};
-  if (!GetMonitorWorkArea(key.monitor, &monitorWork)) return;
-  RECT workArea = {
-      monitorWork.left + g_tileMargin,
-      monitorWork.top + g_tileMargin,
-      monitorWork.right - g_tileMargin,
-      monitorWork.bottom - g_tileMargin};
-  if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) return;
+  RECT workArea{};
+  if (!GetWorkspaceWorkArea(key.monitor, &workArea)) return;
 
   // Repair missed destroy events from the authoritative record table.
   std::vector<HWND> invalidWindows;
@@ -2936,6 +3014,8 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   }
 }
 
+// Uses aggregate work-area coverage as a coarse guard against learning arbitrary
+// floating geometry as an authoritative tiled layout.
 static bool SnapshotLooksTiled(const std::vector<HWND>& windows, const RECT& workArea) {
   if (windows.empty()) return false;
   const long long workAreaArea = RectAreaLL(workArea);
@@ -2954,6 +3034,9 @@ static bool EnsureUniqueWindowOwnership(
     HWND hwnd, const DesktopMonitorKey& targetKey,
     std::vector<DesktopMonitorKey>* changedKeys = nullptr);
 
+// Reconciles a monitor snapshot into the current workspace while preserving known
+// order and inactive records. Explicit adoption can re-tile floated windows and
+// learn complete tiled geometry before persisting and arranging the result.
 static bool EnsureWorkspaceFromSnapshot(
     HMONITOR monitor, bool adoptCurrentGeometry,
     std::vector<DesktopMonitorKey>* ownershipChangedKeys = nullptr) {
@@ -3116,6 +3199,8 @@ static void ClearMoveSizeSamples(HWND hwnd) {
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 }
 
+// Removes an HWND from every recorded owner, reflows each affected workspace,
+// and clears any captured move/size samples.
 static void ForgetManagedWindow(HWND hwnd) {
   std::vector<DesktopMonitorKey> keys = FindWorkspaceKeysContainingWindow(hwnd);
   for (const auto& key : keys) {
@@ -3190,6 +3275,8 @@ static SuspendedSlot MakeAppendedSuspendedSlot(const TilingState& state) {
   return slot;
 }
 
+// Transfers a managed record between workspaces, rebasing tiled or suspended
+// membership at the destination end. Both states are saved; callers own reflow.
 static bool MigrateManagedWindow(
     HWND hwnd, const DesktopMonitorKey& sourceKey, const DesktopMonitorKey& targetKey) {
   if (!hwnd || SameWorkspaceKey(sourceKey, targetKey)) return false;
@@ -3282,6 +3369,8 @@ static bool EnsureUniqueWindowOwnership(
   return changed;
 }
 
+// Refreshes only the requested parts of a fallback key from the HWND's physical
+// desktop and monitor, succeeding when at least one requested observation is valid.
 static bool GetObservedWorkspaceKey(
     HWND hwnd, const DesktopMonitorKey& fallback, bool reconcileDesktop,
     bool reconcileMonitor, DesktopMonitorKey* outKey) {
@@ -3407,7 +3496,6 @@ static void ReconcileKnownWindows(
   }
 }
 
-// If monit
 static void AddUniqueMonitor(std::vector<HMONITOR>& monitors, HMONITOR monitor) {
   if (monitor && std::find(monitors.begin(), monitors.end(), monitor) == monitors.end()) {
     monitors.push_back(monitor);
@@ -3431,10 +3519,10 @@ static void ScheduleLifecycleReconcile(HWND hwnd);
 
 // Current-desktop discovery has two separate jobs: reconcile already-managed
 // HWND ownership to the observed workspace, and optionally admit truly new
-// windows when full-auto is enabled.
+// windows while Automatic mode is active.
 static bool DiscoverWorkspaceWindows(
     HMONITOR monitor, const GUID& desktopId, const std::vector<HWND>& snapshot,
-    bool discoverNew, DesktopMonitorKey* outKey,
+    DesktopMonitorKey* outKey,
     std::vector<DesktopMonitorKey>* ownershipChangedKeys = nullptr) {
   if (!monitor) return false;
 
@@ -3443,7 +3531,8 @@ static bool DiscoverWorkspaceWindows(
 
   TilingState state;
   const bool workspaceExisted = LoadTilingState(key, &state);
-  const bool initializing = !workspaceExisted && discoverNew;
+  const bool admitUntracked = !g_autoDiscoverySuspended;
+  const bool initializing = !workspaceExisted && admitUntracked;
   std::vector<HWND> initialSnapshot;
   if (initializing) {
     initialSnapshot = CollectWorkspaceWindowsForInitialization(monitor, desktopId);
@@ -3479,7 +3568,7 @@ static bool DiscoverWorkspaceWindows(
     }
   }
 
-  // Reconcile already-managed windows independently of full-auto discovery.
+  // Reconcile already-managed windows independently of automatic discovery.
   // Being present in this current-desktop snapshot is authoritative evidence
   // for the window's logical workspace, just like FancyWM's desktop.HasWindow
   // reconciliation and komorebi's Show/Uncloak reconciliation.
@@ -3500,7 +3589,7 @@ static bool DiscoverWorkspaceWindows(
     // reconciliation could not complete. Never create a second logical copy.
     if (IsWindowTrackedInAnyState(w)) continue;
 
-    if (discoverNew) {
+    if (admitUntracked) {
       state.windows.push_back(w);
       state.records.emplace(w, MakeWindowRecord(w, ManageState::Tiled));
       hasState = true;
@@ -3511,6 +3600,27 @@ static bool DiscoverWorkspaceWindows(
   if (!hasState || !changed) return false;
   EnsureSaneWeightVector(state);
   SaveTilingState(key, state);
+  return true;
+}
+
+// Runs the normal discovery path for one monitor. The pipeline is always active;
+// DiscoverWorkspaceWindows() alone decides whether untracked HWND admission is
+// currently suspended by Manual mode.
+static bool DiscoverCurrentWorkspaceOnMonitor(HMONITOR monitor) {
+  if (!monitor) return false;
+
+  GUID currentDesktop{};
+  if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&currentDesktop)) {
+    return false;
+  }
+
+  std::vector<HWND> snapshot = CollectTileWindows(monitor);
+  DesktopMonitorKey key{};
+  if (!DiscoverWorkspaceWindows(monitor, currentDesktop, snapshot, &key)) {
+    return false;
+  }
+
+  ArrangeWorkspace(key);
   return true;
 }
 
@@ -3525,10 +3635,9 @@ static void EnumerateCurrentMonitors(std::vector<HMONITOR>& monitors) {
       reinterpret_cast<LPARAM>(&monitors));
 }
 
-// DWM cloaking happens to all windows on VD switch. 
-// Windows cloaks/uncloaks the incoming/outgoing desktop one HWND at a time. This
-// Snapshot all eligible windows by desktop GUID, but ignores only the transient cloak bit. 
-// Genuine app/shell cloaks will be handled later on the now-current desktop.
+// During a virtual-desktop switch, DWM cloaks and uncloaks windows one at a time.
+// Snapshot otherwise eligible windows by desktop GUID while deliberately ignoring
+// that transient cloak bit; settled reconciliation handles genuine cloaks later.
 static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
     HMONITOR monitor, const GUID& desktopId) {
   std::vector<HWND> windows;
@@ -3545,7 +3654,7 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
 
         if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return TRUE;
-        if (!CouldBeTileEligible(hwnd)) return TRUE;
+        if (!WindowCanBeManaged(hwnd)) return TRUE;
         if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
 
         GUID windowDesktop{};
@@ -3609,12 +3718,11 @@ static void HandleVirtualDesktopChanged() {
     }
   }
 
-  const bool discoverNew = g_enableTileNewWin && !g_tileNewWinSuspended;
   for (HMONITOR monitor : monitors) {
     std::vector<HWND> snapshot = GetTileWindowsAfterDesktopSwitch(monitor, currentDesktop);
     DesktopMonitorKey key{};
     if (DiscoverWorkspaceWindows(
-            monitor, currentDesktop, snapshot, discoverNew, &key)) {
+            monitor, currentDesktop, snapshot, &key)) {
       // New/migrated membership is also reinforced by the same settled pass.
       AddPendingWorkspaceArrange(currentDesktop, monitor);
     }
@@ -3648,6 +3756,9 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
   }
 }
 
+// After a lifecycle burst settles, reconcile tracked-window physical and desktop
+// state, discover eligible windows only on the current desktop, then arrange each
+// changed or pending workspace once and refresh the tray.
 static void ReconcileDeferredLifecycle() {
   if (g_lifecycleReconcileTimer) {
     KillTimer(nullptr, g_lifecycleReconcileTimer);
@@ -3689,7 +3800,7 @@ static void ReconcileDeferredLifecycle() {
   }
   ReleaseSRWLockShared(&g_tilingStateLock);
 
-  // Also include monitors implicated by the shell burst so full-auto discovery
+  // Also include monitors implicated by the shell burst so automatic discovery
   // can seed a new desktop+monitor workspace.
   for (HWND hwnd : dirtyWindows) {
     if (!hwnd || !IsWindow(hwnd)) continue;
@@ -3709,12 +3820,11 @@ static void ReconcileDeferredLifecycle() {
   }
 
   std::vector<DesktopMonitorKey> arrangedKeys;
-  const bool discoverNew = g_enableTileNewWin && !g_tileNewWinSuspended;
   for (HMONITOR monitor : monitors) {
     DesktopMonitorKey key{};
     std::vector<HWND> snapshot = CollectTileWindows(monitor);
     bool changed = DiscoverWorkspaceWindows(
-        monitor, currentDesktop, snapshot, discoverNew, &key, &globallyChanged);
+        monitor, currentDesktop, snapshot, &key, &globallyChanged);
     bool pendingArrange = std::any_of(
         g_pendingDesktopArranges.begin(), g_pendingDesktopArranges.end(),
         [&](const PendingWorkspaceArrange& pending) {
@@ -3727,25 +3837,12 @@ static void ReconcileDeferredLifecycle() {
     }
   }
 
-  // A model mutation can target an inactive VD (for example, moving a window
-  // away from that desktop without switching to it). ArrangeWorkspace deliberately
-  // refuses to drive inactive desktops, so don't discard that required reflow.
-  // Persist it and consume it the next time this desktop becomes current.
-  GUID zeroGuid{};
   for (const auto& key : globallyChanged) {
-    if (std::any_of(arrangedKeys.begin(), arrangedKeys.end(),
-                    [&](const DesktopMonitorKey& arranged) {
-                      return SameWorkspaceKey(arranged, key);
-                    })) {
-      continue;
-    }
-
-    if (IsEqualGUID(key.desktopId, zeroGuid) ||
-        IsEqualGUID(key.desktopId, currentDesktop)) {
+    if (std::none_of(arrangedKeys.begin(), arrangedKeys.end(),
+                     [&](const DesktopMonitorKey& arranged) {
+                       return SameWorkspaceKey(arranged, key);
+                     })) {
       ArrangeWorkspace(key);
-      AddUniqueWorkspaceKey(arrangedKeys, key);
-    } else {
-      AddPendingWorkspaceArrange(key.desktopId, key.monitor);
     }
   }
 
@@ -3766,6 +3863,9 @@ static void ReconcileManagedWindowStateNow(HWND hwnd) {
   for (const auto& key : changedKeys) ArrangeWorkspace(key);
 }
 
+// Converts queued lifecycle events into model actions: destruction is authoritative,
+// state changes get immediate and settled reconciliation, while visibility and
+// cloak events remain dirty signals until shell state stabilizes.
 static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
   switch (event) {
     case EVENT_OBJECT_DESTROY:
@@ -3795,6 +3895,8 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
   }
 }
 
+// Advances the current workspace layout and invalidates layout-specific hints in
+// suspended slots before persisting, arranging, and updating UI feedback.
 static void CycleCurrentWorkspaceLayout() {
   HMONITOR monitor = GetTargetMonitor();
   if (!monitor) return;
@@ -3823,6 +3925,10 @@ static void CycleCurrentWorkspaceLayout() {
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.layout));
 }
 
+// "RetileFromResize"
+// Consumes a completed move/size gesture and updates the workspace model: moves
+// float or swap by policy, while supported divider resizes transfer adjacent
+// weights. The authoritative layout is reapplied after committing the result.
 void ApplyUserMoveSize(HWND hwnd) {
   if (!g_enableTiling || !IsWindow(hwnd)) return;
 
@@ -3839,8 +3945,7 @@ void ApplyUserMoveSize(HWND hwnd) {
   }
 
   HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
-  RECT monitorWork{};
-  if (!monitor || !GetMonitorWorkArea(monitor, &monitorWork)) return;
+  if (!monitor) return;
 
   GUID desktopId{};
   if (!GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
@@ -3853,9 +3958,8 @@ void ApplyUserMoveSize(HWND hwnd) {
   }
   if (state.layout == TileLayout::Floating) return;
 
-  RECT workArea = {monitorWork.left + g_tileMargin, monitorWork.top + g_tileMargin,
-                   monitorWork.right - g_tileMargin, monitorWork.bottom - g_tileMargin};
-  if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) return;
+  RECT workArea{};
+  if (!GetWorkspaceWorkArea(monitor, &workArea)) return;
 
   HWND resizedHwnd = hwnd;
   if (!ContainsWindow(state.windows, resizedHwnd)) {
@@ -4133,6 +4237,9 @@ static void QueueWindowEvent(DWORD event, HWND hwnd) {
   }
 }
 
+// Treats out-of-context WinEvents as edge-triggered observations: filter noise,
+// cache move/resize boundaries, and post accepted work to the hotkey thread.
+// Workspace state is never mutated from this callback.
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
   switch (event) {
     case EVENT_SYSTEM_FOREGROUND:
@@ -4174,8 +4281,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     return;
   }
 
-  // Keep shell/framework noise out of the WM queue. Untracked HWNDs matter only
-  // when full-auto can discover them, and only once they resemble real windows.
+  // Keep shell/framework noise out of the WM queue. Untracked HWNDs still flow
+  // through the normal discovery pipeline in both modes, but only after they
+  // resemble real windows; Manual mode blocks admission at the model boundary.
   if (!tracked) {
     const bool discoveryEvent =
         event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED ||
@@ -4183,8 +4291,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     const bool restoredCandidate =
         event != EVENT_OBJECT_STATECHANGE ||
         (IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsZoomed(hwnd));
-    if (!discoveryEvent || !restoredCandidate || !g_enableTileNewWin ||
-        g_tileNewWinSuspended || !CouldBeTileEligible(hwnd)) {
+    if (!discoveryEvent || !restoredCandidate || !WindowCanBeManaged(hwnd)) {
       return;
     }
   }
@@ -4757,8 +4864,14 @@ void LoadSettings() {
 
   g_tilingModifiers = ReadModifierSetting(L"TilingModifier", MOD_ALT);
 
-  g_tileMargin = Wh_GetIntSetting(L"TileMargin");
-  if (g_tileMargin < 0 || g_tileMargin > 100) g_tileMargin = 4;
+  auto readInset = [](PCWSTR name) -> LONG {
+    int value = Wh_GetIntSetting(name);
+    return (value >= 0 && value <= 500) ? static_cast<LONG>(value) : 4;
+  };
+  g_workspaceInsetLeft = readInset(L"WorkspaceInsetLeft");
+  g_workspaceInsetTop = readInset(L"WorkspaceInsetTop");
+  g_workspaceInsetRight = readInset(L"WorkspaceInsetRight");
+  g_workspaceInsetBottom = readInset(L"WorkspaceInsetBottom");
   g_tileGap = Wh_GetIntSetting(L"TileGap");
   if (g_tileGap < 0 || g_tileGap > 100) g_tileGap = 4;
   g_masterPercent = Wh_GetIntSetting(L"MasterPercent");
@@ -4775,8 +4888,11 @@ void LoadSettings() {
   Wh_FreeStringSetting(mouseBehavior);
 
   g_enableTiling = Wh_GetIntSetting(L"EnableTiling") != 0;
-  g_enableTileNewWin = Wh_GetIntSetting(L"EnableTileNewWin") != 0;
-  g_tileNewWinSuspended = false;
+
+  PCWSTR managementMode = Wh_GetStringSetting(L"DefaultWindowManagementMode");
+  g_autoDiscoverySuspended =
+      !managementMode || _wcsicmp(managementMode, L"automatic") != 0;
+  Wh_FreeStringSetting(managementMode);
 
   int reconcileDelay = Wh_GetIntSetting(L"ReconcileDelayMs");
   if (reconcileDelay < 20 || reconcileDelay > 2000) reconcileDelay = 80;
@@ -4805,13 +4921,16 @@ void LoadSettings() {
   g_tileKey = ReadHotkeySetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
   g_layoutKey = ReadHotkeySetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
   g_swapMasterKey = ReadHotkeySetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
-  g_tileNewWinToggleKey = ReadHotkeySetting(L"TileNewWinToggleKey", ParseSingleCharKey, (UINT)'U');
+  g_managementModeToggleKey = ReadHotkeySetting(L"ManagementModeToggleKey", ParseSingleCharKey, (UINT)'U');
   g_floatFocusedKey = ReadHotkeySetting(L"FloatFocusedKey", ParseSingleCharKey, (UINT)'F');
   g_diagnosticDumpKey = ReadHotkeySetting(L"DiagnosticDumpKey", ParseSingleCharKey, (UINT)'I');
 
   TrayUi::LoadSettings();
 }
 
+// Owns the STA message loop for virtual-desktop callbacks, lifecycle timers,
+// hotkeys, tray UI, and all serialized workspace mutations. Every thread-owned
+// resource is released on this thread before the loop exits.
 DWORD WINAPI HotkeyThreadProc(LPVOID) {
   g_threadId = GetCurrentThreadId();
   Wh_Log(L"Hotkey thread started, thread ID: %lu", g_threadId);
@@ -4840,7 +4959,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   if (g_enableTiling) {
     if (g_tileKey) RegisterHotKey(nullptr, HK_TILE, g_tilingModifiers, g_tileKey);
     if (g_swapMasterKey) RegisterHotKey(nullptr, HK_SWAP_MASTER, g_tilingModifiers, g_swapMasterKey);
-    if (g_tileNewWinToggleKey) RegisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE, g_tilingModifiers, g_tileNewWinToggleKey);
+    if (g_managementModeToggleKey) RegisterHotKey(nullptr, HK_MANAGEMENT_MODE_TOGGLE, g_tilingModifiers, g_managementModeToggleKey);
     if (g_floatFocusedKey) RegisterHotKey(nullptr, HK_FLOAT_FOCUSED, g_tilingModifiers, g_floatFocusedKey);
     if (g_layoutKey) RegisterHotKey(nullptr, HK_LAYOUT, g_tilingModifiers, g_layoutKey);
   }
@@ -4857,11 +4976,12 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
         TilingState existingState;
         if (GetCurrentWorkspaceKey(monitor, &key) && LoadTilingState(key, &existingState)) {
           ArrangeWorkspace(key);
-        } else if (g_enableTileNewWin) {
-          EnsureWorkspaceFromSnapshot(monitor, false);
+        } else {
+          DiscoverCurrentWorkspaceOnMonitor(monitor);
         }
       }
-      if (g_enableTileNewWin) Wh_Log(L"TileNewWin enabled: reconciled current workspace on startup");
+      Wh_Log(L"Window management mode at startup: %s",
+             g_autoDiscoverySuspended ? L"Manual" : L"Automatic");
   }
 
   if (g_enableTiling) {
@@ -4954,19 +5074,23 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
                 continue;
               }
 
-              case HK_TILENEWWIN_TOGGLE: {
-                if (g_enableTileNewWin) {
-                  g_tileNewWinSuspended = !g_tileNewWinSuspended;
-                  Wh_Log(L"TileNewWin %s", g_tileNewWinSuspended ? L"suspended" : L"resumed");
-                  
-                  // Reconcile anything that appeared while auto-management was paused.
-                  if (!g_tileNewWinSuspended) {
-                    HMONITOR monitor = GetTargetMonitor();
-                    if (monitor) EnsureWorkspaceFromSnapshot(monitor, false);
+              case HK_MANAGEMENT_MODE_TOGGLE: {
+                g_autoDiscoverySuspended = !g_autoDiscoverySuspended;
+                const bool automatic = !g_autoDiscoverySuspended;
+                Wh_Log(L"Window management mode: %s",
+                       automatic ? L"Automatic" : L"Manual");
+                TrayUi::ShowManagementModeFlyout(automatic);
+
+                // Automatic mode adopts eligible windows that appeared while
+                // discovery was suspended. Existing Floating records remain excluded.
+                if (automatic) {
+                  std::vector<HMONITOR> monitors;
+                  EnumerateCurrentMonitors(monitors);
+                  for (HMONITOR monitor : monitors) {
+                    DiscoverCurrentWorkspaceOnMonitor(monitor);
                   }
-                  continue;
-                };
-                Wh_Log(L"TileNewWin is disabled from settings. ");
+                  ScheduleLifecycleReconcile(nullptr);
+                }
                 continue;
               }
 
@@ -4998,7 +5122,7 @@ cleanup:
   if (g_enableTiling) {
     UnregisterHotKey(nullptr, HK_TILE);
     UnregisterHotKey(nullptr, HK_SWAP_MASTER);
-    UnregisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE);
+    UnregisterHotKey(nullptr, HK_MANAGEMENT_MODE_TOGGLE);
     UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
     UnregisterHotKey(nullptr, HK_LAYOUT);
   }
@@ -5097,11 +5221,16 @@ void WhTool_ModSettingsChanged() {
 bool g_isToolModProcessLauncher;
 HANDLE g_toolModProcessMutex;
 
+// Ends only the dedicated worker's bootstrap thread at its normal entry point;
+// the already-started hotkey thread keeps the tool process alive.
 void WINAPI EntryPoint_Hook() {
   Wh_Log(L">");
   ExitThread(0);
 }
 
+// Routes each windhawk.exe instance into its tool-mod role. Normal instances act
+// as launchers; only the worker tagged with this mod ID enforces singleton
+// ownership and initializes the tiling service.
 BOOL Wh_ModInit() {
   DWORD sessionId;
   if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
@@ -5180,6 +5309,8 @@ BOOL Wh_ModInit() {
   return TRUE;
 }
 
+// Launcher-side phase: starts a copy of windhawk.exe tagged as this mod's
+// dedicated tool process, then releases the returned process and thread handles.
 void Wh_ModAfterInit() {
   if (!g_isToolModProcessLauncher) {
     return;
