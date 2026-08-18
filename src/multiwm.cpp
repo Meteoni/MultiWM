@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.7.13
+// @version         1.7.14
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -1523,10 +1523,8 @@ bool IsWindowCloaked(HWND hwnd) {
 static bool IsWindowTrackedInAnyState(HWND hwnd) {
   if (!hwnd) return false;
 
-  // normalize to root owner so events from owned windows still match
-  HWND root = GetAncestor(hwnd, GA_ROOTOWNER);
-  if (root) hwnd = root;
-
+  // WindowRecord identity is exact. Child/owned HWND lifecycle events must not
+  // inherit the managed state of their top-level/root-owner window.
   bool tracked = false;
 
   AcquireSRWLockShared(&g_tilingStateLock);
@@ -3662,10 +3660,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
 
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
-  if (tracked && IsWindow(hwnd)) {
-    HWND rootOwner = GetAncestor(hwnd, GA_ROOTOWNER);
-    if (rootOwner && rootOwner != hwnd && IsWindowTrackedInAnyState(rootOwner)) hwnd = rootOwner;
-  }
 
   // Keep shell/framework noise out of the WM queue. Untracked HWNDs matter only
   // when full-auto can discover them, and only once they resemble real windows.
