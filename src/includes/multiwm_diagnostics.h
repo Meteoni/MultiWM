@@ -488,8 +488,20 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
   }
 
   report.Line(
-      L"      capabilities: move=%d resize=%d topmost=%d",
-      record.canMove ? 1 : 0, record.canResize ? 1 : 0, record.topmost ? 1 : 0);
+      L"      capabilities: move=%d resize=%d topmost=%d generation=%llu",
+      record.canMove ? 1 : 0, record.canResize ? 1 : 0, record.topmost ? 1 : 0,
+      static_cast<unsigned long long>(record.tilingGeneration));
+  const std::wstring constraintMaxWidth = record.constraints.maxWidthBounded
+      ? std::to_wstring(record.constraints.maxWidth) : L"unbounded";
+  const std::wstring constraintMaxHeight = record.constraints.maxHeightBounded
+      ? std::to_wstring(record.constraints.maxHeight) : L"unbounded";
+  report.Line(
+      L"      constraints: valid=%d dpi=%u min=%ldx%ld max=%ls x %ls timeout=%d error=%lu",
+      record.constraints.valid ? 1 : 0, record.constraints.dpi,
+      record.constraints.minWidth, record.constraints.minHeight,
+      constraintMaxWidth.c_str(), constraintMaxHeight.c_str(),
+      record.constraints.lastProbeTimedOut ? 1 : 0,
+      record.constraints.lastProbeError);
   report.Line(
       L"      placement: result=%ls failures=%d",
       DiagnosticPlacementResultName(record.lastPlacementResult), record.placementFailures);
@@ -636,6 +648,12 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Placement refused", c.placementRefused, previous.placementRefused, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement dead HWND", c.placementDead, previous.placementDead, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Floating geometry repairs", c.floatingGeometryRepairs, previous.floatingGeometryRepairs, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Constraint probes", c.constraintProbeAttempts, previous.constraintProbeAttempts, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"  constraint probe successes", c.constraintProbeSuccesses, previous.constraintProbeSuccesses, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"  constraint probe timeouts", c.constraintProbeTimeouts, previous.constraintProbeTimeouts, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"  constraint probe failures", c.constraintProbeFailures, previous.constraintProbeFailures, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Constraint-unsatisfiable plans", c.constraintUnsatisfiablePlans, previous.constraintUnsatisfiablePlans, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Constraint-triggered floats", c.constraintFloats, previous.constraintFloats, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance leases started", c.conformanceLeasesStarted, previous.conformanceLeasesStarted, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance lease reinforcement attempts", c.conformanceLeaseRepairs, previous.conformanceLeaseRepairs, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance lease exhausted", c.conformanceLeaseExhausted, previous.conformanceLeaseExhausted, uptimeMs, intervalMs);
@@ -1292,6 +1310,9 @@ static void WriteDiagnosticReport() {
   const uint64_t placementPathSum =
       counters.placementNoOps + counters.placementPreflightStops +
       counters.setWindowPosCalls;
+  const uint64_t constraintProbeResultSum =
+      counters.constraintProbeSuccesses + counters.constraintProbeTimeouts +
+      counters.constraintProbeFailures;
   const uint64_t vdInitResultSum =
       counters.vdApiInitSuccesses + counters.vdApiInitFailures;
   const uint64_t vdNotificationResultSum =
@@ -1309,6 +1330,8 @@ static void WriteDiagnosticReport() {
       placementResultSum == counters.placementChecks;
   const bool placementPathsOk =
       placementPathSum == counters.placementChecks;
+  const bool constraintProbeAccountingOk =
+      constraintProbeResultSum == counters.constraintProbeAttempts;
   const bool vdInitAccountingOk =
       vdInitResultSum == counters.vdApiInitAttempts;
   const bool vdNotificationAccountingOk =
@@ -1335,6 +1358,11 @@ static void WriteDiagnosticReport() {
       placementPathsOk ? L"PASS" : L"FAIL",
       static_cast<unsigned long long>(placementPathSum),
       static_cast<unsigned long long>(counters.placementChecks));
+  report.Line(
+      L"  constraint probe results == attempts: %ls (%llu == %llu)",
+      constraintProbeAccountingOk ? L"PASS" : L"FAIL",
+      static_cast<unsigned long long>(constraintProbeResultSum),
+      static_cast<unsigned long long>(counters.constraintProbeAttempts));
   report.Line(
       L"  VD init successes + failures == attempts: %ls (%llu == %llu)",
       vdInitAccountingOk ? L"PASS" : L"FAIL",
@@ -1384,8 +1412,8 @@ static void WriteDiagnosticReport() {
       currentDesktopHealthy;
   const bool telemetryHealthy =
       lifecycleAccountingOk && placementResultsOk && placementPathsOk &&
-      vdInitAccountingOk && vdNotificationAccountingOk &&
-      reportAccountingOk && gestureAccountingOk;
+      constraintProbeAccountingOk && vdInitAccountingOk &&
+      vdNotificationAccountingOk && reportAccountingOk && gestureAccountingOk;
   const bool overallHealthy =
       structuralHealthy && runtimeWindowHealthy && telemetryHealthy;
 

@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.0
+// @version         1.14.0
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -41,6 +41,7 @@ resize-adjusted ratios per virtual desktop.
 - New-workspace initialization discovers visible minimized/maximized windows as suspended logical members instead of losing them
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
+- Constraint-aware layout measurement respects reported minimum/meaningful maximum tracking sizes; unsatisfiable layouts float the newest tiled window and retry
 
 ## Default Hotkeys
 - Tile windows: Alt + D
@@ -55,6 +56,7 @@ resize-adjusted ratios per virtual desktop.
 - Floating exists both as a workspace mode and as a per-window managed state; remembered floating geometry is restored on migration, explicit floating, and workspace layout transitions into Floating.
 - Private virtual-desktop manager and notification ABIs are selected automatically from the actual Explorer build/revision; unknown manager generations are rejected instead of guessed.
 - If Virtual Desktop APIs are unavailable, tiling still works but per-desktop memory is disabled.
+- A window floated because its size constraints cannot fit becomes an ordinary managed Floating window; it is not automatically re-tiled later.
 */
 // ==/WindhawkModReadme==
 

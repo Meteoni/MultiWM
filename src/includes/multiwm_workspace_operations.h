@@ -202,6 +202,9 @@ bool Workspace::AdmitInitial(
   AssertWmThread(L"Workspace::AdmitInitial");
   const HWND hwnd = record.hwnd;
   if (!hwnd || HasRecord(hwnd) || reason == SuspensionReason::Hidden) return false;
+  if (!record.tilingGeneration) {
+    record.tilingGeneration = Model::NextTilingGeneration();
+  }
 
   record.state = reason == SuspensionReason::None
                      ? ManageState::Tiled
@@ -243,6 +246,9 @@ bool Workspace::Restore(HWND hwnd) {
   }
 
   const SuspendedSlot slot = record->savedSlot;
+  if (!record->tilingGeneration) {
+    record->tilingGeneration = Model::NextTilingGeneration();
+  }
   const size_t index = std::min(
       LogicalIndexToActiveIndex(slot.index, hwnd), windows_.size());
   windows_.insert(windows_.begin() + index, hwnd);
@@ -370,6 +376,14 @@ void Workspace::AdmitMigrated(WindowRecord record) {
   AssertWmThread(L"Workspace::AdmitMigrated");
   const HWND hwnd = record.hwnd;
   if (!hwnd) return;
+  // Migration is a fresh admission to this workspace. Match FancyWM's node
+  // generation policy: if this member participates in tiled ordering here, it is
+  // newer than the destination's existing members. Floating records get a fresh
+  // generation only if/when they are explicitly tiled again.
+  if (record.state == ManageState::Tiled ||
+      record.state == ManageState::Suspended) {
+    record.tilingGeneration = Model::NextTilingGeneration();
+  }
   Forget(hwnd);
 
   if (record.state == ManageState::Tiled) {
@@ -483,6 +497,9 @@ void Workspace::RepairForArrangement(
 
   for (WindowRecord record : missingActiveRecords) {
     if (!record.hwnd || !ContainsWindow(windows_, record.hwnd)) continue;
+    if (!record.tilingGeneration) {
+      record.tilingGeneration = Model::NextTilingGeneration();
+    }
     record.state = ManageState::Tiled;
     record.suspensionReason = SuspensionReason::None;
     record.savedSlot = {};
@@ -574,11 +591,19 @@ bool Workspace::LearnMasterStackResize(
   AssertWmThread(L"Workspace::LearnMasterStackResize");
   EnsureWeights();
   const bool horizontal = layout_ == TileLayout::MasterStackH;
+  std::vector<Model::WindowConstraints> constraints;
+  constraints.reserve(windows_.size());
+  for (HWND hwnd : windows_) {
+    const WindowRecord* record = Find(hwnd);
+    constraints.push_back(record ? record->constraints : Model::WindowConstraints{});
+  }
   std::vector<RECT> expectedRects;
-  Layout::LayoutMasterStackWeighted(
-      workArea, gap, windows_.size(), expectedRects, horizontal,
-      ClampDouble(masterRatio_, 0.1, 0.9), stackWeights_);
-  if (expectedRects.size() != windows_.size()) return false;
+  if (!Layout::LayoutMasterStackConstrained(
+          workArea, gap, horizontal, ClampDouble(masterRatio_, 0.1, 0.9),
+          stackWeights_, constraints, &expectedRects) ||
+      expectedRects.size() != windows_.size()) {
+    return false;
+  }
 
   bool changed = false;
 
@@ -643,10 +668,18 @@ bool Workspace::LearnGridResize(
   AssertWmThread(L"Workspace::LearnGridResize");
   EnsureWeights();
   const bool horizontal = layout_ == TileLayout::Rows;
+  std::vector<Model::WindowConstraints> constraints;
+  constraints.reserve(windows_.size());
+  for (HWND hwnd : windows_) {
+    const WindowRecord* record = Find(hwnd);
+    constraints.push_back(record ? record->constraints : Model::WindowConstraints{});
+  }
   std::vector<RECT> expectedRects;
-  Layout::LayoutGridWeighted(
-      workArea, gap, windows_.size(), expectedRects, horizontal, gridWeights_);
-  if (expectedRects.size() != windows_.size()) return false;
+  if (!Layout::LayoutGridConstrained(
+          workArea, gap, gridWeights_, constraints, horizontal, &expectedRects) ||
+      expectedRects.size() != windows_.size()) {
+    return false;
+  }
 
   bool changed = false;
   const LONG leadingDelta = horizontal
@@ -672,53 +705,64 @@ bool Workspace::LearnGridResize(
   return changed;
 }
 
-static bool BuildWorkspaceLayoutPlan(
+enum class LayoutPlanStatus {
+  Success,
+  NotApplicable,
+  Unsatisfiable,
+};
+
+static std::vector<Model::WindowConstraints> ActiveWindowConstraints(
+    const Workspace& workspace) {
+  std::vector<Model::WindowConstraints> constraints;
+  constraints.reserve(workspace.ActiveCount());
+  for (HWND hwnd : workspace.TiledWindows()) {
+    const WindowRecord* record = workspace.Find(hwnd);
+    constraints.push_back(record ? record->constraints : Model::WindowConstraints{});
+  }
+  return constraints;
+}
+
+static LayoutPlanStatus BuildWorkspaceLayoutPlan(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     std::vector<RECT>* outRects) {
-  if (!outRects) return false;
+  if (!outRects) return LayoutPlanStatus::Unsatisfiable;
+  const std::vector<Model::WindowConstraints> constraints =
+      ActiveWindowConstraints(workspace);
   outRects->assign(workspace.ActiveCount(), RECT{});
 
+  bool success = false;
   switch (workspace.Layout()) {
     case TileLayout::MasterStack:
-      Layout::LayoutMasterStackWeighted(
-          workArea, gap, workspace.ActiveCount(), *outRects, false,
-          ClampDouble(workspace.MasterRatio(), 0.1, 0.9),
-          workspace.StackWeights());
-      return true;
-
+      success = Layout::LayoutMasterStackConstrained(
+          workArea, gap, false, ClampDouble(workspace.MasterRatio(), 0.1, 0.9),
+          workspace.StackWeights(), constraints, outRects);
+      break;
     case TileLayout::MasterStackH:
-      Layout::LayoutMasterStackWeighted(
-          workArea, gap, workspace.ActiveCount(), *outRects, true,
-          ClampDouble(workspace.MasterRatio(), 0.1, 0.9),
-          workspace.StackWeights());
-      return true;
-
+      success = Layout::LayoutMasterStackConstrained(
+          workArea, gap, true, ClampDouble(workspace.MasterRatio(), 0.1, 0.9),
+          workspace.StackWeights(), constraints, outRects);
+      break;
     case TileLayout::Columns:
-      Layout::LayoutGridWeighted(
-          workArea, gap, workspace.ActiveCount(), *outRects, false,
-          workspace.GridWeights());
-      return true;
-
+      success = Layout::LayoutGridConstrained(
+          workArea, gap, workspace.GridWeights(), constraints, false, outRects);
+      break;
     case TileLayout::Rows:
-      Layout::LayoutGridWeighted(
-          workArea, gap, workspace.ActiveCount(), *outRects, true,
-          workspace.GridWeights());
-      return true;
-
+      success = Layout::LayoutGridConstrained(
+          workArea, gap, workspace.GridWeights(), constraints, true, outRects);
+      break;
     case TileLayout::BSP:
-      Layout::LayoutBSP(workArea, gap, 0, workspace.ActiveCount(), 0, *outRects);
-      return true;
-
+      success = Layout::LayoutBSPConstrained(workArea, gap, constraints, outRects);
+      break;
     case TileLayout::Monocle:
-      outRects->assign(workspace.ActiveCount(), workArea);
-      return true;
-
+      success = Layout::LayoutMonocleConstrained(workArea, constraints, outRects);
+      break;
     case TileLayout::Floating:
     case TileLayout::COUNT:
       outRects->clear();
-      return false;
+      return LayoutPlanStatus::NotApplicable;
   }
-  return false;
+  return success ? LayoutPlanStatus::Success
+                 : LayoutPlanStatus::Unsatisfiable;
 }
 
 Workspace::PlacementAction Workspace::ApplyPlacementObservation(
@@ -752,10 +796,23 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
   return PlacementAction::None;
 }
 
+static void RefreshWorkspaceConstraints(Workspace& workspace) {
+  for (HWND hwnd : workspace.TiledWindows()) {
+    const WindowRecord* record = workspace.Find(hwnd);
+    if (!record || !IsWindow(hwnd)) continue;
+    WindowConstraints observed = MergeConstraintProbeWithCache(
+        record->constraints, ProbeWindowConstraints(hwnd, record->canResize));
+    workspace.UpdateConstraints(hwnd, observed);
+  }
+}
+
 // Renders one workspace from authoritative model state. Arrangement itself is a
-// small pipeline: repair local invariants -> compute targets -> apply placement ->
-// fold placement outcomes back into the model. Reflow is iterative rather than
-// recursive; each continuing pass removes at least one active tile.
+// small pipeline: repair local invariants -> measure constraints -> compute targets
+// -> apply placement -> fold placement outcomes back into the model. Reflow is
+// iterative rather than recursive; each continuing pass removes at least one active
+// tile. Constraint failure uses FancyWM's stable policy: float the newest tiled
+// admission and retry, leaving that window ordinarily Floating until explicitly
+// tiled again.
 static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   ++Diagnostics::g_runtime.counters.arrangeCalls;
   if (!IsWorkspaceOnActiveDesktop(key)) return;
@@ -767,8 +824,12 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   if (!GetWorkspaceWorkArea(key.monitor, &workArea)) return;
 
   ObserveAndRepairWorkspaceForArrangement(workspace);
+  RefreshWorkspaceConstraints(workspace);
   const LONG gap = GetWorkspaceGapPixels(key.monitor);
-  const size_t maxPasses = workspace.ActiveCount() + 1;
+  // Constraint discovery can legitimately trigger a re-plan without removing a
+  // window, while each unsatisfiable pass removes one tile. Keep a generous but
+  // finite safety bound against pathological clients whose constraints oscillate.
+  const size_t maxPasses = workspace.ActiveCount() * 3 + 4;
   for (size_t pass = 0; pass < maxPasses; ++pass) {
     ++Diagnostics::g_runtime.counters.arrangePasses;
     if (workspace.Layout() == TileLayout::Floating || workspace.Empty()) {
@@ -781,13 +842,50 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
 
     std::vector<RECT> rects;
     ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
-    if (!BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects)) {
+    const LayoutPlanStatus planStatus =
+        BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects);
+    if (planStatus == LayoutPlanStatus::NotApplicable) {
       g_workspaces.Save(key, workspace);
       return;
+    }
+    if (planStatus == LayoutPlanStatus::Unsatisfiable) {
+      ++Diagnostics::g_runtime.counters.constraintUnsatisfiablePlans;
+      const HWND victim = workspace.NewestTiledWindow();
+      const WindowRecord* victimRecord = victim ? workspace.Find(victim) : nullptr;
+      if (!victim || !victimRecord) {
+        g_workspaces.Save(key, workspace);
+        return;
+      }
+
+      const uint64_t generation = victimRecord->tilingGeneration;
+      const Model::WindowConstraints constraints = victimRecord->constraints;
+      Wh_Log(
+          L"Constraint layout unsatisfiable; floating newest tiled HWND %p (generation=%llu min=%ldx%ld max=%ldx%ld)",
+          victim, static_cast<unsigned long long>(generation),
+          constraints.minWidth, constraints.minHeight,
+          constraints.maxWidthBounded ? constraints.maxWidth : -1L,
+          constraints.maxHeightBounded ? constraints.maxHeight : -1L);
+      Diagnostics::RecordEvent(
+          L"constraints floated hwnd=%p generation=%llu min=%ldx%ld max=%ldx%ld",
+          victim, static_cast<unsigned long long>(generation),
+          constraints.minWidth, constraints.minHeight,
+          constraints.maxWidthBounded ? constraints.maxWidth : -1L,
+          constraints.maxHeightBounded ? constraints.maxHeight : -1L);
+      CancelConformanceLease(victim);
+      if (!workspace.Float(victim)) {
+        g_workspaces.Save(key, workspace);
+        return;
+      }
+      ++Diagnostics::g_runtime.counters.constraintFloats;
+      RepairFloatingGeometry(key, workspace, victim, FloatingPlacementHint{});
+      g_workspaces.Save(key, workspace);
+      if (workspace.Empty()) return;
+      continue;
     }
 
     std::vector<HWND> toFloat;
     std::vector<HWND> toForget;
+    bool constraintReplanRequested = false;
     const std::vector<HWND> active = workspace.TiledWindows();
     const size_t count = std::min(active.size(), rects.size());
     for (size_t i = 0; i < count; ++i) {
@@ -805,7 +903,25 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
           PlacementObservation observation =
               PlaceWindowChecked(hwnd, record->canMove, rects[i]);
           action = workspace.ApplyPlacementObservation(hwnd, observation);
-          if (observation.result == PlacementResult::Success &&
+
+          // If the window adjusted our requested rectangle, re-query constraints
+          // before treating it as a generic placement failure. Some frameworks
+          // publish their real minimum only after startup/content initialization.
+          if (observation.result == PlacementResult::AdjustedByWindow) {
+            WindowConstraints observed = MergeConstraintProbeWithCache(
+                record->constraints,
+                ProbeWindowConstraints(hwnd, record->canResize));
+            if (!SameConstraintGeometry(record->constraints, observed)) {
+              workspace.UpdateConstraints(hwnd, observed);
+              workspace.ResetPlacementFailures(hwnd);
+              action = Workspace::PlacementAction::None;
+              constraintReplanRequested = true;
+              CancelConformanceLease(hwnd);
+            }
+          }
+
+          if (!constraintReplanRequested &&
+              observation.result == PlacementResult::Success &&
               observation.placementIssued &&
               action == Workspace::PlacementAction::None) {
             BeginConformanceLease(hwnd, rects[i]);
@@ -826,6 +942,12 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
           toForget.push_back(hwnd);
           break;
       }
+      if (constraintReplanRequested) break;
+    }
+
+    if (constraintReplanRequested) {
+      g_workspaces.Save(key, workspace);
+      continue;
     }
 
     bool participationChanged = false;
@@ -891,6 +1013,20 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
   }
   if (RectsNear(current, lease.expectedRect)) {
     return true;  // Our own placement/event echo; nothing to repair.
+  }
+
+  WindowConstraints observed = MergeConstraintProbeWithCache(
+      record->constraints, ProbeWindowConstraints(hwnd, record->canResize));
+  if (!SameConstraintGeometry(record->constraints, observed)) {
+    workspace.UpdateConstraints(hwnd, observed);
+    workspace.ResetPlacementFailures(hwnd);
+    CancelConformanceLease(hwnd);
+    g_workspaces.Save(owners.front(), workspace);
+    Diagnostics::RecordEvent(
+        L"conformance deviation exposed new constraints hwnd=%p min=%ldx%ld",
+        hwnd, observed.minWidth, observed.minHeight);
+    ArrangeWorkspace(owners.front());
+    return true;
   }
 
   if (lease.repairs >= kConformanceLeaseMaxRepairs) {

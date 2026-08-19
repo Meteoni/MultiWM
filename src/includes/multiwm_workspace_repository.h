@@ -155,6 +155,31 @@ static bool RepairFloatingGeometry(
   if (!record->canResize && haveCurrent) {
     width = current.right - current.left;
     height = current.bottom - current.top;
+  } else {
+    // Floating is still subject to the same observed tracking bounds. Constraint
+    // values are physical pixels at their capture DPI, so scale cached values if
+    // the window is being restored onto a monitor with different scaling.
+    const UINT constraintDpi = record->constraints.dpi ? record->constraints.dpi : 96;
+    const LONG minWidth = std::max<LONG>(
+        1, MulDiv(record->constraints.minWidth, static_cast<int>(targetDpi),
+                  static_cast<int>(constraintDpi)));
+    const LONG minHeight = std::max<LONG>(
+        1, MulDiv(record->constraints.minHeight, static_cast<int>(targetDpi),
+                  static_cast<int>(constraintDpi)));
+    width = std::max<LONG>(width, minWidth);
+    height = std::max<LONG>(height, minHeight);
+    if (record->constraints.maxWidthBounded) {
+      const LONG maxWidth = std::max<LONG>(
+          minWidth, MulDiv(record->constraints.maxWidth, static_cast<int>(targetDpi),
+                           static_cast<int>(constraintDpi)));
+      width = std::min<LONG>(width, maxWidth);
+    }
+    if (record->constraints.maxHeightBounded) {
+      const LONG maxHeight = std::max<LONG>(
+          minHeight, MulDiv(record->constraints.maxHeight, static_cast<int>(targetDpi),
+                            static_cast<int>(constraintDpi)));
+      height = std::min<LONG>(height, maxHeight);
+    }
   }
 
   POINT center{};
