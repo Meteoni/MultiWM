@@ -507,7 +507,7 @@ WorkspaceRepository::OwnershipIndexSnapshot() const {
 
 void WorkspaceRepository::ClearAfterWmStopped() {
   // This operation is intentionally permitted only when no WM actor exists.
-  assert(!g_wm.thread || g_wm.threadId == 0);
+  assert(!g_wm.thread || g_wm.threadId.load(std::memory_order_acquire) == 0);
   AcquireSRWLockExclusive(&lock_);
   states_.clear();
   ownersByWindow_.clear();

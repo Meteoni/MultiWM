@@ -319,12 +319,11 @@ static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd) {
 
   // Virtual desktop filter: other desktops' windows may not yet be cloaked
   // at the moment we enumerate (race between uncloak/cloak during switch).
-  if (g_vd.desktopManager) {
-    BOOL onCurrent = FALSE;
-    if (SUCCEEDED(g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent)) &&
-        !onCurrent) {
-      return nullptr;
-    }
+  // Fail closed when the desktop predicate is temporarily unavailable; the
+  // centralized runtime-maintenance path will recover the COM service and retry.
+  BOOL onCurrent = FALSE;
+  if (!IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) {
+    return nullptr;
   }
 
   RECT frameRect{};
@@ -419,6 +418,7 @@ static PlacementObservation PlaceWindowChecked(
 
   SetLastError(ERROR_SUCCESS);
   ++Diagnostics::g_runtime.counters.setWindowPosCalls;
+  observation.placementIssued = true;
   BOOL placed = SetWindowPos(
       hwnd, nullptr,
       targetRect.left - offsetLeft,
@@ -452,6 +452,14 @@ static void ClearMoveSizeSamples(HWND hwnd) {
   g_moveSize.startRects.erase(hwnd);
   g_moveSize.endRects.erase(hwnd);
   g_moveSize.endPoints.erase(hwnd);
+  ReleaseSRWLockExclusive(&g_moveSize.lock);
+}
+
+static void ClearAllMoveSizeSamples() {
+  AcquireSRWLockExclusive(&g_moveSize.lock);
+  g_moveSize.startRects.clear();
+  g_moveSize.endRects.clear();
+  g_moveSize.endPoints.clear();
   ReleaseSRWLockExclusive(&g_moveSize.lock);
 }
 

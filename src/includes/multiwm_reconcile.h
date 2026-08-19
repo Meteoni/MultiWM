@@ -161,6 +161,7 @@ static std::vector<DesktopMonitorKey> FindWorkspaceKeysContainingWindow(HWND hwn
 }
 
 static void ForgetManagedWindow(HWND hwnd) {
+  CancelConformanceLease(hwnd);
   const std::vector<DesktopMonitorKey> keys = g_workspaces.OwnersOf(hwnd);
   for (const auto& key : keys) {
     Workspace workspace;
@@ -193,6 +194,7 @@ static void AddUniqueWorkspaceKey(
 static bool MigrateManagedWindow(
     HWND hwnd, const DesktopMonitorKey& sourceKey, const DesktopMonitorKey& targetKey) {
   if (!hwnd || SameWorkspaceKey(sourceKey, targetKey)) return false;
+  CancelConformanceLease(hwnd);
 
   Workspace source;
   if (!g_workspaces.Load(sourceKey, &source)) return false;
@@ -331,6 +333,7 @@ static bool GetObservedWorkspaceKey(
 static void ForgetWindowFromOwners(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
+  CancelConformanceLease(hwnd);
   for (const auto& ownerKey : ownerKeys) {
     Workspace workspace;
     if (!g_workspaces.Load(ownerKey, &workspace)) continue;
@@ -398,6 +401,7 @@ static void ReconcileWindowParticipation(
     bool restoredIntoFloatingLayout = false;
     if (record->state == ManageState::Tiled &&
         reason != SuspensionReason::None) {
+      CancelConformanceLease(hwnd);
       changed = workspace.Suspend(hwnd, reason);
     } else if (record->state == ManageState::Suspended) {
       if (reason == SuspensionReason::None) {
@@ -430,6 +434,31 @@ static void ReconcileKnownWindow(
 
   if (!IsWindow(hwnd) || IsWindowExcludedByRules(hwnd)) {
     ForgetWindowFromOwners(hwnd, ownerKeys, changedKeys);
+    return;
+  }
+
+  // HWND values are reusable. A destroy event can be missed during a brief hook/
+  // shell lifecycle gap and the numeric handle may later identify another process.
+  // Never let the old logical record silently attach itself to that new window.
+  DWORD livePid = 0;
+  GetWindowThreadProcessId(hwnd, &livePid);
+  bool pidMismatch = false;
+  for (const auto& ownerKey : ownerKeys) {
+    Workspace workspace;
+    if (!g_workspaces.Load(ownerKey, &workspace)) continue;
+    const WindowRecord* record = workspace.Find(hwnd);
+    if (record && record->pid != 0 && livePid != 0 && record->pid != livePid) {
+      pidMismatch = true;
+      break;
+    }
+  }
+  if (pidMismatch) {
+    Diagnostics::RecordEvent(
+        L"discarded stale HWND ownership after PID reuse hwnd=%p livePid=%lu",
+        hwnd, livePid);
+    ForgetWindowFromOwners(hwnd, ownerKeys, changedKeys);
+    ClearMoveSizeSamples(hwnd);
+    CancelConformanceLease(hwnd);
     return;
   }
 
@@ -612,6 +641,8 @@ static void HandleVirtualDesktopChanged() {
 
   Diagnostics::RecordEvent(
       L"virtual desktop changed currentDesktop=%08X", currentDesktop.Data1);
+  g_wm.reconciledDesktop = currentDesktop;
+  g_wm.reconciledDesktopValid = true;
 
   // A native VD transition is an authoritative reason to repair desktop ownership.
   // Do not infer monitor migration here; defer visibility/window-state participation
@@ -675,7 +706,11 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
 
   g_wm.lifecycleTimer = SetTimer(nullptr, 0, g_settings.reconcileDelayMs, nullptr);
   if (!g_wm.lifecycleTimer) {
-    Wh_Log(L"Failed to schedule lifecycle reconciliation");
+    Wh_Log(L"Failed to schedule lifecycle timer; queueing immediate reconciliation");
+    const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+    if (threadId) {
+      PostThreadMessage(threadId, WM_APP_RECONCILE_NOW, 0, 0);
+    }
   }
 }
 
@@ -691,57 +726,89 @@ static void ReconcileDeferredLifecycle() {
 
   std::vector<HWND> dirtyWindows;
   dirtyWindows.swap(g_wm.lifecycleDirtyWindows);
-  Diagnostics::g_runtime.counters.lifecycleDirtyWindowsProcessed += dirtyWindows.size();
   Diagnostics::RecordLifecycleBurst(
       dirtyWindows.size(), g_wm.pendingDesktopArranges.size());
 
-  // First repair liveness/exclusions and settled hidden/minimized/maximized participation
-  // globally. This also suspends every stale logical copy defensively if an old
-  // version already duplicated an HWND.
+  // Resolve desktop identity before mutating model state. If Explorer is still
+  // coming up (or restarting), preserve the dirty set and let the single runtime
+  // maintenance owner recover COM before this exact work is retried.
+  GUID currentDesktop{};
+  if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&currentDesktop)) {
+    for (HWND hwnd : dirtyWindows) {
+      if (hwnd && std::find(g_wm.lifecycleDirtyWindows.begin(),
+                            g_wm.lifecycleDirtyWindows.end(), hwnd) ==
+                      g_wm.lifecycleDirtyWindows.end()) {
+        g_wm.lifecycleDirtyWindows.push_back(hwnd);
+      }
+    }
+    g_wm.lifecycleRetryAfterPlatformRecovery = true;
+    RuntimeLifecycle::RequestMaintenance(false);
+    Wh_Log(L"Lifecycle reconcile deferred: current virtual desktop unavailable");
+    return;
+  }
+
+  Diagnostics::g_runtime.counters.lifecycleDirtyWindowsProcessed += dirtyWindows.size();
+
+  // Native notifications are primary, but a settled cloak/uncloak burst can
+  // independently detect a missed subscription/callback. Treat an observed GUID
+  // change as a real desktop transition: repair global desktop ownership and
+  // reinforce all known/current monitors on the incoming desktop.
+  const bool fallbackDesktopChange =
+      g_wm.reconciledDesktopValid &&
+      !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
+  if (fallbackDesktopChange) {
+    ++Diagnostics::g_runtime.counters.virtualDesktopFallbackChanges;
+    Diagnostics::RecordEvent(
+        L"virtual desktop change recovered from settled WinEvents currentDesktop=%08X",
+        currentDesktop.Data1);
+    // A missed native callback is also a high-confidence signal that an exhausted
+    // subscription retry burst deserves one fresh attempt sequence.
+    if (!g_vd.notificationsRegistered) RuntimeLifecycle::RequestMaintenance(true);
+  }
+  g_wm.reconciledDesktop = currentDesktop;
+  g_wm.reconciledDesktopValid = true;
+
+  // Repair liveness/exclusions and settled hidden/minimized/maximized participation
+  // globally before doing current-desktop discovery.
   std::vector<DesktopMonitorKey> globallyChanged;
   ReconcileKnownWindows(ReconcileScope::Participation, &globallyChanged);
+  if (fallbackDesktopChange) {
+    ReconcileKnownWindows(ReconcileScope::Desktop, &globallyChanged);
+  }
 
-  // WinMan/FancyWM treat visibility events as prompts to dirty-check physical
-  // state rather than as membership decisions. Do the same, scoped only to the
-  // tracked HWNDs implicated by this burst. A per-window VD move does not emit
-  // CurrentVirtualDesktopChanged, so this is the recovery path for that case.
+  // Dirty tracked HWNDs also get a desktop ownership check; per-window moves do
+  // not emit CurrentVirtualDesktopChanged.
   for (HWND hwnd : dirtyWindows) {
     if (!hwnd || !IsWindowTrackedInAnyState(hwnd)) continue;
     ReconcileKnownWindows(ReconcileScope::Desktop, &globallyChanged, hwnd);
   }
 
-  GUID currentDesktop{};
-  if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&currentDesktop)) {
-    Wh_Log(L"Lifecycle discovery skipped: current virtual desktop unavailable");
-    return;
-  }
-
-  // Discover only on the current desktop after global known-window repair.
   std::vector<HMONITOR> monitors = g_workspaces.MonitorsOnDesktop(currentDesktop);
+  if (fallbackDesktopChange || g_wm.forceMonitorReconcile) {
+    // Desktop transitions, display/work-area changes, and platform recovery are
+    // all authoritative reasons to softly reinforce existing current workspaces,
+    // even when logical membership itself did not change.
+    for (HMONITOR monitor : monitors) {
+      AddPendingWorkspaceArrange(currentDesktop, monitor);
+    }
+    EnumerateCurrentMonitors(monitors);
+  }
+  if (g_wm.forceMonitorReconcile) {
+    ReconcileKnownWindows(ReconcileScope::Monitor, &globallyChanged);
+    g_wm.forceMonitorReconcile = false;
+  }
 
   // Also include monitors implicated by the shell burst so automatic discovery
   // can seed a new desktop+monitor workspace.
   for (HWND hwnd : dirtyWindows) {
     if (!hwnd || !IsWindow(hwnd)) continue;
-
-    // GetWindowDesktopId can be briefly unavailable while a window is being
-    // reassigned. Prefer the public current-desktop predicate here; if even that
-    // is inconclusive, including the monitor is harmless because CollectTileWindows
-    // performs the authoritative eligibility/current-desktop filter afterward.
-    if (g_vd.desktopManager) {
-      BOOL onCurrent = FALSE;
-      if (SUCCEEDED(g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent)) &&
-          !onCurrent) {
-        continue;
-      }
-    }
+    BOOL onCurrent = FALSE;
+    if (!IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) continue;
     AddUniqueMonitor(monitors, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL));
   }
 
-  // One top-level enumeration is enough for every monitor involved in this
-  // settled burst. Per-monitor discovery below consumes the already-bucketed views.
-  std::vector<std::vector<HWND>> snapshots =
-      CollectTileWindowsForMonitors(monitors);
+  // One top-level enumeration is enough for every monitor involved in this burst.
+  std::vector<std::vector<HWND>> snapshots = CollectTileWindowsForMonitors(monitors);
 
   std::vector<DesktopMonitorKey> arrangedKeys;
   for (size_t monitorIndex = 0; monitorIndex < monitors.size(); ++monitorIndex) {
@@ -779,6 +846,7 @@ static void ReconcileDeferredLifecycle() {
           }),
       g_wm.pendingDesktopArranges.end());
 
+  g_wm.lifecycleRetryAfterPlatformRecovery = false;
   TrayUi::RefreshForCurrentWorkspace();
 }
 
@@ -840,9 +908,17 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
       }
       break;
 
+    case EVENT_OBJECT_LOCATIONCHANGE:
+      // A leased tiled window may have accepted our placement and moved itself
+      // later during startup/session restore. Consume that narrow case before the
+      // normal participation fallback used for maximize/restore transitions.
+      if (HandleConformanceLeaseLocationChange(hwnd)) break;
+      ReconcileManagedWindowStateNow(hwnd);
+      ScheduleLifecycleReconcile(hwnd);
+      break;
+
     case EVENT_SYSTEM_MINIMIZEEND:
     case EVENT_OBJECT_STATECHANGE:
-    case EVENT_OBJECT_LOCATIONCHANGE:
       // These are prompts to query actual physical state. In Automatic mode,
       // minimize/restore preserves membership; in both modes maximize/restore
       // preserves the saved logical slot. Run immediately and after settle.

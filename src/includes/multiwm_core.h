@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <winver.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cassert>
 #include <cstdarg>
@@ -117,10 +118,19 @@ struct VirtualDesktopAbiProfile {
 
 bool InitializeVirtualDesktopAPI();
 void CleanupVirtualDesktopAPI();
+void AbandonVirtualDesktopAPIForShellRestart();
 bool GetCurrentDesktopId(GUID* outGuid);
 bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid);
+bool IsWindowOnCurrentDesktopSafe(HWND hwnd, BOOL* onCurrent);
 bool RegisterVirtualDesktopNotifications();
 }  // namespace Platform::VirtualDesktop
+
+namespace RuntimeLifecycle {
+void RequestMaintenance(bool resetAttempts = false);
+void RunMaintenanceNow();
+void NotifyShellRestarted();
+void NotifyDisplayTopologyChanged();
+}  // namespace RuntimeLifecycle
 
 // Narrow platform surface used by the WM core. The private COM implementation
 // lives with the other Windows adapters near the end of the source.
@@ -128,7 +138,7 @@ using Platform::VirtualDesktop::CleanupVirtualDesktopAPI;
 using Platform::VirtualDesktop::GetCurrentDesktopId;
 using Platform::VirtualDesktop::GetWindowDesktopIdSafe;
 using Platform::VirtualDesktop::InitializeVirtualDesktopAPI;
-using Platform::VirtualDesktop::RegisterVirtualDesktopNotifications;
+using Platform::VirtualDesktop::IsWindowOnCurrentDesktopSafe;
 
 struct PendingWorkspaceArrange {
   GUID desktopId{};
@@ -155,6 +165,7 @@ constexpr UINT WM_APP_WINDOW_EVENT = WM_APP + 2;
 constexpr UINT WM_APP_VIRTUAL_DESKTOP_CHANGED = WM_APP + 3;
 constexpr UINT WM_APP_TRAY_REFRESH = WM_APP + 4;
 constexpr UINT WM_APP_LAYOUT_CYCLE = WM_APP + 5;
+constexpr UINT WM_APP_RECONCILE_NOW = WM_APP + 6;
 
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
 enum class MouseMoveBehavior { Float, Swap };
@@ -193,6 +204,7 @@ struct FloatingDefaultSize {
 // replace these fields; transient WM state lives in WmRuntime instead.
 struct SettingsState {
   UINT reconcileDelayMs = 80;
+  UINT conformanceLeaseMs = 1500;
 
   UINT tilingModifiers = MOD_ALT;
   UINT tileKey = 'D';
@@ -227,6 +239,10 @@ struct VirtualDesktopRuntime {
   Platform::VirtualDesktop::VirtualDesktopNotificationObject* notificationObject = nullptr;
   DWORD notificationCookie = 0;
   bool notificationsRegistered = false;
+  HRESULT notificationLastHr = S_OK;
+  DWORD shellPid = 0;
+  ULONGLONG notificationLastAttemptTickMs = 0;
+  ULONGLONG notificationLastSuccessTickMs = 0;
   DWORD explorerBuild = 0;
   DWORD explorerRevision = 0;
   Platform::VirtualDesktop::VirtualDesktopAbiProfile abi{};
@@ -239,13 +255,21 @@ struct VirtualDesktopRuntime {
 
 // Serialized actor/thread state. Management mode affects admission/retention
 // policy only; observation, reconciliation, resize learning, and arrangement
-// remain live in both modes.
+// remain live in both modes. Only threadId is observed outside the actor.
 struct WmRuntime {
   HANDLE thread = nullptr;
-  DWORD threadId = 0;
+  std::atomic<DWORD> threadId{0};
   HANDLE readyEvent = nullptr;
 
   UINT_PTR lifecycleTimer = 0;
+  UINT_PTR maintenanceTimer = 0;
+  UINT maintenanceAttempts = 0;
+  bool maintenanceRunning = false;
+  bool lifecycleRetryAfterPlatformRecovery = false;
+  bool forceMonitorReconcile = false;
+  bool comInitialized = false;
+  GUID reconciledDesktop{};
+  bool reconciledDesktopValid = false;
   std::vector<HWND> lifecycleDirtyWindows;
   std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
   ManagementMode managementMode = ManagementMode::Manual;
@@ -310,10 +334,24 @@ struct Counters {
   uint64_t floatingGeometryRepairs = 0;
 
   uint64_t virtualDesktopChangesProcessed = 0;
+  uint64_t virtualDesktopFallbackChanges = 0;
   uint64_t vdApiInitAttempts = 0;
   uint64_t vdApiInitSuccesses = 0;
   uint64_t vdApiInitFailures = 0;
   uint64_t vdApiReinitializations = 0;
+  uint64_t vdNotificationRegisterAttempts = 0;
+  uint64_t vdNotificationRegisterSuccesses = 0;
+  uint64_t vdNotificationRegisterFailures = 0;
+  uint64_t runtimeMaintenanceRuns = 0;
+  uint64_t runtimeMaintenanceRetries = 0;
+  uint64_t runtimeMaintenanceExhausted = 0;
+  uint64_t shellRestartSignals = 0;
+  uint64_t displayTopologySignals = 0;
+  uint64_t winEventHookInstallFailures = 0;
+
+  uint64_t conformanceLeasesStarted = 0;
+  uint64_t conformanceLeaseRepairs = 0;
+  uint64_t conformanceLeaseExhausted = 0;
 
   uint64_t tileCommands = 0;
   uint64_t layoutCycleCommands = 0;
@@ -417,14 +455,15 @@ static bool IsAutomaticMode() {
 struct MoveSizeGesture;
 
 static void AssertWmThread(const wchar_t* operation) {
-  if (!g_wm.threadId) return;
+  const DWORD expectedThread = g_wm.threadId.load(std::memory_order_acquire);
+  if (!expectedThread) return;
   const DWORD currentThread = GetCurrentThreadId();
-  if (currentThread == g_wm.threadId) return;
+  if (currentThread == expectedThread) return;
 
   Wh_Log(
       L"WM-thread affinity violation in %s: expected=%lu actual=%lu",
-      operation ? operation : L"<unknown>", g_wm.threadId, currentThread);
-  assert(currentThread == g_wm.threadId);
+      operation ? operation : L"<unknown>", expectedThread, currentThread);
+  assert(currentThread == expectedThread);
 }
 
 namespace Model {
@@ -530,6 +569,9 @@ struct PlacementObservation {
   PlacementResult result = PlacementResult::Success;
   RECT requested{};
   RECT observed{};
+  // True only when PlaceWindowChecked actually issued SetWindowPos. A successful
+  // no-op does not create/extend a conformance lease.
+  bool placementIssued = false;
 };
 
 struct WorkspaceGeometryItem {
@@ -694,4 +736,100 @@ struct WinEventHooks {
 static WorkspaceRepository g_workspaces;
 static MoveSizeTracker g_moveSize;
 static WinEventHooks g_hooks;
+
+struct ConformanceLease {
+  RECT expectedRect{};
+  ULONGLONG expiresAtTickMs = 0;
+  unsigned repairs = 0;
+};
+
+struct ConformanceLeaseTracker {
+  SRWLOCK lock = SRWLOCK_INIT;
+  std::unordered_map<HWND, ConformanceLease> leases;
+};
+
+static ConformanceLeaseTracker g_conformanceLeases;
+static constexpr unsigned kConformanceLeaseMaxRepairs = 4;
+
+static void CancelConformanceLease(HWND hwnd);
+
+static bool ReadActiveConformanceLease(HWND hwnd, ConformanceLease* outLease) {
+  if (!hwnd || !outLease) return false;
+  bool active = false;
+  bool expired = false;
+  const ULONGLONG now = GetTickCount64();
+  AcquireSRWLockShared(&g_conformanceLeases.lock);
+  auto it = g_conformanceLeases.leases.find(hwnd);
+  if (it != g_conformanceLeases.leases.end()) {
+    if (now < it->second.expiresAtTickMs) {
+      *outLease = it->second;
+      active = true;
+    } else {
+      expired = true;
+    }
+  }
+  ReleaseSRWLockShared(&g_conformanceLeases.lock);
+  if (expired) CancelConformanceLease(hwnd);
+  return active;
+}
+
+static bool HasActiveConformanceLease(HWND hwnd) {
+  ConformanceLease ignored;
+  return ReadActiveConformanceLease(hwnd, &ignored);
+}
+
+static void CancelConformanceLease(HWND hwnd) {
+  if (!hwnd) return;
+  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
+  g_conformanceLeases.leases.erase(hwnd);
+  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+}
+
+static void ClearAllConformanceLeases() {
+  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
+  g_conformanceLeases.leases.clear();
+  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+}
+
+static size_t CountActiveConformanceLeases() {
+  const ULONGLONG now = GetTickCount64();
+  size_t count = 0;
+  AcquireSRWLockShared(&g_conformanceLeases.lock);
+  for (const auto& kv : g_conformanceLeases.leases) {
+    if (now < kv.second.expiresAtTickMs) ++count;
+  }
+  ReleaseSRWLockShared(&g_conformanceLeases.lock);
+  return count;
+}
+
+static void BeginConformanceLease(HWND hwnd, const RECT& expectedRect) {
+  if (!hwnd || g_settings.conformanceLeaseMs == 0 ||
+      expectedRect.right <= expectedRect.left ||
+      expectedRect.bottom <= expectedRect.top) {
+    CancelConformanceLease(hwnd);
+    return;
+  }
+
+  ConformanceLease lease;
+  lease.expectedRect = expectedRect;
+  lease.expiresAtTickMs = GetTickCount64() + g_settings.conformanceLeaseMs;
+  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
+  g_conformanceLeases.leases[hwnd] = lease;
+  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+  ++Diagnostics::g_runtime.counters.conformanceLeasesStarted;
+}
+
+static bool RecordConformanceLeaseRepair(HWND hwnd, ConformanceLease* updated) {
+  bool retained = false;
+  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
+  auto it = g_conformanceLeases.leases.find(hwnd);
+  if (it != g_conformanceLeases.leases.end() &&
+      GetTickCount64() < it->second.expiresAtTickMs) {
+    ++it->second.repairs;
+    if (updated) *updated = it->second;
+    retained = true;
+  }
+  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+  return retained;
+}
 

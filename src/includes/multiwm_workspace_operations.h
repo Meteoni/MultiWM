@@ -501,8 +501,8 @@ static bool IsWorkspaceOnActiveDesktop(const DesktopMonitorKey& key) {
   if (IsEqualGUID(key.desktopId, zeroGuid)) return true;
 
   GUID currentDesktop{};
-  return !GetCurrentDesktopId(&currentDesktop) ||
-         IsEqualGUID(currentDesktop, key.desktopId);
+  if (!GetCurrentDesktopId(&currentDesktop)) return false;
+  return IsEqualGUID(currentDesktop, key.desktopId);
 }
 
 // Repairs only model-local arrangement preconditions. OS lifecycle/ownership
@@ -772,6 +772,9 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   for (size_t pass = 0; pass < maxPasses; ++pass) {
     ++Diagnostics::g_runtime.counters.arrangePasses;
     if (workspace.Layout() == TileLayout::Floating || workspace.Empty()) {
+      if (workspace.Layout() == TileLayout::Floating) {
+        for (HWND hwnd : workspace.TiledWindows()) CancelConformanceLease(hwnd);
+      }
       g_workspaces.Save(key, workspace);
       return;
     }
@@ -802,6 +805,14 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
           PlacementObservation observation =
               PlaceWindowChecked(hwnd, record->canMove, rects[i]);
           action = workspace.ApplyPlacementObservation(hwnd, observation);
+          if (observation.result == PlacementResult::Success &&
+              observation.placementIssued &&
+              action == Workspace::PlacementAction::None) {
+            BeginConformanceLease(hwnd, rects[i]);
+          } else if (observation.result != PlacementResult::Success ||
+                     action != Workspace::PlacementAction::None) {
+            CancelConformanceLease(hwnd);
+          }
         }
       }
 
@@ -819,6 +830,7 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
 
     bool participationChanged = false;
     for (HWND hwnd : toForget) {
+      CancelConformanceLease(hwnd);
       participationChanged |= workspace.Forget(hwnd);
     }
     for (HWND hwnd : toFloat) {
@@ -831,12 +843,98 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
       Diagnostics::RecordEvent(
           L"placement failures forced hwnd=%p to per-window Floating (failures=%d result=%d)",
           hwnd, record->placementFailures, static_cast<int>(record->lastPlacementResult));
+      CancelConformanceLease(hwnd);
       participationChanged |= workspace.Float(hwnd);
     }
 
     g_workspaces.Save(key, workspace);
     if (!participationChanged || workspace.Empty()) return;
   }
+}
+
+// During a short post-placement lease, an application may accept our rectangle
+// synchronously and then restore its own startup/session geometry later. Repair
+// only that unexpected late movement; explicit user gestures cancel the lease at
+// MOVESIZESTART and normal tiled placement remains the authoritative source.
+static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
+  ConformanceLease lease;
+  if (!ReadActiveConformanceLease(hwnd, &lease)) return false;
+
+  if (!IsWindow(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd) ||
+      !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd)) {
+    CancelConformanceLease(hwnd);
+    return false;
+  }
+
+  const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
+  if (owners.size() != 1 || !IsWorkspaceOnActiveDesktop(owners.front())) {
+    CancelConformanceLease(hwnd);
+    return false;
+  }
+
+  Workspace workspace;
+  if (!g_workspaces.Load(owners.front(), &workspace)) {
+    CancelConformanceLease(hwnd);
+    return false;
+  }
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record || record->state != ManageState::Tiled ||
+      workspace.Layout() == TileLayout::Floating) {
+    CancelConformanceLease(hwnd);
+    return false;
+  }
+
+  RECT current{};
+  if (!GetWindowFrameRect(hwnd, &current)) {
+    CancelConformanceLease(hwnd);
+    return false;
+  }
+  if (RectsNear(current, lease.expectedRect)) {
+    return true;  // Our own placement/event echo; nothing to repair.
+  }
+
+  if (lease.repairs >= kConformanceLeaseMaxRepairs) {
+    CancelConformanceLease(hwnd);
+    ++Diagnostics::g_runtime.counters.conformanceLeaseExhausted;
+    Diagnostics::RecordEvent(
+        L"conformance lease exhausted hwnd=%p expected=[%ld,%ld,%ld,%ld] actual=[%ld,%ld,%ld,%ld]",
+        hwnd, lease.expectedRect.left, lease.expectedRect.top,
+        lease.expectedRect.right, lease.expectedRect.bottom,
+        current.left, current.top, current.right, current.bottom);
+    return true;
+  }
+
+  PlacementObservation observation =
+      PlaceWindowChecked(hwnd, record->canMove, lease.expectedRect);
+  Workspace::PlacementAction action =
+      workspace.ApplyPlacementObservation(hwnd, observation);
+  ++Diagnostics::g_runtime.counters.conformanceLeaseRepairs;
+  Diagnostics::RecordEvent(
+      L"conformance lease reinforced hwnd=%p repair=%u result=%d",
+      hwnd, lease.repairs + 1, static_cast<int>(observation.result));
+
+  if (action == Workspace::PlacementAction::Forget) {
+    CancelConformanceLease(hwnd);
+    workspace.Forget(hwnd);
+    g_workspaces.Save(owners.front(), workspace);
+    ArrangeWorkspace(owners.front());
+    return true;
+  }
+  if (action == Workspace::PlacementAction::Float) {
+    CancelConformanceLease(hwnd);
+    workspace.Float(hwnd);
+    g_workspaces.Save(owners.front(), workspace);
+    ArrangeWorkspace(owners.front());
+    return true;
+  }
+
+  g_workspaces.Save(owners.front(), workspace);
+  if (observation.result == PlacementResult::Success) {
+    RecordConformanceLeaseRepair(hwnd, nullptr);
+  } else {
+    CancelConformanceLease(hwnd);
+  }
+  return true;
 }
 
 // Uses aggregate work-area coverage as a coarse guard against learning arbitrary

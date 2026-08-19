@@ -156,6 +156,10 @@ void LoadSettings() {
           : ManagementMode::Manual;
   Wh_FreeStringSetting(managementMode);
 
+  int conformanceLease = Wh_GetIntSetting(L"ConformanceLeaseMs");
+  if (conformanceLease < 0 || conformanceLease > 10000) conformanceLease = 1500;
+  g_settings.conformanceLeaseMs = static_cast<UINT>(conformanceLease);
+
   int reconcileDelay = Wh_GetIntSetting(L"ReconcileDelayMs");
   if (reconcileDelay < 20 || reconcileDelay > 2000) reconcileDelay = 80;
   g_settings.reconcileDelayMs = static_cast<UINT>(reconcileDelay);
@@ -200,34 +204,25 @@ void LoadSettings() {
 }
 
 static void RegisterConfiguredHotkeys() {
-  if (g_settings.tileKey) {
-    RegisterHotKey(nullptr, HK_TILE, g_settings.tilingModifiers, g_settings.tileKey);
-  }
-  if (g_settings.swapMasterKey) {
-    RegisterHotKey(
-        nullptr, HK_SWAP_MASTER, g_settings.tilingModifiers,
-        g_settings.swapMasterKey);
-  }
-  if (g_settings.managementModeToggleKey) {
-    RegisterHotKey(
-        nullptr, HK_MANAGEMENT_MODE_TOGGLE, g_settings.tilingModifiers,
-        g_settings.managementModeToggleKey);
-  }
-  if (g_settings.floatFocusedKey) {
-    RegisterHotKey(
-        nullptr, HK_FLOAT_FOCUSED, g_settings.tilingModifiers,
-        g_settings.floatFocusedKey);
-  }
-  if (g_settings.layoutKey) {
-    RegisterHotKey(nullptr, HK_LAYOUT, g_settings.tilingModifiers, g_settings.layoutKey);
-  }
+  auto registerOne = [](int id, UINT modifiers, UINT key, const wchar_t* name) {
+    if (!key) return;
+    if (!RegisterHotKey(nullptr, id, modifiers, key)) {
+      Wh_Log(L"Failed to register %s hotkey (id=%d error=%lu)",
+             name, id, GetLastError());
+    }
+  };
 
-  if (g_settings.diagnosticDumpKey) {
-    RegisterHotKey(
-        nullptr, HK_DIAGNOSTIC_DUMP, g_settings.tilingModifiers,
-        g_settings.diagnosticDumpKey);
-  }
-  Wh_Log(L"Hotkeys registered");
+  registerOne(HK_TILE, g_settings.tilingModifiers, g_settings.tileKey, L"Tile");
+  registerOne(HK_SWAP_MASTER, g_settings.tilingModifiers,
+              g_settings.swapMasterKey, L"Swap master");
+  registerOne(HK_MANAGEMENT_MODE_TOGGLE, g_settings.tilingModifiers,
+              g_settings.managementModeToggleKey, L"Management mode");
+  registerOne(HK_FLOAT_FOCUSED, g_settings.tilingModifiers,
+              g_settings.floatFocusedKey, L"Float focused");
+  registerOne(HK_LAYOUT, g_settings.tilingModifiers,
+              g_settings.layoutKey, L"Layout cycle");
+  registerOne(HK_DIAGNOSTIC_DUMP, g_settings.tilingModifiers,
+              g_settings.diagnosticDumpKey, L"Diagnostic dump");
 }
 
 static void UnregisterConfiguredHotkeys() {
@@ -293,7 +288,6 @@ static void HandleMoveSizeEndMessage(HWND hwnd) {
 enum class WmMessageDisposition {
   Handled,
   DispatchToWindows,
-  Quit,
 };
 
 // Converts one serialized thread message into a domain command. Messages not
@@ -301,9 +295,6 @@ enum class WmMessageDisposition {
 // continues receiving cross-apartment calls.
 static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
   switch (msg.message) {
-    case WM_QUIT:
-      return WmMessageDisposition::Quit;
-
     case WM_APP_MOVE_SIZE_END:
       HandleMoveSizeEndMessage(reinterpret_cast<HWND>(msg.wParam));
       return WmMessageDisposition::Handled;
@@ -326,10 +317,19 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       Commands::CycleCurrentWorkspaceLayout();
       return WmMessageDisposition::Handled;
 
+    case WM_APP_RECONCILE_NOW:
+      Reconcile::ReconcileDeferredLifecycle();
+      return WmMessageDisposition::Handled;
+
     case WM_TIMER:
       if (g_wm.lifecycleTimer &&
           static_cast<UINT_PTR>(msg.wParam) == g_wm.lifecycleTimer) {
         Reconcile::ReconcileDeferredLifecycle();
+        return WmMessageDisposition::Handled;
+      }
+      if (g_wm.maintenanceTimer &&
+          static_cast<UINT_PTR>(msg.wParam) == g_wm.maintenanceTimer) {
+        RuntimeLifecycle::RunMaintenanceNow();
         return WmMessageDisposition::Handled;
       }
       return WmMessageDisposition::DispatchToWindows;
@@ -362,68 +362,86 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
 }
 
 static void RunWmMessageLoop() {
+  // Standard Windhawk tool-mod worker pattern: one ordinary Windows message loop
+  // owns thread messages, timers, the tray windows, and STA COM dispatch.
   MSG msg{};
   for (;;) {
-    DWORD waitResult =
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, INFINITE, QS_ALLINPUT);
-    if (waitResult != WAIT_OBJECT_0) continue;
+    const BOOL result = GetMessageW(&msg, nullptr, 0, 0);
+    if (result == 0) return;  // WM_QUIT
+    if (result == -1) {
+      Wh_Log(L"WM worker GetMessage failed: %lu", GetLastError());
+      return;
+    }
 
-    while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-      switch (HandleWmThreadMessage(msg)) {
-        case WmMessageDisposition::Quit:
-          return;
+    switch (HandleWmThreadMessage(msg)) {
+      case WmMessageDisposition::Handled:
+        break;
 
-        case WmMessageDisposition::Handled:
-          break;
-
-        case WmMessageDisposition::DispatchToWindows:
-          TranslateMessage(&msg);
-          DispatchMessage(&msg);
-          break;
-      }
+      case WmMessageDisposition::DispatchToWindows:
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        break;
     }
   }
 }
 
 static void CleanupWmThread() {
-  if (g_wm.lifecycleTimer) {
-    KillTimer(nullptr, g_wm.lifecycleTimer);
-    g_wm.lifecycleTimer = 0;
-  }
-  g_wm.lifecycleDirtyWindows.clear();
-  g_wm.pendingDesktopArranges.clear();
-  InterlockedExchange(&g_vd.changeQueued, 0);
-
+  // Stop external producers before clearing their transient caches. In particular,
+  // an out-of-context MOVESIZE callback can otherwise repopulate move samples after
+  // they were cleared, leaking gesture state into the next settings-reload session.
   UnregisterConfiguredHotkeys();
   TrayUi::Shutdown();
   Platform::WindowEvents::RemoveWinEventHooks();
   CleanupVirtualDesktopAPI();
+
+  if (g_wm.lifecycleTimer) {
+    KillTimer(nullptr, g_wm.lifecycleTimer);
+    g_wm.lifecycleTimer = 0;
+  }
+  if (g_wm.maintenanceTimer) {
+    KillTimer(nullptr, g_wm.maintenanceTimer);
+    g_wm.maintenanceTimer = 0;
+  }
+  g_wm.lifecycleDirtyWindows.clear();
+  g_wm.pendingDesktopArranges.clear();
+  g_wm.maintenanceAttempts = 0;
+  g_wm.maintenanceRunning = false;
+  g_wm.lifecycleRetryAfterPlatformRecovery = false;
+  g_wm.forceMonitorReconcile = false;
+  g_wm.reconciledDesktop = {};
+  g_wm.reconciledDesktopValid = false;
+  ClearAllConformanceLeases();
+  ClearAllMoveSizeSamples();
+  InterlockedExchange(&g_vd.changeQueued, 0);
 }
 
 // Owns the STA apartment and delegates startup, serialized dispatch, and cleanup
 // to narrow helpers. All workspace mutations reachable from this thread remain
 // serialized; foreign STA messages are dispatched back to Windows.
 DWORD WINAPI HotkeyThreadProc(LPVOID) {
-  g_wm.threadId = GetCurrentThreadId();
+  const DWORD threadId = GetCurrentThreadId();
+  g_wm.threadId.store(threadId, std::memory_order_release);
   Diagnostics::BeginWmSession();
-  Wh_Log(L"Hotkey thread started, thread ID: %lu", g_wm.threadId);
+  Wh_Log(L"Hotkey thread started, thread ID: %lu", threadId);
 
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  Wh_Log(L"CoInitializeEx result: 0x%08X", coHr);
-
-  // Force creation of this STA's message queue before callbacks can arrive.
+  // Readiness means the worker exists and owns a Windows message queue. Signal it
+  // before any shell/COM acquisition so the controller can always request WM_QUIT
+  // without waiting on Explorer readiness.
   MSG msg{};
   PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
+  if (g_wm.readyEvent) SetEvent(g_wm.readyEvent);
 
-  if (SUCCEEDED(coHr) && InitializeVirtualDesktopAPI()) {
-    if (!RegisterVirtualDesktopNotifications()) {
-      Wh_Log(L"Using settled WinEvent reconciliation for virtual desktop changes");
-    }
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  g_wm.comInitialized = SUCCEEDED(coHr);
+  Wh_Log(L"CoInitializeEx result: 0x%08X", coHr);
+
+  if (g_wm.comInitialized) {
+    RuntimeLifecycle::RunMaintenanceNow();
+  } else {
+    Platform::WindowEvents::InstallWinEventHooks();
+    Wh_Log(L"COM initialization failed; virtual desktop integration unavailable for this WM session");
   }
 
-  SetEvent(g_wm.readyEvent);
-
-  Platform::WindowEvents::InstallWinEventHooks();
   Reconcile::ScheduleLifecycleReconcile(nullptr);
   RegisterConfiguredHotkeys();
   InitializeCurrentWorkspace();
@@ -433,49 +451,81 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   }
 
   RunWmMessageLoop();
+
+  // Stop out-of-context callbacks from queueing new work as soon as the actor stops
+  // consuming messages. Cleanup then unhooks producers before clearing their caches.
+  g_wm.threadId.store(0, std::memory_order_release);
   CleanupWmThread();
 
-  if (SUCCEEDED(coHr)) CoUninitialize();
+  if (g_wm.comInitialized) CoUninitialize();
+  g_wm.comInitialized = false;
   return 0;
 }
 
 bool StartHotkeyThread() {
-  g_wm.readyEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-  g_wm.thread = CreateThread(nullptr, 0, HotkeyThreadProc, nullptr, 0, nullptr);
+  if (g_wm.thread) {
+    Wh_Log(L"Refusing to start a second WM actor");
+    return false;
+  }
 
-  if (!g_wm.thread || WaitForSingleObject(g_wm.readyEvent, 5000) != WAIT_OBJECT_0) {
-    Wh_Log(L"Failed to start hotkey thread");
-    if (g_wm.thread) {
-      CloseHandle(g_wm.thread);
-      g_wm.thread = nullptr;
-    }
+  g_wm.readyEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+  if (!g_wm.readyEvent) {
+    Wh_Log(L"Failed to create WM readiness event: %lu", GetLastError());
+    return false;
+  }
+
+  g_wm.thread = CreateThread(nullptr, 0, HotkeyThreadProc, nullptr, 0, nullptr);
+  if (!g_wm.thread) {
+    Wh_Log(L"Failed to create WM thread: %lu", GetLastError());
     CloseHandle(g_wm.readyEvent);
     g_wm.readyEvent = nullptr;
     return false;
   }
 
+  HANDLE waits[] = {g_wm.readyEvent, g_wm.thread};
+  DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, INFINITE);
+  const bool ready = waitResult == WAIT_OBJECT_0;
+  if (!ready) {
+    Wh_Log(L"WM thread exited before signaling readiness (wait=%lu)", waitResult);
+  }
+
   CloseHandle(g_wm.readyEvent);
   g_wm.readyEvent = nullptr;
+
+  if (!ready) {
+    WaitForSingleObject(g_wm.thread, INFINITE);
+    CloseHandle(g_wm.thread);
+    g_wm.thread = nullptr;
+    g_wm.threadId.store(0, std::memory_order_release);
+    return false;
+  }
   return true;
 }
 
-void StopHotkeyThread() {
-  // WM_QUIT is the shutdown signal. Avoid a cross-thread shared stop flag: the
-  // worker owns its loop and exits only after dequeuing this message.
-  if (g_wm.threadId) {
-    PostThreadMessage(g_wm.threadId, WM_QUIT, 0, 0);
+bool StopHotkeyThread() {
+  if (!g_wm.thread) return true;
+
+  const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+  if (threadId && !PostThreadMessage(threadId, WM_QUIT, 0, 0)) {
+    Wh_Log(L"Failed to post WM_QUIT to WM thread: %lu", GetLastError());
   }
 
-  if (g_wm.thread) {
-    DWORD waitResult = WaitForSingleObject(g_wm.thread, 5000);
-    if (waitResult == WAIT_TIMEOUT) {
-      Wh_Log(L"WARNING: Hotkey thread cleanup timeout, thread may be stuck in CoUninitialize");
-    }
-    CloseHandle(g_wm.thread);
-    g_wm.thread = nullptr;
+  const DWORD waitResult = WaitForSingleObject(g_wm.thread, 5000);
+  if (waitResult != WAIT_OBJECT_0) {
+    // During settings reload, retaining these handles prevents a second WM owner.
+    // During WhTool_ModUninit, the standard tool-mod wrapper exits the dedicated
+    // process immediately after the callback returns.
+    Wh_Log(L"WM thread did not stop cleanly (wait=%lu); leaving the existing actor intact", waitResult);
+    return false;
   }
 
-  g_wm.threadId = 0;
-  g_vd.initialized = false;
+  CloseHandle(g_wm.thread);
+  g_wm.thread = nullptr;
+  g_wm.threadId.store(0, std::memory_order_release);
+  if (g_wm.readyEvent) {
+    CloseHandle(g_wm.readyEvent);
+    g_wm.readyEvent = nullptr;
+  }
+  return true;
 }
 

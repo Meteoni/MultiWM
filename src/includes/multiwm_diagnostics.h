@@ -636,15 +636,28 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Placement refused", c.placementRefused, previous.placementRefused, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement dead HWND", c.placementDead, previous.placementDead, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Floating geometry repairs", c.floatingGeometryRepairs, previous.floatingGeometryRepairs, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Conformance leases started", c.conformanceLeasesStarted, previous.conformanceLeasesStarted, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Conformance lease reinforcement attempts", c.conformanceLeaseRepairs, previous.conformanceLeaseRepairs, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Conformance lease exhausted", c.conformanceLeaseExhausted, previous.conformanceLeaseExhausted, uptimeMs, intervalMs);
 
   report.Line();
-  report.Line(L"Virtual desktop / user commands");
+  report.Line(L"Virtual desktop / runtime lifecycle / user commands");
   DiagnosticCounterHeader(report);
-  DiagnosticCounterRow(report, L"VD changes processed", c.virtualDesktopChangesProcessed, previous.virtualDesktopChangesProcessed, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Native VD changes processed", c.virtualDesktopChangesProcessed, previous.virtualDesktopChangesProcessed, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Fallback VD changes detected", c.virtualDesktopFallbackChanges, previous.virtualDesktopFallbackChanges, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"VD API init attempts", c.vdApiInitAttempts, previous.vdApiInitAttempts, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"VD API init successes", c.vdApiInitSuccesses, previous.vdApiInitSuccesses, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"VD API init failures", c.vdApiInitFailures, previous.vdApiInitFailures, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"VD API reinitializations", c.vdApiReinitializations, previous.vdApiReinitializations, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"VD notification register attempts", c.vdNotificationRegisterAttempts, previous.vdNotificationRegisterAttempts, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"VD notification register successes", c.vdNotificationRegisterSuccesses, previous.vdNotificationRegisterSuccesses, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"VD notification register failures", c.vdNotificationRegisterFailures, previous.vdNotificationRegisterFailures, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Runtime maintenance runs", c.runtimeMaintenanceRuns, previous.runtimeMaintenanceRuns, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Runtime maintenance retries", c.runtimeMaintenanceRetries, previous.runtimeMaintenanceRetries, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Runtime maintenance exhausted", c.runtimeMaintenanceExhausted, previous.runtimeMaintenanceExhausted, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Explorer restart signals", c.shellRestartSignals, previous.shellRestartSignals, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Display/work-area signals", c.displayTopologySignals, previous.displayTopologySignals, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"WinEvent hook install failures", c.winEventHookInstallFailures, previous.winEventHookInstallFailures, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Tile commands", c.tileCommands, previous.tileCommands, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Layout cycle commands", c.layoutCycleCommands, previous.layoutCycleCommands, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Float focused commands", c.floatFocusedCommands, previous.floatFocusedCommands, uptimeMs, intervalMs);
@@ -796,7 +809,10 @@ static void DumpCpuUsage(
 }
 
 static void DumpPlatformHealth(ReportBuilder& report) {
-  report.Line(L"WM thread: id=%lu", g_wm.threadId);
+  report.Line(
+      L"WM thread: id=%lu COM(STA)=%d",
+      g_wm.threadId.load(std::memory_order_acquire),
+      g_wm.comInitialized ? 1 : 0);
   if (g_vd.lastKnownDesktopValid) {
     report.Line(
         L"Current virtual desktop: %ls",
@@ -809,11 +825,52 @@ static void DumpPlatformHealth(ReportBuilder& report) {
       g_vd.initialized ? 1 : 0, g_vd.abiResolved ? 1 : 0,
       g_vd.explorerBuild, g_vd.explorerRevision,
       g_vd.abi.usesHMonitor ? 1 : 0);
+  HWND currentShell = GetShellWindow();
+  DWORD currentShellPid = 0;
+  if (currentShell && IsWindow(currentShell)) {
+    GetWindowThreadProcessId(currentShell, &currentShellPid);
+  }
   report.Line(
-      L"VD notifications: registered=%d cookie=%lu methods=%d currentChangedIndex=%d changeQueued=%ld",
+      L"Explorer shell identity: boundPid=%lu currentPid=%lu match=%d",
+      g_vd.shellPid, currentShellPid,
+      g_vd.shellPid && currentShellPid && g_vd.shellPid == currentShellPid ? 1 : 0);
+  DWORD currentShellPid = 0;
+  HWND shell = GetShellWindow();
+  if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &currentShellPid);
+  report.Line(
+      L"Explorer shell binding: currentPid=%lu boundPid=%lu match=%d",
+      currentShellPid, g_vd.shellPid,
+      currentShellPid && g_vd.shellPid && currentShellPid == g_vd.shellPid ? 1 : 0);
+  report.Line(
+      L"VD notifications: registered=%d cookie=%lu methods=%d currentChangedIndex=%d changeQueued=%ld lastHr=0x%08X",
       g_vd.notificationsRegistered ? 1 : 0, g_vd.notificationCookie,
       g_vd.abi.notification.methodCount,
-      g_vd.abi.notification.currentChangedIndex, g_vd.changeQueued);
+      g_vd.abi.notification.currentChangedIndex, g_vd.changeQueued,
+      static_cast<unsigned int>(g_vd.notificationLastHr));
+  const ULONGLONG now = GetTickCount64();
+  const std::wstring notificationAttemptAge =
+      g_vd.notificationLastAttemptTickMs
+          ? DiagnosticDurationString(
+                now >= g_vd.notificationLastAttemptTickMs
+                    ? now - g_vd.notificationLastAttemptTickMs
+                    : 0)
+          : L"never";
+  const std::wstring notificationSuccessAge =
+      g_vd.notificationLastSuccessTickMs
+          ? DiagnosticDurationString(
+                now >= g_vd.notificationLastSuccessTickMs
+                    ? now - g_vd.notificationLastSuccessTickMs
+                    : 0)
+          : L"never";
+  report.Line(
+      L"VD notification timing: lastAttemptAge=%ls lastSuccessAge=%ls",
+      notificationAttemptAge.c_str(), notificationSuccessAge.c_str());
+  report.Line(
+      L"Runtime maintenance: running=%d timerArmed=%d attempt=%u/%u deferredLifecycle=%d forceMonitorReconcile=%d",
+      g_wm.maintenanceRunning ? 1 : 0, g_wm.maintenanceTimer ? 1 : 0,
+      g_wm.maintenanceAttempts, RuntimeLifecycle::kMaintenanceMaxAttempts,
+      g_wm.lifecycleRetryAfterPlatformRecovery ? 1 : 0,
+      g_wm.forceMonitorReconcile ? 1 : 0);
   report.Line(
       L"WinEvent hooks: foreground=%d location=%d moveSize=%d minimize=%d hideDestroy=%d cloak=%d state=%d",
       g_hooks.foreground ? 1 : 0, g_hooks.locationChange ? 1 : 0,
@@ -963,7 +1020,7 @@ static void WriteDiagnosticReport() {
   report.Line(L"============================================================");
   report.Line(L"TILING HELPER DIAGNOSTIC REPORT");
   report.Line(L"============================================================");
-  report.Line(L"Mod version: 1.12.1");
+  report.Line(L"Mod version: 1.13.0");
   report.Line(L"Report sequence: %llu", static_cast<unsigned long long>(reportSequence));
   report.Line(L"Generated local: %ls", DiagnosticSystemTimeString(local).c_str());
   report.Line(L"Generated UTC:   %ls", DiagnosticSystemTimeString(utc).c_str());
@@ -987,6 +1044,10 @@ static void WriteDiagnosticReport() {
       g_wm.lifecycleDirtyWindows.size(), g_wm.pendingDesktopArranges.size(),
       duplicateOwners);
   report.Line(
+      L"Active conformance leases=%zu runtime-maintenance timer=%d attempt=%u",
+      CountActiveConformanceLeases(), g_wm.maintenanceTimer ? 1 : 0,
+      g_wm.maintenanceAttempts);
+  report.Line(
       L"Reverse ownership index: entries=%zu mismatches=%zu",
       ownershipIndex.size(), ownershipIndexMismatches);
   report.Line(
@@ -1007,6 +1068,7 @@ static void WriteDiagnosticReport() {
       g_settings.floatingDefaultSizeDip.height);
   report.Line(L"Master percent: %ld", g_settings.masterPercent);
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
+  report.Line(L"Tiled conformance lease: %u ms", g_settings.conformanceLeaseMs);
   report.Line(L"Lifecycle settle delay: %u ms", g_settings.reconcileDelayMs);
   report.Line(L"Exclusion rules: %zu", g_settings.exclusionRules.size());
   report.TextLine(L"Diagnostic output setting: ", g_settings.diagnosticsOutputPath);
@@ -1232,6 +1294,9 @@ static void WriteDiagnosticReport() {
       counters.setWindowPosCalls;
   const uint64_t vdInitResultSum =
       counters.vdApiInitSuccesses + counters.vdApiInitFailures;
+  const uint64_t vdNotificationResultSum =
+      counters.vdNotificationRegisterSuccesses +
+      counters.vdNotificationRegisterFailures;
   const uint64_t priorReportResultSum =
       counters.reportsWritten + counters.reportWriteFailures;
   const uint64_t classifiedGestureSum =
@@ -1246,6 +1311,8 @@ static void WriteDiagnosticReport() {
       placementPathSum == counters.placementChecks;
   const bool vdInitAccountingOk =
       vdInitResultSum == counters.vdApiInitAttempts;
+  const bool vdNotificationAccountingOk =
+      vdNotificationResultSum == counters.vdNotificationRegisterAttempts;
   const bool reportAccountingOk =
       priorReportResultSum == g_runtime.lifetimeDiagnosticCost.attempts;
   const bool gestureAccountingOk =
@@ -1274,6 +1341,11 @@ static void WriteDiagnosticReport() {
       static_cast<unsigned long long>(vdInitResultSum),
       static_cast<unsigned long long>(counters.vdApiInitAttempts));
   report.Line(
+      L"  VD notification successes + failures == attempts: %ls (%llu == %llu)",
+      vdNotificationAccountingOk ? L"PASS" : L"FAIL",
+      static_cast<unsigned long long>(vdNotificationResultSum),
+      static_cast<unsigned long long>(counters.vdNotificationRegisterAttempts));
+  report.Line(
       L"  prior report results == measured diagnostic attempts: %ls (%llu == %llu)",
       reportAccountingOk ? L"PASS" : L"FAIL",
       static_cast<unsigned long long>(priorReportResultSum),
@@ -1288,6 +1360,14 @@ static void WriteDiagnosticReport() {
   const bool allWinEventHooks =
       g_hooks.foreground && g_hooks.locationChange && g_hooks.moveSize &&
       g_hooks.minimize && g_hooks.hideDestroy && g_hooks.cloak && g_hooks.state;
+  DWORD auditShellPid = 0;
+  HWND auditShell = GetShellWindow();
+  if (auditShell && IsWindow(auditShell)) {
+    GetWindowThreadProcessId(auditShell, &auditShellPid);
+  }
+  const bool shellBindingHealthy =
+      !g_vd.initialized ||
+      (auditShellPid != 0 && g_vd.shellPid == auditShellPid);
   const bool vdCoreHealthy = g_vd.initialized && g_vd.abiResolved;
   const bool vdNotificationsHealthy =
       g_vd.abi.notification.methodCount <= 0 || g_vd.notificationsRegistered;
@@ -1300,10 +1380,12 @@ static void WriteDiagnosticReport() {
   const bool runtimeWindowHealthy =
       deadRecords == 0 && pidMismatches == 0 &&
       recordsWithPlacementFailures == 0 && allWinEventHooks &&
-      vdCoreHealthy && vdNotificationsHealthy && currentDesktopHealthy;
+      shellBindingHealthy && vdCoreHealthy && vdNotificationsHealthy &&
+      currentDesktopHealthy;
   const bool telemetryHealthy =
       lifecycleAccountingOk && placementResultsOk && placementPathsOk &&
-      vdInitAccountingOk && reportAccountingOk && gestureAccountingOk;
+      vdInitAccountingOk && vdNotificationAccountingOk &&
+      reportAccountingOk && gestureAccountingOk;
   const bool overallHealthy =
       structuralHealthy && runtimeWindowHealthy && telemetryHealthy;
 

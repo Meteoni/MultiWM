@@ -211,13 +211,14 @@ static bool IsCurrentNotificationInterface(REFIID riid) {
 }
 
 static void QueueVirtualDesktopChangedNotification() {
-  if (!g_wm.threadId) return;
+  const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+  if (!threadId) return;
 
   // COM can emit redundant desktop notifications. Collapse them before they
   // reach the WM core, just as FancyWM coalesces layout invalidations.
   if (InterlockedExchange(&g_vd.changeQueued, 1) != 0) return;
 
-  if (!PostThreadMessage(g_wm.threadId, WM_APP_VIRTUAL_DESKTOP_CHANGED, 0, 0)) {
+  if (!PostThreadMessage(threadId, WM_APP_VIRTUAL_DESKTOP_CHANGED, 0, 0)) {
     InterlockedExchange(&g_vd.changeQueued, 0);
     Wh_Log(L"Failed to queue virtual desktop changed notification: %lu", GetLastError());
   }
@@ -343,37 +344,56 @@ static void ClearVirtualDesktopNotificationState(bool unregisterFromShell) {
 
 bool RegisterVirtualDesktopNotifications() {
   if (g_vd.notificationsRegistered) return true;
-  if (!g_vd.serviceProvider || !g_vd.abiResolved) return false;
+  if (!g_vd.abiResolved) return false;
 
   NotificationInterfaceConfig config = GetNotificationInterfaceConfig();
   if (config.methodCount == 0) {
-    Wh_Log(L"Native VD notifications unavailable for Explorer build %lu.%lu; using WinEvent settle fallback",
-           g_vd.explorerBuild, g_vd.explorerRevision);
+    return true;  // Supported core API with no known native notification ABI (Win10).
+  }
+
+  ++Diagnostics::g_runtime.counters.vdNotificationRegisterAttempts;
+  g_vd.notificationLastAttemptTickMs = GetTickCount64();
+
+  // Each attempt obtains a fresh ImmersiveShell provider, matching the robust
+  // Taskbar Desktop Indicator pattern. Notification-service readiness can lag the
+  // core VD manager during logon, so don't pin registration to the provider that
+  // happened to initialize the manager first.
+  IServiceProvider* notificationProvider = nullptr;
+  HRESULT hr = CoCreateInstance(
+      CLSID_ImmersiveShell, nullptr,
+      CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
+      reinterpret_cast<void**>(&notificationProvider));
+  if (FAILED(hr) || !notificationProvider) {
+    if (notificationProvider) notificationProvider->Release();
+    g_vd.notificationLastHr = FAILED(hr) ? hr : E_NOINTERFACE;
+    ++Diagnostics::g_runtime.counters.vdNotificationRegisterFailures;
+    Wh_Log(L"VD notification registration: ImmersiveShell unavailable: 0x%08X", hr);
     return false;
   }
 
-  // Never carry an old cookie/sink into a new shell registration. Explorer can
-  // reuse notification cookies after a restart. Normal reinitialization already
-  // clears this state; this is a defensive cleanup for partial/stale attempts.
   if (g_vd.notificationService || g_vd.notificationObject ||
       g_vd.notificationCookie) {
-    HWND shell = GetShellWindow();
-    ClearVirtualDesktopNotificationState(shell && IsWindow(shell));
+    ClearVirtualDesktopNotificationState(true);
   }
 
-  HRESULT hr = g_vd.serviceProvider->QueryService(
+  hr = notificationProvider->QueryService(
       SID_VirtualDesktopNotificationService, IID_IVirtualDesktopNotificationService,
       reinterpret_cast<void**>(&g_vd.notificationService));
+  notificationProvider->Release();
   if (FAILED(hr) || !g_vd.notificationService) {
-    Wh_Log(L"Failed to get VirtualDesktopNotificationService: 0x%08X", hr);
-    g_vd.notificationService = nullptr;
+    SAFE_RELEASE(g_vd.notificationService);
+    g_vd.notificationLastHr = FAILED(hr) ? hr : E_NOINTERFACE;
+    ++Diagnostics::g_runtime.counters.vdNotificationRegisterFailures;
+    Wh_Log(L"VD notification registration: service unavailable: 0x%08X", hr);
     return false;
   }
 
   g_vd.notificationObject = CreateVirtualDesktopNotificationObject();
   if (!g_vd.notificationObject) {
-    Wh_Log(L"Failed to create virtual desktop notification sink");
+    g_vd.notificationLastHr = E_OUTOFMEMORY;
+    ++Diagnostics::g_runtime.counters.vdNotificationRegisterFailures;
     SAFE_RELEASE(g_vd.notificationService);
+    Wh_Log(L"VD notification registration: failed to create sink");
     return false;
   }
 
@@ -381,7 +401,9 @@ bool RegisterVirtualDesktopNotifications() {
   hr = g_vd.notificationService->Register(
       reinterpret_cast<IUnknown*>(g_vd.notificationObject), &cookie);
   if (FAILED(hr) || cookie == 0) {
-    Wh_Log(L"Virtual desktop notification Register failed: 0x%08X cookie=%lu", hr, cookie);
+    g_vd.notificationLastHr = FAILED(hr) ? hr : E_FAIL;
+    ++Diagnostics::g_runtime.counters.vdNotificationRegisterFailures;
+    Wh_Log(L"VD notification registration failed: 0x%08X cookie=%lu", hr, cookie);
     VirtualDesktopNotification_Release(g_vd.notificationObject);
     g_vd.notificationObject = nullptr;
     SAFE_RELEASE(g_vd.notificationService);
@@ -390,12 +412,24 @@ bool RegisterVirtualDesktopNotifications() {
 
   g_vd.notificationCookie = cookie;
   g_vd.notificationsRegistered = true;
+  if (!g_vd.shellPid) {
+    HWND shell = GetShellWindow();
+    if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &g_vd.shellPid);
+  }
+  g_vd.notificationLastHr = S_OK;
+  g_vd.notificationLastSuccessTickMs = GetTickCount64();
+  ++Diagnostics::g_runtime.counters.vdNotificationRegisterSuccesses;
+  Diagnostics::RecordEvent(
+      L"virtual desktop notifications registered cookie=%lu afterAttempt=%llu",
+      cookie,
+      static_cast<unsigned long long>(
+          Diagnostics::g_runtime.counters.vdNotificationRegisterAttempts));
   Wh_Log(L"Native virtual desktop notifications registered (cookie=%lu)", cookie);
   return true;
 }
 
-// Acquires the COM interfaces needed for virtual-desktop queries. The outer
-// lifecycle wrapper owns the initialized flag and notification registration.
+// Acquires the COM interfaces needed for virtual-desktop queries. Notification
+// subscription is deliberately owned by the centralized runtime-maintenance path.
 bool InitializeVirtualDesktopAPIOnce() {
   ++Diagnostics::g_runtime.counters.vdApiInitAttempts;
   if (!ResolveVirtualDesktopAbiProfile()) {
@@ -403,9 +437,12 @@ bool InitializeVirtualDesktopAPIOnce() {
     return false;
   }
 
-  HRESULT hr = CoCreateInstance(CLSID_ImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
-                                (void**)&g_vd.serviceProvider);
+  HRESULT hr = CoCreateInstance(
+      CLSID_ImmersiveShell, nullptr,
+      CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
+      reinterpret_cast<void**>(&g_vd.serviceProvider));
   if (FAILED(hr) || !g_vd.serviceProvider) {
+    SAFE_RELEASE(g_vd.serviceProvider);
     Wh_Log(L"Failed to create ImmersiveShell: 0x%08X", hr);
     ++Diagnostics::g_runtime.counters.vdApiInitFailures;
     return false;
@@ -416,52 +453,90 @@ bool InitializeVirtualDesktopAPIOnce() {
       reinterpret_cast<void**>(&g_vd.managerInternal));
   if (FAILED(hr) || !g_vd.managerInternal) {
     Wh_Log(L"Failed to get VirtualDesktopManagerInternal: 0x%08X", hr);
-    SAFE_RELEASE(g_vd.serviceProvider);
-    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
-    return false;
-  }
-
-  hr = CoCreateInstance(CLSID_VirtualDesktopManager, nullptr, CLSCTX_INPROC_SERVER, IID_IVirtualDesktopManager,
-                        (void**)&g_vd.desktopManager);
-  if (FAILED(hr) || !g_vd.desktopManager) {
-    Wh_Log(L"Failed to create VirtualDesktopManager: 0x%08X", hr);
     SAFE_RELEASE(g_vd.managerInternal);
     SAFE_RELEASE(g_vd.serviceProvider);
     ++Diagnostics::g_runtime.counters.vdApiInitFailures;
     return false;
   }
 
+  hr = CoCreateInstance(
+      CLSID_VirtualDesktopManager, nullptr, CLSCTX_INPROC_SERVER,
+      IID_IVirtualDesktopManager,
+      reinterpret_cast<void**>(&g_vd.desktopManager));
+  if (FAILED(hr) || !g_vd.desktopManager) {
+    Wh_Log(L"Failed to create VirtualDesktopManager: 0x%08X", hr);
+    SAFE_RELEASE(g_vd.desktopManager);
+    SAFE_RELEASE(g_vd.managerInternal);
+    SAFE_RELEASE(g_vd.serviceProvider);
+    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
+    return false;
+  }
+
+  HWND shell = GetShellWindow();
+  g_vd.shellPid = 0;
+  if (shell && IsWindow(shell)) {
+    GetWindowThreadProcessId(shell, &g_vd.shellPid);
+  }
+
   ++Diagnostics::g_runtime.counters.vdApiInitSuccesses;
   return true;
+}
+
+static void ResetVirtualDesktopMetadata() {
+  g_vd.abi = {};
+  g_vd.abiResolved = false;
+  g_vd.explorerBuild = 0;
+  g_vd.explorerRevision = 0;
+  g_vd.shellPid = 0;
+  g_vd.lastKnownDesktop = {};
+  g_vd.lastKnownDesktopValid = false;
+  g_vd.notificationLastHr = S_OK;
+  g_vd.notificationLastAttemptTickMs = 0;
+  g_vd.notificationLastSuccessTickMs = 0;
+  g_vd.initialized = false;
 }
 
 // Releases virtual-desktop COM state while Explorer is responsive. During shell
 // teardown, pointers are intentionally dropped without Release to avoid hangs.
 void CleanupVirtualDesktopAPI() {
   HWND hShell = GetShellWindow();
+  DWORD currentShellPid = 0;
   const bool shellAvailable = hShell && IsWindow(hShell);
+  if (shellAvailable) GetWindowThreadProcessId(hShell, &currentShellPid);
+  const bool sameShell =
+      shellAvailable && g_vd.shellPid != 0 && currentShellPid == g_vd.shellPid;
 
-  ClearVirtualDesktopNotificationState(shellAvailable);
-  g_vd.abi = {};
-  g_vd.abiResolved = false;
-  g_vd.explorerBuild = 0;
-  g_vd.explorerRevision = 0;
-  g_vd.lastKnownDesktop = {};
-  g_vd.lastKnownDesktopValid = false;
-
-  if (!shellAvailable) {
-    Wh_Log(L"Explorer not available, skipping COM cleanup to avoid hang");
+  // A replacement Explorer can already have a valid ShellWindow while our COM
+  // proxies still point at the dead predecessor. Never call Unregister/Release on
+  // those stale proxies merely because *some* shell is now visible.
+  ClearVirtualDesktopNotificationState(sameShell);
+  if (!sameShell) {
+    if (g_vd.initialized || g_vd.serviceProvider || g_vd.managerInternal ||
+        g_vd.desktopManager) {
+      Wh_Log(L"Explorer identity changed/unavailable, abandoning stale VD COM proxies");
+    }
     g_vd.desktopManager = nullptr;
     g_vd.managerInternal = nullptr;
     g_vd.serviceProvider = nullptr;
-    g_vd.initialized = false;
+    ResetVirtualDesktopMetadata();
     return;
   }
 
   SAFE_RELEASE(g_vd.desktopManager);
   SAFE_RELEASE(g_vd.managerInternal);
   SAFE_RELEASE(g_vd.serviceProvider);
-  g_vd.initialized = false;
+  ResetVirtualDesktopMetadata();
+}
+
+// TaskbarCreated means the Explorer instance backing these private proxies has
+// changed. Never call stale shell proxies merely because the replacement shell is
+// already visible; discard them and let the one maintenance owner reacquire all.
+void AbandonVirtualDesktopAPIForShellRestart() {
+  ClearVirtualDesktopNotificationState(false);
+  g_vd.desktopManager = nullptr;
+  g_vd.managerInternal = nullptr;
+  g_vd.serviceProvider = nullptr;
+  ResetVirtualDesktopMetadata();
 }
 
 bool InitializeVirtualDesktopAPI() {
@@ -470,74 +545,117 @@ bool InitializeVirtualDesktopAPI() {
     g_vd.initialized = true;
     return true;
   }
+  RuntimeLifecycle::RequestMaintenance(false);
   return false;
 }
 
 bool ReinitializeVirtualDesktopAPI() {
   ++Diagnostics::g_runtime.counters.vdApiReinitializations;
-  Diagnostics::RecordEvent(L"virtual desktop API reinitialization requested");
+  Diagnostics::RecordEvent(L"virtual desktop core API reinitialization requested");
   CleanupVirtualDesktopAPI();
-  if (!InitializeVirtualDesktopAPI()) return false;
-  RegisterVirtualDesktopNotifications();
-  return true;
+  const bool ready = InitializeVirtualDesktopAPI();
+  // A previously-live COM path failed, so give the centralized recovery owner a
+  // fresh retry burst. Notification registration remains owned there.
+  RuntimeLifecycle::RequestMaintenance(true);
+  return ready;
 }
 
 // Invokes a private manager slot using the Windows-version-specific signature.
-// A failed call forces one API reinitialization and retry before being returned.
+// A failed call forces one core-API reinitialization and retry before returning.
 template <typename TResult>
 HRESULT CallManagerInternal(int vtableIndex, TResult* outResult) {
+  if (!g_vd.managerInternal) return E_NOINTERFACE;
   if (UsesHMonitorParameter()) {
-    auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TResult*)>(g_vd.managerInternal,
-                                                                                         vtableIndex);
+    auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TResult*)>(
+        g_vd.managerInternal, vtableIndex);
     HRESULT hr = pfn(g_vd.managerInternal, nullptr, outResult);
-    if (FAILED(hr) && ReinitializeVirtualDesktopAPI()) {
-      pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TResult*)>(g_vd.managerInternal,
-                                                                                      vtableIndex);
+    if (FAILED(hr) && ReinitializeVirtualDesktopAPI() && g_vd.managerInternal) {
+      pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TResult*)>(
+          g_vd.managerInternal, vtableIndex);
       hr = pfn(g_vd.managerInternal, nullptr, outResult);
     }
     return hr;
-  } else {
-    auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TResult*)>(g_vd.managerInternal, vtableIndex);
-    HRESULT hr = pfn(g_vd.managerInternal, outResult);
-    if (FAILED(hr) && ReinitializeVirtualDesktopAPI()) {
-      pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TResult*)>(g_vd.managerInternal, vtableIndex);
-      hr = pfn(g_vd.managerInternal, outResult);
-    }
-    return hr;
   }
+
+  auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TResult*)>(
+      g_vd.managerInternal, vtableIndex);
+  HRESULT hr = pfn(g_vd.managerInternal, outResult);
+  if (FAILED(hr) && ReinitializeVirtualDesktopAPI() && g_vd.managerInternal) {
+    pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TResult*)>(
+        g_vd.managerInternal, vtableIndex);
+    hr = pfn(g_vd.managerInternal, outResult);
+  }
+  return hr;
 }
 
 bool GetCurrentDesktopId(GUID* outGuid) {
   if (!outGuid) return false;
   if (!g_vd.managerInternal) {
     g_vd.lastKnownDesktopValid = false;
+    RuntimeLifecycle::RequestMaintenance(false);
     return false;
   }
 
-  IVirtualDesktop* desktop = nullptr;
-  HRESULT hr = CallManagerInternal(VTABLE_GET_CURRENT_DESKTOP, &desktop);
-  if (FAILED(hr) || !desktop) {
-    g_vd.lastKnownDesktopValid = false;
-    Wh_Log(L"GetCurrentDesktop failed: 0x%08X", hr);
-    return false;
+  // GetCurrentDesktop itself is already retried once by CallManagerInternal. A
+  // stale IVirtualDesktop can still fail at GetId after Explorer replacement, so
+  // allow one full core reacquisition for that distinct failure boundary too.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    IVirtualDesktop* desktop = nullptr;
+    HRESULT hr = CallManagerInternal(VTABLE_GET_CURRENT_DESKTOP, &desktop);
+    if (FAILED(hr) || !desktop) {
+      g_vd.lastKnownDesktopValid = false;
+      RuntimeLifecycle::RequestMaintenance(false);
+      Wh_Log(L"GetCurrentDesktop failed: 0x%08X", hr);
+      return false;
+    }
+
+    hr = desktop->GetId(outGuid);
+    desktop->Release();
+    if (SUCCEEDED(hr)) {
+      g_vd.lastKnownDesktop = *outGuid;
+      g_vd.lastKnownDesktopValid = true;
+      return true;
+    }
+
+    if (attempt == 0 && ReinitializeVirtualDesktopAPI()) continue;
+    Wh_Log(L"Current virtual desktop GetId failed after recovery: 0x%08X", hr);
   }
 
-  hr = desktop->GetId(outGuid);
-  desktop->Release();
-  if (SUCCEEDED(hr)) {
-    g_vd.lastKnownDesktop = *outGuid;
-    g_vd.lastKnownDesktopValid = true;
-    return true;
-  }
   g_vd.lastKnownDesktopValid = false;
+  RuntimeLifecycle::RequestMaintenance(false);
   return false;
 }
 
 bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid) {
-  if (!outGuid) return false;
-  if (!InitializeVirtualDesktopAPI() || !g_vd.desktopManager) return false;
-  return SUCCEEDED(g_vd.desktopManager->GetWindowDesktopId(hwnd, outGuid));
+  if (!hwnd || !outGuid) return false;
+  if (!g_vd.initialized || !g_vd.desktopManager) {
+    RuntimeLifecycle::RequestMaintenance(false);
+    return false;
+  }
+
+  HRESULT hr = g_vd.desktopManager->GetWindowDesktopId(hwnd, outGuid);
+  if (FAILED(hr) && ReinitializeVirtualDesktopAPI() && g_vd.desktopManager) {
+    hr = g_vd.desktopManager->GetWindowDesktopId(hwnd, outGuid);
+  }
+  if (FAILED(hr)) RuntimeLifecycle::RequestMaintenance(false);
+  return SUCCEEDED(hr);
 }
+
+bool IsWindowOnCurrentDesktopSafe(HWND hwnd, BOOL* onCurrent) {
+  if (!hwnd || !onCurrent) return false;
+  if (!g_vd.initialized || !g_vd.desktopManager) {
+    RuntimeLifecycle::RequestMaintenance(false);
+    return false;
+  }
+
+  HRESULT hr = g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, onCurrent);
+  if (FAILED(hr) && ReinitializeVirtualDesktopAPI() && g_vd.desktopManager) {
+    hr = g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, onCurrent);
+  }
+  if (FAILED(hr)) RuntimeLifecycle::RequestMaintenance(false);
+  return SUCCEEDED(hr);
+}
+
 
 
 }  // namespace Platform::VirtualDesktop

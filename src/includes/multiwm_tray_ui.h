@@ -376,7 +376,10 @@ static void ShowStatusFlyout(const wchar_t* text) {
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
   InvalidateRect(g_flyoutWindow, nullptr, TRUE);
   UpdateWindow(g_flyoutWindow);
-  SetTimer(g_flyoutWindow, kFlyoutTimerId, 16, nullptr);
+  if (!SetTimer(g_flyoutWindow, kFlyoutTimerId, 16, nullptr)) {
+    // A cosmetic timer failure must not leave a permanently visible overlay.
+    ShowWindow(g_flyoutWindow, SW_HIDE);
+  }
 }
 
 static void ShowLayoutFlyout(TileLayout layout) {
@@ -427,6 +430,7 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
   if (g_taskbarCreatedMessage && message == g_taskbarCreatedMessage) {
     g_iconAdded = false;
     AddIconToShell();
+    RuntimeLifecycle::NotifyShellRestarted();
     return 0;
   }
 
@@ -437,13 +441,25 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
         (event == NIN_SELECT || event == NIN_KEYSELECT)) {
       // Emit the exact same action as the layout hotkey; layout mutation stays
       // serialized on the WM thread and is implemented in one place only.
-      if (g_wm.threadId) PostThreadMessageW(g_wm.threadId, WM_APP_LAYOUT_CYCLE, 0, 0);
+      const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+      if (threadId) PostThreadMessageW(threadId, WM_APP_LAYOUT_CYCLE, 0, 0);
     }
     return 0;
   }
 
   switch (message) {
+    case WM_DISPLAYCHANGE:
+    case WM_DPICHANGED:
+      RuntimeLifecycle::NotifyDisplayTopologyChanged();
+      return 0;
+
     case WM_SETTINGCHANGE:
+      HandleThemeChanged();
+      if (wParam == SPI_SETWORKAREA) {
+        RuntimeLifecycle::NotifyDisplayTopologyChanged();
+      }
+      return 0;
+
     case WM_THEMECHANGED:
     case WM_SYSCOLORCHANGE:
       HandleThemeChanged();

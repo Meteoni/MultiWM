@@ -5,15 +5,17 @@ namespace Platform::WindowEvents {
 
 void OnWindowMoveSizeEnd(HWND hwnd) {
   if (!IsWindow(hwnd)) return;
-  if (!g_wm.threadId) return;
-  if (!PostThreadMessage(g_wm.threadId, WM_APP_MOVE_SIZE_END, reinterpret_cast<WPARAM>(hwnd), 0)) {
+  const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+  if (!threadId) return;
+  if (!PostThreadMessage(threadId, WM_APP_MOVE_SIZE_END, reinterpret_cast<WPARAM>(hwnd), 0)) {
     Wh_Log(L"Failed to queue resize event");
   }
 }
 
 static void QueueWindowEvent(DWORD event, HWND hwnd) {
-  if (!g_wm.threadId || !hwnd) return;
-  if (!PostThreadMessage(g_wm.threadId, WM_APP_WINDOW_EVENT,
+  const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+  if (!threadId || !hwnd) return;
+  if (!PostThreadMessage(threadId, WM_APP_WINDOW_EVENT,
                          static_cast<WPARAM>(event), reinterpret_cast<LPARAM>(hwnd))) {
     Wh_Log(L"Failed to queue lifecycle event %lu", event);
   }
@@ -44,7 +46,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // Foreground changes only affect which per-monitor workspace the tray icon
   // represents. Keep that UI refresh serialized on the WM thread as well.
   if (event == EVENT_SYSTEM_FOREGROUND) {
-    if (g_wm.threadId) PostThreadMessage(g_wm.threadId, WM_APP_TRAY_REFRESH, 0, 0);
+    const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+    if (threadId) PostThreadMessage(threadId, WM_APP_TRAY_REFRESH, 0, 0);
     return;
   }
 
@@ -53,12 +56,14 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
 
-  // WinMan uses location changes as one of its dirty-check signals. Do not mirror
-  // that broadly here: normal layout placement itself produces LOCATIONCHANGE.
-  // The event is only needed to catch a maximized managed HWND becoming restored
-  // on Windows/apps that don't deliver a useful OBJECT_STATECHANGE at that edge.
+  // Normal layout placement itself produces LOCATIONCHANGE, so keep this path
+  // narrow. Besides maximized->restored detection, a short conformance lease may
+  // opt a tiled HWND into location observation while an app finishes startup.
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
-    if (!tracked || !IsWindowSuspendedMaximized(hwnd)) return;
+    if (!tracked ||
+        (!IsWindowSuspendedMaximized(hwnd) && !HasActiveConformanceLease(hwnd))) {
+      return;
+    }
     QueueWindowEvent(event, hwnd);
     return;
   }
@@ -76,6 +81,13 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     if (!discoveryEvent || !restoredCandidate || !WindowCanBeManaged(hwnd)) {
       return;
     }
+  }
+
+  // Explicit user manipulation always wins over a transient placement lease.
+  // Cancellation is lock-protected because this callback is outside the model
+  // mutation boundary.
+  if (event == EVENT_SYSTEM_MOVESIZESTART) {
+    CancelConformanceLease(hwnd);
   }
 
   // Cache user move/resize boundaries. The callback only records facts; model
@@ -103,33 +115,43 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   QueueWindowEvent(event, hwnd);
 }
 
-void InstallWinEventHooks() {
+bool AllWinEventHooksInstalled() {
+  return g_hooks.foreground && g_hooks.locationChange && g_hooks.moveSize &&
+         g_hooks.minimize && g_hooks.hideDestroy && g_hooks.cloak && g_hooks.state;
+}
+
+bool InstallWinEventHooks() {
+  auto noteFailure = [](const wchar_t* name) {
+    ++Diagnostics::g_runtime.counters.winEventHookInstallFailures;
+    Wh_Log(L"Failed to install %s WinEvent hook: %lu", name, GetLastError());
+  };
+
   if (!g_hooks.foreground) {
     g_hooks.foreground = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc,
         0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.foreground) Wh_Log(L"Failed to install foreground hook");
+    if (!g_hooks.foreground) noteFailure(L"foreground");
   }
 
   if (!g_hooks.locationChange) {
     g_hooks.locationChange = SetWinEventHook(
         EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr, WinEventProc,
         0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.locationChange) Wh_Log(L"Failed to install location-change hook");
+    if (!g_hooks.locationChange) noteFailure(L"location-change");
   }
 
   if (!g_hooks.moveSize) {
     g_hooks.moveSize = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
                                       nullptr, WinEventProc, 0, 0,
                                       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.moveSize) Wh_Log(L"Failed to install move/size hook");
+    if (!g_hooks.moveSize) noteFailure(L"move/size");
   }
 
   if (!g_hooks.minimize) {
     g_hooks.minimize = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
                                       nullptr, WinEventProc, 0, 0,
                                       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.minimize) Wh_Log(L"Failed to install minimization hook");
+    if (!g_hooks.minimize) noteFailure(L"minimization");
   }
 
   if (!g_hooks.hideDestroy) {
@@ -138,7 +160,7 @@ void InstallWinEventHooks() {
       nullptr, WinEventProc, 0, 0,
       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
     );
-    if (!g_hooks.hideDestroy) Wh_Log(L"Failed to install hide/destroy hook");
+    if (!g_hooks.hideDestroy) noteFailure(L"hide/destroy");
   }
 
   if (!g_hooks.cloak) {
@@ -147,7 +169,7 @@ void InstallWinEventHooks() {
       nullptr, WinEventProc, 0, 0,
       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
     );
-    if (!g_hooks.cloak) Wh_Log(L"Failed to install uncloak hook");
+    if (!g_hooks.cloak) noteFailure(L"cloak");
   }
 
   if (!g_hooks.state) {
@@ -155,8 +177,10 @@ void InstallWinEventHooks() {
         EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE,
         nullptr, WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.state) Wh_Log(L"Failed to install state-change hook");
+    if (!g_hooks.state) noteFailure(L"state-change");
   }
+
+  return AllWinEventHooksInstalled();
 }
 
 void RemoveWinEventHooks() {

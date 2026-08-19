@@ -59,6 +59,7 @@ void FloatFocusedWindow() {
     hint.anchor = RectCenter(before);
   }
 
+  CancelConformanceLease(tiled);
   if (!workspace.Float(tiled)) return;
   workspace.ResetPlacementFailures(tiled);
   RepairFloatingGeometry(key, workspace, tiled, hint);
@@ -128,6 +129,7 @@ static void HandleUserMove(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const MoveSizeGesture& gesture) {
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
+    CancelConformanceLease(hwnd);
     if (workspace.Float(hwnd)) {
       workspace.ResetPlacementFailures(hwnd);
       RepairFloatingGeometry(

@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.12.1
+// @version         1.13.0
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -23,8 +23,8 @@ resize-adjusted ratios per virtual desktop.
 - 7 per-workspace modes: Master+Stack (Vertical/Horizontal), Columns, Rows, BSP, Monocle, Floating
 - DPI-aware workspace insets/window gaps and independent master size
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
-- Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
-- Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
+- Uses native virtual-desktop notifications with centralized transient-failure retry; settled cloak/visibility reconciliation independently detects missed desktop switches as a safety fallback
+- Checked placement with per-window failure tracking, a configurable short conformance lease for late application self-moves, and automatic floating for repeatedly non-compliant windows
 - Manual or Automatic management modes: Manual keeps Alt+D groups inert, while Automatic continuously discovers and migrates windows
 - Configurable mouse drag behavior: float the moved window or swap it with the tiled window under the pointer
 - Dedicated optional hotkey to float the focused tiled window
@@ -187,6 +187,10 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Appearance] Custom Tray Layout Icons'
   $description: Optional per-layout .ico overrides. Failed or empty paths use the generated text icon.
 
+- ConformanceLeaseMs: 1500
+  $name: '[Advanced] Tiled Window Conformance Lease (ms)'
+  $description: 'After an authoritative tiled placement, briefly reinforce the assigned rectangle if the application moves itself again. User move/resize gestures cancel the lease immediately. Set to 0 to disable (0-10000 ms). [Default 1500]'
+
 - ReconcileDelayMs: 80
   $name: '[Advanced] Lifecycle Settle Delay (ms)'
   $description: Delay before visibility/lifecycle bursts are reconciled. Increase only if shell transitions are unusually slow (20-2000 ms).
@@ -212,6 +216,7 @@ resize-adjusted ratios per virtual desktop.
 #include "includes/multiwm_commands.h"
 #include "includes/multiwm_window_events.h"
 #include "includes/multiwm_virtual_desktop.h"
+#include "includes/multiwm_runtime_lifecycle.h"
 #include "includes/multiwm_tray_ui.h"
 #include "includes/multiwm_diagnostics.h"
 #include "includes/multiwm_bootstrap.h"
@@ -234,7 +239,11 @@ BOOL WhTool_ModInit() {
 
 void WhTool_ModUninit() {
   Wh_Log(L"Tiling Helper mod uninitializing...");
-  StopHotkeyThread();
+  if (!StopHotkeyThread()) {
+    // The standard tool-mod wrapper exits this dedicated process immediately
+    // after WhTool_ModUninit returns, so never create a second owner here.
+    Wh_Log(L"WM worker did not join before tool-process shutdown");
+  }
   Wh_Log(L"Tiling Helper mod uninitialized");
 }
 
@@ -242,9 +251,12 @@ void WhTool_ModSettingsChanged() {
   Wh_Log(L"Settings changed, reloading...");
 
   // Join the old diagnostics/model owner before touching lifetime telemetry.
-  // This keeps Counters and the bounded event histories single-writer without
-  // adding atomics or locks to hot paths.
-  StopHotkeyThread();
+  // If it cannot stop, keep the old worker/settings rather than allowing two WM
+  // actors to overlap inside the dedicated tool-mod process.
+  if (!StopHotkeyThread()) {
+    Wh_Log(L"Settings reload aborted because the existing WM worker is still alive");
+    return;
+  }
 
   ++Diagnostics::g_runtime.counters.settingsReloads;
   Diagnostics::RecordEvent(L"settings reload requested");
@@ -253,7 +265,7 @@ void WhTool_ModSettingsChanged() {
   // workspace identity, layout mode, ordering, or learned ratios.
   LoadSettings();
   if (!StartHotkeyThread()) {
-    Wh_Log(L"Failed to restart hotkey thread after settings change");
+    Wh_Log(L"Failed to restart WM worker after settings change");
   }
 }
 
