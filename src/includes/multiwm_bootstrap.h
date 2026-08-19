@@ -68,10 +68,6 @@ static bool ParseWorkspaceInsetsSetting(PCWSTR text, WorkspaceInsets* outInsets)
 }
 
 void LoadSettings() {
-  PCWSTR version = Wh_GetStringSetting(L"WindowsVersion");
-  g_settings.windowsVersionIndex = ParseWindowsVersion(version);
-  Wh_FreeStringSetting(version);
-
   g_settings.tilingModifiers = ReadModifierSetting(L"TilingModifier", MOD_ALT);
 
   PCWSTR insets = Wh_GetStringSetting(L"WorkspaceInsets");

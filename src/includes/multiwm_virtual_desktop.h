@@ -43,41 +43,21 @@ static const IID IID_IVirtualDesktopNotification_Current = {
     0xB9E5E94D, 0x233E, 0x49AB, {0xAF, 0x5C, 0x2B, 0x45, 0x41, 0xC3, 0xAA, 0xDE}};
 
 //=============================================================================
-// Windows Version-Specific Interface IDs
+// Virtual Desktop private ABI identifiers
 //=============================================================================
-struct VersionIIDs {
-  IID managerInternal;  // IID for IVirtualDesktopManagerInternal
-  IID virtualDesktop;   // IID for IVirtualDesktop
-  bool usesHMonitor;    // Whether API methods require HMONITOR parameter
-};
 
-static const VersionIIDs g_versionIIDs[] = {
-    // [0] Windows 10 (Build < 20348)
-    {{0xF31574D6, 0xB682, 0x4CDC, {0xBD, 0x56, 0x18, 0x27, 0x86, 0x0A, 0xBE, 0xC6}},
-     {0xFF72FFDD, 0xBE7E, 0x43FC, {0x9C, 0x03, 0xAD, 0x81, 0x68, 0x1E, 0x88, 0xE4}},
-     false},
-
-    // [1] Windows 10 (Build 20348 - 21999)
-    {{0x094AFE11, 0x44F2, 0x4BA0, {0x97, 0x6F, 0x29, 0xA9, 0x7E, 0x26, 0x3E, 0xE0}},
-     {0x62FDF88B, 0x11CA, 0x4AFB, {0x8B, 0xD8, 0x22, 0x96, 0xDF, 0xAE, 0x49, 0xE2}},
-     true},
-
-    // [2] Windows 11 (Build 22000 - 22482)
-    {{0xB2F925B9, 0x5A0F, 0x4D2E, {0x9F, 0x4D, 0x2B, 0x15, 0x07, 0x59, 0x3C, 0x10}},
-     {0x536D3495, 0xB208, 0x4CC9, {0xAE, 0x26, 0xDE, 0x81, 0x11, 0x27, 0x5B, 0xF8}},
-     true},
-
-    // [3] Windows 11 (Build 22621/22631/23H2)
-    {{0xA3175F2D, 0x239C, 0x4BD2, {0x8A, 0xA0, 0xEE, 0xBA, 0x8B, 0x0B, 0x13, 0x8E}},
-     {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
-     false},
-
-    // [4] Windows 11 (Build 26100+ / 24H2)
-    {{0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}},
-     {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
-     false},
-};
-
+// Manager interface generations. Selection is automatic from explorer.exe's
+// build; there is no user-facing Windows-version override.
+static const IID IID_IVirtualDesktopManagerInternal_Win10Old = {
+    0xF31574D6, 0xB682, 0x4CDC, {0xBD, 0x56, 0x18, 0x27, 0x86, 0x0A, 0xBE, 0xC6}};
+static const IID IID_IVirtualDesktopManagerInternal_Win10_20348 = {
+    0x094AFE11, 0x44F2, 0x4BA0, {0x97, 0x6F, 0x29, 0xA9, 0x7E, 0x26, 0x3E, 0xE0}};
+static const IID IID_IVirtualDesktopManagerInternal_Win11_22000 = {
+    0xB2F925B9, 0x5A0F, 0x4D2E, {0x9F, 0x4D, 0x2B, 0x15, 0x07, 0x59, 0x3C, 0x10}};
+static const IID IID_IVirtualDesktopManagerInternal_Win11_22621 = {
+    0xA3175F2D, 0x239C, 0x4BD2, {0x8A, 0xA0, 0xEE, 0xBA, 0x8B, 0x0B, 0x13, 0x8E}};
+static const IID IID_IVirtualDesktopManagerInternal_Win11_26100 = {
+    0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}};
 
 //=============================================================================
 // COM Interface Definitions (undocumented, reverse-engineered)
@@ -96,20 +76,12 @@ IVirtualDesktopNotificationService : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE Unregister(DWORD cookie) = 0;
 };
 
-struct NotificationInterfaceConfig {
-  IID iid{};
-  int methodCount = 0;
-  int currentChangedIndex = -1;
-  bool currentChangedHasMonitors = false;
-};
-
 struct VirtualDesktopNotificationObject {
   void** vtable = nullptr;
   LONG refCount = 1;
 };
 
-
-bool UsesHMonitorParameter() { return g_versionIIDs[g_settings.windowsVersionIndex].usesHMonitor; }
+bool UsesHMonitorParameter() { return g_vd.abi.usesHMonitor; }
 
 
 //=============================================================================
@@ -118,34 +90,66 @@ bool UsesHMonitorParameter() { return g_versionIIDs[g_settings.windowsVersionInd
 
 static const int VTABLE_GET_CURRENT_DESKTOP = 6;
 
-// Selects the private notification IID and vtable shape for this Explorer build.
-// An empty result means the ABI is unknown and native notifications are unsafe.
-static NotificationInterfaceConfig GetNotificationInterfaceConfig() {
-  if (g_vd.explorerBuild < 22000) return {};
-
-  // Mirrors Windhawk's Taskbar Desktop Indicator ABI table. The private
-  // notification interface changed both IID and callback layout within the
-  // Windows 11 22H2/23H2 servicing lifetime, so build number alone is not enough.
-  if (g_vd.explorerBuild < 22483 ||
-      (g_vd.explorerBuild == 22621 && g_vd.explorerRevision < 2215)) {
-    return {IID_IVirtualDesktopNotification_Old, 13, 11, true};
-  }
-
-  if (g_vd.explorerBuild < 22631 ||
-      (g_vd.explorerBuild == 22631 && g_vd.explorerRevision < 3085)) {
-    return {IID_IVirtualDesktopNotification_Intermediate, 14, 10, false};
-  }
-
-  return {IID_IVirtualDesktopNotification_Current, 14, 10, false};
+static const NotificationInterfaceConfig& GetNotificationInterfaceConfig() {
+  return g_vd.abi.notification;
 }
 
-static bool ReadExplorerVersion() {
+// Resolves every private VD ABI choice from one observed Explorer version.
+// Known gaps are rejected instead of guessing an undocumented manager IID.
+static bool SelectVirtualDesktopAbiProfile(
+    DWORD build, DWORD revision, VirtualDesktopAbiProfile* outProfile) {
+  if (!outProfile) return false;
+
+  VirtualDesktopAbiProfile profile{};
+
+  if (build < 20348) {
+    profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win10Old;
+    profile.usesHMonitor = false;
+  } else if (build < 22000) {
+    profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win10_20348;
+    profile.usesHMonitor = true;
+  } else if (build < 22483) {
+    profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win11_22000;
+    profile.usesHMonitor = true;
+  } else if (build >= 22621 && build < 26100) {
+    profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win11_22621;
+    profile.usesHMonitor = false;
+  } else if (build >= 26100) {
+    profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win11_26100;
+    profile.usesHMonitor = false;
+  } else {
+    // The old manual table did not claim a manager ABI for Insider builds
+    // 22483..22620. Keep that gap explicit rather than silently guessing.
+    return false;
+  }
+
+  // Mirrors Windhawk's Taskbar Desktop Indicator notification ABI table.
+  if (build >= 22000) {
+    if (build < 22483 ||
+        (build == 22621 && revision < 2215)) {
+      profile.notification = {IID_IVirtualDesktopNotification_Old, 13, 11, true};
+    } else if (build < 22631 ||
+               (build == 22631 && revision < 3085)) {
+      profile.notification = {
+          IID_IVirtualDesktopNotification_Intermediate, 14, 10, false};
+    } else {
+      profile.notification = {IID_IVirtualDesktopNotification_Current, 14, 10, false};
+    }
+  }
+
+  *outProfile = profile;
+  return true;
+}
+
+static bool ReadExplorerVersion(DWORD* outBuild, DWORD* outRevision) {
+  if (!outBuild || !outRevision) return false;
+
   wchar_t explorerPath[MAX_PATH]{};
   UINT length = GetWindowsDirectoryW(explorerPath, ARRAYSIZE(explorerPath));
   static constexpr wchar_t suffix[] = L"\\explorer.exe";
   if (!length || length >= ARRAYSIZE(explorerPath) ||
       length + ARRAYSIZE(suffix) > ARRAYSIZE(explorerPath)) {
-    Wh_Log(L"Failed to resolve explorer.exe path for VD notification ABI detection");
+    Wh_Log(L"Failed to resolve explorer.exe path for VD ABI detection");
     return false;
   }
   memcpy(explorerPath + length, suffix, sizeof(suffix));
@@ -171,10 +175,33 @@ static bool ReadExplorerVersion() {
     return false;
   }
 
-  g_vd.explorerBuild = HIWORD(fixedInfo->dwFileVersionLS);
-  g_vd.explorerRevision = LOWORD(fixedInfo->dwFileVersionLS);
-  Wh_Log(L"Explorer version for VD notifications: build=%lu revision=%lu",
-         g_vd.explorerBuild, g_vd.explorerRevision);
+  *outBuild = HIWORD(fixedInfo->dwFileVersionLS);
+  *outRevision = LOWORD(fixedInfo->dwFileVersionLS);
+  return true;
+}
+
+static bool ResolveVirtualDesktopAbiProfile() {
+  DWORD build = 0;
+  DWORD revision = 0;
+  if (!ReadExplorerVersion(&build, &revision)) return false;
+
+  VirtualDesktopAbiProfile profile{};
+  if (!SelectVirtualDesktopAbiProfile(build, revision, &profile)) {
+    Wh_Log(
+        L"Unsupported Explorer virtual-desktop ABI: build=%lu revision=%lu",
+        build, revision);
+    return false;
+  }
+
+  g_vd.explorerBuild = build;
+  g_vd.explorerRevision = revision;
+  g_vd.abi = profile;
+  g_vd.abiResolved = true;
+
+  Wh_Log(
+      L"Explorer virtual-desktop ABI resolved: build=%lu revision=%lu hmonitor=%d notifications=%d",
+      build, revision, profile.usesHMonitor ? 1 : 0,
+      profile.notification.methodCount);
   return true;
 }
 
@@ -316,8 +343,7 @@ static void ClearVirtualDesktopNotificationState(bool unregisterFromShell) {
 
 bool RegisterVirtualDesktopNotifications() {
   if (g_vd.notificationsRegistered) return true;
-  if (!g_vd.serviceProvider) return false;
-  if (!ReadExplorerVersion()) return false;
+  if (!g_vd.serviceProvider || !g_vd.abiResolved) return false;
 
   NotificationInterfaceConfig config = GetNotificationInterfaceConfig();
   if (config.methodCount == 0) {
@@ -371,6 +397,8 @@ bool RegisterVirtualDesktopNotifications() {
 // Acquires the COM interfaces needed for virtual-desktop queries. The outer
 // lifecycle wrapper owns the initialized flag and notification registration.
 bool InitializeVirtualDesktopAPIOnce() {
+  if (!ResolveVirtualDesktopAbiProfile()) return false;
+
   HRESULT hr = CoCreateInstance(CLSID_ImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
                                 (void**)&g_vd.serviceProvider);
   if (FAILED(hr) || !g_vd.serviceProvider) {
@@ -378,9 +406,9 @@ bool InitializeVirtualDesktopAPIOnce() {
     return false;
   }
 
-  hr = g_vd.serviceProvider->QueryService(CLSID_VirtualDesktopManagerInternal,
-                                        g_versionIIDs[g_settings.windowsVersionIndex].managerInternal,
-                                        (void**)&g_vd.managerInternal);
+  hr = g_vd.serviceProvider->QueryService(
+      CLSID_VirtualDesktopManagerInternal, g_vd.abi.managerInternal,
+      reinterpret_cast<void**>(&g_vd.managerInternal));
   if (FAILED(hr) || !g_vd.managerInternal) {
     Wh_Log(L"Failed to get VirtualDesktopManagerInternal: 0x%08X", hr);
     SAFE_RELEASE(g_vd.serviceProvider);
@@ -406,6 +434,10 @@ void CleanupVirtualDesktopAPI() {
   const bool shellAvailable = hShell && IsWindow(hShell);
 
   ClearVirtualDesktopNotificationState(shellAvailable);
+  g_vd.abi = {};
+  g_vd.abiResolved = false;
+  g_vd.explorerBuild = 0;
+  g_vd.explorerRevision = 0;
 
   if (!shellAvailable) {
     Wh_Log(L"Explorer not available, skipping COM cleanup to avoid hang");

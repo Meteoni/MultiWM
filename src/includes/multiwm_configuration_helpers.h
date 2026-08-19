@@ -29,12 +29,6 @@ TileLayout ParseLayoutSetting(PCWSTR str) {
   return LookupTable(str, kLayoutMap, _countof(kLayoutMap), TileLayout::MasterStack);
 }
 
-int ParseWindowsVersion(PCWSTR str) {
-  static const std::pair<PCWSTR, int> kVersionMap[] = {
-      {L"win10_old", 0}, {L"win10_20348", 1}, {L"win11_22000", 2}, {L"win11_22621", 3}, {L"win11_26100", 4}};
-  return LookupTable(str, kVersionMap, _countof(kVersionMap), 4);
-}
-
 template <typename T, typename Parser>
 T ReadHotkeySetting(PCWSTR name, Parser parser, T defaultVal) {
   PCWSTR str = Wh_GetStringSetting(name);

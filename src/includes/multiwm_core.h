@@ -98,6 +98,19 @@ struct IVirtualDesktopManagerInternal;
 struct IVirtualDesktopNotificationService;
 struct VirtualDesktopNotificationObject;
 
+struct NotificationInterfaceConfig {
+  IID iid{};
+  int methodCount = 0;
+  int currentChangedIndex = -1;
+  bool currentChangedHasMonitors = false;
+};
+
+struct VirtualDesktopAbiProfile {
+  IID managerInternal{};
+  bool usesHMonitor = false;
+  NotificationInterfaceConfig notification{};
+};
+
 bool InitializeVirtualDesktopAPI();
 void CleanupVirtualDesktopAPI();
 bool GetCurrentDesktopId(GUID* outGuid);
@@ -159,7 +172,6 @@ struct WorkspaceInsets {
 // Windhawk settings and immutable-at-runtime policy values. Settings reloads
 // replace these fields; transient WM state lives in WmRuntime instead.
 struct SettingsState {
-  int windowsVersionIndex = 4;
   UINT reconcileDelayMs = 80;
 
   UINT tilingModifiers = MOD_ALT;
@@ -191,6 +203,8 @@ struct VirtualDesktopRuntime {
   bool notificationsRegistered = false;
   DWORD explorerBuild = 0;
   DWORD explorerRevision = 0;
+  Platform::VirtualDesktop::VirtualDesktopAbiProfile abi{};
+  bool abiResolved = false;
   LONG changeQueued = 0;
   bool initialized = false;
 };

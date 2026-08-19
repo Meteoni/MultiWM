@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.11.4
+// @version         1.11.5
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -53,7 +53,7 @@ resize-adjusted ratios per virtual desktop.
 ## Notes
 - Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
 - Floating exists both as a workspace mode and as a per-window managed state.
-- Native virtual-desktop notifications are selected from the actual Explorer build/revision; unsupported builds fall back to settled WinEvent reconciliation.
+- Private virtual-desktop manager and notification ABIs are selected automatically from the actual Explorer build/revision; unknown manager generations are rejected instead of guessed.
 - If Virtual Desktop APIs are unavailable, tiling still works but per-desktop memory is disabled.
 */
 // ==/WindhawkModReadme==
@@ -170,16 +170,6 @@ resize-adjusted ratios per virtual desktop.
         $name: Icon path (.ico)
   $name: '[Appearance] Custom Tray Layout Icons'
   $description: Optional per-layout .ico overrides. Failed or empty paths use the generated text icon.
-
-- WindowsVersion: win11_26100
-  $name: '[Advanced] Windows Version'
-  $description: Select your Windows version for private virtual-desktop interface IDs. Run "winver" to check your build number.
-  $options:
-    - win10_old: Windows 10 (Build < 20348)
-    - win10_20348: Windows 10 (Build 20348 - 21999)
-    - win11_22000: Windows 11 (Build 22000 - 22482)
-    - win11_22621: Windows 11 (Build 22621/22631/23H2)
-    - win11_26100: Windows 11 (Build 26100+ / 24H2)
 
 - ReconcileDelayMs: 80
   $name: '[Advanced] Lifecycle Settle Delay (ms)'
