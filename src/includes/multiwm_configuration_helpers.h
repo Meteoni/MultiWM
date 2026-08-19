@@ -10,23 +10,30 @@ UINT ParseModifiers(PCWSTR str) {
   return modifiers;
 }
 
-template <typename T>
-T LookupTable(PCWSTR str, const std::pair<PCWSTR, T>* table, size_t count, T defaultVal) {
-  for (size_t i = 0; i < count; ++i) {
-    if (wcscmp(str, table[i].first) == 0) return table[i].second;
+static bool TryParseLayoutSetting(PCWSTR str, TileLayout* outLayout) {
+  if (!str || !outLayout) return false;
+  static const std::pair<PCWSTR, TileLayout> kLayoutMap[] = {
+      {L"master_stack", TileLayout::MasterStack},
+      {L"master_stack_h", TileLayout::MasterStackH},
+      {L"columns", TileLayout::Columns},
+      {L"rows", TileLayout::Rows},
+      {L"bsp", TileLayout::BSP},
+      {L"monocle", TileLayout::Monocle},
+      {L"floating", TileLayout::Floating},
+  };
+  for (const auto& entry : kLayoutMap) {
+    if (wcscmp(str, entry.first) == 0) {
+      *outLayout = entry.second;
+      return true;
+    }
   }
-  return defaultVal;
+  return false;
 }
 
 TileLayout ParseLayoutSetting(PCWSTR str) {
-  static const std::pair<PCWSTR, TileLayout> kLayoutMap[] = {{L"master_stack", TileLayout::MasterStack},
-                                                             {L"master_stack_h", TileLayout::MasterStackH},
-                                                             {L"columns", TileLayout::Columns},
-                                                             {L"rows", TileLayout::Rows},
-                                                             {L"bsp", TileLayout::BSP},
-                                                             {L"monocle", TileLayout::Monocle},
-                                                             {L"floating", TileLayout::Floating}};
-  return LookupTable(str, kLayoutMap, _countof(kLayoutMap), TileLayout::MasterStack);
+  TileLayout layout = TileLayout::MasterStack;
+  TryParseLayoutSetting(str, &layout);
+  return layout;
 }
 
 template <typename T, typename Parser>

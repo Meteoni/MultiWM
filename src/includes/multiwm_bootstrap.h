@@ -123,6 +123,26 @@ void LoadSettings() {
   g_settings.defaultLayout = ParseLayoutSetting(layout);
   Wh_FreeStringSetting(layout);
 
+  g_settings.layoutCycle.clear();
+  for (int i = 0; i < 32; ++i) {
+    auto cycleEntry = WindhawkUtils::StringSetting::make(L"LayoutCycle[%d]", i);
+    if (!*cycleEntry.get()) break;
+
+    TileLayout cycleLayout{};
+    if (!TryParseLayoutSetting(cycleEntry.get(), &cycleLayout)) {
+      Wh_Log(L"Ignoring invalid LayoutCycle[%d] entry: %s", i, cycleEntry.get());
+      continue;
+    }
+    if (std::find(g_settings.layoutCycle.begin(), g_settings.layoutCycle.end(),
+                  cycleLayout) == g_settings.layoutCycle.end()) {
+      g_settings.layoutCycle.push_back(cycleLayout);
+    }
+  }
+  if (g_settings.layoutCycle.empty()) {
+    g_settings.layoutCycle = MakeBuiltInLayoutCycle();
+    Wh_Log(L"LayoutCycle is empty or invalid; using the built-in layout sequence");
+  }
+
   PCWSTR mouseBehavior = Wh_GetStringSetting(L"MouseMoveBehavior");
   g_settings.mouseMoveBehavior = mouseBehavior && _wcsicmp(mouseBehavior, L"swap") == 0
                             ? MouseMoveBehavior::Swap

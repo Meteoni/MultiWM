@@ -427,13 +427,20 @@ void Workspace::SetLayout(TileLayout layout) {
   DebugValidateMutation(L"Workspace::SetLayout");
 }
 
-void Workspace::CycleLayout() {
+bool Workspace::CycleLayout(const std::vector<TileLayout>& cycle) {
   AssertWmThread(L"Workspace::CycleLayout");
-  layout_ = static_cast<TileLayout>(
-      (static_cast<int>(layout_) + 1) % static_cast<int>(TileLayout::COUNT));
-  ResetSuspendedLayoutHints();
-  EnsureWeights();
-  DebugValidateMutation(L"Workspace::CycleLayout");
+  if (cycle.empty()) return false;
+
+  auto it = std::find(cycle.begin(), cycle.end(), layout_);
+  TileLayout nextLayout = cycle.front();
+  if (it != cycle.end()) {
+    ++it;
+    if (it != cycle.end()) nextLayout = *it;
+  }
+  if (nextLayout == layout_) return false;
+
+  SetLayout(nextLayout);
+  return true;
 }
 
 void Workspace::SetMasterRatio(double ratio) {

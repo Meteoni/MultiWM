@@ -159,6 +159,17 @@ enum class MouseMoveBehavior { Float, Swap };
 enum class ExclusionMatch { Process, Class, Title };
 enum class ManagementMode { Manual, Automatic };
 
+static std::vector<TileLayout> MakeBuiltInLayoutCycle() {
+  return {
+      TileLayout::MasterStack,
+      TileLayout::Columns,
+      TileLayout::Rows,
+      TileLayout::MasterStackH,
+      TileLayout::BSP,
+      TileLayout::Monocle,
+      TileLayout::Floating};
+}
+
 struct ExclusionRule {
   ExclusionMatch match = ExclusionMatch::Process;
   std::wstring value;
@@ -198,6 +209,7 @@ struct SettingsState {
 
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
   TileLayout defaultLayout = TileLayout::MasterStack;
+  std::vector<TileLayout> layoutCycle = MakeBuiltInLayoutCycle();
   std::vector<ExclusionRule> exclusionRules;
 };
 
@@ -397,7 +409,7 @@ class Workspace {
   bool AllTiledVisible(const std::vector<HWND>& snapshot) const;
 
   void SetLayout(TileLayout layout);
-  void CycleLayout();
+  bool CycleLayout(const std::vector<TileLayout>& cycle);
   void SetMasterRatio(double ratio);
   bool MakeMaster(HWND hwnd, HWND* oldMaster = nullptr);
   bool SwapTiled(HWND first, HWND second);

@@ -101,7 +101,7 @@ void CycleCurrentWorkspaceLayout() {
   }
 
   const TileLayout previousLayout = state.Layout();
-  state.CycleLayout();
+  if (!state.CycleLayout(g_settings.layoutCycle)) return;
   if (previousLayout != TileLayout::Floating &&
       state.Layout() == TileLayout::Floating) {
     RestoreWorkspaceFloatingGeometry(key, state);

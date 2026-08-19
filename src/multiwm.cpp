@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.11.8
+// @version         1.11.9
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -19,7 +19,7 @@ resize-adjusted ratios per virtual desktop.
 
 ## Features
 - Manual tiling hotkey
-- Layout cycle hotkey
+- Layout cycle hotkey with a user-configurable per-layout cycle order
 - 7 per-workspace modes: Master+Stack (Vertical/Horizontal), Columns, Rows, BSP, Monocle, Floating
 - DPI-aware workspace insets/window gaps and independent master size
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
@@ -70,6 +70,18 @@ resize-adjusted ratios per virtual desktop.
 - DefaultLayout: master_stack
   $name: '[General] Default Workspace Layout'
   $description: Initial layout used when a new desktop + monitor workspace is created.
+  $options:
+    - master_stack: Master + Stack (Vertical)
+    - master_stack_h: Master + Stack (Horizontal)
+    - columns: Columns
+    - rows: Rows
+    - bsp: BSP (Binary Space Partition)
+    - monocle: Monocle (Fullscreen)
+    - floating: Floating (managed, no automatic placement)
+
+- LayoutCycle: [master_stack, columns, rows, master_stack_h, bsp, monocle, floating]
+  $name: '[Workspace] Layout Cycle'
+  $description: 'Layouts visited by the Cycle Layout hotkey, in order. Remove layouts you never want to cycle through or drag entries to reorder them. If the current layout is not in the list, the next cycle starts at the first entry.'
   $options:
     - master_stack: Master + Stack (Vertical)
     - master_stack_h: Master + Stack (Horizontal)
