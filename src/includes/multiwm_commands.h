@@ -6,6 +6,7 @@ namespace Commands {
 // Promotes the foreground window, or its tiled owner, to the master slot, then
 // clears stale gesture samples for both windows and reflows the workspace.
 void SwapMaster() {
+  ++Diagnostics::g_runtime.counters.swapMasterCommands;
   HWND fg = GetForegroundWindow();
   if (!fg) return;
 
@@ -30,9 +31,12 @@ void SwapMaster() {
   ClearMoveSizeSamples(oldMaster);
   ClearMoveSizeSamples(resolved);
   ArrangeWorkspace(key);
+  Diagnostics::RecordEvent(
+      L"Swap Master old=%p new=%p", oldMaster, resolved);
 }
 
 void FloatFocusedWindow() {
+  ++Diagnostics::g_runtime.counters.floatFocusedCommands;
   HWND hwnd = GetForegroundWindow();
   if (!hwnd) return;
 
@@ -61,11 +65,13 @@ void FloatFocusedWindow() {
   g_workspaces.Save(key, workspace);
   ArrangeWorkspace(key);
   Wh_Log(L"Focused window floated %p", tiled);
+  Diagnostics::RecordEvent(L"Float Focused hwnd=%p", tiled);
 }
 
 // Manual tile: reconcile membership and explicitly adopt the user's current
 // geometry. Automatic events never call this with adoptCurrentGeometry=true.
 void TileWindows() {
+  ++Diagnostics::g_runtime.counters.tileCommands;
   HMONITOR monitor = GetTargetMonitor();
   if (!monitor) return;
 
@@ -85,11 +91,13 @@ void TileWindows() {
 
   TrayUi::RefreshForCurrentWorkspace();
   Wh_Log(L"Manual tile/global reconcile completed");
+  Diagnostics::RecordEvent(L"Tile Workspace command completed monitor=%p", monitor);
 }
 
 // Advances the current workspace layout and invalidates layout-specific hints in
 // suspended slots before persisting, arranging, and updating UI feedback.
 void CycleCurrentWorkspaceLayout() {
+  ++Diagnostics::g_runtime.counters.layoutCycleCommands;
   HMONITOR monitor = GetTargetMonitor();
   if (!monitor) return;
   DesktopMonitorKey key{};
@@ -111,11 +119,15 @@ void CycleCurrentWorkspaceLayout() {
   TrayUi::UpdateIcon(state.Layout());
   TrayUi::ShowLayoutFlyout(state.Layout());
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.Layout()));
+  Diagnostics::RecordEvent(
+      L"layout cycle desktop=%08X monitor=%p from=%d to=%d", key.desktopId.Data1,
+      key.monitor, static_cast<int>(previousLayout), static_cast<int>(state.Layout()));
 }
 
 static void HandleUserMove(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const MoveSizeGesture& gesture) {
+  ++Diagnostics::g_runtime.counters.userMoveGestures;
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
     if (workspace.Float(hwnd)) {
       workspace.ResetPlacementFailures(hwnd);
@@ -123,6 +135,7 @@ static void HandleUserMove(
           key, workspace, hwnd, MakeFloatingPlacementHintFromGesture(gesture));
       g_workspaces.Save(key, workspace);
       Wh_Log(L"User move floated managed window %p", hwnd);
+      Diagnostics::RecordEvent(L"user drag floated hwnd=%p", hwnd);
     }
     ArrangeWorkspace(key);
     return;
@@ -143,6 +156,7 @@ static void HandleUserMove(
   if (target && workspace.SwapTiled(hwnd, target)) {
     g_workspaces.Save(key, workspace);
     Wh_Log(L"User move swapped managed windows %p and %p", hwnd, target);
+    Diagnostics::RecordEvent(L"user drag swapped hwnd=%p target=%p", hwnd, target);
   }
 
   // No target means the source remains tiled and simply snaps back to its slot.
@@ -152,6 +166,7 @@ static void HandleUserMove(
 static void HandleUserResize(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const RECT& workArea, const MoveSizeGesture& gesture) {
+  ++Diagnostics::g_runtime.counters.userResizeGestures;
   if (!gesture.hasRects) {
     ArrangeWorkspace(key);
     return;
@@ -189,6 +204,7 @@ static void HandleUserResize(
   if (changed) {
     g_workspaces.Save(key, workspace);
     Wh_Log(L"User resize updated local divider state for %p", hwnd);
+    Diagnostics::RecordEvent(L"user resize updated divider hwnd=%p", hwnd);
   }
   ArrangeWorkspace(key);
 }

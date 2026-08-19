@@ -397,12 +397,17 @@ bool RegisterVirtualDesktopNotifications() {
 // Acquires the COM interfaces needed for virtual-desktop queries. The outer
 // lifecycle wrapper owns the initialized flag and notification registration.
 bool InitializeVirtualDesktopAPIOnce() {
-  if (!ResolveVirtualDesktopAbiProfile()) return false;
+  ++Diagnostics::g_runtime.counters.vdApiInitAttempts;
+  if (!ResolveVirtualDesktopAbiProfile()) {
+    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
+    return false;
+  }
 
   HRESULT hr = CoCreateInstance(CLSID_ImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
                                 (void**)&g_vd.serviceProvider);
   if (FAILED(hr) || !g_vd.serviceProvider) {
     Wh_Log(L"Failed to create ImmersiveShell: 0x%08X", hr);
+    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
     return false;
   }
 
@@ -412,6 +417,7 @@ bool InitializeVirtualDesktopAPIOnce() {
   if (FAILED(hr) || !g_vd.managerInternal) {
     Wh_Log(L"Failed to get VirtualDesktopManagerInternal: 0x%08X", hr);
     SAFE_RELEASE(g_vd.serviceProvider);
+    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
     return false;
   }
 
@@ -421,9 +427,11 @@ bool InitializeVirtualDesktopAPIOnce() {
     Wh_Log(L"Failed to create VirtualDesktopManager: 0x%08X", hr);
     SAFE_RELEASE(g_vd.managerInternal);
     SAFE_RELEASE(g_vd.serviceProvider);
+    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
     return false;
   }
 
+  ++Diagnostics::g_runtime.counters.vdApiInitSuccesses;
   return true;
 }
 
@@ -464,6 +472,8 @@ bool InitializeVirtualDesktopAPI() {
 }
 
 bool ReinitializeVirtualDesktopAPI() {
+  ++Diagnostics::g_runtime.counters.vdApiReinitializations;
+  Diagnostics::RecordEvent(L"virtual desktop API reinitialization requested");
   CleanupVirtualDesktopAPI();
   if (!InitializeVirtualDesktopAPI()) return false;
   RegisterVirtualDesktopNotifications();

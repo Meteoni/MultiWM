@@ -181,6 +181,7 @@ static bool RepairFloatingGeometry(
           ? observation.observed
           : target;
   workspace.RememberFloatingGeometry(hwnd, remembered, key.monitor, targetDpi);
+  ++Diagnostics::g_runtime.counters.floatingGeometryRepairs;
   return true;
 }
 
@@ -236,13 +237,27 @@ static bool GetCurrentWorkspaceKey(HMONITOR monitor, DesktopMonitorKey* outKey, 
 }
 
 bool Workspace::Validate(
-    const DesktopMonitorKey& key, const wchar_t* context) const {
+    const DesktopMonitorKey& key, const wchar_t* context,
+    std::vector<std::wstring>* errors, bool logFailures) const {
   bool valid = true;
   auto fail = [&](const wchar_t* message, HWND hwnd = nullptr) {
-    Wh_Log(
-        L"Workspace invariant violation (%s, desktop=%08X monitor=%p hwnd=%p): %s",
-        context ? context : L"workspace", key.desktopId.Data1, key.monitor, hwnd,
-        message);
+    if (errors) {
+      if (hwnd) {
+        wchar_t buffer[512]{};
+        swprintf(
+            buffer, ARRAYSIZE(buffer), L"%ls (hwnd=%p)", message,
+            reinterpret_cast<void*>(hwnd));
+        errors->push_back(buffer);
+      } else {
+        errors->push_back(message);
+      }
+    }
+    if (logFailures) {
+      Wh_Log(
+          L"Workspace invariant violation (%s, desktop=%08X monitor=%p hwnd=%p): %s",
+          context ? context : L"workspace", key.desktopId.Data1, key.monitor, hwnd,
+          message);
+    }
     valid = false;
   };
 
@@ -359,6 +374,7 @@ bool WorkspaceRepository::Load(
 void WorkspaceRepository::Save(
     const DesktopMonitorKey& key, const Workspace& workspace) {
   AssertWmThread(L"WorkspaceRepository::Save");
+  ++Diagnostics::g_runtime.counters.workspaceSaves;
   workspace.Validate(key, L"repository save");
 
   AcquireSRWLockExclusive(&lock_);
@@ -475,6 +491,16 @@ WorkspaceRepository::Snapshot() const {
   AcquireSRWLockShared(&lock_);
   snapshot.reserve(states_.size());
   for (const auto& kv : states_) snapshot.push_back(kv);
+  ReleaseSRWLockShared(&lock_);
+  return snapshot;
+}
+
+std::vector<std::pair<HWND, std::vector<DesktopMonitorKey>>>
+WorkspaceRepository::OwnershipIndexSnapshot() const {
+  std::vector<std::pair<HWND, std::vector<DesktopMonitorKey>>> snapshot;
+  AcquireSRWLockShared(&lock_);
+  snapshot.reserve(ownersByWindow_.size());
+  for (const auto& kv : ownersByWindow_) snapshot.push_back(kv);
   ReleaseSRWLockShared(&lock_);
   return snapshot;
 }

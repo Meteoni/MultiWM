@@ -110,11 +110,14 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
     std::vector<HWND>* windowList;
   } context = {monitor, &windows};
 
+  ++Diagnostics::g_runtime.counters.enumWindowsPasses;
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        ++Diagnostics::g_runtime.counters.enumWindowsVisited;
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
         if (GetCurrentManagedWindowMonitor(hwnd) == ctx->targetMonitor) {
           ctx->windowList->push_back(hwnd);
+          ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
         }
         return TRUE;
       },
@@ -136,8 +139,10 @@ static std::vector<std::vector<HWND>> CollectTileWindowsForMonitors(
     std::vector<std::vector<HWND>>* snapshots;
   } context = {&monitors, &snapshots};
 
+  ++Diagnostics::g_runtime.counters.enumWindowsPasses;
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        ++Diagnostics::g_runtime.counters.enumWindowsVisited;
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
         const HMONITOR monitor = GetCurrentManagedWindowMonitor(hwnd);
         if (!monitor) return TRUE;
@@ -147,6 +152,7 @@ static std::vector<std::vector<HWND>> CollectTileWindowsForMonitors(
 
         const size_t index = static_cast<size_t>(it - ctx->monitors->begin());
         (*ctx->snapshots)[index].push_back(hwnd);
+        ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
         return TRUE;
       },
       reinterpret_cast<LPARAM>(&context));
@@ -350,11 +356,35 @@ static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPla
 // resulting value object is folded into Workspace separately.
 static PlacementObservation PlaceWindowChecked(
     HWND hwnd, bool canMove, const RECT& targetRect) {
+  ++Diagnostics::g_runtime.counters.placementChecks;
   PlacementObservation observation;
   observation.requested = targetRect;
 
   auto finish = [&](PlacementResult result) {
     observation.result = result;
+    switch (result) {
+      case PlacementResult::Success:
+        ++Diagnostics::g_runtime.counters.placementSuccess;
+        break;
+      case PlacementResult::AdjustedByWindow:
+        ++Diagnostics::g_runtime.counters.placementAdjusted;
+        break;
+      case PlacementResult::AccessDenied:
+        ++Diagnostics::g_runtime.counters.placementAccessDenied;
+        break;
+      case PlacementResult::Refused:
+        ++Diagnostics::g_runtime.counters.placementRefused;
+        break;
+      case PlacementResult::Dead:
+        ++Diagnostics::g_runtime.counters.placementDead;
+        break;
+    }
+    if (result != PlacementResult::Success) {
+      Diagnostics::RecordEvent(
+          L"placement result=%d hwnd=%p target=[%ld,%ld,%ld,%ld]",
+          static_cast<int>(result), hwnd, targetRect.left, targetRect.top,
+          targetRect.right, targetRect.bottom);
+    }
     return observation;
   };
 
@@ -365,6 +395,7 @@ static PlacementObservation PlaceWindowChecked(
   if (GetWindowFrameRect(hwnd, &currentFrame)) {
     observation.observed = currentFrame;
     if (RectsNear(currentFrame, targetRect)) {
+      ++Diagnostics::g_runtime.counters.placementNoOps;
       return finish(PlacementResult::Success);
     }
   }
@@ -381,6 +412,7 @@ static PlacementObservation PlaceWindowChecked(
   }
 
   SetLastError(ERROR_SUCCESS);
+  ++Diagnostics::g_runtime.counters.setWindowPosCalls;
   BOOL placed = SetWindowPos(
       hwnd, nullptr,
       targetRect.left - offsetLeft,

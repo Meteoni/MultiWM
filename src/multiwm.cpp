@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.11.9
+// @version         1.12.0
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -37,7 +37,7 @@ resize-adjusted ratios per virtual desktop.
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
-- Diagnostic bookkeeping dump prints a deterministic, formatted snapshot of every saved workspace/window record with live window/process identity, without mutating state
+- Hotkey diagnostics write a timestamped UTF-8 text report with runtime/churn counters, recent significant events, platform health, invariant audit, and deterministic per-workspace/window state
 - New-workspace initialization discovers visible minimized/maximized windows as suspended logical members instead of losing them
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
@@ -48,7 +48,7 @@ resize-adjusted ratios per virtual desktop.
 - Switch master window: Alt + M
 - Float focused window: unbound by default
 - Toggle Automatic/Manual mode: Alt + U
-- Dump saved bookkeeping: Alt + I
+- Write diagnostic report: Alt + I
 
 ## Notes
 - Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
@@ -191,9 +191,13 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Advanced] Lifecycle Settle Delay (ms)'
   $description: Delay before visibility/lifecycle bursts are reconciled. Increase only if shell transitions are unusually slow (20-2000 ms).
 
+- DiagnosticsOutputPath: "%USERPROFILE%\\Documents\\TilingHelperDiagnostics"
+  $name: '[Diagnostics] Output Directory'
+  $description: 'Directory for timestamped UTF-8 .txt diagnostic reports. Environment variables such as %USERPROFILE% are supported and missing directories are created. Reports include window titles and executable paths, so review them before sharing.'
+
 - DiagnosticDumpKey: "I"
-  $name: '[Diagnostics] Dump Workspace State'
-  $description: 'Dump the complete saved workspace/window state and invariant audit to the Windhawk log. Uses the configured modifier. Leave blank to disable.'
+  $name: '[Diagnostics] Write Diagnostic Report'
+  $description: 'Write a formatted state, health, churn, and invariant report to the configured output directory. Uses the configured modifier. Leave blank to disable.'
 */
 // ==/WindhawkModSettings==
 
@@ -217,6 +221,7 @@ resize-adjusted ratios per virtual desktop.
 //=============================================================================
 
 BOOL WhTool_ModInit() {
+  Diagnostics::InitializeProcessRuntime();
   Wh_Log(L"Tiling Helper mod initializing...");
   LoadSettings();
   if (!StartHotkeyThread()) {
@@ -234,6 +239,8 @@ void WhTool_ModUninit() {
 }
 
 void WhTool_ModSettingsChanged() {
+  ++Diagnostics::g_runtime.counters.settingsReloads;
+  Diagnostics::RecordEvent(L"settings reload requested");
   Wh_Log(L"Settings changed, reloading...");
   StopHotkeyThread();
   // Settings reload changes defaults/policies but does not destroy per-desktop

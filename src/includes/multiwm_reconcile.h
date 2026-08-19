@@ -230,6 +230,11 @@ static bool MigrateManagedWindow(
   }
 
   g_workspaces.Save(targetKey, target);
+  ++Diagnostics::g_runtime.counters.workspaceMigrations;
+  Diagnostics::RecordEvent(
+      L"workspace migration hwnd=%p sourceDesktop=%08X targetDesktop=%08X sourceMonitor=%p targetMonitor=%p",
+      hwnd, sourceKey.desktopId.Data1, targetKey.desktopId.Data1, sourceKey.monitor,
+      targetKey.monitor);
   return true;
 }
 
@@ -441,9 +446,11 @@ static void ReconcileKnownWindow(
 static void ReconcileKnownWindows(
     ReconcileScope scope, std::vector<DesktopMonitorKey>* changedKeys,
     HWND onlyHwnd) {
+  ++Diagnostics::g_runtime.counters.reconcileCalls;
   const std::vector<HWND> known = onlyHwnd
                                       ? std::vector<HWND>{onlyHwnd}
                                       : g_workspaces.KnownWindows();
+  Diagnostics::g_runtime.counters.reconcileWindowsExamined += known.size();
   for (HWND hwnd : known) ReconcileKnownWindow(hwnd, scope, changedKeys);
 }
 
@@ -555,8 +562,10 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
     std::vector<HWND>* windowList;
   } context = {monitor, desktopId, &windows};
 
+  ++Diagnostics::g_runtime.counters.enumWindowsPasses;
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        ++Diagnostics::g_runtime.counters.enumWindowsVisited;
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
 
         if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return TRUE;
@@ -577,6 +586,7 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
 
         if (MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == ctx->targetMonitor) {
           ctx->windowList->push_back(hwnd);
+          ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
         }
         return TRUE;
       },
@@ -590,13 +600,18 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
 // windows; known WindowRecord membership is never rebuilt from shell visibility.
 static void HandleVirtualDesktopChanged() {
   InterlockedExchange(&g_vd.changeQueued, 0);
+  ++Diagnostics::g_runtime.counters.virtualDesktopChangesProcessed;
 
   GUID currentDesktop{};
   if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&currentDesktop)) {
     Wh_Log(L"Native VD change received but current desktop query failed");
+    Diagnostics::RecordEvent(L"virtual desktop notification: current desktop query failed");
     ScheduleLifecycleReconcile(nullptr);
     return;
   }
+
+  Diagnostics::RecordEvent(
+      L"virtual desktop changed currentDesktop=%08X", currentDesktop.Data1);
 
   // A native VD transition is an authoritative reason to repair desktop ownership.
   // Do not infer monitor migration here; defer visibility/window-state participation
@@ -645,6 +660,7 @@ static void HandleVirtualDesktopChanged() {
 // desktop ownership for the affected tracked HWND, but never infer ownership
 // directly from HIDE/SHOW/CLOAK itself.
 static void ScheduleLifecycleReconcile(HWND hwnd) {
+  ++Diagnostics::g_runtime.counters.lifecycleScheduleRequests;
   // HotkeyThreadProc owns this vector/timer; no additional lock is required.
   if (hwnd && std::find(g_wm.lifecycleDirtyWindows.begin(), g_wm.lifecycleDirtyWindows.end(), hwnd) ==
                   g_wm.lifecycleDirtyWindows.end()) {
@@ -652,6 +668,7 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
   }
 
   if (g_wm.lifecycleTimer) {
+    ++Diagnostics::g_runtime.counters.lifecycleTimerResets;
     KillTimer(nullptr, g_wm.lifecycleTimer);
     g_wm.lifecycleTimer = 0;
   }
@@ -666,6 +683,7 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
 // state, discover eligible windows only on the current desktop, then arrange each
 // changed or pending workspace once and refresh the tray.
 static void ReconcileDeferredLifecycle() {
+  ++Diagnostics::g_runtime.counters.lifecycleReconciles;
   if (g_wm.lifecycleTimer) {
     KillTimer(nullptr, g_wm.lifecycleTimer);
     g_wm.lifecycleTimer = 0;
@@ -673,6 +691,10 @@ static void ReconcileDeferredLifecycle() {
 
   std::vector<HWND> dirtyWindows;
   dirtyWindows.swap(g_wm.lifecycleDirtyWindows);
+  Diagnostics::g_runtime.counters.lifecycleDirtyWindowsProcessed += dirtyWindows.size();
+  Diagnostics::RecordEvent(
+      L"settled lifecycle reconcile dirtyWindows=%zu pendingArranges=%zu",
+      dirtyWindows.size(), g_wm.pendingDesktopArranges.size());
 
   // First repair liveness/exclusions and settled hidden/minimized/maximized participation
   // globally. This also suspends every stale logical copy defensively if an old
@@ -771,6 +793,37 @@ static void ReconcileManagedWindowStateNow(HWND hwnd) {
 // state changes get immediate and settled reconciliation, while visibility and
 // cloak events remain dirty signals until shell state stabilizes.
 static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
+  ++Diagnostics::g_runtime.counters.lifecycleEventsProcessed;
+  switch (event) {
+    case EVENT_OBJECT_DESTROY:
+      ++Diagnostics::g_runtime.counters.lifecycleDestroy;
+      break;
+    case EVENT_SYSTEM_MINIMIZESTART:
+      ++Diagnostics::g_runtime.counters.lifecycleMinimizeStart;
+      break;
+    case EVENT_SYSTEM_MINIMIZEEND:
+      ++Diagnostics::g_runtime.counters.lifecycleMinimizeEnd;
+      break;
+    case EVENT_OBJECT_STATECHANGE:
+      ++Diagnostics::g_runtime.counters.lifecycleStateChange;
+      break;
+    case EVENT_OBJECT_LOCATIONCHANGE:
+      ++Diagnostics::g_runtime.counters.lifecycleLocationChange;
+      break;
+    case EVENT_OBJECT_HIDE:
+      ++Diagnostics::g_runtime.counters.lifecycleHide;
+      break;
+    case EVENT_OBJECT_SHOW:
+      ++Diagnostics::g_runtime.counters.lifecycleShow;
+      break;
+    case EVENT_OBJECT_CLOAKED:
+      ++Diagnostics::g_runtime.counters.lifecycleCloaked;
+      break;
+    case EVENT_OBJECT_UNCLOAKED:
+      ++Diagnostics::g_runtime.counters.lifecycleUncloaked;
+      break;
+  }
+
   switch (event) {
     case EVENT_OBJECT_DESTROY:
       ForgetManagedWindow(hwnd);

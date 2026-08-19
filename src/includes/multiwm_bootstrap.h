@@ -187,6 +187,15 @@ void LoadSettings() {
   g_settings.floatFocusedKey = ReadHotkeySetting(L"FloatFocusedKey", ParseSingleCharKey, (UINT)'F');
   g_settings.diagnosticDumpKey = ReadHotkeySetting(L"DiagnosticDumpKey", ParseSingleCharKey, (UINT)'I');
 
+  PCWSTR diagnosticsPath = Wh_GetStringSetting(L"DiagnosticsOutputPath");
+  if (diagnosticsPath && *diagnosticsPath) {
+    g_settings.diagnosticsOutputPath = diagnosticsPath;
+  } else {
+    g_settings.diagnosticsOutputPath =
+        L"%USERPROFILE%\\Documents\\TilingHelperDiagnostics";
+  }
+  Wh_FreeStringSetting(diagnosticsPath);
+
   TrayUi::LoadSettings();
 }
 
@@ -253,6 +262,8 @@ static void ToggleWindowManagementMode() {
       IsAutomaticMode() ? ManagementMode::Manual : ManagementMode::Automatic;
   const bool automatic = IsAutomaticMode();
   Wh_Log(L"Window management mode: %s", automatic ? L"Automatic" : L"Manual");
+  Diagnostics::RecordEvent(
+      L"management mode changed to %ls", automatic ? L"Automatic" : L"Manual");
   TrayUi::ShowManagementModeFlyout(automatic);
 
   // Entering Automatic mode runs the normal discovery path for every monitor.
@@ -268,6 +279,7 @@ static void ToggleWindowManagementMode() {
 }
 
 static void HandleMoveSizeEndMessage(HWND hwnd) {
+  ++Diagnostics::g_runtime.counters.moveSizeEndMessages;
   // MOVESIZEEND is an authoritative monitor-transition boundary. Repair monitor
   // ownership before interpreting final geometry, without querying desktop
   // ownership for unrelated lifecycle noise.
@@ -306,6 +318,7 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       return WmMessageDisposition::Handled;
 
     case WM_APP_TRAY_REFRESH:
+      ++Diagnostics::g_runtime.counters.trayRefreshMessages;
       TrayUi::RefreshForCurrentWorkspace();
       return WmMessageDisposition::Handled;
 
@@ -336,7 +349,7 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
           Commands::FloatFocusedWindow();
           break;
         case HK_DIAGNOSTIC_DUMP:
-          Diagnostics::DumpSavedBookkeeping();
+          Diagnostics::WriteDiagnosticReport();
           break;
         case HK_MANAGEMENT_MODE_TOGGLE:
           ToggleWindowManagementMode();
@@ -392,6 +405,7 @@ static void CleanupWmThread() {
 // serialized; foreign STA messages are dispatched back to Windows.
 DWORD WINAPI HotkeyThreadProc(LPVOID) {
   g_wm.threadId = GetCurrentThreadId();
+  Diagnostics::BeginWmSession();
   Wh_Log(L"Hotkey thread started, thread ID: %lu", g_wm.threadId);
 
   HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

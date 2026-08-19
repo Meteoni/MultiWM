@@ -151,8 +151,10 @@ static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
     std::vector<HWND>* windowList;
   } context = {monitor, desktopId, &windows};
 
+  ++Diagnostics::g_runtime.counters.enumWindowsPasses;
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        ++Diagnostics::g_runtime.counters.enumWindowsVisited;
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
         if (!IsWindowVisible(hwnd)) return TRUE;
         if (!WindowCanBeManaged(hwnd)) return TRUE;
@@ -169,6 +171,7 @@ static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
         }
 
         ctx->windowList->push_back(hwnd);
+        ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
         return TRUE;
       },
       reinterpret_cast<LPARAM>(&context));
@@ -754,6 +757,7 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
 // fold placement outcomes back into the model. Reflow is iterative rather than
 // recursive; each continuing pass removes at least one active tile.
 static void ArrangeWorkspace(const DesktopMonitorKey& key) {
+  ++Diagnostics::g_runtime.counters.arrangeCalls;
   if (!IsWorkspaceOnActiveDesktop(key)) return;
 
   Workspace workspace;
@@ -766,12 +770,14 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   const LONG gap = GetWorkspaceGapPixels(key.monitor);
   const size_t maxPasses = workspace.ActiveCount() + 1;
   for (size_t pass = 0; pass < maxPasses; ++pass) {
+    ++Diagnostics::g_runtime.counters.arrangePasses;
     if (workspace.Layout() == TileLayout::Floating || workspace.Empty()) {
       g_workspaces.Save(key, workspace);
       return;
     }
 
     std::vector<RECT> rects;
+    ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
     if (!BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects)) {
       g_workspaces.Save(key, workspace);
       return;
@@ -822,6 +828,9 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
           L"Window %p failed checked placement %d times (last result=%d); switching it to Floating",
           hwnd, record->placementFailures,
           static_cast<int>(record->lastPlacementResult));
+      Diagnostics::RecordEvent(
+          L"placement failures forced hwnd=%p to per-window Floating (failures=%d result=%d)",
+          hwnd, record->placementFailures, static_cast<int>(record->lastPlacementResult));
       participationChanged |= workspace.Float(hwnd);
     }
 

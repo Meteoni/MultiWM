@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cassert>
+#include <cstdarg>
+#include <deque>
 #include <cstdint>
 #include <cstdlib>
 #include <cwchar>
@@ -211,6 +213,8 @@ struct SettingsState {
   TileLayout defaultLayout = TileLayout::MasterStack;
   std::vector<TileLayout> layoutCycle = MakeBuiltInLayoutCycle();
   std::vector<ExclusionRule> exclusionRules;
+  std::wstring diagnosticsOutputPath =
+      L"%USERPROFILE%\\Documents\\TilingHelperDiagnostics";
 };
 
 // Private virtual-desktop COM state. This entire object belongs to the STA WM
@@ -245,6 +249,123 @@ struct WmRuntime {
   std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
   ManagementMode managementMode = ManagementMode::Manual;
 };
+
+namespace Diagnostics {
+
+// Lifetime counters are deliberately cheap increments on already-serialized WM
+// paths. They are never flushed continuously; the diagnostic hotkey snapshots
+// them into a report, preserving the mod's event-driven/idle-zero-cost design.
+struct Counters {
+  uint64_t wmSessionStarts = 0;
+  uint64_t settingsReloads = 0;
+
+  uint64_t lifecycleEventsProcessed = 0;
+  uint64_t lifecycleDestroy = 0;
+  uint64_t lifecycleMinimizeStart = 0;
+  uint64_t lifecycleMinimizeEnd = 0;
+  uint64_t lifecycleStateChange = 0;
+  uint64_t lifecycleLocationChange = 0;
+  uint64_t lifecycleHide = 0;
+  uint64_t lifecycleShow = 0;
+  uint64_t lifecycleCloaked = 0;
+  uint64_t lifecycleUncloaked = 0;
+  uint64_t lifecycleScheduleRequests = 0;
+  uint64_t lifecycleTimerResets = 0;
+  uint64_t lifecycleReconciles = 0;
+  uint64_t lifecycleDirtyWindowsProcessed = 0;
+  uint64_t moveSizeEndMessages = 0;
+  uint64_t trayRefreshMessages = 0;
+  uint64_t userMoveGestures = 0;
+  uint64_t userResizeGestures = 0;
+
+  uint64_t reconcileCalls = 0;
+  uint64_t reconcileWindowsExamined = 0;
+  uint64_t workspaceSaves = 0;
+  uint64_t workspaceMigrations = 0;
+
+  uint64_t enumWindowsPasses = 0;
+  uint64_t enumWindowsVisited = 0;
+  uint64_t tileCandidatesCollected = 0;
+
+  uint64_t arrangeCalls = 0;
+  uint64_t arrangePasses = 0;
+  uint64_t layoutPlansBuilt = 0;
+
+  uint64_t placementChecks = 0;
+  uint64_t placementNoOps = 0;
+  uint64_t setWindowPosCalls = 0;
+  uint64_t placementSuccess = 0;
+  uint64_t placementAdjusted = 0;
+  uint64_t placementAccessDenied = 0;
+  uint64_t placementRefused = 0;
+  uint64_t placementDead = 0;
+  uint64_t floatingGeometryRepairs = 0;
+
+  uint64_t virtualDesktopChangesProcessed = 0;
+  uint64_t vdApiInitAttempts = 0;
+  uint64_t vdApiInitSuccesses = 0;
+  uint64_t vdApiInitFailures = 0;
+  uint64_t vdApiReinitializations = 0;
+
+  uint64_t tileCommands = 0;
+  uint64_t layoutCycleCommands = 0;
+  uint64_t floatFocusedCommands = 0;
+  uint64_t swapMasterCommands = 0;
+
+  uint64_t reportsWritten = 0;
+  uint64_t reportWriteFailures = 0;
+};
+
+struct RecentEvent {
+  ULONGLONG tickMs = 0;
+  std::wstring text;
+};
+
+struct Runtime {
+  ULONGLONG processStartedTickMs = 0;
+  ULONGLONG wmSessionStartedTickMs = 0;
+  ULONGLONG lastReportTickMs = 0;
+  uint64_t reportSequence = 0;
+  Counters counters{};
+  Counters lastReportCounters{};
+  std::deque<RecentEvent> recentEvents;
+};
+
+static Runtime g_runtime;
+static constexpr size_t kRecentEventLimit = 64;
+
+static void InitializeProcessRuntime() {
+  if (!g_runtime.processStartedTickMs) {
+    g_runtime.processStartedTickMs = GetTickCount64();
+  }
+}
+
+static void RecordEvent(const wchar_t* format, ...) {
+  InitializeProcessRuntime();
+  wchar_t buffer[768]{};
+  va_list args;
+  va_start(args, format);
+  int written = vswprintf(buffer, ARRAYSIZE(buffer), format, args);
+  va_end(args);
+  if (written < 0) {
+    const wchar_t fallback[] = L"<diagnostic event formatting failed>";
+    wcsncpy(buffer, fallback, ARRAYSIZE(buffer) - 1);
+  }
+
+  g_runtime.recentEvents.push_back({GetTickCount64(), buffer});
+  while (g_runtime.recentEvents.size() > kRecentEventLimit) {
+    g_runtime.recentEvents.pop_front();
+  }
+}
+
+static void BeginWmSession() {
+  InitializeProcessRuntime();
+  g_runtime.wmSessionStartedTickMs = GetTickCount64();
+  ++g_runtime.counters.wmSessionStarts;
+  RecordEvent(L"WM session started");
+}
+
+}  // namespace Diagnostics
 
 static SettingsState g_settings;
 static VirtualDesktopRuntime g_vd;
@@ -441,7 +562,8 @@ class Workspace {
   PlacementAction ApplyPlacementObservation(HWND hwnd, const PlacementObservation& observation);
 
   bool Validate(
-      const DesktopMonitorKey& key, const wchar_t* context = L"workspace") const;
+      const DesktopMonitorKey& key, const wchar_t* context = L"workspace",
+      std::vector<std::wstring>* errors = nullptr, bool logFailures = true) const;
 
   static Workspace AdoptGeometry(
       TileLayout layout, const RECT& workArea, LONG gap,
@@ -489,6 +611,8 @@ class WorkspaceRepository {
   std::vector<HWND> KnownWindows() const;
   std::vector<HMONITOR> MonitorsOnDesktop(const GUID& desktopId) const;
   std::vector<std::pair<DesktopMonitorKey, Workspace>> Snapshot() const;
+  std::vector<std::pair<HWND, std::vector<DesktopMonitorKey>>>
+      OwnershipIndexSnapshot() const;
   void ClearAfterWmStopped();
 
  private:
