@@ -363,7 +363,7 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
 
 static void RunWmMessageLoop() {
   MSG msg{};
-  while (!g_wm.stopRequested) {
+  for (;;) {
     DWORD waitResult =
         MsgWaitForMultipleObjects(0, nullptr, FALSE, INFINITE, QS_ALLINPUT);
     if (waitResult != WAIT_OBJECT_0) continue;
@@ -460,10 +460,8 @@ bool StartHotkeyThread() {
 }
 
 void StopHotkeyThread() {
-  g_wm.stopRequested = true;
-
-  g_vd.initialized = false;
-
+  // WM_QUIT is the shutdown signal. Avoid a cross-thread shared stop flag: the
+  // worker owns its loop and exits only after dequeuing this message.
   if (g_wm.threadId) {
     PostThreadMessage(g_wm.threadId, WM_QUIT, 0, 0);
   }
@@ -478,6 +476,6 @@ void StopHotkeyThread() {
   }
 
   g_wm.threadId = 0;
-  g_wm.stopRequested = false;
+  g_vd.initialized = false;
 }
 

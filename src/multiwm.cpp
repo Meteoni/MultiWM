@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.12.0
+// @version         1.12.1
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -37,7 +37,7 @@ resize-adjusted ratios per virtual desktop.
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
-- Hotkey diagnostics write a timestamped UTF-8 text report with runtime/churn counters, recent significant events, platform health, invariant audit, and deterministic per-workspace/window state
+- Hotkey diagnostics write a timestamped UTF-8 text report with runtime/churn counters, diagnostic self-cost accounting, significant/lifecycle histories, platform health, telemetry/invariant audits, and deterministic per-workspace/window state
 - New-workspace initialization discovers visible minimized/maximized windows as suspended logical members instead of losing them
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
@@ -239,10 +239,16 @@ void WhTool_ModUninit() {
 }
 
 void WhTool_ModSettingsChanged() {
+  Wh_Log(L"Settings changed, reloading...");
+
+  // Join the old diagnostics/model owner before touching lifetime telemetry.
+  // This keeps Counters and the bounded event histories single-writer without
+  // adding atomics or locks to hot paths.
+  StopHotkeyThread();
+
   ++Diagnostics::g_runtime.counters.settingsReloads;
   Diagnostics::RecordEvent(L"settings reload requested");
-  Wh_Log(L"Settings changed, reloading...");
-  StopHotkeyThread();
+
   // Settings reload changes defaults/policies but does not destroy per-desktop
   // workspace identity, layout mode, ordering, or learned ratios.
   LoadSettings();

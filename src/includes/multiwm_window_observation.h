@@ -388,8 +388,14 @@ static PlacementObservation PlaceWindowChecked(
     return observation;
   };
 
-  if (!hwnd || !IsWindow(hwnd)) return finish(PlacementResult::Dead);
-  if (!canMove) return finish(PlacementResult::Refused);
+  if (!hwnd || !IsWindow(hwnd)) {
+    ++Diagnostics::g_runtime.counters.placementPreflightStops;
+    return finish(PlacementResult::Dead);
+  }
+  if (!canMove) {
+    ++Diagnostics::g_runtime.counters.placementPreflightStops;
+    return finish(PlacementResult::Refused);
+  }
 
   RECT currentFrame{};
   if (GetWindowFrameRect(hwnd, &currentFrame)) {

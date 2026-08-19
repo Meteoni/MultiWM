@@ -127,13 +127,13 @@ void CycleCurrentWorkspaceLayout() {
 static void HandleUserMove(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const MoveSizeGesture& gesture) {
-  ++Diagnostics::g_runtime.counters.userMoveGestures;
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
     if (workspace.Float(hwnd)) {
       workspace.ResetPlacementFailures(hwnd);
       RepairFloatingGeometry(
           key, workspace, hwnd, MakeFloatingPlacementHintFromGesture(gesture));
       g_workspaces.Save(key, workspace);
+      ++Diagnostics::g_runtime.counters.tiledFloatActions;
       Wh_Log(L"User move floated managed window %p", hwnd);
       Diagnostics::RecordEvent(L"user drag floated hwnd=%p", hwnd);
     }
@@ -155,6 +155,7 @@ static void HandleUserMove(
 
   if (target && workspace.SwapTiled(hwnd, target)) {
     g_workspaces.Save(key, workspace);
+    ++Diagnostics::g_runtime.counters.tiledSwapActions;
     Wh_Log(L"User move swapped managed windows %p and %p", hwnd, target);
     Diagnostics::RecordEvent(L"user drag swapped hwnd=%p target=%p", hwnd, target);
   }
@@ -166,7 +167,6 @@ static void HandleUserMove(
 static void HandleUserResize(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const RECT& workArea, const MoveSizeGesture& gesture) {
-  ++Diagnostics::g_runtime.counters.userResizeGestures;
   if (!gesture.hasRects) {
     ArrangeWorkspace(key);
     return;
@@ -203,6 +203,7 @@ static void HandleUserResize(
 
   if (changed) {
     g_workspaces.Save(key, workspace);
+    ++Diagnostics::g_runtime.counters.dividerUpdates;
     Wh_Log(L"User resize updated local divider state for %p", hwnd);
     Diagnostics::RecordEvent(L"user resize updated divider hwnd=%p", hwnd);
   }
@@ -229,19 +230,36 @@ void ApplyUserMoveSize(HWND hwnd) {
   Workspace state;
   if (!g_workspaces.Load(key, &state)) return;
 
+  // Classify every completed move/size gesture at the common boundary before
+  // routing it to tiled or floating policy. This makes the counters describe
+  // actual user gestures instead of only gestures that reached tiled handlers.
+  MoveSizeGesture gesture = ConsumeMoveSizeGesture(hwnd);
+  switch (gesture.intent) {
+    case MoveSizeIntent::Move:
+      ++Diagnostics::g_runtime.counters.userMoveGestures;
+      break;
+    case MoveSizeIntent::Resize:
+      ++Diagnostics::g_runtime.counters.userResizeGestures;
+      break;
+    case MoveSizeIntent::None:
+      ++Diagnostics::g_runtime.counters.userNoopGestures;
+      break;
+  }
+
   const WindowRecord* directRecord = state.Find(hwnd);
   if (directRecord &&
       (state.Layout() == TileLayout::Floating ||
        directRecord->state == ManageState::Floating)) {
-    ConsumeMoveSizeGesture(hwnd);
     if (RememberCurrentFloatingGeometry(key, state, hwnd)) {
       g_workspaces.Save(key, state);
+      if (gesture.intent != MoveSizeIntent::None) {
+        ++Diagnostics::g_runtime.counters.floatingGeometryUserUpdates;
+      }
     }
     return;
   }
 
   if (state.Layout() == TileLayout::Floating) {
-    ClearMoveSizeSamples(hwnd);
     return;
   }
 
@@ -256,7 +274,6 @@ void ApplyUserMoveSize(HWND hwnd) {
     return;
   }
 
-  MoveSizeGesture gesture = ConsumeMoveSizeGesture(hwnd);
   switch (gesture.intent) {
     case MoveSizeIntent::None:
       ArrangeWorkspace(key);

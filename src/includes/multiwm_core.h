@@ -232,6 +232,8 @@ struct VirtualDesktopRuntime {
   Platform::VirtualDesktop::VirtualDesktopAbiProfile abi{};
   bool abiResolved = false;
   LONG changeQueued = 0;
+  GUID lastKnownDesktop{};
+  bool lastKnownDesktopValid = false;
   bool initialized = false;
 };
 
@@ -242,7 +244,6 @@ struct WmRuntime {
   HANDLE thread = nullptr;
   DWORD threadId = 0;
   HANDLE readyEvent = nullptr;
-  volatile bool stopRequested = false;
 
   UINT_PTR lifecycleTimer = 0;
   std::vector<HWND> lifecycleDirtyWindows;
@@ -252,9 +253,10 @@ struct WmRuntime {
 
 namespace Diagnostics {
 
-// Lifetime counters are deliberately cheap increments on already-serialized WM
-// paths. They are never flushed continuously; the diagnostic hotkey snapshots
-// them into a report, preserving the mod's event-driven/idle-zero-cost design.
+// Lifetime counters are deliberately cheap increments on the serialized WM
+// actor, or on the controller only after that actor has been joined. They are
+// never flushed continuously; the diagnostic hotkey snapshots them into a
+// report, preserving the mod's event-driven/idle-zero-cost design.
 struct Counters {
   uint64_t wmSessionStarts = 0;
   uint64_t settingsReloads = 0;
@@ -277,6 +279,11 @@ struct Counters {
   uint64_t trayRefreshMessages = 0;
   uint64_t userMoveGestures = 0;
   uint64_t userResizeGestures = 0;
+  uint64_t userNoopGestures = 0;
+  uint64_t floatingGeometryUserUpdates = 0;
+  uint64_t tiledSwapActions = 0;
+  uint64_t tiledFloatActions = 0;
+  uint64_t dividerUpdates = 0;
 
   uint64_t reconcileCalls = 0;
   uint64_t reconcileWindowsExamined = 0;
@@ -293,6 +300,7 @@ struct Counters {
 
   uint64_t placementChecks = 0;
   uint64_t placementNoOps = 0;
+  uint64_t placementPreflightStops = 0;
   uint64_t setWindowPosCalls = 0;
   uint64_t placementSuccess = 0;
   uint64_t placementAdjusted = 0;
@@ -321,6 +329,19 @@ struct RecentEvent {
   std::wstring text;
 };
 
+struct LifecycleBurst {
+  ULONGLONG tickMs = 0;
+  size_t dirtyWindows = 0;
+  size_t pendingArranges = 0;
+};
+
+struct DiagnosticCost {
+  uint64_t attempts = 0;
+  ULONGLONG wallMs = 0;
+  uint64_t processCpu100ns = 0;
+  uint64_t wmCpu100ns = 0;
+};
+
 struct Runtime {
   ULONGLONG processStartedTickMs = 0;
   ULONGLONG wmSessionStartedTickMs = 0;
@@ -328,11 +349,15 @@ struct Runtime {
   uint64_t reportSequence = 0;
   Counters counters{};
   Counters lastReportCounters{};
-  std::deque<RecentEvent> recentEvents;
+  DiagnosticCost lifetimeDiagnosticCost{};
+  DiagnosticCost wmSessionDiagnosticCost{};
+  std::deque<RecentEvent> significantEvents;
+  std::deque<LifecycleBurst> lifecycleBursts;
 };
 
 static Runtime g_runtime;
 static constexpr size_t kRecentEventLimit = 64;
+static constexpr size_t kLifecycleBurstLimit = 16;
 
 static void InitializeProcessRuntime() {
   if (!g_runtime.processStartedTickMs) {
@@ -352,15 +377,25 @@ static void RecordEvent(const wchar_t* format, ...) {
     wcsncpy(buffer, fallback, ARRAYSIZE(buffer) - 1);
   }
 
-  g_runtime.recentEvents.push_back({GetTickCount64(), buffer});
-  while (g_runtime.recentEvents.size() > kRecentEventLimit) {
-    g_runtime.recentEvents.pop_front();
+  g_runtime.significantEvents.push_back({GetTickCount64(), buffer});
+  while (g_runtime.significantEvents.size() > kRecentEventLimit) {
+    g_runtime.significantEvents.pop_front();
+  }
+}
+
+static void RecordLifecycleBurst(size_t dirtyWindows, size_t pendingArranges) {
+  InitializeProcessRuntime();
+  g_runtime.lifecycleBursts.push_back(
+      {GetTickCount64(), dirtyWindows, pendingArranges});
+  while (g_runtime.lifecycleBursts.size() > kLifecycleBurstLimit) {
+    g_runtime.lifecycleBursts.pop_front();
   }
 }
 
 static void BeginWmSession() {
   InitializeProcessRuntime();
   g_runtime.wmSessionStartedTickMs = GetTickCount64();
+  g_runtime.wmSessionDiagnosticCost = {};
   ++g_runtime.counters.wmSessionStarts;
   RecordEvent(L"WM session started");
 }

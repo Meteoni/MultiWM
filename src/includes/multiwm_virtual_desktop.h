@@ -211,7 +211,7 @@ static bool IsCurrentNotificationInterface(REFIID riid) {
 }
 
 static void QueueVirtualDesktopChangedNotification() {
-  if (!g_wm.threadId || g_wm.stopRequested) return;
+  if (!g_wm.threadId) return;
 
   // COM can emit redundant desktop notifications. Collapse them before they
   // reach the WM core, just as FancyWM coalesces layout invalidations.
@@ -446,6 +446,8 @@ void CleanupVirtualDesktopAPI() {
   g_vd.abiResolved = false;
   g_vd.explorerBuild = 0;
   g_vd.explorerRevision = 0;
+  g_vd.lastKnownDesktop = {};
+  g_vd.lastKnownDesktopValid = false;
 
   if (!shellAvailable) {
     Wh_Log(L"Explorer not available, skipping COM cleanup to avoid hang");
@@ -507,18 +509,28 @@ HRESULT CallManagerInternal(int vtableIndex, TResult* outResult) {
 
 bool GetCurrentDesktopId(GUID* outGuid) {
   if (!outGuid) return false;
-  if (!g_vd.managerInternal) return false;
+  if (!g_vd.managerInternal) {
+    g_vd.lastKnownDesktopValid = false;
+    return false;
+  }
 
   IVirtualDesktop* desktop = nullptr;
   HRESULT hr = CallManagerInternal(VTABLE_GET_CURRENT_DESKTOP, &desktop);
   if (FAILED(hr) || !desktop) {
+    g_vd.lastKnownDesktopValid = false;
     Wh_Log(L"GetCurrentDesktop failed: 0x%08X", hr);
     return false;
   }
 
   hr = desktop->GetId(outGuid);
   desktop->Release();
-  return SUCCEEDED(hr);
+  if (SUCCEEDED(hr)) {
+    g_vd.lastKnownDesktop = *outGuid;
+    g_vd.lastKnownDesktopValid = true;
+    return true;
+  }
+  g_vd.lastKnownDesktopValid = false;
+  return false;
 }
 
 bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid) {

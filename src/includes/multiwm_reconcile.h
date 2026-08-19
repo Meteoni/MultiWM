@@ -692,8 +692,7 @@ static void ReconcileDeferredLifecycle() {
   std::vector<HWND> dirtyWindows;
   dirtyWindows.swap(g_wm.lifecycleDirtyWindows);
   Diagnostics::g_runtime.counters.lifecycleDirtyWindowsProcessed += dirtyWindows.size();
-  Diagnostics::RecordEvent(
-      L"settled lifecycle reconcile dirtyWindows=%zu pendingArranges=%zu",
+  Diagnostics::RecordLifecycleBurst(
       dirtyWindows.size(), g_wm.pendingDesktopArranges.size());
 
   // First repair liveness/exclusions and settled hidden/minimized/maximized participation

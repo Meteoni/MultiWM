@@ -428,6 +428,10 @@ static size_t DiagnosticLogicalIndex(
   return state.LogicalIndex(hwnd);
 }
 
+static bool DiagnosticIsMinimizedSentinelFrame(const RECT& frame) {
+  return frame.left <= -30000 || frame.top <= -30000;
+}
+
 struct DiagnosticRecordAudit {
   bool deadHwnd = false;
   bool pidMismatch = false;
@@ -474,7 +478,10 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
       identity.visible ? 1 : 0, identity.minimized ? 1 : 0,
       identity.maximized ? 1 : 0, identity.cloaked ? 1 : 0,
       reinterpret_cast<void*>(identity.monitor), identity.dpi);
-  if (identity.hasFrame) {
+  if (identity.minimized && identity.hasFrame &&
+      DiagnosticIsMinimizedSentinelFrame(identity.frame)) {
+    report.Line(L"      liveFrame=<Windows minimized sentinel omitted>");
+  } else if (identity.hasFrame) {
     report.Line(L"      liveFrame=%ls", DiagnosticRectString(identity.frame).c_str());
   } else {
     report.Line(L"      liveFrame=<unavailable>");
@@ -600,6 +607,11 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Foreground/tray refreshes", c.trayRefreshMessages, previous.trayRefreshMessages, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"User move gestures", c.userMoveGestures, previous.userMoveGestures, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"User resize gestures", c.userResizeGestures, previous.userResizeGestures, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Unclassified/no-op gestures", c.userNoopGestures, previous.userNoopGestures, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Floating geometry user updates", c.floatingGeometryUserUpdates, previous.floatingGeometryUserUpdates, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Tiled drag -> Floating actions", c.tiledFloatActions, previous.tiledFloatActions, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Tiled drag swap actions", c.tiledSwapActions, previous.tiledSwapActions, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Divider weight updates", c.dividerUpdates, previous.dividerUpdates, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Reconcile calls", c.reconcileCalls, previous.reconcileCalls, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Known HWNDs examined", c.reconcileWindowsExamined, previous.reconcileWindowsExamined, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Workspace saves", c.workspaceSaves, previous.workspaceSaves, uptimeMs, intervalMs);
@@ -616,6 +628,7 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Layout plans built", c.layoutPlansBuilt, previous.layoutPlansBuilt, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement checks", c.placementChecks, previous.placementChecks, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement no-ops", c.placementNoOps, previous.placementNoOps, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Placement preflight stops", c.placementPreflightStops, previous.placementPreflightStops, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"SetWindowPos calls", c.setWindowPosCalls, previous.setWindowPosCalls, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement success", c.placementSuccess, previous.placementSuccess, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Adjusted by window", c.placementAdjusted, previous.placementAdjusted, uptimeMs, intervalMs);
@@ -638,54 +651,159 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Swap master commands", c.swapMasterCommands, previous.swapMasterCommands, uptimeMs, intervalMs);
 }
 
-static ULONGLONG DiagnosticFileTimeMilliseconds(const FILETIME& value) {
+static uint64_t DiagnosticFileTime100ns(const FILETIME& value) {
   ULARGE_INTEGER ticks{};
   ticks.LowPart = value.dwLowDateTime;
   ticks.HighPart = value.dwHighDateTime;
-  return ticks.QuadPart / 10000ULL;
+  return ticks.QuadPart;
 }
 
-static void DumpCpuUsage(
-    ReportBuilder& report, ULONGLONG processUptimeMs, ULONGLONG wmSessionMs) {
+static ULONGLONG Diagnostic100nsToMilliseconds(uint64_t ticks100ns) {
+  return static_cast<ULONGLONG>(ticks100ns / 10000ULL);
+}
+
+struct DiagnosticCpuSnapshot {
+  bool processAvailable = false;
+  bool wmAvailable = false;
+  uint64_t processKernel100ns = 0;
+  uint64_t processUser100ns = 0;
+  uint64_t wmKernel100ns = 0;
+  uint64_t wmUser100ns = 0;
+
+  uint64_t ProcessTotal100ns() const {
+    return processKernel100ns + processUser100ns;
+  }
+
+  uint64_t WmTotal100ns() const {
+    return wmKernel100ns + wmUser100ns;
+  }
+};
+
+static DiagnosticCpuSnapshot CaptureDiagnosticCpuSnapshot() {
+  DiagnosticCpuSnapshot snapshot;
   FILETIME creation{}, exit{}, kernel{}, user{};
   if (GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
-    const ULONGLONG kernelMs = DiagnosticFileTimeMilliseconds(kernel);
-    const ULONGLONG userMs = DiagnosticFileTimeMilliseconds(user);
-    const ULONGLONG totalMs = kernelMs + userMs;
-    const double averageCore = processUptimeMs
-        ? static_cast<double>(totalMs) * 100.0 /
-              static_cast<double>(processUptimeMs)
-        : 0.0;
-    report.Line(
-        L"Tool process CPU: kernel=%ls user=%ls total=%ls average-one-core=%.3f%%",
-        DiagnosticDurationString(kernelMs).c_str(),
-        DiagnosticDurationString(userMs).c_str(),
-        DiagnosticDurationString(totalMs).c_str(), averageCore);
-  } else {
-    report.Line(L"Tool process CPU: <unavailable>");
+    snapshot.processAvailable = true;
+    snapshot.processKernel100ns = DiagnosticFileTime100ns(kernel);
+    snapshot.processUser100ns = DiagnosticFileTime100ns(user);
   }
 
   if (g_wm.thread &&
       GetThreadTimes(g_wm.thread, &creation, &exit, &kernel, &user)) {
-    const ULONGLONG kernelMs = DiagnosticFileTimeMilliseconds(kernel);
-    const ULONGLONG userMs = DiagnosticFileTimeMilliseconds(user);
-    const ULONGLONG totalMs = kernelMs + userMs;
-    const double averageCore = wmSessionMs
-        ? static_cast<double>(totalMs) * 100.0 /
+    snapshot.wmAvailable = true;
+    snapshot.wmKernel100ns = DiagnosticFileTime100ns(kernel);
+    snapshot.wmUser100ns = DiagnosticFileTime100ns(user);
+  }
+  return snapshot;
+}
+
+static uint64_t DiagnosticCpuDelta100ns(
+    uint64_t endValue, uint64_t startValue) {
+  return endValue >= startValue ? endValue - startValue : 0;
+}
+
+static void AccumulateDiagnosticSelfCost(
+    ULONGLONG startTickMs, const DiagnosticCpuSnapshot& startCpu) {
+  const ULONGLONG endTickMs = GetTickCount64();
+  const DiagnosticCpuSnapshot endCpu = CaptureDiagnosticCpuSnapshot();
+
+  const ULONGLONG wallMs =
+      endTickMs >= startTickMs ? endTickMs - startTickMs : 0;
+  uint64_t processCpu100ns = 0;
+  uint64_t wmCpu100ns = 0;
+  if (startCpu.processAvailable && endCpu.processAvailable) {
+    processCpu100ns = DiagnosticCpuDelta100ns(
+        endCpu.ProcessTotal100ns(), startCpu.ProcessTotal100ns());
+  }
+  if (startCpu.wmAvailable && endCpu.wmAvailable) {
+    wmCpu100ns = DiagnosticCpuDelta100ns(
+        endCpu.WmTotal100ns(), startCpu.WmTotal100ns());
+  }
+
+  ++g_runtime.lifetimeDiagnosticCost.attempts;
+  g_runtime.lifetimeDiagnosticCost.wallMs += wallMs;
+  g_runtime.lifetimeDiagnosticCost.processCpu100ns += processCpu100ns;
+  g_runtime.lifetimeDiagnosticCost.wmCpu100ns += wmCpu100ns;
+
+  ++g_runtime.wmSessionDiagnosticCost.attempts;
+  g_runtime.wmSessionDiagnosticCost.wallMs += wallMs;
+  g_runtime.wmSessionDiagnosticCost.processCpu100ns += processCpu100ns;
+  g_runtime.wmSessionDiagnosticCost.wmCpu100ns += wmCpu100ns;
+}
+
+static void DumpCpuUsage(
+    ReportBuilder& report, ULONGLONG processUptimeMs, ULONGLONG wmSessionMs,
+    const DiagnosticCpuSnapshot& snapshot) {
+  if (snapshot.processAvailable) {
+    const uint64_t raw100ns = snapshot.ProcessTotal100ns();
+    const uint64_t priorDiagnostic100ns = std::min<uint64_t>(
+        raw100ns, g_runtime.lifetimeDiagnosticCost.processCpu100ns);
+    const uint64_t operational100ns = raw100ns - priorDiagnostic100ns;
+    const ULONGLONG rawMs = Diagnostic100nsToMilliseconds(raw100ns);
+    const ULONGLONG operationalMs =
+        Diagnostic100nsToMilliseconds(operational100ns);
+    const double rawAverageCore = processUptimeMs
+        ? static_cast<double>(rawMs) * 100.0 /
+              static_cast<double>(processUptimeMs)
+        : 0.0;
+    const double operationalAverageCore = processUptimeMs
+        ? static_cast<double>(operationalMs) * 100.0 /
+              static_cast<double>(processUptimeMs)
+        : 0.0;
+    report.Line(
+        L"Tool process CPU raw: kernel=%ls user=%ls total=%ls average-one-core=%.3f%%",
+        DiagnosticDurationString(
+            Diagnostic100nsToMilliseconds(snapshot.processKernel100ns)).c_str(),
+        DiagnosticDurationString(
+            Diagnostic100nsToMilliseconds(snapshot.processUser100ns)).c_str(),
+        DiagnosticDurationString(rawMs).c_str(), rawAverageCore);
+    report.Line(
+        L"Tool process CPU excluding prior diagnostic reporting: total=%ls average-one-core=%.3f%%",
+        DiagnosticDurationString(operationalMs).c_str(), operationalAverageCore);
+  } else {
+    report.Line(L"Tool process CPU: <unavailable>");
+  }
+
+  if (snapshot.wmAvailable) {
+    const uint64_t raw100ns = snapshot.WmTotal100ns();
+    const uint64_t priorDiagnostic100ns = std::min<uint64_t>(
+        raw100ns, g_runtime.wmSessionDiagnosticCost.wmCpu100ns);
+    const uint64_t operational100ns = raw100ns - priorDiagnostic100ns;
+    const ULONGLONG rawMs = Diagnostic100nsToMilliseconds(raw100ns);
+    const ULONGLONG operationalMs =
+        Diagnostic100nsToMilliseconds(operational100ns);
+    const double rawAverageCore = wmSessionMs
+        ? static_cast<double>(rawMs) * 100.0 /
+              static_cast<double>(wmSessionMs)
+        : 0.0;
+    const double operationalAverageCore = wmSessionMs
+        ? static_cast<double>(operationalMs) * 100.0 /
               static_cast<double>(wmSessionMs)
         : 0.0;
     report.Line(
-        L"WM thread CPU:   kernel=%ls user=%ls total=%ls average-one-core=%.3f%%",
-        DiagnosticDurationString(kernelMs).c_str(),
-        DiagnosticDurationString(userMs).c_str(),
-        DiagnosticDurationString(totalMs).c_str(), averageCore);
+        L"WM thread CPU raw: kernel=%ls user=%ls total=%ls average-one-core=%.3f%%",
+        DiagnosticDurationString(
+            Diagnostic100nsToMilliseconds(snapshot.wmKernel100ns)).c_str(),
+        DiagnosticDurationString(
+            Diagnostic100nsToMilliseconds(snapshot.wmUser100ns)).c_str(),
+        DiagnosticDurationString(rawMs).c_str(), rawAverageCore);
+    report.Line(
+        L"WM thread CPU excluding prior diagnostic reporting: total=%ls average-one-core=%.3f%%",
+        DiagnosticDurationString(operationalMs).c_str(), operationalAverageCore);
   } else {
     report.Line(L"WM thread CPU: <unavailable>");
   }
 }
 
 static void DumpPlatformHealth(ReportBuilder& report) {
-  report.Line(L"WM thread: id=%lu stopRequested=%d", g_wm.threadId, g_wm.stopRequested ? 1 : 0);
+  report.Line(L"WM thread: id=%lu", g_wm.threadId);
+  if (g_vd.lastKnownDesktopValid) {
+    report.Line(
+        L"Current virtual desktop: %ls",
+        DiagnosticGuidString(g_vd.lastKnownDesktop).c_str());
+  } else {
+    report.Line(L"Current virtual desktop: <unknown>");
+  }
   report.Line(
       L"Virtual desktop API: initialized=%d abiResolved=%d Explorer=%lu.%lu usesHMonitor=%d",
       g_vd.initialized ? 1 : 0, g_vd.abiResolved ? 1 : 0,
@@ -715,12 +833,12 @@ static void DumpPlatformHealth(ReportBuilder& report) {
 }
 
 static void DumpRecentEvents(ReportBuilder& report, ULONGLONG now) {
-  if (g_runtime.recentEvents.empty()) {
+  if (g_runtime.significantEvents.empty()) {
     report.Line(L"(none)");
     return;
   }
 
-  for (const RecentEvent& event : g_runtime.recentEvents) {
+  for (const RecentEvent& event : g_runtime.significantEvents) {
     ULONGLONG sinceStart = event.tickMs >= g_runtime.processStartedTickMs
         ? event.tickMs - g_runtime.processStartedTickMs
         : 0;
@@ -732,9 +850,30 @@ static void DumpRecentEvents(ReportBuilder& report, ULONGLONG now) {
   }
 }
 
+static void DumpLifecycleBursts(ReportBuilder& report, ULONGLONG now) {
+  if (g_runtime.lifecycleBursts.empty()) {
+    report.Line(L"(none)");
+    return;
+  }
+
+  for (const LifecycleBurst& burst : g_runtime.lifecycleBursts) {
+    ULONGLONG sinceStart = burst.tickMs >= g_runtime.processStartedTickMs
+        ? burst.tickMs - g_runtime.processStartedTickMs
+        : 0;
+    ULONGLONG age = now >= burst.tickMs ? now - burst.tickMs : 0;
+    report.Line(
+        L"+%ls  age=%ls  dirtyWindows=%zu pendingArranges=%zu",
+        DiagnosticDurationString(sinceStart).c_str(),
+        DiagnosticDurationString(age).c_str(),
+        burst.dirtyWindows, burst.pendingArranges);
+  }
+}
+
 static void WriteDiagnosticReport() {
   InitializeProcessRuntime();
-  const ULONGLONG now = GetTickCount64();
+  const ULONGLONG reportStartTickMs = GetTickCount64();
+  const DiagnosticCpuSnapshot reportStartCpu = CaptureDiagnosticCpuSnapshot();
+  const ULONGLONG now = reportStartTickMs;
   const ULONGLONG uptimeMs = now - g_runtime.processStartedTickMs;
   const ULONGLONG wmSessionMs = g_runtime.wmSessionStartedTickMs
       ? now - g_runtime.wmSessionStartedTickMs
@@ -824,7 +963,7 @@ static void WriteDiagnosticReport() {
   report.Line(L"============================================================");
   report.Line(L"TILING HELPER DIAGNOSTIC REPORT");
   report.Line(L"============================================================");
-  report.Line(L"Mod version: 1.12.0");
+  report.Line(L"Mod version: 1.12.1");
   report.Line(L"Report sequence: %llu", static_cast<unsigned long long>(reportSequence));
   report.Line(L"Generated local: %ls", DiagnosticSystemTimeString(local).c_str());
   report.Line(L"Generated UTC:   %ls", DiagnosticSystemTimeString(utc).c_str());
@@ -877,7 +1016,7 @@ static void WriteDiagnosticReport() {
   DumpPlatformHealth(report);
 
   report.Section(L"Performance and churn counters");
-  DumpCpuUsage(report, uptimeMs, wmSessionMs);
+  DumpCpuUsage(report, uptimeMs, wmSessionMs, reportStartCpu);
   report.Line();
   DumpDerivedPerformanceIndicators(report, counters);
   report.Line();
@@ -888,6 +1027,12 @@ static void WriteDiagnosticReport() {
   report.Section(L"Recent significant events (bounded in-memory tail)");
   report.Line(L"Newest events are at the bottom; at most %zu are retained.", kRecentEventLimit);
   DumpRecentEvents(report, now);
+
+  report.Section(L"Recent lifecycle bursts (bounded in-memory tail)");
+  report.Line(
+      L"Newest bursts are at the bottom; at most %zu are retained.",
+      kLifecycleBurstLimit);
+  DumpLifecycleBursts(report, now);
 
   report.Section(L"Workspace / window state");
 
@@ -929,6 +1074,11 @@ static void WriteDiagnosticReport() {
         L"---------------- Workspace %zu / %zu ----------------",
         workspaceIndex + 1, workspaces.size());
     report.Line(L"desktopId: %ls", desktopId.c_str());
+    report.Line(
+        L"currentDesktop: %ls",
+        !g_vd.lastKnownDesktopValid
+            ? L"unknown"
+            : (IsEqualGUID(key.desktopId, g_vd.lastKnownDesktop) ? L"YES" : L"no"));
     report.Line(L"monitor:   %p", reinterpret_cast<void*>(key.monitor));
 
     MONITORINFOEXW monitorInfo{};
@@ -1066,10 +1216,155 @@ static void WriteDiagnosticReport() {
   report.Line(L"Dead HWND records:            %zu", deadRecords);
   report.Line(L"Live PID mismatches:           %zu", pidMismatches);
   report.Line(L"Records with placement issue:  %zu", recordsWithPlacementFailures);
-  const bool clean = invariantFailures == 0 && duplicateOwners == 0 &&
-                     ownershipIndexMismatches == 0 && deadRecords == 0 &&
-                     pidMismatches == 0;
-  report.Line(L"Overall structural audit:      %ls", clean ? L"PASS" : L"REVIEW NEEDED");
+
+  const uint64_t lifecycleCategorySum =
+      counters.lifecycleDestroy + counters.lifecycleMinimizeStart +
+      counters.lifecycleMinimizeEnd + counters.lifecycleStateChange +
+      counters.lifecycleLocationChange + counters.lifecycleHide +
+      counters.lifecycleShow + counters.lifecycleCloaked +
+      counters.lifecycleUncloaked;
+  const uint64_t placementResultSum =
+      counters.placementSuccess + counters.placementAdjusted +
+      counters.placementAccessDenied + counters.placementRefused +
+      counters.placementDead;
+  const uint64_t placementPathSum =
+      counters.placementNoOps + counters.placementPreflightStops +
+      counters.setWindowPosCalls;
+  const uint64_t vdInitResultSum =
+      counters.vdApiInitSuccesses + counters.vdApiInitFailures;
+  const uint64_t priorReportResultSum =
+      counters.reportsWritten + counters.reportWriteFailures;
+  const uint64_t classifiedGestureSum =
+      counters.userMoveGestures + counters.userResizeGestures +
+      counters.userNoopGestures;
+
+  const bool lifecycleAccountingOk =
+      lifecycleCategorySum == counters.lifecycleEventsProcessed;
+  const bool placementResultsOk =
+      placementResultSum == counters.placementChecks;
+  const bool placementPathsOk =
+      placementPathSum == counters.placementChecks;
+  const bool vdInitAccountingOk =
+      vdInitResultSum == counters.vdApiInitAttempts;
+  const bool reportAccountingOk =
+      priorReportResultSum == g_runtime.lifetimeDiagnosticCost.attempts;
+  const bool gestureAccountingOk =
+      classifiedGestureSum <= counters.moveSizeEndMessages;
+
+  report.Line();
+  report.Line(L"Telemetry consistency:");
+  report.Line(
+      L"  lifecycle categories == lifecycle events: %ls (%llu == %llu)",
+      lifecycleAccountingOk ? L"PASS" : L"FAIL",
+      static_cast<unsigned long long>(lifecycleCategorySum),
+      static_cast<unsigned long long>(counters.lifecycleEventsProcessed));
+  report.Line(
+      L"  placement result sum == placement checks: %ls (%llu == %llu)",
+      placementResultsOk ? L"PASS" : L"FAIL",
+      static_cast<unsigned long long>(placementResultSum),
+      static_cast<unsigned long long>(counters.placementChecks));
+  report.Line(
+      L"  placement path sum == placement checks: %ls (%llu == %llu)",
+      placementPathsOk ? L"PASS" : L"FAIL",
+      static_cast<unsigned long long>(placementPathSum),
+      static_cast<unsigned long long>(counters.placementChecks));
+  report.Line(
+      L"  VD init successes + failures == attempts: %ls (%llu == %llu)",
+      vdInitAccountingOk ? L"PASS" : L"FAIL",
+      static_cast<unsigned long long>(vdInitResultSum),
+      static_cast<unsigned long long>(counters.vdApiInitAttempts));
+  report.Line(
+      L"  prior report results == measured diagnostic attempts: %ls (%llu == %llu)",
+      reportAccountingOk ? L"PASS" : L"FAIL",
+      static_cast<unsigned long long>(priorReportResultSum),
+      static_cast<unsigned long long>(
+          g_runtime.lifetimeDiagnosticCost.attempts));
+  report.Line(
+      L"  classified gestures <= move/size end messages: %ls (%llu <= %llu)",
+      gestureAccountingOk ? L"PASS" : L"FAIL",
+      static_cast<unsigned long long>(classifiedGestureSum),
+      static_cast<unsigned long long>(counters.moveSizeEndMessages));
+
+  const bool allWinEventHooks =
+      g_hooks.foreground && g_hooks.locationChange && g_hooks.moveSize &&
+      g_hooks.minimize && g_hooks.hideDestroy && g_hooks.cloak && g_hooks.state;
+  const bool vdCoreHealthy = g_vd.initialized && g_vd.abiResolved;
+  const bool vdNotificationsHealthy =
+      g_vd.abi.notification.methodCount <= 0 || g_vd.notificationsRegistered;
+  const bool currentDesktopHealthy =
+      !g_vd.initialized || g_vd.lastKnownDesktopValid;
+
+  const bool structuralHealthy =
+      invariantFailures == 0 && duplicateOwners == 0 &&
+      ownershipIndexMismatches == 0;
+  const bool runtimeWindowHealthy =
+      deadRecords == 0 && pidMismatches == 0 &&
+      recordsWithPlacementFailures == 0 && allWinEventHooks &&
+      vdCoreHealthy && vdNotificationsHealthy && currentDesktopHealthy;
+  const bool telemetryHealthy =
+      lifecycleAccountingOk && placementResultsOk && placementPathsOk &&
+      vdInitAccountingOk && reportAccountingOk && gestureAccountingOk;
+  const bool overallHealthy =
+      structuralHealthy && runtimeWindowHealthy && telemetryHealthy;
+
+  report.Line();
+  report.Line(
+      L"Model structural audit:       %ls",
+      structuralHealthy ? L"PASS" : L"REVIEW NEEDED");
+  report.Line(
+      L"Runtime / window health:      %ls",
+      runtimeWindowHealthy ? L"PASS" : L"REVIEW NEEDED");
+  report.Line(
+      L"Telemetry accounting audit:   %ls",
+      telemetryHealthy ? L"PASS" : L"REVIEW NEEDED");
+  report.Line(
+      L"Overall diagnostic status:    %ls",
+      overallHealthy ? L"PASS" : L"REVIEW NEEDED");
+
+  const ULONGLONG buildEndTickMs = GetTickCount64();
+  const DiagnosticCpuSnapshot buildEndCpu = CaptureDiagnosticCpuSnapshot();
+  const ULONGLONG currentBuildWallMs =
+      buildEndTickMs >= reportStartTickMs
+          ? buildEndTickMs - reportStartTickMs
+          : 0;
+  const uint64_t currentBuildProcessCpu100ns =
+      reportStartCpu.processAvailable && buildEndCpu.processAvailable
+          ? DiagnosticCpuDelta100ns(
+                buildEndCpu.ProcessTotal100ns(),
+                reportStartCpu.ProcessTotal100ns())
+          : 0;
+  const uint64_t currentBuildWmCpu100ns =
+      reportStartCpu.wmAvailable && buildEndCpu.wmAvailable
+          ? DiagnosticCpuDelta100ns(
+                buildEndCpu.WmTotal100ns(), reportStartCpu.WmTotal100ns())
+          : 0;
+
+  report.Section(L"Diagnostic reporting self-cost");
+  report.Line(
+      L"Prior diagnostic attempts: %llu lifetime, %llu current WM session",
+      static_cast<unsigned long long>(
+          g_runtime.lifetimeDiagnosticCost.attempts),
+      static_cast<unsigned long long>(
+          g_runtime.wmSessionDiagnosticCost.attempts));
+  report.Line(
+      L"Prior completed diagnostic cost (includes file writes): wall=%ls processCPU=%ls wmCPU=%ls",
+      DiagnosticDurationString(
+          g_runtime.lifetimeDiagnosticCost.wallMs).c_str(),
+      DiagnosticDurationString(
+          Diagnostic100nsToMilliseconds(
+              g_runtime.lifetimeDiagnosticCost.processCpu100ns)).c_str(),
+      DiagnosticDurationString(
+          Diagnostic100nsToMilliseconds(
+              g_runtime.lifetimeDiagnosticCost.wmCpu100ns)).c_str());
+  report.Line(
+      L"Current report construction so far (file write excluded): wall=%ls processCPU=%ls wmCPU=%ls",
+      DiagnosticDurationString(currentBuildWallMs).c_str(),
+      DiagnosticDurationString(
+          Diagnostic100nsToMilliseconds(currentBuildProcessCpu100ns)).c_str(),
+      DiagnosticDurationString(
+          Diagnostic100nsToMilliseconds(currentBuildWmCpu100ns)).c_str());
+  report.Line(
+      L"Note: the next report's prior-cost totals include this report's final file-write cost.");
 
   report.Line();
   report.Line(L"========================== END REPORT ==========================");
@@ -1082,18 +1377,22 @@ static void WriteDiagnosticReport() {
         L"Failed to write diagnostic report to '%ls' (error=%lu)",
         g_settings.diagnosticsOutputPath.c_str(), writeError);
     RecordEvent(L"diagnostic report write failed error=%lu", writeError);
+    AccumulateDiagnosticSelfCost(reportStartTickMs, reportStartCpu);
     return;
   }
 
   ++g_runtime.counters.reportsWritten;
   ++g_runtime.reportSequence;
-  g_runtime.lastReportTickMs = GetTickCount64();
   g_runtime.lastReportCounters = counters;
   // Account for the successful report in the baseline so the next delta doesn't
   // misleadingly attribute this report write to unrelated runtime activity.
   g_runtime.lastReportCounters.reportsWritten = g_runtime.counters.reportsWritten;
   RecordEvent(L"diagnostic report written: %ls", outputPath.c_str());
   Wh_Log(L"Diagnostic report written: %ls", outputPath.c_str());
+  AccumulateDiagnosticSelfCost(reportStartTickMs, reportStartCpu);
+  // The interval baseline is the end of a successful diagnostic operation, so
+  // report-generation time is not charged to the next "since dump" period.
+  g_runtime.lastReportTickMs = GetTickCount64();
 }
 
 }  // namespace Diagnostics
