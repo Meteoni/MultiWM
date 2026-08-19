@@ -390,16 +390,27 @@ static void ReconcileWindowParticipation(
     if (!record) continue;
 
     bool changed = false;
+    bool restoredIntoFloatingLayout = false;
     if (record->state == ManageState::Tiled &&
         reason != SuspensionReason::None) {
       changed = workspace.Suspend(hwnd, reason);
     } else if (record->state == ManageState::Suspended) {
-      changed = reason == SuspensionReason::None
-                    ? workspace.Restore(hwnd)
-                    : workspace.Suspend(hwnd, reason);
+      if (reason == SuspensionReason::None) {
+        changed = workspace.Restore(hwnd);
+        restoredIntoFloatingLayout =
+            changed && workspace.Layout() == TileLayout::Floating;
+      } else {
+        changed = workspace.Suspend(hwnd, reason);
+      }
     }
 
     if (changed) {
+      // A member that was suspended while its workspace entered Floating missed
+      // the layout-transition restore. Apply the same passive remembered-geometry
+      // policy when it becomes active again.
+      if (restoredIntoFloatingLayout) {
+        RepairFloatingGeometry(ownerKey, workspace, hwnd, FloatingPlacementHint{});
+      }
       g_workspaces.Save(ownerKey, workspace);
       if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, ownerKey);
     }

@@ -202,6 +202,22 @@ static bool RememberCurrentFloatingGeometry(
       hwnd, frame, key.monitor, GetMonitorEffectiveDpi(key.monitor));
 }
 
+// Entering the workspace-level Floating layout is a state restoration, not a
+// per-window drag/float command. Restore each active tiled member's complete
+// remembered floating rectangle; windows without memory use the configured
+// centered fallback. Per-window Floating records are already user-positioned and
+// deliberately remain untouched.
+static void RestoreWorkspaceFloatingGeometry(
+    const DesktopMonitorKey& key, Workspace& workspace) {
+  if (workspace.Layout() != TileLayout::Floating) return;
+
+  const std::vector<HWND> active = workspace.TiledWindows();
+  const FloatingPlacementHint passiveRestore{};
+  for (HWND hwnd : active) {
+    RepairFloatingGeometry(key, workspace, hwnd, passiveRestore);
+  }
+}
+
 // Resolves a monitor on the current virtual desktop to its workspace key and,
 // when requested, returns the configured workspace-inset work area.
 static bool GetCurrentWorkspaceKey(HMONITOR monitor, DesktopMonitorKey* outKey, RECT* outWorkArea = nullptr) {

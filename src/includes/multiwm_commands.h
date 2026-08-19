@@ -100,7 +100,12 @@ void CycleCurrentWorkspaceLayout() {
     if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, false) || !g_workspaces.Load(key, &state)) return;
   }
 
+  const TileLayout previousLayout = state.Layout();
   state.CycleLayout();
+  if (previousLayout != TileLayout::Floating &&
+      state.Layout() == TileLayout::Floating) {
+    RestoreWorkspaceFloatingGeometry(key, state);
+  }
   g_workspaces.Save(key, state);
   ArrangeWorkspace(key);
   TrayUi::UpdateIcon(state.Layout());

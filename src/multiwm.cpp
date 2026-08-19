@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.11.7
+// @version         1.11.8
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -52,7 +52,7 @@ resize-adjusted ratios per virtual desktop.
 
 ## Notes
 - Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
-- Floating exists both as a workspace mode and as a per-window managed state; remembered floating geometry is restored when managed windows re-enter floating contexts.
+- Floating exists both as a workspace mode and as a per-window managed state; remembered floating geometry is restored on migration, explicit floating, and workspace layout transitions into Floating.
 - Private virtual-desktop manager and notification ABIs are selected automatically from the actual Explorer build/revision; unknown manager generations are rejected instead of guessed.
 - If Virtual Desktop APIs are unavailable, tiling still works but per-desktop memory is disabled.
 */
