@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.11.6
+// @version         1.11.7
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -21,7 +21,7 @@ resize-adjusted ratios per virtual desktop.
 - Manual tiling hotkey
 - Layout cycle hotkey
 - 7 per-workspace modes: Master+Stack (Vertical/Horizontal), Columns, Rows, BSP, Monocle, Floating
-- Independent workspace insets, window gap, and master size
+- DPI-aware workspace insets/window gaps and independent master size
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
 - Uses native virtual-desktop notifications when available, with coalesced visibility/cloak reconciliation as a safety fallback
 - Checked placement with per-window failure tracking and automatic floating for repeatedly non-compliant windows
@@ -52,7 +52,7 @@ resize-adjusted ratios per virtual desktop.
 
 ## Notes
 - Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
-- Floating exists both as a workspace mode and as a per-window managed state.
+- Floating exists both as a workspace mode and as a per-window managed state; remembered floating geometry is restored when managed windows re-enter floating contexts.
 - Private virtual-desktop manager and notification ABIs are selected automatically from the actual Explorer build/revision; unknown manager generations are rejected instead of guessed.
 - If Virtual Desktop APIs are unavailable, tiling still works but per-desktop memory is disabled.
 */
@@ -80,12 +80,12 @@ resize-adjusted ratios per virtual desktop.
     - floating: Floating (managed, no automatic placement)
 
 - TileGap: 4
-  $name: '[Workspace] Window Gap (pixels)'
-  $description: Gap between adjacent tiled windows (0-100).
+  $name: '[Workspace] Window Gap (DPI-scaled pixels)'
+  $description: Gap between adjacent tiled windows at 96 DPI (0-100); scaled per monitor.
 
 - WorkspaceInsets: "4, 4, 4, 4"
-  $name: '[Workspace] Insets (pixels)'
-  $description: 'Left, Top, Right, Bottom. Positive values inset the workspace from that edge; each value must be 0-500. Example: 4, 4, 4, 4'
+  $name: '[Workspace] Insets (DPI-scaled pixels)'
+  $description: 'Left, Top, Right, Bottom at 96 DPI. Positive values inset the workspace from that edge; each value must be 0-500 and is scaled per monitor. Example: 4, 4, 4, 4'
 
 - MasterPercent: 50
   $name: '[Workspace] Master Size (%)'
@@ -97,6 +97,10 @@ resize-adjusted ratios per virtual desktop.
   $options:
     - float: Float moved window
     - swap: Swap with tiled window under pointer
+
+- FloatingDefaultSize: "960, 640"
+  $name: '[Floating] Default Size (DPI-scaled pixels)'
+  $description: 'Fallback Width, Height at 96 DPI when no remembered floating size exists. Each value must be 100-4000 and is scaled per monitor. Example: 960, 640'
 
 - Exclusions:
     - - Match: process

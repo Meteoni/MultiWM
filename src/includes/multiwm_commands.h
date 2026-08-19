@@ -45,8 +45,19 @@ void FloatFocusedWindow() {
   if (!g_workspaces.Load(key, &workspace)) return;
 
   HWND tiled = ResolveToTiledWindow(hwnd, workspace.TiledWindows());
-  if (!tiled || !workspace.Float(tiled)) return;
+  if (!tiled) return;
+
+  RECT before{};
+  FloatingPlacementHint hint;
+  if (GetWindowFrameRect(tiled, &before) && before.right > before.left &&
+      before.bottom > before.top) {
+    hint.intent = FloatingPlacementIntent::PreserveAnchor;
+    hint.anchor = RectCenter(before);
+  }
+
+  if (!workspace.Float(tiled)) return;
   workspace.ResetPlacementFailures(tiled);
+  RepairFloatingGeometry(key, workspace, tiled, hint);
   g_workspaces.Save(key, workspace);
   ArrangeWorkspace(key);
   Wh_Log(L"Focused window floated %p", tiled);
@@ -103,6 +114,8 @@ static void HandleUserMove(
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
     if (workspace.Float(hwnd)) {
       workspace.ResetPlacementFailures(hwnd);
+      RepairFloatingGeometry(
+          key, workspace, hwnd, MakeFloatingPlacementHintFromGesture(gesture));
       g_workspaces.Save(key, workspace);
       Wh_Log(L"User move floated managed window %p", hwnd);
     }
@@ -149,12 +162,14 @@ static void HandleUserResize(
   switch (workspace.Layout()) {
     case TileLayout::MasterStack:
     case TileLayout::MasterStackH:
-      changed = workspace.LearnMasterStackResize(workArea, g_settings.gap, resizedIndex, gesture);
+      changed = workspace.LearnMasterStackResize(
+          workArea, GetWorkspaceGapPixels(key.monitor), resizedIndex, gesture);
       break;
 
     case TileLayout::Columns:
     case TileLayout::Rows:
-      changed = workspace.LearnGridResize(workArea, g_settings.gap, resizedIndex, gesture);
+      changed = workspace.LearnGridResize(
+          workArea, GetWorkspaceGapPixels(key.monitor), resizedIndex, gesture);
       break;
 
     case TileLayout::COUNT:
@@ -191,7 +206,23 @@ void ApplyUserMoveSize(HWND hwnd) {
 
   DesktopMonitorKey key{desktopId, monitor};
   Workspace state;
-  if (!g_workspaces.Load(key, &state) || state.Layout() == TileLayout::Floating) return;
+  if (!g_workspaces.Load(key, &state)) return;
+
+  const WindowRecord* directRecord = state.Find(hwnd);
+  if (directRecord &&
+      (state.Layout() == TileLayout::Floating ||
+       directRecord->state == ManageState::Floating)) {
+    ConsumeMoveSizeGesture(hwnd);
+    if (RememberCurrentFloatingGeometry(key, state, hwnd)) {
+      g_workspaces.Save(key, state);
+    }
+    return;
+  }
+
+  if (state.Layout() == TileLayout::Floating) {
+    ClearMoveSizeSamples(hwnd);
+    return;
+  }
 
   RECT workArea{};
   if (!GetWorkspaceWorkArea(monitor, &workArea)) return;

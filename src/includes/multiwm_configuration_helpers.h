@@ -70,6 +70,48 @@ bool GetMonitorWorkArea(HMONITOR monitor, RECT* outRect) {
   return true;
 }
 
+static UINT GetMonitorEffectiveDpi(HMONITOR monitor) {
+  if (!monitor) return 96;
+
+  using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+  using GetScaleFactorForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int*);
+  struct DpiApis {
+    GetDpiForMonitorFn getDpi = nullptr;
+    GetScaleFactorForMonitorFn getScale = nullptr;
+  };
+  static const DpiApis apis = [] {
+    DpiApis result;
+    HMODULE shcore = LoadLibraryW(L"Shcore.dll");
+    if (shcore) {
+      result.getDpi = reinterpret_cast<GetDpiForMonitorFn>(
+          GetProcAddress(shcore, "GetDpiForMonitor"));
+      result.getScale = reinterpret_cast<GetScaleFactorForMonitorFn>(
+          GetProcAddress(shcore, "GetScaleFactorForMonitor"));
+    }
+    return result;
+  }();
+
+  UINT dpiX = 96;
+  UINT dpiY = 96;
+  // MDT_EFFECTIVE_DPI == 0. Keep the enum types local so no Shcore import
+  // library is required. GetScaleFactorForMonitor also guards against hosts
+  // whose DPI-awareness context makes GetDpiForMonitor report 96.
+  const bool haveDpi = apis.getDpi &&
+      SUCCEEDED(apis.getDpi(monitor, 0, &dpiX, &dpiY)) && dpiX;
+
+  int scalePercent = 100;
+  const bool haveScale = apis.getScale &&
+      SUCCEEDED(apis.getScale(monitor, &scalePercent)) && scalePercent > 0;
+  if (haveScale && (!haveDpi || (dpiX == 96 && scalePercent != 100))) {
+    return static_cast<UINT>(MulDiv(96, scalePercent, 100));
+  }
+  return haveDpi ? dpiX : 96;
+}
+
+static LONG ScaleDip(LONG value, UINT dpi) {
+  return MulDiv(value, static_cast<int>(dpi ? dpi : 96), 96);
+}
+
 bool AreSameWindows(const std::vector<HWND>& a, const std::vector<HWND>& b) {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) {
@@ -84,6 +126,7 @@ std::vector<double> DefaultWeights(size_t count) {
 
 bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor);
 static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd);
+static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd);
 static bool WindowCanBeManaged(HWND hwnd);
 static bool IsWindowTrackedInAnyState(HWND hwnd);
 bool ContainsWindow(const std::vector<HWND>& windows, HWND hwnd) {
@@ -160,6 +203,10 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     const PlacementResult lastResult = existing.lastPlacementResult;
     const RECT lastRequested = existing.lastRequestedRect;
     const RECT lastObserved = existing.lastObservedRect;
+    const RECT floatingRect = existing.floatingRect;
+    const HMONITOR floatingMonitor = existing.floatingMonitor;
+    const UINT floatingDpi = existing.floatingDpi;
+    const bool hasFloatingRect = existing.hasFloatingRect;
     const ManageState state = existing.state;
     const SuspensionReason suspension = existing.suspensionReason;
     const SuspendedSlot slot = existing.savedSlot;
@@ -171,6 +218,12 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     existing.lastPlacementResult = lastResult;
     existing.lastRequestedRect = lastRequested;
     existing.lastObservedRect = lastObserved;
+    if (hasFloatingRect) {
+      existing.floatingRect = floatingRect;
+      existing.floatingMonitor = floatingMonitor;
+      existing.floatingDpi = floatingDpi;
+      existing.hasFloatingRect = true;
+    }
     existing.state = state;
     existing.suspensionReason = suspension;
     existing.savedSlot = slot;
@@ -221,6 +274,31 @@ bool Workspace::ResetPlacementFailures(HWND hwnd) {
   if (!record || record->placementFailures == 0) return false;
   record->placementFailures = 0;
   DebugValidateMutation(L"Workspace::ResetPlacementFailures");
+  return true;
+}
+
+bool Workspace::RememberFloatingGeometry(
+    HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi) {
+  AssertWmThread(L"Workspace::RememberFloatingGeometry");
+  WindowRecord* record = FindMutable(hwnd);
+  if (!record || !monitor || frame.right <= frame.left ||
+      frame.bottom <= frame.top) {
+    return false;
+  }
+
+  const UINT normalizedDpi = dpi ? dpi : 96;
+  if (record->hasFloatingRect &&
+      EqualRect(&record->floatingRect, &frame) &&
+      record->floatingMonitor == monitor &&
+      record->floatingDpi == normalizedDpi) {
+    return false;
+  }
+
+  record->floatingRect = frame;
+  record->floatingMonitor = monitor;
+  record->floatingDpi = normalizedDpi;
+  record->hasFloatingRect = true;
+  DebugValidateMutation(L"Workspace::RememberFloatingGeometry");
   return true;
 }
 

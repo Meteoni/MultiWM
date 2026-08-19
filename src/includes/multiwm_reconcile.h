@@ -108,8 +108,9 @@ static bool AdoptSnapshotGeometryIfEligible(
   std::vector<WorkspaceGeometryItem> geometry = CaptureWorkspaceGeometry(
       workspace.TiledWindows(), monitor, workArea);
   Workspace captured = Workspace::AdoptGeometry(
-      workspace.Layout(), workArea, g_settings.gap,
+      workspace.Layout(), workArea, GetWorkspaceGapPixels(monitor),
       g_settings.masterPercent / 100.0, geometry, preferredMaster);
+  captured.MergeRememberedFloatingGeometryFrom(workspace);
   captured.MergeNonTiledRecordsFrom(workspace);
   workspace = std::move(captured);
   return true;
@@ -195,9 +196,11 @@ static bool MigrateManagedWindow(
 
   Workspace source;
   if (!g_workspaces.Load(sourceKey, &source)) return false;
+  const TileLayout sourceLayout = source.Layout();
 
   WindowRecord record;
   if (!source.ExtractForMigration(hwnd, &record)) return false;
+  const ManageState sourceState = record.state;
   g_workspaces.Save(sourceKey, source);
 
   Workspace target;
@@ -206,6 +209,26 @@ static bool MigrateManagedWindow(
     target.SetMasterRatio(g_settings.masterPercent / 100.0);
   }
   target.AdmitMigrated(std::move(record));
+
+  if (sourceLayout != TileLayout::Floating &&
+      sourceState != ManageState::Floating &&
+      target.Layout() == TileLayout::Floating) {
+    const MoveSizeGesture gesture = PeekMoveSizeGesture(hwnd);
+    const FloatingPlacementHint hint = MakeFloatingPlacementHintFromGesture(gesture);
+    // Automatic migration owns passive geometry. Manual cross-desktop moves
+    // never reach this path; same-desktop Manual monitor drags may repair only
+    // when the completed user gesture supplies an explicit anchor.
+    if (IsAutomaticMode() ||
+        hint.intent == FloatingPlacementIntent::PreserveAnchor) {
+      const bool repaired = RepairFloatingGeometry(targetKey, target, hwnd, hint);
+      if (repaired && hint.intent == FloatingPlacementIntent::PreserveAnchor) {
+        // The completed gesture has already served as migration context. Clear it
+        // so a deferred desktop migration cannot leave an old drag sample behind.
+        ClearMoveSizeSamples(hwnd);
+      }
+    }
+  }
+
   g_workspaces.Save(targetKey, target);
   return true;
 }

@@ -17,6 +17,20 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
     record.canMove = (GetAncestor(hwnd, GA_ROOT) == hwnd) && !(style & WS_CHILD);
     record.canResize = (style & WS_SIZEBOX) != 0;
     record.topmost = (exStyle & WS_EX_TOPMOST) != 0;
+
+    RECT frame{};
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    // Only a restored window exposes meaningful natural/floating geometry.
+    // Minimized/maximized admission should fall back to the configured size
+    // rather than remembering an iconic or maximized rectangle.
+    if (monitor && IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsZoomed(hwnd) &&
+        GetWindowFrameRect(hwnd, &frame) &&
+        frame.right > frame.left && frame.bottom > frame.top) {
+      record.floatingRect = frame;
+      record.floatingMonitor = monitor;
+      record.floatingDpi = GetMonitorEffectiveDpi(monitor);
+      record.hasFloatingRect = true;
+    }
   }
 
   return record;

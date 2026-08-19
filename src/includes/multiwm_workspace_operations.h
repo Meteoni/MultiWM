@@ -383,6 +383,21 @@ void Workspace::AdmitMigrated(WindowRecord record) {
   DebugValidateMutation(L"Workspace::AdmitMigrated");
 }
 
+void Workspace::MergeRememberedFloatingGeometryFrom(const Workspace& source) {
+  AssertWmThread(L"Workspace::MergeRememberedFloatingGeometryFrom");
+  for (const auto& kv : source.records_) {
+    const WindowRecord& sourceRecord = kv.second;
+    if (!sourceRecord.hasFloatingRect) continue;
+    WindowRecord* targetRecord = FindMutable(kv.first);
+    if (!targetRecord) continue;
+    targetRecord->floatingRect = sourceRecord.floatingRect;
+    targetRecord->floatingMonitor = sourceRecord.floatingMonitor;
+    targetRecord->floatingDpi = sourceRecord.floatingDpi;
+    targetRecord->hasFloatingRect = true;
+  }
+  DebugValidateMutation(L"Workspace::MergeRememberedFloatingGeometryFrom");
+}
+
 void Workspace::MergeNonTiledRecordsFrom(const Workspace& source) {
   AssertWmThread(L"Workspace::MergeNonTiledRecordsFrom");
   for (const auto& kv : source.records_) {
@@ -648,7 +663,7 @@ bool Workspace::LearnGridResize(
 }
 
 static bool BuildWorkspaceLayoutPlan(
-    const Workspace& workspace, const RECT& workArea,
+    const Workspace& workspace, const RECT& workArea, LONG gap,
     std::vector<RECT>* outRects) {
   if (!outRects) return false;
   outRects->assign(workspace.ActiveCount(), RECT{});
@@ -656,32 +671,32 @@ static bool BuildWorkspaceLayoutPlan(
   switch (workspace.Layout()) {
     case TileLayout::MasterStack:
       Layout::LayoutMasterStackWeighted(
-          workArea, g_settings.gap, workspace.ActiveCount(), *outRects, false,
+          workArea, gap, workspace.ActiveCount(), *outRects, false,
           ClampDouble(workspace.MasterRatio(), 0.1, 0.9),
           workspace.StackWeights());
       return true;
 
     case TileLayout::MasterStackH:
       Layout::LayoutMasterStackWeighted(
-          workArea, g_settings.gap, workspace.ActiveCount(), *outRects, true,
+          workArea, gap, workspace.ActiveCount(), *outRects, true,
           ClampDouble(workspace.MasterRatio(), 0.1, 0.9),
           workspace.StackWeights());
       return true;
 
     case TileLayout::Columns:
       Layout::LayoutGridWeighted(
-          workArea, g_settings.gap, workspace.ActiveCount(), *outRects, false,
+          workArea, gap, workspace.ActiveCount(), *outRects, false,
           workspace.GridWeights());
       return true;
 
     case TileLayout::Rows:
       Layout::LayoutGridWeighted(
-          workArea, g_settings.gap, workspace.ActiveCount(), *outRects, true,
+          workArea, gap, workspace.ActiveCount(), *outRects, true,
           workspace.GridWeights());
       return true;
 
     case TileLayout::BSP:
-      Layout::LayoutBSP(workArea, g_settings.gap, 0, workspace.ActiveCount(), 0, *outRects);
+      Layout::LayoutBSP(workArea, gap, 0, workspace.ActiveCount(), 0, *outRects);
       return true;
 
     case TileLayout::Monocle:
@@ -741,6 +756,7 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   if (!GetWorkspaceWorkArea(key.monitor, &workArea)) return;
 
   ObserveAndRepairWorkspaceForArrangement(workspace);
+  const LONG gap = GetWorkspaceGapPixels(key.monitor);
   const size_t maxPasses = workspace.ActiveCount() + 1;
   for (size_t pass = 0; pass < maxPasses; ++pass) {
     if (workspace.Layout() == TileLayout::Floating || workspace.Empty()) {
@@ -749,7 +765,7 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
     }
 
     std::vector<RECT> rects;
-    if (!BuildWorkspaceLayoutPlan(workspace, workArea, &rects)) {
+    if (!BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects)) {
       g_workspaces.Save(key, workspace);
       return;
     }

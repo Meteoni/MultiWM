@@ -211,6 +211,15 @@ static void DiagnosticDumpWindowRecord(
   Wh_Log(L"      lastRequested=%s", requested.c_str());
   Wh_Log(L"      lastObserved =%s", observed.c_str());
 
+  if (record.hasFloatingRect) {
+    std::wstring floating = DiagnosticRectString(record.floatingRect);
+    Wh_Log(
+        L"      floatingGeometry=%s dpi=%u monitor=%p", floating.c_str(),
+        record.floatingDpi, reinterpret_cast<void*>(record.floatingMonitor));
+  } else {
+    Wh_Log(L"      floatingGeometry=none");
+  }
+
   if (record.hasSavedSlot) {
     Wh_Log(
         L"      savedSlot: index=%zu weight=%.9g hasWeight=%d wasMaster=%d",

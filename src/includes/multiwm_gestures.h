@@ -62,6 +62,27 @@ MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LON
     return MoveSizeIntent::Resize;
 }
 
+static MoveSizeGesture PeekMoveSizeGesture(HWND hwnd) {
+  MoveSizeGesture gesture;
+  AcquireSRWLockShared(&g_moveSize.lock);
+  auto startIt = g_moveSize.startRects.find(hwnd);
+  auto endIt = g_moveSize.endRects.find(hwnd);
+  auto pointIt = g_moveSize.endPoints.find(hwnd);
+  if (startIt != g_moveSize.startRects.end() &&
+      endIt != g_moveSize.endRects.end()) {
+    gesture.start = startIt->second;
+    gesture.end = endIt->second;
+    gesture.hasRects = true;
+    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
+  }
+  if (pointIt != g_moveSize.endPoints.end()) {
+    gesture.dropPoint = pointIt->second;
+    gesture.hasDropPoint = true;
+  }
+  ReleaseSRWLockShared(&g_moveSize.lock);
+  return gesture;
+}
+
 
 
 

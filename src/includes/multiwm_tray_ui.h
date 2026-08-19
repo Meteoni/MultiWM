@@ -344,8 +344,7 @@ static void ShowStatusFlyout(const wchar_t* text) {
 
   g_flyoutText = text;
 
-  UINT dpi = GetDpiForWindow(g_flyoutWindow);
-  if (!dpi) dpi = 96;
+  UINT dpi = GetMonitorEffectiveDpi(monitor);
   HFONT font = CreateFlyoutFont(dpi);
   HDC dc = GetDC(g_flyoutWindow);
   HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;

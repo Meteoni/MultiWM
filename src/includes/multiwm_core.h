@@ -77,6 +77,8 @@
 //    Manual admits only through explicit commands, forgets minimized members, and
 //    releases membership when a managed HWND moves to another virtual desktop.
 //    Maximized members remain suspended so restoring preserves their exact slot.
+// 9. Floating geometry is remembered independently of tiled geometry. Tiling and
+//    geometry adoption never overwrite the last meaningful floating rectangle.
 //
 // If a change cannot be explained in terms of those invariants, it probably
 // belongs in the observation/reconciliation layer rather than layout code.
@@ -169,6 +171,11 @@ struct WorkspaceInsets {
   LONG bottom = 4;
 };
 
+struct FloatingDefaultSize {
+  LONG width = 960;
+  LONG height = 640;
+};
+
 // Windhawk settings and immutable-at-runtime policy values. Settings reloads
 // replace these fields; transient WM state lives in WmRuntime instead.
 struct SettingsState {
@@ -182,8 +189,11 @@ struct SettingsState {
   UINT floatFocusedKey = 0;
   UINT diagnosticDumpKey = 'I';
 
-  WorkspaceInsets insets{};
-  LONG gap = 4;
+  // User-facing pixel values are logical pixels at 96 DPI; scale only at a
+  // concrete monitor/window boundary so stored screen geometry remains physical.
+  WorkspaceInsets insetsDip{};
+  LONG gapDip = 4;
+  FloatingDefaultSize floatingDefaultSizeDip{};
   LONG masterPercent = 50;
 
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
@@ -334,6 +344,13 @@ struct WindowRecord {
   RECT lastRequestedRect{};
   RECT lastObservedRect{};
 
+  // Last meaningful floating frame in physical screen pixels. The capture DPI
+  // and monitor let migration restore size sensibly across per-monitor scaling.
+  RECT floatingRect{};
+  HMONITOR floatingMonitor = nullptr;
+  UINT floatingDpi = 96;
+  bool hasFloatingRect = false;
+
   // Only meaningful while state == Suspended. It preserves the tiled logical
   // position/weight across non-participating physical states.
   SuspensionReason suspensionReason = SuspensionReason::None;
@@ -385,6 +402,8 @@ class Workspace {
   bool MakeMaster(HWND hwnd, HWND* oldMaster = nullptr);
   bool SwapTiled(HWND first, HWND second);
   bool ResetPlacementFailures(HWND hwnd);
+  bool RememberFloatingGeometry(
+      HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
 
   bool ActivateTiled(HWND hwnd, bool resetPlacementFailures = false);
   bool AdmitTiled(WindowRecord record, bool resetPlacementFailures = false);
@@ -395,6 +414,7 @@ class Workspace {
   bool Forget(HWND hwnd);
   bool ExtractForMigration(HWND hwnd, WindowRecord* outRecord);
   void AdmitMigrated(WindowRecord record);
+  void MergeRememberedFloatingGeometryFrom(const Workspace& source);
   void MergeNonTiledRecordsFrom(const Workspace& source);
   void RepairForArrangement(
       const std::vector<HWND>& invalidWindows,

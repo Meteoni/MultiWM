@@ -29,18 +29,177 @@ static HMONITOR GetTargetMonitor() {
   return monitor;
 }
 
+static LONG GetWorkspaceGapPixels(HMONITOR monitor) {
+  return ScaleDip(g_settings.gapDip, GetMonitorEffectiveDpi(monitor));
+}
+
+static WorkspaceInsets GetWorkspaceInsetsPixels(HMONITOR monitor) {
+  const UINT dpi = GetMonitorEffectiveDpi(monitor);
+  return {
+      ScaleDip(g_settings.insetsDip.left, dpi),
+      ScaleDip(g_settings.insetsDip.top, dpi),
+      ScaleDip(g_settings.insetsDip.right, dpi),
+      ScaleDip(g_settings.insetsDip.bottom, dpi)};
+}
+
 static bool GetWorkspaceWorkArea(HMONITOR monitor, RECT* outWorkArea) {
   if (!monitor || !outWorkArea) return false;
   RECT monitorWork{};
   if (!GetMonitorWorkArea(monitor, &monitorWork)) return false;
+  const WorkspaceInsets insets = GetWorkspaceInsetsPixels(monitor);
 
   *outWorkArea = {
-      monitorWork.left + g_settings.insets.left,
-      monitorWork.top + g_settings.insets.top,
-      monitorWork.right - g_settings.insets.right,
-      monitorWork.bottom - g_settings.insets.bottom};
+      monitorWork.left + insets.left,
+      monitorWork.top + insets.top,
+      monitorWork.right - insets.right,
+      monitorWork.bottom - insets.bottom};
   return outWorkArea->right > outWorkArea->left &&
          outWorkArea->bottom > outWorkArea->top;
+}
+
+enum class FloatingPlacementIntent {
+  PassiveRestore,
+  PreserveAnchor,
+};
+
+struct FloatingPlacementHint {
+  FloatingPlacementIntent intent = FloatingPlacementIntent::PassiveRestore;
+  POINT anchor{};
+};
+
+static POINT RectCenter(const RECT& rect) {
+  return {
+      rect.left + (rect.right - rect.left) / 2,
+      rect.top + (rect.bottom - rect.top) / 2};
+}
+
+static RECT CenteredRect(POINT center, LONG width, LONG height) {
+  width = std::max<LONG>(1, width);
+  height = std::max<LONG>(1, height);
+  const LONG left = center.x - width / 2;
+  const LONG top = center.y - height / 2;
+  return {left, top, left + width, top + height};
+}
+
+static RECT ClampFloatingRectToWorkArea(RECT rect, const RECT& workArea) {
+  const LONG areaWidth = std::max<LONG>(1, workArea.right - workArea.left);
+  const LONG areaHeight = std::max<LONG>(1, workArea.bottom - workArea.top);
+  const LONG width = std::min<LONG>(
+      std::max<LONG>(1, rect.right - rect.left), areaWidth);
+  const LONG height = std::min<LONG>(
+      std::max<LONG>(1, rect.bottom - rect.top), areaHeight);
+
+  LONG left = rect.left;
+  LONG top = rect.top;
+  if (left < workArea.left) left = workArea.left;
+  if (top < workArea.top) top = workArea.top;
+  if (left + width > workArea.right) left = workArea.right - width;
+  if (top + height > workArea.bottom) top = workArea.bottom - height;
+  return {left, top, left + width, top + height};
+}
+
+static FloatingPlacementHint MakeFloatingPlacementHintFromGesture(
+    const MoveSizeGesture& gesture) {
+  FloatingPlacementHint hint;
+  if (gesture.intent != MoveSizeIntent::Move) return hint;
+
+  hint.intent = FloatingPlacementIntent::PreserveAnchor;
+  // Preserve the moved window's final center rather than the mouse pointer. The
+  // pointer is usually on the title bar, so centering a repaired window on it
+  // would visibly jump away from the user's chosen placement.
+  if (gesture.hasRects) {
+    hint.anchor = RectCenter(gesture.end);
+  } else if (gesture.hasDropPoint) {
+    hint.anchor = gesture.dropPoint;
+  }
+  return hint;
+}
+
+// Converts remembered floating geometry into a destination-monitor rectangle.
+// Passive migration restores the full rectangle on the same monitor and centers
+// remembered/default size on a different monitor. Explicit drag/hotkey intent
+// always preserves the user's anchor while repairing only the size.
+static bool RepairFloatingGeometry(
+    const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
+    const FloatingPlacementHint& hint) {
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record || !record->canMove || !IsWindow(hwnd) ||
+      GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+    return false;
+  }
+
+  RECT workArea{};
+  if (!GetWorkspaceWorkArea(key.monitor, &workArea)) return false;
+
+  RECT current{};
+  const bool haveCurrent = GetWindowFrameRect(hwnd, &current) &&
+                           current.right > current.left &&
+                           current.bottom > current.top;
+  const UINT targetDpi = GetMonitorEffectiveDpi(key.monitor);
+
+  LONG width = 0;
+  LONG height = 0;
+  if (record->hasFloatingRect) {
+    const UINT sourceDpi = record->floatingDpi ? record->floatingDpi : 96;
+    width = MulDiv(
+        record->floatingRect.right - record->floatingRect.left,
+        static_cast<int>(targetDpi), static_cast<int>(sourceDpi));
+    height = MulDiv(
+        record->floatingRect.bottom - record->floatingRect.top,
+        static_cast<int>(targetDpi), static_cast<int>(sourceDpi));
+  } else {
+    width = ScaleDip(g_settings.floatingDefaultSizeDip.width, targetDpi);
+    height = ScaleDip(g_settings.floatingDefaultSizeDip.height, targetDpi);
+  }
+
+  if (!record->canResize && haveCurrent) {
+    width = current.right - current.left;
+    height = current.bottom - current.top;
+  }
+
+  POINT center{};
+  if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
+    center = hint.anchor;
+  } else if (record->hasFloatingRect && record->floatingMonitor == key.monitor) {
+    center = RectCenter(record->floatingRect);
+  } else {
+    center = RectCenter(workArea);
+  }
+
+  RECT target = ClampFloatingRectToWorkArea(
+      CenteredRect(center, width, height), workArea);
+  PlacementObservation observation =
+      PlaceWindowChecked(hwnd, record->canMove, target);
+  if (observation.result != PlacementResult::Success &&
+      observation.result != PlacementResult::AdjustedByWindow) {
+    return false;
+  }
+
+  const RECT remembered =
+      observation.observed.right > observation.observed.left &&
+              observation.observed.bottom > observation.observed.top
+          ? observation.observed
+          : target;
+  workspace.RememberFloatingGeometry(hwnd, remembered, key.monitor, targetDpi);
+  return true;
+}
+
+static bool RememberCurrentFloatingGeometry(
+    const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd) {
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record) return false;
+  if (workspace.Layout() != TileLayout::Floating &&
+      record->state != ManageState::Floating) {
+    return false;
+  }
+
+  RECT frame{};
+  if (!GetWindowFrameRect(hwnd, &frame) || frame.right <= frame.left ||
+      frame.bottom <= frame.top) {
+    return false;
+  }
+  return workspace.RememberFloatingGeometry(
+      hwnd, frame, key.monitor, GetMonitorEffectiveDpi(key.monitor));
 }
 
 // Resolves a monitor on the current virtual desktop to its workspace key and,
@@ -93,6 +252,12 @@ bool Workspace::Validate(
 
     if (record.hwnd && record.hwnd != hwnd) {
       fail(L"WindowRecord hwnd field disagrees with record-map key", hwnd);
+    }
+    if (record.hasFloatingRect &&
+        (record.floatingRect.right <= record.floatingRect.left ||
+         record.floatingRect.bottom <= record.floatingRect.top ||
+         !record.floatingMonitor || !record.floatingDpi)) {
+      fail(L"remembered floating geometry is invalid", hwnd);
     }
 
     switch (record.state) {

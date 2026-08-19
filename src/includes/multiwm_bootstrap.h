@@ -67,20 +67,55 @@ static bool ParseWorkspaceInsetsSetting(PCWSTR text, WorkspaceInsets* outInsets)
   return true;
 }
 
+static bool ParseFloatingDefaultSizeSetting(
+    PCWSTR text, FloatingDefaultSize* outSize) {
+  if (!text || !outSize) return false;
+
+  LONG values[2]{};
+  const wchar_t* cursor = text;
+  for (size_t i = 0; i < 2; ++i) {
+    while (*cursor && std::iswspace(*cursor)) ++cursor;
+    wchar_t* end = nullptr;
+    long value = std::wcstol(cursor, &end, 10);
+    if (end == cursor || value < 100 || value > 4000) return false;
+    values[i] = static_cast<LONG>(value);
+    cursor = end;
+    while (*cursor && std::iswspace(*cursor)) ++cursor;
+    if (i == 0) {
+      if (*cursor != L',') return false;
+      ++cursor;
+    }
+  }
+  while (*cursor && std::iswspace(*cursor)) ++cursor;
+  if (*cursor != L'\0') return false;
+  *outSize = {values[0], values[1]};
+  return true;
+}
+
 void LoadSettings() {
   g_settings.tilingModifiers = ReadModifierSetting(L"TilingModifier", MOD_ALT);
 
   PCWSTR insets = Wh_GetStringSetting(L"WorkspaceInsets");
   WorkspaceInsets parsedInsets{};
   if (ParseWorkspaceInsetsSetting(insets, &parsedInsets)) {
-    g_settings.insets = parsedInsets;
+    g_settings.insetsDip = parsedInsets;
   } else {
-    g_settings.insets = {};
+    g_settings.insetsDip = {};
     Wh_Log(L"Invalid WorkspaceInsets setting; using 4, 4, 4, 4");
   }
   Wh_FreeStringSetting(insets);
-  g_settings.gap = Wh_GetIntSetting(L"TileGap");
-  if (g_settings.gap < 0 || g_settings.gap > 100) g_settings.gap = 4;
+  g_settings.gapDip = Wh_GetIntSetting(L"TileGap");
+  if (g_settings.gapDip < 0 || g_settings.gapDip > 100) g_settings.gapDip = 4;
+
+  PCWSTR floatingSize = Wh_GetStringSetting(L"FloatingDefaultSize");
+  FloatingDefaultSize parsedFloatingSize{};
+  if (ParseFloatingDefaultSizeSetting(floatingSize, &parsedFloatingSize)) {
+    g_settings.floatingDefaultSizeDip = parsedFloatingSize;
+  } else {
+    g_settings.floatingDefaultSizeDip = {};
+    Wh_Log(L"Invalid FloatingDefaultSize setting; using 960, 640");
+  }
+  Wh_FreeStringSetting(floatingSize);
   g_settings.masterPercent = Wh_GetIntSetting(L"MasterPercent");
   if (g_settings.masterPercent < 1 || g_settings.masterPercent > 99) g_settings.masterPercent = 50;
 
