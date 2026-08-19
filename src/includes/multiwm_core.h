@@ -462,6 +462,11 @@ class WorkspaceRepository {
  private:
   mutable SRWLOCK lock_ = SRWLOCK_INIT;
   WorkspaceMap states_;
+
+  // Fast reverse ownership index used by WinEvent/reconciliation hot paths.
+  // The vector normally contains exactly one key (global uniqueness invariant),
+  // but retaining all keys preserves duplicate-owner repair semantics.
+  std::unordered_map<HWND, std::vector<DesktopMonitorKey>> ownersByWindow_;
 };
 
 

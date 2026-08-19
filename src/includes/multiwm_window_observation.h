@@ -99,7 +99,7 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
-        if (IsCurrentlyManagedWindow(hwnd, ctx->targetMonitor)) {
+        if (GetCurrentManagedWindowMonitor(hwnd) == ctx->targetMonitor) {
           ctx->windowList->push_back(hwnd);
         }
         return TRUE;
@@ -107,6 +107,37 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
       reinterpret_cast<LPARAM>(&context));
 
   return windows;
+}
+
+// Deferred reconciliation often needs snapshots for several monitors at once.
+// Enumerate top-level HWNDs once and bucket each eligible window by monitor instead
+// of repeating EnumWindows (and its DWM/VD checks) once per monitor.
+static std::vector<std::vector<HWND>> CollectTileWindowsForMonitors(
+    const std::vector<HMONITOR>& monitors) {
+  std::vector<std::vector<HWND>> snapshots(monitors.size());
+  if (monitors.empty()) return snapshots;
+
+  struct EnumContext {
+    const std::vector<HMONITOR>* monitors;
+    std::vector<std::vector<HWND>>* snapshots;
+  } context = {&monitors, &snapshots};
+
+  EnumWindows(
+      [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        auto* ctx = reinterpret_cast<EnumContext*>(lParam);
+        const HMONITOR monitor = GetCurrentManagedWindowMonitor(hwnd);
+        if (!monitor) return TRUE;
+
+        auto it = std::find(ctx->monitors->begin(), ctx->monitors->end(), monitor);
+        if (it == ctx->monitors->end()) return TRUE;
+
+        const size_t index = static_cast<size_t>(it - ctx->monitors->begin());
+        (*ctx->snapshots)[index].push_back(hwnd);
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&context));
+
+  return snapshots;
 }
 
 // Captures Win32 geometry/capability observations before the pure Workspace
@@ -227,14 +258,16 @@ static bool IsWindowExcludedByRules(HWND hwnd) {
 // tolerate a temporarily missing resize style so transient app UI cannot evict them.
 static bool WindowCanBeManaged(HWND hwnd) {
   if (!hwnd) return false;
-  if (IsWindowExcludedByRules(hwnd)) return false;
 
+  // Reject structurally ineligible HWNDs before evaluating configurable exclusion
+  // rules. Process-name exclusions can require OpenProcess/QueryFullProcessImageName,
+  // so there is no reason to pay that cost for tool/owned/child windows.
   if (GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindow(hwnd, GW_OWNER)) return false;
 
   LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
   if (style & WS_CHILD) return false;
 
-  // window could temporarily lose its WS_SizeBox. 
+  // window could temporarily lose its WS_SizeBox.
   // (example: Office save/discard dialog)
   if (!(style & WS_SIZEBOX) && !IsWindowTrackedInAnyState(hwnd)) return false;
 
@@ -242,44 +275,54 @@ static bool WindowCanBeManaged(HWND hwnd) {
   if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return false;
 
   wchar_t className[64];
-  if (GetClassNameW(hwnd, className, 64)) {
+  if (GetClassNameW(hwnd, className, ARRAYSIZE(className))) {
     for (const auto* ignoredClass : kIgnoredWindowClasses) {
       if (_wcsicmp(className, ignoredClass) == 0) return false;
     }
   }
 
-  return true;
+  return !IsWindowExcludedByRules(hwnd);
 }
 
-// Determines whether an HWND can actively participate on targetMonitor now.
-// Participation requires restored, visible, uncloaked current-desktop geometry,
-// while structural eligibility remains tolerant of already-tracked windows.
-bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor) {
+// Returns the monitor on which an HWND can actively participate right now.
+// A null result means the window is not currently tile-eligible.
+static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd) {
   // window might become temporarily disabled
   // (example: VSCode unstaged commit dialog)
-  if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return false;
+  if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return nullptr;
 
   // FancyWM only tiles windows in the Restored state. Maximized windows remain
   // managed logically but do not participate until Windows reports Restored.
-  if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return false;
-  if (!WindowCanBeManaged(hwnd)) return false;
-  if (IsWindowCloaked(hwnd)) return false;
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return nullptr;
+  if (!WindowCanBeManaged(hwnd)) return nullptr;
+  if (IsWindowCloaked(hwnd)) return nullptr;
 
   // Virtual desktop filter: other desktops' windows may not yet be cloaked
   // at the moment we enumerate (race between uncloak/cloak during switch).
   if (g_vd.desktopManager) {
     BOOL onCurrent = FALSE;
-    if (SUCCEEDED(g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent)) && !onCurrent)
-      return false;
+    if (SUCCEEDED(g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent)) &&
+        !onCurrent) {
+      return nullptr;
+    }
   }
 
-  RECT frameRect;
-  if (!SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frameRect, sizeof(frameRect)))) {
-    if (!GetWindowRect(hwnd, &frameRect)) return false;
+  RECT frameRect{};
+  if (FAILED(DwmGetWindowAttribute(
+          hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frameRect, sizeof(frameRect))) &&
+      !GetWindowRect(hwnd, &frameRect)) {
+    return nullptr;
   }
 
-  return frameRect.right > frameRect.left && frameRect.bottom > frameRect.top &&
-         MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == targetMonitor;
+  if (frameRect.right <= frameRect.left || frameRect.bottom <= frameRect.top) {
+    return nullptr;
+  }
+  return MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL);
+}
+
+// Determines whether an HWND can actively participate on targetMonitor now.
+bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor) {
+  return targetMonitor && GetCurrentManagedWindowMonitor(hwnd) == targetMonitor;
 }
 
 static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPlacementTolerancePx) {

@@ -83,6 +83,7 @@ std::vector<double> DefaultWeights(size_t count) {
 }
 
 bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor);
+static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd);
 static bool WindowCanBeManaged(HWND hwnd);
 static bool IsWindowTrackedInAnyState(HWND hwnd);
 bool ContainsWindow(const std::vector<HWND>& windows, HWND hwnd) {

@@ -683,10 +683,16 @@ static void ReconcileDeferredLifecycle() {
     AddUniqueMonitor(monitors, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL));
   }
 
+  // One top-level enumeration is enough for every monitor involved in this
+  // settled burst. Per-monitor discovery below consumes the already-bucketed views.
+  std::vector<std::vector<HWND>> snapshots =
+      CollectTileWindowsForMonitors(monitors);
+
   std::vector<DesktopMonitorKey> arrangedKeys;
-  for (HMONITOR monitor : monitors) {
+  for (size_t monitorIndex = 0; monitorIndex < monitors.size(); ++monitorIndex) {
+    HMONITOR monitor = monitors[monitorIndex];
     DesktopMonitorKey key{};
-    std::vector<HWND> snapshot = CollectTileWindows(monitor);
+    const std::vector<HWND>& snapshot = snapshots[monitorIndex];
     bool changed = DiscoverWorkspaceWindows(
         monitor, currentDesktop, snapshot, &key, &globallyChanged);
     bool pendingArrange = std::any_of(
