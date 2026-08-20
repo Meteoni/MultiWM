@@ -234,9 +234,9 @@ static bool MigrateManagedWindow(
   g_workspaces.Save(targetKey, target);
   ++Diagnostics::g_runtime.counters.workspaceMigrations;
   Diagnostics::RecordEvent(
-      L"workspace migration hwnd=%p sourceDesktop=%08X targetDesktop=%08X sourceMonitor=%p targetMonitor=%p",
-      hwnd, sourceKey.desktopId.Data1, targetKey.desktopId.Data1, sourceKey.monitor,
-      targetKey.monitor);
+      L"workspace migration hwnd=%p sourceDesktop=%08X targetDesktop=%08X sourceMonitorId=%ls targetMonitorId=%ls",
+      hwnd, sourceKey.desktopId.Data1, targetKey.desktopId.Data1,
+      sourceKey.monitor.deviceId.c_str(), targetKey.monitor.deviceId.c_str());
   return true;
 }
 
@@ -313,8 +313,9 @@ static bool GetObservedWorkspaceKey(
 
   if (HasReconcileScope(scope, ReconcileScope::Monitor)) {
     HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
-    if (monitor) {
-      observed.monitor = monitor;
+    Model::MonitorId monitorId;
+    if (monitor && Model::MonitorId::FromHMonitor(monitor, &monitorId)) {
+      observed.monitor = std::move(monitorId);
       observedAnything = true;
     }
   }
@@ -508,7 +509,8 @@ static bool DiscoverWorkspaceWindows(
     std::vector<DesktopMonitorKey>* ownershipChangedKeys = nullptr) {
   if (!IsLiveMonitorHandle(monitor)) return false;
 
-  DesktopMonitorKey key{desktopId, monitor};
+  DesktopMonitorKey key{};
+  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return false;
   if (outKey) *outKey = key;
 
   Workspace workspace;
@@ -552,7 +554,8 @@ static bool DiscoverCurrentWorkspaceOnMonitor(HMONITOR monitor) {
   }
 
   std::vector<HWND> snapshot = CollectTileWindows(monitor);
-  DesktopMonitorKey key{currentDesktop, monitor};
+  DesktopMonitorKey key{};
+  if (!DesktopMonitorKey::FromHMonitor(currentDesktop, monitor, &key)) return false;
   const bool changed =
       DiscoverWorkspaceWindows(monitor, currentDesktop, snapshot, &key);
 
@@ -655,7 +658,7 @@ static void HandleVirtualDesktopChanged() {
   ReconcileKnownWindows(ReconcileScope::Desktop, &changedKeys);
   for (const auto& key : changedKeys) {
     if (IsEqualGUID(key.desktopId, currentDesktop)) {
-      AddPendingWorkspaceArrange(key.desktopId, key.monitor);
+      AddPendingWorkspaceArrange(key.desktopId, key.ResolveMonitor());
     }
   }
 
@@ -667,7 +670,8 @@ static void HandleVirtualDesktopChanged() {
   // shell's cloak/uncloak burst settles. Existing workspaces are reinforced even
   // when their bookkeeping did not change.
   for (HMONITOR monitor : monitors) {
-    DesktopMonitorKey knownKey{currentDesktop, monitor};
+    DesktopMonitorKey knownKey{};
+    if (!DesktopMonitorKey::FromHMonitor(currentDesktop, monitor, &knownKey)) continue;
     Workspace knownState;
     if (g_workspaces.Load(knownKey, &knownState)) {
       AddPendingWorkspaceArrange(currentDesktop, monitor);
@@ -793,7 +797,8 @@ static void ReconcileDeferredLifecycle() {
     // not from whatever workspace keys happened to exist before the transition.
     EnumerateCurrentMonitors(monitors);
     for (HMONITOR monitor : monitors) {
-      DesktopMonitorKey key{currentDesktop, monitor};
+      DesktopMonitorKey key{};
+      if (!DesktopMonitorKey::FromHMonitor(currentDesktop, monitor, &key)) continue;
       Workspace existing;
       if (g_workspaces.Load(key, &existing)) {
         AddPendingWorkspaceArrange(currentDesktop, monitor);

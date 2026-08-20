@@ -150,7 +150,7 @@ void LoadSettings() {
   Wh_FreeStringSetting(mouseBehavior);
 
   PCWSTR managementMode = Wh_GetStringSetting(L"DefaultWindowManagementMode");
-  g_settings.defaultManagementMode =
+  g_wm.managementMode =
       managementMode && _wcsicmp(managementMode, L"automatic") == 0
           ? ManagementMode::Automatic
           : ManagementMode::Manual;
@@ -232,46 +232,6 @@ static void UnregisterConfiguredHotkeys() {
   UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
   UnregisterHotKey(nullptr, HK_LAYOUT);
   UnregisterHotKey(nullptr, HK_DIAGNOSTIC_DUMP);
-}
-
-// Ordinary configuration edits stay on the existing serialized WM actor. Reading
-// the complete settings block is cheap; the expensive worker/COM/hook/tray
-// lifetime remains untouched. A little redundant subsystem refresh is deliberate:
-// it keeps future settings additions localized in LoadSettings() instead of
-// requiring a parallel field-by-field change classifier.
-static void ReloadSettingsInPlace() {
-  AssertWmThread(L"ReloadSettingsInPlace");
-  ++Diagnostics::g_runtime.counters.settingsReloads;
-  Diagnostics::RecordEvent(L"settings hot reload requested");
-
-  // Hotkey IDs are stable, so unregister the old bindings before the bulk read.
-  UnregisterConfiguredHotkeys();
-
-  // A lease is explicitly short-lived policy derived from the old configuration.
-  // Drop pending delayed repair work rather than carrying it across a policy edit.
-  if (g_wm.conformanceTimer) {
-    KillTimer(nullptr, g_wm.conformanceTimer);
-    g_wm.conformanceTimer = 0;
-  }
-  ClearAllConformanceLeases();
-
-  LoadSettings();
-
-  // Reloading the startup default must not overwrite the live mode selected with
-  // Alt+U/the tray. The new default is consumed only on the next actor startup.
-  TrayUi::ReloadAppearance();
-  RegisterConfiguredHotkeys();
-
-  // Re-arm any existing lifecycle burst with the newly loaded settle delay and
-  // force one authoritative current-monitor pass. This cheaply applies new
-  // exclusions and geometry while preserving workspace identity/order/weights.
-  g_wm.forceMonitorReconcile = true;
-  Reconcile::ScheduleLifecycleReconcile(nullptr);
-
-  Diagnostics::RecordEvent(
-      L"settings hot reload applied; live management mode preserved as %ls",
-      IsAutomaticMode() ? L"Automatic" : L"Manual");
-  Wh_Log(L"Settings hot reload applied on existing WM worker");
 }
 
 static void InitializeCurrentDesktopWorkspaces() {
@@ -373,10 +333,6 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
           msg.wParam == static_cast<WPARAM>(ManagementMode::Automatic)) {
         SetWindowManagementMode(static_cast<ManagementMode>(msg.wParam));
       }
-      return WmMessageDisposition::Handled;
-
-    case WM_APP_SETTINGS_RELOAD:
-      ReloadSettingsInPlace();
       return WmMessageDisposition::Handled;
 
     case WM_APP_RECONCILE_NOW:

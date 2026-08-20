@@ -94,6 +94,74 @@ static bool IsLiveMonitorHandle(HMONITOR monitor) {
   return GetMonitorInfoW(monitor, &monitorInfo) != FALSE;
 }
 
+static void NormalizeMonitorIdentityToken(std::wstring* value) {
+  if (!value) return;
+  std::transform(
+      value->begin(), value->end(), value->begin(),
+      [](wchar_t ch) { return static_cast<wchar_t>(std::towupper(ch)); });
+}
+
+bool Model::MonitorId::FromHMonitor(HMONITOR monitor, MonitorId* out) {
+  if (!out || !IsLiveMonitorHandle(monitor)) return false;
+
+  MONITORINFOEXW monitorInfo{};
+  monitorInfo.cbSize = sizeof(monitorInfo);
+  if (!GetMonitorInfoW(
+          monitor, reinterpret_cast<MONITORINFO*>(&monitorInfo))) {
+    return false;
+  }
+
+  // This is the same stable display-interface identity source used by FancyWM:
+  // map the current GDI display name (\\.\DISPLAYn) to the monitor device
+  // interface exposed by EnumDisplayDevices + EDD_GET_DEVICE_INTERFACE_NAME.
+  DISPLAY_DEVICEW device{};
+  device.cb = sizeof(device);
+  std::wstring identity;
+  if (EnumDisplayDevicesW(
+          monitorInfo.szDevice, 0, &device, EDD_GET_DEVICE_INTERFACE_NAME) &&
+      device.DeviceID[0]) {
+    identity = L"IFACE:";
+    identity += device.DeviceID;
+  } else if (monitorInfo.szDevice[0]) {
+    // Compatibility fallback only. Normal physical monitors should have an
+    // interface ID; retaining the GDI name is preferable to disabling tiling on
+    // unusual virtual/RDP display providers that don't expose one.
+    identity = L"GDI:";
+    identity += monitorInfo.szDevice;
+  } else {
+    return false;
+  }
+
+  NormalizeMonitorIdentityToken(&identity);
+  out->deviceId = std::move(identity);
+  return true;
+}
+
+HMONITOR Model::MonitorId::Resolve() const {
+  if (deviceId.empty()) return nullptr;
+
+  struct ResolveContext {
+    const MonitorId* target = nullptr;
+    HMONITOR result = nullptr;
+  } context{this, nullptr};
+
+  EnumDisplayMonitors(
+      nullptr, nullptr,
+      [](HMONITOR monitor, HDC, LPRECT, LPARAM lParam) WINAPI -> BOOL {
+        auto* context = reinterpret_cast<ResolveContext*>(lParam);
+        MonitorId candidate;
+        if (MonitorId::FromHMonitor(monitor, &candidate) &&
+            candidate == *context->target) {
+          context->result = monitor;
+          return FALSE;
+        }
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&context));
+
+  return context.result;
+}
+
 bool GetMonitorWorkArea(HMONITOR monitor, RECT* outRect) {
   if (!monitor || !outRect) return false;
   MONITORINFO monitorInfo = {sizeof(monitorInfo)};

@@ -961,8 +961,7 @@ static void WriteDiagnosticReport() {
         std::wstring aDesktop = DiagnosticGuidString(a.first.desktopId);
         std::wstring bDesktop = DiagnosticGuidString(b.first.desktopId);
         if (aDesktop != bDesktop) return aDesktop < bDesktop;
-        return reinterpret_cast<uintptr_t>(a.first.monitor) <
-               reinterpret_cast<uintptr_t>(b.first.monitor);
+        return a.first.monitor.deviceId < b.first.monitor.deviceId;
       });
 
   size_t totalRecords = 0;
@@ -1067,10 +1066,6 @@ static void WriteDiagnosticReport() {
       static_cast<unsigned long long>(counters.reportWriteFailures));
 
   report.Section(L"Configuration snapshot");
-  report.Line(
-      L"Default management mode (next start): %ls",
-      g_settings.defaultManagementMode == ManagementMode::Automatic
-          ? L"Automatic" : L"Manual");
   report.Line(L"Default layout: %ls", DiagnosticLayoutName(g_settings.defaultLayout));
   report.TextLine(L"Layout cycle: ", DiagnosticLayoutCycleString(g_settings.layoutCycle));
   report.Line(
@@ -1136,14 +1131,15 @@ static void WriteDiagnosticReport() {
       }
     }
 
+    const HMONITOR resolvedMonitor = key.ResolveMonitor();
     const bool pendingReinforcement = std::any_of(
         g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
         [&](const PendingWorkspaceArrange& pending) {
-          return pending.monitor == key.monitor &&
+          return resolvedMonitor && pending.monitor == resolvedMonitor &&
                  IsEqualGUID(pending.desktopId, key.desktopId);
         });
 
-    const bool liveMonitor = IsLiveMonitorHandle(key.monitor);
+    const bool liveMonitor = resolvedMonitor != nullptr;
     if (!liveMonitor) {
       ++staleMonitorWorkspaces;
       recordsOnStaleMonitorWorkspaces += state.RecordCount();
@@ -1168,22 +1164,23 @@ static void WriteDiagnosticReport() {
         !g_vd.lastKnownDesktopValid
             ? L"unknown"
             : (IsEqualGUID(key.desktopId, g_vd.lastKnownDesktop) ? L"YES" : L"no"));
-    report.Line(L"monitor:   %p", reinterpret_cast<void*>(key.monitor));
+    report.Line(L"monitorId: %ls", key.monitor.deviceId.c_str());
+    report.Line(L"monitor:   %p", reinterpret_cast<void*>(resolvedMonitor));
 
     MONITORINFOEXW monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
-    if (key.monitor && GetMonitorInfoW(
-            key.monitor, reinterpret_cast<MONITORINFO*>(&monitorInfo))) {
+    if (resolvedMonitor && GetMonitorInfoW(
+            resolvedMonitor, reinterpret_cast<MONITORINFO*>(&monitorInfo))) {
       report.Line(L"device:    %ls", monitorInfo.szDevice);
       report.Line(L"monitorRect: %ls", DiagnosticRectString(monitorInfo.rcMonitor).c_str());
       report.Line(L"systemWork:  %ls", DiagnosticRectString(monitorInfo.rcWork).c_str());
-      report.Line(L"monitorDpi:  %u", GetMonitorEffectiveDpi(key.monitor));
+      report.Line(L"monitorDpi:  %u", GetMonitorEffectiveDpi(resolvedMonitor));
       RECT configuredWork{};
-      if (GetWorkspaceWorkArea(key.monitor, &configuredWork)) {
+      if (GetWorkspaceWorkArea(resolvedMonitor, &configuredWork)) {
         report.Line(L"configuredWork: %ls", DiagnosticRectString(configuredWork).c_str());
       }
     } else {
-      report.Line(L"monitorInfo: <unavailable / stale handle>");
+      report.Line(L"monitorInfo: <detached / currently unresolved>");
     }
 
     report.Line(
@@ -1347,7 +1344,7 @@ static void WriteDiagnosticReport() {
 
   report.Line();
   report.Line(
-      L"Stale monitor workspace keys: %zu (records attached: %zu; current-desktop records: %zu)",
+      L"Detached/unresolved monitor workspaces: %zu (records attached: %zu; current-desktop records: %zu)",
       staleMonitorWorkspaces, recordsOnStaleMonitorWorkspaces,
       currentDesktopRecordsOnStaleMonitorWorkspaces);
 

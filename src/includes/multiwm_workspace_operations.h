@@ -777,11 +777,14 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   Workspace workspace;
   if (!g_workspaces.Load(key, &workspace)) return;
 
+  HMONITOR monitor = key.ResolveMonitor();
+  if (!monitor) return;  // Detached monitor: keep workspace state dormant.
+
   RECT workArea{};
-  if (!GetWorkspaceWorkArea(key.monitor, &workArea)) return;
+  if (!GetWorkspaceWorkArea(monitor, &workArea)) return;
 
   ObserveAndRepairWorkspaceForArrangement(workspace);
-  const LONG gap = GetWorkspaceGapPixels(key.monitor);
+  const LONG gap = GetWorkspaceGapPixels(monitor);
   const size_t maxPasses = workspace.ActiveCount() + 1;
   for (size_t pass = 0; pass < maxPasses; ++pass) {
     ++Diagnostics::g_runtime.counters.arrangePasses;

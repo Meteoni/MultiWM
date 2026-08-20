@@ -16,7 +16,8 @@ void SwapMaster() {
   GUID desktopId{};
   if (!GetWindowDesktopIdSafe(fg, &desktopId)) return;
 
-  DesktopMonitorKey key{desktopId, monitor};
+  DesktopMonitorKey key{};
+  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
   Workspace workspace;
   if (!g_workspaces.Load(key, &workspace) || workspace.ActiveCount() < 2 ||
       workspace.Layout() == TileLayout::Floating) {
@@ -44,7 +45,8 @@ void FloatFocusedWindow() {
   GUID desktopId{};
   if (!monitor || !GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
 
-  DesktopMonitorKey key{desktopId, monitor};
+  DesktopMonitorKey key{};
+  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
   Workspace workspace;
   if (!g_workspaces.Load(key, &workspace)) return;
 
@@ -121,8 +123,9 @@ void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
   TrayUi::ShowLayoutFlyout(state.Layout(), monitor);
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.Layout()));
   Diagnostics::RecordEvent(
-      L"layout cycle desktop=%08X monitor=%p from=%d to=%d", key.desktopId.Data1,
-      key.monitor, static_cast<int>(previousLayout), static_cast<int>(state.Layout()));
+      L"layout cycle desktop=%08X monitorId=%ls from=%d to=%d", key.desktopId.Data1,
+      key.monitor.deviceId.c_str(), static_cast<int>(previousLayout),
+      static_cast<int>(state.Layout()));
 }
 
 // Direct layout selection used by the tray context menu. This is intentionally
@@ -161,8 +164,9 @@ void SetCurrentWorkspaceLayout(TileLayout layout, HMONITOR monitor = nullptr) {
   TrayUi::ShowLayoutFlyout(layout, monitor);
   Wh_Log(L"Workspace layout set to %d", static_cast<int>(layout));
   Diagnostics::RecordEvent(
-      L"layout set desktop=%08X monitor=%p from=%d to=%d", key.desktopId.Data1,
-      key.monitor, static_cast<int>(previousLayout), static_cast<int>(layout));
+      L"layout set desktop=%08X monitorId=%ls from=%d to=%d", key.desktopId.Data1,
+      key.monitor.deviceId.c_str(), static_cast<int>(previousLayout),
+      static_cast<int>(layout));
 }
 
 static void HandleUserMove(
@@ -220,18 +224,21 @@ static void HandleUserResize(
     return;
   }
 
+  HMONITOR monitor = key.ResolveMonitor();
+  if (!monitor) return;
+
   bool changed = false;
   switch (workspace.Layout()) {
     case TileLayout::MasterStack:
     case TileLayout::MasterStackH:
       changed = workspace.LearnMasterStackResize(
-          workArea, GetWorkspaceGapPixels(key.monitor), resizedIndex, gesture);
+          workArea, GetWorkspaceGapPixels(monitor), resizedIndex, gesture);
       break;
 
     case TileLayout::Columns:
     case TileLayout::Rows:
       changed = workspace.LearnGridResize(
-          workArea, GetWorkspaceGapPixels(key.monitor), resizedIndex, gesture);
+          workArea, GetWorkspaceGapPixels(monitor), resizedIndex, gesture);
       break;
 
     case TileLayout::COUNT:
@@ -268,7 +275,8 @@ void ApplyUserMoveSize(HWND hwnd) {
   GUID desktopId{};
   if (!GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
 
-  DesktopMonitorKey key{desktopId, monitor};
+  DesktopMonitorKey key{};
+  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
   Workspace state;
   if (!g_workspaces.Load(key, &state)) return;
 

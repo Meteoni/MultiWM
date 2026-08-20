@@ -268,7 +268,9 @@ static void SetTooltip(TileLayout layout) {
         const HMONITOR monitor = monitors[i];
         TileLayout monitorLayout = g_settings.defaultLayout;
         Workspace state;
-        if (g_workspaces.Load({desktopId, monitor}, &state)) {
+        DesktopMonitorKey key{};
+        if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key) &&
+            g_workspaces.Load(key, &state)) {
           monitorLayout = state.Layout();
         }
 
@@ -520,7 +522,9 @@ static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
   for (HMONITOR monitor : monitors) {
     TileLayout layout = g_settings.defaultLayout;
     Workspace state;
-    if (g_workspaces.Load({desktopId, monitor}, &state)) {
+    DesktopMonitorKey key{};
+    if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key) &&
+        g_workspaces.Load(key, &state)) {
       layout = state.Layout();
     }
     ShowLayoutFlyout(layout, monitor);
@@ -667,19 +671,6 @@ static void RefreshForCurrentWorkspace() {
   HMONITOR monitor = GetForegroundMonitor();
   if (!monitor) monitor = GetCursorMonitor();
   if (monitor) RefreshForMonitor(monitor);
-}
-
-// Bulk settings reload already refreshed flyout geometry and custom icon paths.
-// Rebuild only the cheap UI resources that depend on those values; keep the tray
-// windows, shell icon registration, and flyout instances alive.
-static void ReloadAppearance() {
-  RebuildIcons();
-  RefreshDisplayedMonitor();
-  for (FlyoutInstance* instance : g_flyouts) {
-    if (instance && instance->hwnd && IsWindowVisible(instance->hwnd)) {
-      InvalidateRect(instance->hwnd, nullptr, TRUE);
-    }
-  }
 }
 
 static void HandleThemeChanged() {

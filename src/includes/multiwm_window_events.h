@@ -23,13 +23,16 @@ static void QueueWindowEvent(DWORD event, HWND hwnd) {
 
 static bool HasTrackedMonitorOwnershipMismatch(HWND hwnd) {
   const HMONITOR observed = GetWindowPhysicalMonitor(hwnd);
-  if (!observed) return false;
+  Model::MonitorId observedId;
+  if (!observed || !Model::MonitorId::FromHMonitor(observed, &observedId)) {
+    return false;
+  }
 
   const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
   if (owners.empty()) return false;
   return std::any_of(
       owners.begin(), owners.end(),
-      [&](const DesktopMonitorKey& owner) { return owner.monitor != observed; });
+      [&](const DesktopMonitorKey& owner) { return owner.monitor != observedId; });
 }
 
 // Treats out-of-context WinEvents as edge-triggered observations: filter noise,

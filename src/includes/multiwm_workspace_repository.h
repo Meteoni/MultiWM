@@ -151,14 +151,17 @@ static bool RepairFloatingGeometry(
     return false;
   }
 
+  HMONITOR monitor = key.ResolveMonitor();
+  if (!monitor) return false;
+
   RECT workArea{};
-  if (!GetWorkspaceWorkArea(key.monitor, &workArea)) return false;
+  if (!GetWorkspaceWorkArea(monitor, &workArea)) return false;
 
   RECT current{};
   const bool haveCurrent = GetWindowFrameRect(hwnd, &current) &&
                            current.right > current.left &&
                            current.bottom > current.top;
-  const UINT targetDpi = GetMonitorEffectiveDpi(key.monitor);
+  const UINT targetDpi = GetMonitorEffectiveDpi(monitor);
 
   LONG width = 0;
   LONG height = 0;
@@ -184,7 +187,7 @@ static bool RepairFloatingGeometry(
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     center = hint.anchor;
   } else if (record->hasFloatingRect &&
-             ResolveRememberedFloatingMonitor(*record) == key.monitor) {
+             ResolveRememberedFloatingMonitor(*record) == monitor) {
     center = RectCenter(record->floatingRect);
   } else {
     center = RectCenter(workArea);
@@ -204,7 +207,7 @@ static bool RepairFloatingGeometry(
               observation.observed.bottom > observation.observed.top
           ? observation.observed
           : target;
-  workspace.RememberFloatingGeometry(hwnd, remembered, key.monitor, targetDpi);
+  workspace.RememberFloatingGeometry(hwnd, remembered, monitor, targetDpi);
   ++Diagnostics::g_runtime.counters.floatingGeometryRepairs;
   return true;
 }
@@ -218,13 +221,16 @@ static bool RememberCurrentFloatingGeometry(
     return false;
   }
 
+  HMONITOR monitor = key.ResolveMonitor();
+  if (!monitor) return false;
+
   RECT frame{};
   if (!GetWindowFrameRect(hwnd, &frame) || frame.right <= frame.left ||
       frame.bottom <= frame.top) {
     return false;
   }
   return workspace.RememberFloatingGeometry(
-      hwnd, frame, key.monitor, GetMonitorEffectiveDpi(key.monitor));
+      hwnd, frame, monitor, GetMonitorEffectiveDpi(monitor));
 }
 
 // Entering the workspace-level Floating layout is a state restoration, not a
@@ -253,8 +259,7 @@ static bool GetCurrentWorkspaceKey(HMONITOR monitor, DesktopMonitorKey* outKey, 
   if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&desktopId)) {
     return false;
   }
-  outKey->desktopId = desktopId;
-  outKey->monitor = monitor;
+  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, outKey)) return false;
 
   if (outWorkArea && !GetWorkspaceWorkArea(monitor, outWorkArea)) return false;
   return true;
@@ -278,9 +283,9 @@ bool Workspace::Validate(
     }
     if (logFailures) {
       Wh_Log(
-          L"Workspace invariant violation (%s, desktop=%08X monitor=%p hwnd=%p): %s",
-          context ? context : L"workspace", key.desktopId.Data1, key.monitor, hwnd,
-          message);
+          L"Workspace invariant violation (%s, desktop=%08X monitorId=%ls hwnd=%p): %s",
+          context ? context : L"workspace", key.desktopId.Data1,
+          key.monitor.deviceId.c_str(), hwnd, message);
     }
     valid = false;
   };
@@ -497,27 +502,26 @@ std::vector<HWND> WorkspaceRepository::KnownWindows() const {
 
 std::vector<HMONITOR> WorkspaceRepository::MonitorsOnDesktop(
     const GUID& desktopId) const {
-  std::vector<HMONITOR> monitors;
+  std::vector<Model::MonitorId> monitorIds;
   AcquireSRWLockShared(&lock_);
   for (const auto& kv : states_) {
     if (!IsEqualGUID(kv.first.desktopId, desktopId)) continue;
-    if (std::find(monitors.begin(), monitors.end(), kv.first.monitor) == monitors.end()) {
-      monitors.push_back(kv.first.monitor);
+    if (std::find(monitorIds.begin(), monitorIds.end(), kv.first.monitor) ==
+        monitorIds.end()) {
+      monitorIds.push_back(kv.first.monitor);
     }
   }
   ReleaseSRWLockShared(&lock_);
 
-  // HMONITOR is a live-session routing token, not a durable display identity.
-  // After a topology rebuild, old workspace keys can legitimately remain in the
-  // repository until their records migrate. Never feed invalid handles back into
-  // ordinary current-desktop discovery/arrangement.
-  monitors.erase(
-      std::remove_if(
-          monitors.begin(), monitors.end(),
-          [](HMONITOR monitor) {
-            return !IsLiveMonitorHandle(monitor);
-          }),
-      monitors.end());
+  // Repository identity survives topology churn. Only return identities that
+  // currently resolve to a live HMONITOR; detached workspaces remain dormant.
+  std::vector<HMONITOR> monitors;
+  for (const auto& monitorId : monitorIds) {
+    HMONITOR monitor = monitorId.Resolve();
+    if (monitor && std::find(monitors.begin(), monitors.end(), monitor) == monitors.end()) {
+      monitors.push_back(monitor);
+    }
+  }
   return monitors;
 }
 
@@ -555,7 +559,6 @@ void WorkspaceRepository::ClearAfterWmStopped() {
 // visible to the WM core.
 namespace TrayUi {
 static void LoadSettings();
-static void ReloadAppearance();
 static bool Initialize();
 static void Shutdown();
 static void UpdateIcon(TileLayout layout, HMONITOR monitor = nullptr);

@@ -169,7 +169,6 @@ constexpr UINT WM_APP_RECONCILE_NOW = WM_APP + 6;
 constexpr UINT WM_APP_LAYOUT_SET = WM_APP + 7;
 constexpr UINT WM_APP_MANAGEMENT_MODE_SET = WM_APP + 8;
 constexpr UINT WM_APP_TILE_WORKSPACE = WM_APP + 9;
-constexpr UINT WM_APP_SETTINGS_RELOAD = WM_APP + 10;
 
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
 enum class MouseMoveBehavior { Float, Swap };
@@ -204,10 +203,8 @@ struct FloatingDefaultSize {
   LONG height = 640;
 };
 
-// Seeded once before actor startup, then actor-owned for the lifetime of the WM
-// session. Ordinary settings changes are read again in bulk by that same actor,
-// so hot paths can keep using plain fields without per-setting atomics or locks.
-// Transient/live state belongs in WmRuntime.
+// Windhawk settings and immutable-at-runtime policy values. Settings reloads
+// replace these fields; transient WM state lives in WmRuntime instead.
 struct SettingsState {
   UINT reconcileDelayMs = 80;
   UINT conformanceLeaseMs = 1500;
@@ -228,7 +225,6 @@ struct SettingsState {
   LONG masterPercent = 50;
 
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
-  ManagementMode defaultManagementMode = ManagementMode::Manual;
   TileLayout defaultLayout = TileLayout::MasterStack;
   std::vector<TileLayout> layoutCycle = MakeBuiltInLayoutCycle();
   std::vector<ExclusionRule> exclusionRules;
@@ -493,15 +489,54 @@ struct GuidEqual {
   bool operator()(const GUID& a, const GUID& b) const { return IsEqualGUID(a, b); }
 };
 
+// Stable monitor identity used by workspace keys. HMONITOR remains a live
+// routing token only and is resolved on demand at Win32 boundaries. Physical
+// monitor device-interface IDs are preferred; the GDI device name is retained
+// only as a compatibility fallback on systems where the interface ID query fails.
+struct MonitorId {
+  std::wstring deviceId;
+
+  bool Empty() const { return deviceId.empty(); }
+  explicit operator bool() const { return !Empty(); }
+
+  bool operator==(const MonitorId& other) const {
+    return deviceId == other.deviceId;
+  }
+  bool operator!=(const MonitorId& other) const {
+    return !(*this == other);
+  }
+
+  static bool FromHMonitor(HMONITOR monitor, MonitorId* out);
+  HMONITOR Resolve() const;
+};
+
+struct MonitorIdHash {
+  size_t operator()(const MonitorId& monitor) const {
+    return std::hash<std::wstring>{}(monitor.deviceId);
+  }
+};
+
 struct DesktopMonitorKey {
-  GUID desktopId;
-  HMONITOR monitor;
+  GUID desktopId{};
+  MonitorId monitor;
+
+  static bool FromHMonitor(
+      const GUID& desktopId, HMONITOR hmonitor, DesktopMonitorKey* out) {
+    if (!out) return false;
+    MonitorId monitorId;
+    if (!MonitorId::FromHMonitor(hmonitor, &monitorId)) return false;
+    out->desktopId = desktopId;
+    out->monitor = std::move(monitorId);
+    return true;
+  }
+
+  HMONITOR ResolveMonitor() const { return monitor.Resolve(); }
 };
 
 struct DesktopMonitorKeyHash {
   size_t operator()(const DesktopMonitorKey& key) const {
     size_t hash = GuidHash{}(key.desktopId);
-    hash ^= std::hash<void*>{}(key.monitor) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= MonitorIdHash{}(key.monitor) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     return hash;
   }
 };
