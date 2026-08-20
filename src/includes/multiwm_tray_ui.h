@@ -17,6 +17,9 @@ constexpr wchar_t kTrayWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
 constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkTilingHelperStatusFlyout";
 constexpr UINT kTrayCallbackMessage = WM_APP + 20;
 constexpr UINT kIconId = 1;
+constexpr UINT kContextAutomaticMode = 41001;
+constexpr UINT kContextManualMode = 41002;
+constexpr UINT kContextLayoutBase = 41100;
 constexpr int kIconCanvasSize = 32;
 constexpr int kTrayFontHeight = 26;
 constexpr UINT_PTR kFlyoutTimerId = 1;
@@ -270,7 +273,9 @@ static void SetTooltip(TileLayout layout) {
         }
 
         tooltip += L"\n";
-        tooltip += monitor == g_displayedMonitor ? L"\x25B8 " : L"  ";
+        // Reserve the same visual marker column for every row. A figure space
+        // is much closer to the triangle glyph width than two proportional spaces.
+        tooltip += monitor == g_displayedMonitor ? L"\x25B8 " : L"\u2007 ";
         tooltip += MonitorTooltipLabel(monitor, i);
         tooltip += L": ";
         tooltip += LayoutFlyoutText(monitorLayout);
@@ -523,6 +528,104 @@ static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
 }
 
 //-----------------------------------------------------------------------------
+// Standard tray context menu
+//-----------------------------------------------------------------------------
+
+static HMONITOR GetContextMenuMonitor() {
+  MONITORINFO info{sizeof(info)};
+  if (g_displayedMonitor && GetMonitorInfoW(g_displayedMonitor, &info)) {
+    return g_displayedMonitor;
+  }
+
+  HMONITOR monitor = GetForegroundMonitor();
+  if (!monitor) monitor = GetCursorMonitor();
+  return monitor;
+}
+
+static TileLayout GetMonitorLayoutOrDefault(HMONITOR monitor) {
+  TileLayout layout = g_settings.defaultLayout;
+  DesktopMonitorKey key{};
+  Workspace state;
+  if (monitor && GetCurrentWorkspaceKey(monitor, &key) &&
+      g_workspaces.Load(key, &state)) {
+    layout = state.Layout();
+  }
+  return layout;
+}
+
+static void ShowContextMenu() {
+  if (!g_trayWindow) return;
+
+  const HMONITOR monitor = GetContextMenuMonitor();
+  if (!monitor) return;
+
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return;
+
+  AppendMenuW(menu, MF_STRING, kContextAutomaticMode, L"Automatic Mode");
+  AppendMenuW(menu, MF_STRING, kContextManualMode, L"Manual Mode");
+  CheckMenuRadioItem(
+      menu, kContextAutomaticMode, kContextManualMode,
+      IsAutomaticMode() ? kContextAutomaticMode : kContextManualMode,
+      MF_BYCOMMAND);
+
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+  const TileLayout currentLayout = GetMonitorLayoutOrDefault(monitor);
+  UINT checkedLayoutCommand = 0;
+  for (size_t i = 0; i < g_settings.layoutCycle.size(); ++i) {
+    const TileLayout layout = g_settings.layoutCycle[i];
+    const UINT command = kContextLayoutBase + static_cast<UINT>(i);
+    AppendMenuW(menu, MF_STRING, command, LayoutDisplayName(layout));
+    if (layout == currentLayout) checkedLayoutCommand = command;
+  }
+
+  if (!g_settings.layoutCycle.empty() && checkedLayoutCommand) {
+    CheckMenuRadioItem(
+        menu, kContextLayoutBase,
+        kContextLayoutBase + static_cast<UINT>(g_settings.layoutCycle.size() - 1),
+        checkedLayoutCommand, MF_BYCOMMAND);
+  }
+
+  POINT point{};
+  if (!GetCursorPos(&point)) {
+    DestroyMenu(menu);
+    return;
+  }
+
+  // Required for reliable dismissal of notification-area popup menus.
+  SetForegroundWindow(g_trayWindow);
+  const UINT command = TrackPopupMenuEx(
+      menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+      point.x, point.y, g_trayWindow, nullptr);
+  PostMessageW(g_trayWindow, WM_NULL, 0, 0);
+  DestroyMenu(menu);
+
+  const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+  if (!threadId || !command) return;
+
+  if (command == kContextAutomaticMode || command == kContextManualMode) {
+    const ManagementMode mode = command == kContextAutomaticMode
+                                    ? ManagementMode::Automatic
+                                    : ManagementMode::Manual;
+    PostThreadMessageW(
+        threadId, WM_APP_MANAGEMENT_MODE_SET,
+        static_cast<WPARAM>(mode), 0);
+    return;
+  }
+
+  if (command >= kContextLayoutBase) {
+    const size_t index = static_cast<size_t>(command - kContextLayoutBase);
+    if (index < g_settings.layoutCycle.size()) {
+      PostThreadMessageW(
+          threadId, WM_APP_LAYOUT_SET,
+          reinterpret_cast<WPARAM>(monitor),
+          static_cast<LPARAM>(g_settings.layoutCycle[index]));
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
 // Lifecycle / shell integration
 //-----------------------------------------------------------------------------
 
@@ -588,6 +691,11 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
   if (message == kTrayCallbackMessage) {
     const UINT event = LOWORD(lParam);
     const UINT iconId = HIWORD(lParam);
+    if (iconId == kIconId &&
+        (event == WM_CONTEXTMENU || event == WM_RBUTTONUP)) {
+      ShowContextMenu();
+      return 0;
+    }
     if (iconId == kIconId &&
         (event == NIN_SELECT || event == NIN_KEYSELECT)) {
       // Emit the exact same action as the layout hotkey; layout mutation stays

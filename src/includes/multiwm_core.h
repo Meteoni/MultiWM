@@ -166,6 +166,8 @@ constexpr UINT WM_APP_VIRTUAL_DESKTOP_CHANGED = WM_APP + 3;
 constexpr UINT WM_APP_TRAY_REFRESH = WM_APP + 4;
 constexpr UINT WM_APP_LAYOUT_CYCLE = WM_APP + 5;
 constexpr UINT WM_APP_RECONCILE_NOW = WM_APP + 6;
+constexpr UINT WM_APP_LAYOUT_SET = WM_APP + 7;
+constexpr UINT WM_APP_MANAGEMENT_MODE_SET = WM_APP + 8;
 
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
 enum class MouseMoveBehavior { Float, Swap };

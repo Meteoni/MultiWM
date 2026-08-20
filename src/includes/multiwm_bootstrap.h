@@ -247,9 +247,9 @@ static void InitializeCurrentDesktopWorkspaces() {
       monitors.size() == 1 ? L"" : L"s");
 }
 
-static void ToggleWindowManagementMode() {
-  g_wm.managementMode =
-      IsAutomaticMode() ? ManagementMode::Manual : ManagementMode::Automatic;
+static void SetWindowManagementMode(ManagementMode mode) {
+  if (g_wm.managementMode == mode) return;
+  g_wm.managementMode = mode;
   const bool automatic = IsAutomaticMode();
   Wh_Log(L"Window management mode: %s", automatic ? L"Automatic" : L"Manual");
   Diagnostics::RecordEvent(
@@ -266,6 +266,11 @@ static void ToggleWindowManagementMode() {
     }
     Reconcile::ScheduleLifecycleReconcile(nullptr);
   }
+}
+
+static void ToggleWindowManagementMode() {
+  SetWindowManagementMode(
+      IsAutomaticMode() ? ManagementMode::Manual : ManagementMode::Automatic);
 }
 
 static void HandleMoveSizeEndMessage(HWND hwnd) {
@@ -311,6 +316,19 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
     case WM_APP_LAYOUT_CYCLE:
       Commands::CycleCurrentWorkspaceLayout(
           reinterpret_cast<HMONITOR>(msg.wParam));
+      return WmMessageDisposition::Handled;
+
+    case WM_APP_LAYOUT_SET:
+      Commands::SetCurrentWorkspaceLayout(
+          static_cast<TileLayout>(msg.lParam),
+          reinterpret_cast<HMONITOR>(msg.wParam));
+      return WmMessageDisposition::Handled;
+
+    case WM_APP_MANAGEMENT_MODE_SET:
+      if (msg.wParam == static_cast<WPARAM>(ManagementMode::Manual) ||
+          msg.wParam == static_cast<WPARAM>(ManagementMode::Automatic)) {
+        SetWindowManagementMode(static_cast<ManagementMode>(msg.wParam));
+      }
       return WmMessageDisposition::Handled;
 
     case WM_APP_RECONCILE_NOW:

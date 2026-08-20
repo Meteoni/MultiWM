@@ -125,6 +125,46 @@ void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
       key.monitor, static_cast<int>(previousLayout), static_cast<int>(state.Layout()));
 }
 
+// Direct layout selection used by the tray context menu. This is intentionally
+// separate from CycleCurrentWorkspaceLayout: selecting a named layout should not
+// depend on its current position in the configured cycle.
+void SetCurrentWorkspaceLayout(TileLayout layout, HMONITOR monitor = nullptr) {
+  if (layout == TileLayout::COUNT) return;
+  if (!monitor) monitor = GetWorkspaceCommandMonitor();
+  if (!monitor) return;
+
+  DesktopMonitorKey key{};
+  if (!GetCurrentWorkspaceKey(monitor, &key)) return;
+
+  Workspace state;
+  if (!g_workspaces.Load(key, &state)) {
+    if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, false) ||
+        !g_workspaces.Load(key, &state)) {
+      return;
+    }
+  }
+
+  const TileLayout previousLayout = state.Layout();
+  if (previousLayout == layout) {
+    // Keep the tray view coherent even if the selected item was already active.
+    TrayUi::UpdateIcon(layout, monitor);
+    return;
+  }
+
+  state.SetLayout(layout);
+  if (previousLayout != TileLayout::Floating && layout == TileLayout::Floating) {
+    RestoreWorkspaceFloatingGeometry(key, state);
+  }
+  g_workspaces.Save(key, state);
+  ArrangeWorkspace(key);
+  TrayUi::UpdateIcon(layout, monitor);
+  TrayUi::ShowLayoutFlyout(layout, monitor);
+  Wh_Log(L"Workspace layout set to %d", static_cast<int>(layout));
+  Diagnostics::RecordEvent(
+      L"layout set desktop=%08X monitor=%p from=%d to=%d", key.desktopId.Data1,
+      key.monitor, static_cast<int>(previousLayout), static_cast<int>(layout));
+}
+
 static void HandleUserMove(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const MoveSizeGesture& gesture) {
