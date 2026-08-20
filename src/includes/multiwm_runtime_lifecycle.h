@@ -121,6 +121,9 @@ void NotifyShellRestarted() {
     g_wm.reconciledDesktopValid = false;
   }
 
+  // A shell replacement can move/recreate windows asynchronously. Never let a
+  // pre-restart conformance rectangle fight the replacement shell.
+  ClearAllConformanceLeases();
   g_wm.forceMonitorReconcile = true;
   const bool platformNeedsRecovery =
       !Platform::WindowEvents::AllWinEventHooksInstalled() ||
@@ -134,6 +137,17 @@ void NotifyDisplayTopologyChanged() {
   AssertWmThread(L"RuntimeLifecycle::NotifyDisplayTopologyChanged");
   ++Diagnostics::g_runtime.counters.displayTopologySignals;
   Diagnostics::RecordEvent(L"display/work-area topology changed");
+
+  // Every existing lease was computed against the old work-area/monitor topology.
+  // Cancel it before Windows' own topology-induced LOCATIONCHANGE burst arrives.
+  ClearAllConformanceLeases();
+  g_wm.pendingDesktopArranges.erase(
+      std::remove_if(
+          g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
+          [](const PendingWorkspaceArrange& pending) {
+            return !IsLiveMonitorHandle(pending.monitor);
+          }),
+      g_wm.pendingDesktopArranges.end());
   g_wm.forceMonitorReconcile = true;
 
   // Display/work-area changes normally require only model/geometry reconciliation.

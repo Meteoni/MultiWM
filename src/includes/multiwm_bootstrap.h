@@ -234,22 +234,17 @@ static void UnregisterConfiguredHotkeys() {
   UnregisterHotKey(nullptr, HK_DIAGNOSTIC_DUMP);
 }
 
-static void InitializeCurrentWorkspace() {
-  HMONITOR monitor = GetTargetMonitor();
-  if (monitor) {
-    DesktopMonitorKey key{};
-    Workspace existingState;
-    if (GetCurrentWorkspaceKey(monitor, &key) &&
-        g_workspaces.Load(key, &existingState)) {
-      ArrangeWorkspace(key);
-    } else {
-      Reconcile::DiscoverCurrentWorkspaceOnMonitor(monitor);
-    }
+static void InitializeCurrentDesktopWorkspaces() {
+  std::vector<HMONITOR> monitors;
+  Reconcile::EnumerateCurrentMonitors(monitors);
+  for (HMONITOR monitor : monitors) {
+    Reconcile::DiscoverCurrentWorkspaceOnMonitor(monitor);
   }
 
   Wh_Log(
-      L"Window management mode at startup: %s",
-      IsManualMode() ? L"Manual" : L"Automatic");
+      L"Window management mode at startup: %s (%zu connected monitor%s)",
+      IsManualMode() ? L"Manual" : L"Automatic", monitors.size(),
+      monitors.size() == 1 ? L"" : L"s");
 }
 
 static void ToggleWindowManagementMode() {
@@ -444,7 +439,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
   Reconcile::ScheduleLifecycleReconcile(nullptr);
   RegisterConfiguredHotkeys();
-  InitializeCurrentWorkspace();
+  InitializeCurrentDesktopWorkspaces();
 
   if (!TrayUi::Initialize()) {
     Wh_Log(L"Tiling layout tray icon unavailable; window management remains active");

@@ -387,7 +387,7 @@ static DiagnosticWindowIdentity DiagnosticReadWindowIdentity(
     identity.hasFrame = GetWindowFrameRect(hwnd, &identity.frame) &&
                         identity.frame.right > identity.frame.left &&
                         identity.frame.bottom > identity.frame.top;
-    identity.monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    identity.monitor = GetWindowPhysicalMonitor(hwnd);
     if (identity.monitor) identity.dpi = GetMonitorEffectiveDpi(identity.monitor);
 
     wchar_t className[256]{};
@@ -488,20 +488,8 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
   }
 
   report.Line(
-      L"      capabilities: move=%d resize=%d topmost=%d generation=%llu",
-      record.canMove ? 1 : 0, record.canResize ? 1 : 0, record.topmost ? 1 : 0,
-      static_cast<unsigned long long>(record.tilingGeneration));
-  const std::wstring constraintMaxWidth = record.constraints.maxWidthBounded
-      ? std::to_wstring(record.constraints.maxWidth) : L"unbounded";
-  const std::wstring constraintMaxHeight = record.constraints.maxHeightBounded
-      ? std::to_wstring(record.constraints.maxHeight) : L"unbounded";
-  report.Line(
-      L"      constraints: valid=%d dpi=%u min=%ldx%ld max=%ls x %ls timeout=%d error=%lu",
-      record.constraints.valid ? 1 : 0, record.constraints.dpi,
-      record.constraints.minWidth, record.constraints.minHeight,
-      constraintMaxWidth.c_str(), constraintMaxHeight.c_str(),
-      record.constraints.lastProbeTimedOut ? 1 : 0,
-      record.constraints.lastProbeError);
+      L"      capabilities: move=%d resize=%d topmost=%d",
+      record.canMove ? 1 : 0, record.canResize ? 1 : 0, record.topmost ? 1 : 0);
   report.Line(
       L"      placement: result=%ls failures=%d",
       DiagnosticPlacementResultName(record.lastPlacementResult), record.placementFailures);
@@ -648,12 +636,6 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Placement refused", c.placementRefused, previous.placementRefused, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement dead HWND", c.placementDead, previous.placementDead, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Floating geometry repairs", c.floatingGeometryRepairs, previous.floatingGeometryRepairs, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Constraint probes", c.constraintProbeAttempts, previous.constraintProbeAttempts, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  constraint probe successes", c.constraintProbeSuccesses, previous.constraintProbeSuccesses, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  constraint probe timeouts", c.constraintProbeTimeouts, previous.constraintProbeTimeouts, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  constraint probe failures", c.constraintProbeFailures, previous.constraintProbeFailures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Constraint-unsatisfiable plans", c.constraintUnsatisfiablePlans, previous.constraintUnsatisfiablePlans, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Constraint-triggered floats", c.constraintFloats, previous.constraintFloats, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance leases started", c.conformanceLeasesStarted, previous.conformanceLeasesStarted, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance lease reinforcement attempts", c.conformanceLeaseRepairs, previous.conformanceLeaseRepairs, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance lease exhausted", c.conformanceLeaseExhausted, previous.conformanceLeaseExhausted, uptimeMs, intervalMs);
@@ -838,6 +820,10 @@ static void DumpPlatformHealth(ReportBuilder& report) {
   } else {
     report.Line(L"Current virtual desktop: <unknown>");
   }
+  std::vector<HMONITOR> connectedMonitors;
+  Reconcile::EnumerateCurrentMonitors(connectedMonitors);
+  report.Line(
+      L"Connected physical monitors: %zu", connectedMonitors.size());
   report.Line(
       L"Virtual desktop API: initialized=%d abiResolved=%d Explorer=%lu.%lu usesHMonitor=%d",
       g_vd.initialized ? 1 : 0, g_vd.abiResolved ? 1 : 0,
@@ -852,7 +838,7 @@ static void DumpPlatformHealth(ReportBuilder& report) {
       L"Explorer shell identity: boundPid=%lu currentPid=%lu match=%d",
       g_vd.shellPid, currentShellPid,
       g_vd.shellPid && currentShellPid && g_vd.shellPid == currentShellPid ? 1 : 0);
-  DWORD currentShellPid = 0;
+  currentShellPid = 0;
   HWND shell = GetShellWindow();
   if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &currentShellPid);
   report.Line(
@@ -1038,7 +1024,7 @@ static void WriteDiagnosticReport() {
   report.Line(L"============================================================");
   report.Line(L"TILING HELPER DIAGNOSTIC REPORT");
   report.Line(L"============================================================");
-  report.Line(L"Mod version: 1.13.0");
+  report.Line(L"Mod version: 1.13.1");
   report.Line(L"Report sequence: %llu", static_cast<unsigned long long>(reportSequence));
   report.Line(L"Generated local: %ls", DiagnosticSystemTimeString(local).c_str());
   report.Line(L"Generated UTC:   %ls", DiagnosticSystemTimeString(utc).c_str());
@@ -1120,6 +1106,9 @@ static void WriteDiagnosticReport() {
   size_t deadRecords = 0;
   size_t pidMismatches = 0;
   size_t recordsWithPlacementFailures = 0;
+  size_t staleMonitorWorkspaces = 0;
+  size_t recordsOnStaleMonitorWorkspaces = 0;
+  size_t currentDesktopRecordsOnStaleMonitorWorkspaces = 0;
 
   for (size_t workspaceIndex = 0; workspaceIndex < workspaces.size(); ++workspaceIndex) {
     const DesktopMonitorKey& key = workspaces[workspaceIndex].first;
@@ -1143,6 +1132,16 @@ static void WriteDiagnosticReport() {
           return pending.monitor == key.monitor &&
                  IsEqualGUID(pending.desktopId, key.desktopId);
         });
+
+    const bool liveMonitor = IsLiveMonitorHandle(key.monitor);
+    if (!liveMonitor) {
+      ++staleMonitorWorkspaces;
+      recordsOnStaleMonitorWorkspaces += state.RecordCount();
+      if (g_vd.lastKnownDesktopValid &&
+          IsEqualGUID(key.desktopId, g_vd.lastKnownDesktop)) {
+        currentDesktopRecordsOnStaleMonitorWorkspaces += state.RecordCount();
+      }
+    }
 
     std::vector<std::wstring> invariantErrors;
     const bool invariantsValid =
@@ -1310,9 +1309,6 @@ static void WriteDiagnosticReport() {
   const uint64_t placementPathSum =
       counters.placementNoOps + counters.placementPreflightStops +
       counters.setWindowPosCalls;
-  const uint64_t constraintProbeResultSum =
-      counters.constraintProbeSuccesses + counters.constraintProbeTimeouts +
-      counters.constraintProbeFailures;
   const uint64_t vdInitResultSum =
       counters.vdApiInitSuccesses + counters.vdApiInitFailures;
   const uint64_t vdNotificationResultSum =
@@ -1330,8 +1326,6 @@ static void WriteDiagnosticReport() {
       placementResultSum == counters.placementChecks;
   const bool placementPathsOk =
       placementPathSum == counters.placementChecks;
-  const bool constraintProbeAccountingOk =
-      constraintProbeResultSum == counters.constraintProbeAttempts;
   const bool vdInitAccountingOk =
       vdInitResultSum == counters.vdApiInitAttempts;
   const bool vdNotificationAccountingOk =
@@ -1340,6 +1334,12 @@ static void WriteDiagnosticReport() {
       priorReportResultSum == g_runtime.lifetimeDiagnosticCost.attempts;
   const bool gestureAccountingOk =
       classifiedGestureSum <= counters.moveSizeEndMessages;
+
+  report.Line();
+  report.Line(
+      L"Stale monitor workspace keys: %zu (records attached: %zu; current-desktop records: %zu)",
+      staleMonitorWorkspaces, recordsOnStaleMonitorWorkspaces,
+      currentDesktopRecordsOnStaleMonitorWorkspaces);
 
   report.Line();
   report.Line(L"Telemetry consistency:");
@@ -1358,11 +1358,6 @@ static void WriteDiagnosticReport() {
       placementPathsOk ? L"PASS" : L"FAIL",
       static_cast<unsigned long long>(placementPathSum),
       static_cast<unsigned long long>(counters.placementChecks));
-  report.Line(
-      L"  constraint probe results == attempts: %ls (%llu == %llu)",
-      constraintProbeAccountingOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(constraintProbeResultSum),
-      static_cast<unsigned long long>(counters.constraintProbeAttempts));
   report.Line(
       L"  VD init successes + failures == attempts: %ls (%llu == %llu)",
       vdInitAccountingOk ? L"PASS" : L"FAIL",
@@ -1407,13 +1402,14 @@ static void WriteDiagnosticReport() {
       ownershipIndexMismatches == 0;
   const bool runtimeWindowHealthy =
       deadRecords == 0 && pidMismatches == 0 &&
-      recordsWithPlacementFailures == 0 && allWinEventHooks &&
+      recordsWithPlacementFailures == 0 &&
+      currentDesktopRecordsOnStaleMonitorWorkspaces == 0 && allWinEventHooks &&
       shellBindingHealthy && vdCoreHealthy && vdNotificationsHealthy &&
       currentDesktopHealthy;
   const bool telemetryHealthy =
       lifecycleAccountingOk && placementResultsOk && placementPathsOk &&
-      constraintProbeAccountingOk && vdInitAccountingOk &&
-      vdNotificationAccountingOk && reportAccountingOk && gestureAccountingOk;
+      vdInitAccountingOk && vdNotificationAccountingOk &&
+      reportAccountingOk && gestureAccountingOk;
   const bool overallHealthy =
       structuralHealthy && runtimeWindowHealthy && telemetryHealthy;
 

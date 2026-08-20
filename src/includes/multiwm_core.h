@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <climits>
 #include <cassert>
 #include <cstdarg>
 #include <deque>
@@ -334,13 +333,6 @@ struct Counters {
   uint64_t placementDead = 0;
   uint64_t floatingGeometryRepairs = 0;
 
-  uint64_t constraintProbeAttempts = 0;
-  uint64_t constraintProbeSuccesses = 0;
-  uint64_t constraintProbeTimeouts = 0;
-  uint64_t constraintProbeFailures = 0;
-  uint64_t constraintUnsatisfiablePlans = 0;
-  uint64_t constraintFloats = 0;
-
   uint64_t virtualDesktopChangesProcessed = 0;
   uint64_t virtualDesktopFallbackChanges = 0;
   uint64_t vdApiInitAttempts = 0;
@@ -543,45 +535,16 @@ enum class PlacementResult {
   Dead,
 };
 
-// Tracking constraints expressed in the same DWM extended-frame coordinate
-// system used by the layout engine. Windows' WM_GETMINMAXINFO values describe
-// the outer window rectangle, so observation converts them before they enter
-// the model. Default/system maximum tracking sizes are treated as unbounded;
-// only an application-specific restrictive maximum becomes a hard layout limit.
-struct WindowConstraints {
-  LONG minWidth = 1;
-  LONG minHeight = 1;
-  LONG maxWidth = LONG_MAX;
-  LONG maxHeight = LONG_MAX;
-  UINT dpi = 96;
-  bool valid = false;
-  bool maxWidthBounded = false;
-  bool maxHeightBounded = false;
-  bool lastProbeTimedOut = false;
-  DWORD lastProbeError = ERROR_SUCCESS;
-};
-
-static uint64_t NextTilingGeneration() {
-  static uint64_t nextGeneration = 1;
-  return nextGeneration++;
-}
-
 struct WindowRecord {
   HWND hwnd = nullptr;
   DWORD pid = 0;
   ManageState state = ManageState::Tiled;
 
-  // Capabilities and measured tracking constraints are OS observations. They are
-  // cached on the record so layout policy never has to reach into HWND messaging.
+  // Capabilities are observations, not hard policy yet. They give later rule/
+  // constraint work somewhere stable to live without re-querying every branch.
   bool canMove = true;
   bool canResize = true;
   bool topmost = false;
-
-  // Monotonic admission generation used by the FancyWM-style overflow policy:
-  // when a constraint set is impossible, the newest tiled member is floated
-  // first. Reordering a tile does not change its generation.
-  uint64_t tilingGeneration = 0;
-  WindowConstraints constraints{};
 
   int placementFailures = 0;
   PlacementResult lastPlacementResult = PlacementResult::Success;
@@ -649,8 +612,6 @@ class Workspace {
   bool MakeMaster(HWND hwnd, HWND* oldMaster = nullptr);
   bool SwapTiled(HWND first, HWND second);
   bool ResetPlacementFailures(HWND hwnd);
-  bool UpdateConstraints(HWND hwnd, const WindowConstraints& constraints);
-  HWND NewestTiledWindow() const;
   bool RememberFloatingGeometry(
       HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
 
@@ -750,7 +711,6 @@ using Model::PlacementObservation;
 using Model::PlacementResult;
 using Model::SuspendedSlot;
 using Model::SuspensionReason;
-using Model::WindowConstraints;
 using Model::WindowRecord;
 using Model::Workspace;
 using Model::WorkspaceGeometryItem;

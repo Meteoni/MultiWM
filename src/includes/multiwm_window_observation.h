@@ -5,155 +5,6 @@
 // Win32 observation lives here, outside Model. These helpers translate live HWND
 // properties/geometry into value objects consumed by Workspace and reconciliation.
 
-constexpr UINT kConstraintProbeTimeoutMs = 40;
-
-static int GetSystemMetricForDpiCompat(int index, UINT dpi) {
-  using GetSystemMetricsForDpiFn = int(WINAPI*)(int, UINT);
-  static GetSystemMetricsForDpiFn fn = [] {
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    return user32 ? reinterpret_cast<GetSystemMetricsForDpiFn>(
-                        GetProcAddress(user32, "GetSystemMetricsForDpi"))
-                  : nullptr;
-  }();
-  return fn ? fn(index, dpi ? dpi : 96) : GetSystemMetrics(index);
-}
-
-static void GetFrameDecorationSpan(HWND hwnd, LONG* width, LONG* height) {
-  if (width) *width = 0;
-  if (height) *height = 0;
-  RECT windowRect{}, frame{};
-  if (!hwnd || !GetWindowRect(hwnd, &windowRect) ||
-      FAILED(DwmGetWindowAttribute(
-          hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) {
-    return;
-  }
-  if (width) {
-    *width = std::max<LONG>(
-        0, (frame.left - windowRect.left) +
-               (windowRect.right - frame.right));
-  }
-  if (height) {
-    *height = std::max<LONG>(
-        0, (frame.top - windowRect.top) +
-               (windowRect.bottom - frame.bottom));
-  }
-}
-
-// WM_GETMINMAXINFO is synchronous application code, so never allow a hung client
-// to stall the WM actor indefinitely. The returned tracking dimensions describe
-// the outer HWND rectangle; convert them to our DWM-frame geometry before storing.
-static WindowConstraints ProbeWindowConstraints(HWND hwnd, bool canResize) {
-  ++Diagnostics::g_runtime.counters.constraintProbeAttempts;
-
-  WindowConstraints constraints;
-  HMONITOR monitor = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
-  constraints.dpi = GetMonitorEffectiveDpi(monitor);
-
-  const LONG defaultMinWidth =
-      std::max<LONG>(1, GetSystemMetricForDpiCompat(SM_CXMINTRACK, constraints.dpi));
-  const LONG defaultMinHeight =
-      std::max<LONG>(1, GetSystemMetricForDpiCompat(SM_CYMINTRACK, constraints.dpi));
-  const LONG defaultMaxWidth =
-      std::max<LONG>(defaultMinWidth,
-                     GetSystemMetricForDpiCompat(SM_CXMAXTRACK, constraints.dpi));
-  const LONG defaultMaxHeight =
-      std::max<LONG>(defaultMinHeight,
-                     GetSystemMetricForDpiCompat(SM_CYMAXTRACK, constraints.dpi));
-
-  MINMAXINFO mmi{};
-  mmi.ptMinTrackSize = {defaultMinWidth, defaultMinHeight};
-  mmi.ptMaxTrackSize = {defaultMaxWidth, defaultMaxHeight};
-
-  DWORD_PTR result = 0;
-  SetLastError(ERROR_SUCCESS);
-  const LRESULT delivered = hwnd && IsWindow(hwnd)
-      ? SendMessageTimeoutW(
-            hwnd, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&mmi),
-            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
-            kConstraintProbeTimeoutMs, &result)
-      : 0;
-  if (!delivered) {
-    DWORD error = GetLastError();
-    if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
-    constraints.lastProbeError = error;
-    constraints.lastProbeTimedOut = error == ERROR_TIMEOUT;
-    if (constraints.lastProbeTimedOut) {
-      ++Diagnostics::g_runtime.counters.constraintProbeTimeouts;
-    } else {
-      ++Diagnostics::g_runtime.counters.constraintProbeFailures;
-    }
-    // Even when client code doesn't respond, Windows' ordinary minimum tracking
-    // size remains a safe floor. Do not invent a restrictive maximum.
-    mmi.ptMinTrackSize = {defaultMinWidth, defaultMinHeight};
-    mmi.ptMaxTrackSize = {defaultMaxWidth, defaultMaxHeight};
-  } else {
-    constraints.valid = true;
-    ++Diagnostics::g_runtime.counters.constraintProbeSuccesses;
-  }
-
-  LONG decorationWidth = 0, decorationHeight = 0;
-  GetFrameDecorationSpan(hwnd, &decorationWidth, &decorationHeight);
-  constraints.minWidth =
-      std::max<LONG>(1, std::max<LONG>(defaultMinWidth, mmi.ptMinTrackSize.x) -
-                            decorationWidth);
-  constraints.minHeight =
-      std::max<LONG>(1, std::max<LONG>(defaultMinHeight, mmi.ptMinTrackSize.y) -
-                            decorationHeight);
-
-  // The system default max-track values are implementation limits, not useful
-  // application intent. Honor only a client-reported more restrictive maximum.
-  constexpr LONG kTrackComparisonTolerance = 2;
-  if (mmi.ptMaxTrackSize.x > 0 &&
-      mmi.ptMaxTrackSize.x + kTrackComparisonTolerance < defaultMaxWidth) {
-    constraints.maxWidthBounded = true;
-    constraints.maxWidth =
-        std::max<LONG>(constraints.minWidth, mmi.ptMaxTrackSize.x - decorationWidth);
-  }
-  if (mmi.ptMaxTrackSize.y > 0 &&
-      mmi.ptMaxTrackSize.y + kTrackComparisonTolerance < defaultMaxHeight) {
-    constraints.maxHeightBounded = true;
-    constraints.maxHeight =
-        std::max<LONG>(constraints.minHeight, mmi.ptMaxTrackSize.y - decorationHeight);
-  }
-
-  // A non-resizable tracked window is effectively fixed-size. Normally new
-  // non-sizeable windows are excluded before admission, but preserving this fact
-  // makes migration/legacy records deterministic.
-  if (!canResize) {
-    RECT frame{};
-    if (GetWindowFrameRect(hwnd, &frame) &&
-        frame.right > frame.left && frame.bottom > frame.top) {
-      constraints.minWidth = constraints.maxWidth = frame.right - frame.left;
-      constraints.minHeight = constraints.maxHeight = frame.bottom - frame.top;
-      constraints.maxWidthBounded = true;
-      constraints.maxHeightBounded = true;
-    }
-  }
-
-  return constraints;
-}
-
-static bool SameConstraintGeometry(
-    const WindowConstraints& a, const WindowConstraints& b) {
-  return a.minWidth == b.minWidth && a.minHeight == b.minHeight &&
-         a.maxWidth == b.maxWidth && a.maxHeight == b.maxHeight &&
-         a.dpi == b.dpi &&
-         a.maxWidthBounded == b.maxWidthBounded &&
-         a.maxHeightBounded == b.maxHeightBounded;
-}
-
-static WindowConstraints MergeConstraintProbeWithCache(
-    const WindowConstraints& cached, WindowConstraints observed) {
-  if (!observed.valid && cached.valid) {
-    const bool timedOut = observed.lastProbeTimedOut;
-    const DWORD error = observed.lastProbeError;
-    observed = cached;
-    observed.lastProbeTimedOut = timedOut;
-    observed.lastProbeError = error;
-  }
-  return observed;
-}
-
 static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState::Tiled) {
   WindowRecord record;
   record.hwnd = hwnd;
@@ -166,10 +17,9 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
     record.canMove = (GetAncestor(hwnd, GA_ROOT) == hwnd) && !(style & WS_CHILD);
     record.canResize = (style & WS_SIZEBOX) != 0;
     record.topmost = (exStyle & WS_EX_TOPMOST) != 0;
-    record.constraints = ProbeWindowConstraints(hwnd, record.canResize);
 
     RECT frame{};
-    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
     // Only a restored window exposes meaningful natural/floating geometry.
     // Minimized/maximized admission should fall back to the configured size
     // rather than remembering an iconic or maximized rectangle.
@@ -476,17 +326,7 @@ static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd) {
     return nullptr;
   }
 
-  RECT frameRect{};
-  if (FAILED(DwmGetWindowAttribute(
-          hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frameRect, sizeof(frameRect))) &&
-      !GetWindowRect(hwnd, &frameRect)) {
-    return nullptr;
-  }
-
-  if (frameRect.right <= frameRect.left || frameRect.bottom <= frameRect.top) {
-    return nullptr;
-  }
-  return MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL);
+  return GetWindowPhysicalMonitor(hwnd);
 }
 
 // Determines whether an HWND can actively participate on targetMonitor now.

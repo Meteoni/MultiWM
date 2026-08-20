@@ -10,7 +10,7 @@ void SwapMaster() {
   HWND fg = GetForegroundWindow();
   if (!fg) return;
 
-  HMONITOR monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+  HMONITOR monitor = GetWindowPhysicalMonitor(fg);
   if (!monitor) return;
 
   GUID desktopId{};
@@ -40,7 +40,7 @@ void FloatFocusedWindow() {
   HWND hwnd = GetForegroundWindow();
   if (!hwnd) return;
 
-  HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+  HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
   GUID desktopId{};
   if (!monitor || !GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
 
@@ -80,7 +80,7 @@ void TileWindows() {
   Reconcile::ReconcileKnownWindows(Reconcile::ReconcileScope::All, &changedKeys);
 
   DesktopMonitorKey targetKey{};
-  GetCurrentWorkspaceKey(monitor, &targetKey);
+  if (!GetCurrentWorkspaceKey(monitor, &targetKey)) return;
   if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, true, &changedKeys)) return;
 
   // Ensure other affected current workspaces also lose stale slots. Keep the
@@ -222,7 +222,7 @@ void ApplyUserMoveSize(HWND hwnd) {
     return;
   }
 
-  HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+  HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
   if (!monitor) return;
 
   GUID desktopId{};

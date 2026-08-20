@@ -19,7 +19,7 @@ static inline long long WindowAreaOnWorkArea(HWND hwnd, const RECT& workArea) {
 
 static HMONITOR GetTargetMonitor() {
   HWND foregroundWindow = GetForegroundWindow();
-  HMONITOR monitor = foregroundWindow ? MonitorFromWindow(foregroundWindow, MONITOR_DEFAULTTONULL) : nullptr;
+  HMONITOR monitor = foregroundWindow ? GetWindowPhysicalMonitor(foregroundWindow) : nullptr;
   if (!monitor) {
     POINT cursorPos{};
     if (GetCursorPos(&cursorPos)) {
@@ -115,6 +115,20 @@ static FloatingPlacementHint MakeFloatingPlacementHintFromGesture(
   return hint;
 }
 
+static HMONITOR ResolveRememberedFloatingMonitor(
+    const WindowRecord& record) {
+  if (!record.hasFloatingRect) return nullptr;
+  if (IsLiveMonitorHandle(record.floatingMonitor)) {
+    return record.floatingMonitor;
+  }
+
+  // HMONITOR can be invalidated by a live display-topology rebuild. The remembered
+  // physical rectangle is still a useful best-effort hint inside the same session;
+  // if it maps to a current monitor, treat that as the remembered boundary.
+  return MonitorFromRect(
+      &record.floatingRect, MONITOR_DEFAULTTONULL);
+}
+
 // Converts remembered floating geometry into a destination-monitor rectangle.
 // Passive migration restores the full rectangle on the same monitor and centers
 // remembered/default size on a different monitor. Explicit drag/hotkey intent
@@ -155,37 +169,13 @@ static bool RepairFloatingGeometry(
   if (!record->canResize && haveCurrent) {
     width = current.right - current.left;
     height = current.bottom - current.top;
-  } else {
-    // Floating is still subject to the same observed tracking bounds. Constraint
-    // values are physical pixels at their capture DPI, so scale cached values if
-    // the window is being restored onto a monitor with different scaling.
-    const UINT constraintDpi = record->constraints.dpi ? record->constraints.dpi : 96;
-    const LONG minWidth = std::max<LONG>(
-        1, MulDiv(record->constraints.minWidth, static_cast<int>(targetDpi),
-                  static_cast<int>(constraintDpi)));
-    const LONG minHeight = std::max<LONG>(
-        1, MulDiv(record->constraints.minHeight, static_cast<int>(targetDpi),
-                  static_cast<int>(constraintDpi)));
-    width = std::max<LONG>(width, minWidth);
-    height = std::max<LONG>(height, minHeight);
-    if (record->constraints.maxWidthBounded) {
-      const LONG maxWidth = std::max<LONG>(
-          minWidth, MulDiv(record->constraints.maxWidth, static_cast<int>(targetDpi),
-                           static_cast<int>(constraintDpi)));
-      width = std::min<LONG>(width, maxWidth);
-    }
-    if (record->constraints.maxHeightBounded) {
-      const LONG maxHeight = std::max<LONG>(
-          minHeight, MulDiv(record->constraints.maxHeight, static_cast<int>(targetDpi),
-                            static_cast<int>(constraintDpi)));
-      height = std::min<LONG>(height, maxHeight);
-    }
   }
 
   POINT center{};
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     center = hint.anchor;
-  } else if (record->hasFloatingRect && record->floatingMonitor == key.monitor) {
+  } else if (record->hasFloatingRect &&
+             ResolveRememberedFloatingMonitor(*record) == key.monitor) {
     center = RectCenter(record->floatingRect);
   } else {
     center = RectCenter(workArea);
@@ -247,7 +237,7 @@ static void RestoreWorkspaceFloatingGeometry(
 // Resolves a monitor on the current virtual desktop to its workspace key and,
 // when requested, returns the configured workspace-inset work area.
 static bool GetCurrentWorkspaceKey(HMONITOR monitor, DesktopMonitorKey* outKey, RECT* outWorkArea = nullptr) {
-  if (!monitor || !outKey) return false;
+  if (!outKey || !IsLiveMonitorHandle(monitor)) return false;
   GUID desktopId{};
   // Never collapse separate desktops into a zero-GUID workspace when the
   // private API is temporarily unavailable; let the caller retry after recovery.
@@ -507,6 +497,18 @@ std::vector<HMONITOR> WorkspaceRepository::MonitorsOnDesktop(
     }
   }
   ReleaseSRWLockShared(&lock_);
+
+  // HMONITOR is a live-session routing token, not a durable display identity.
+  // After a topology rebuild, old workspace keys can legitimately remain in the
+  // repository until their records migrate. Never feed invalid handles back into
+  // ordinary current-desktop discovery/arrangement.
+  monitors.erase(
+      std::remove_if(
+          monitors.begin(), monitors.end(),
+          [](HMONITOR monitor) {
+            return !IsLiveMonitorHandle(monitor);
+          }),
+      monitors.end());
   return monitors;
 }
 

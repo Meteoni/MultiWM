@@ -21,6 +21,17 @@ static void QueueWindowEvent(DWORD event, HWND hwnd) {
   }
 }
 
+static bool HasTrackedMonitorOwnershipMismatch(HWND hwnd) {
+  const HMONITOR observed = GetWindowPhysicalMonitor(hwnd);
+  if (!observed) return false;
+
+  const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
+  if (owners.empty()) return false;
+  return std::any_of(
+      owners.begin(), owners.end(),
+      [&](const DesktopMonitorKey& owner) { return owner.monitor != observed; });
+}
+
 // Treats out-of-context WinEvents as edge-triggered observations: filter noise,
 // cache move/resize boundaries, and post accepted work to the hotkey thread.
 // Workspace state is never mutated from this callback.
@@ -60,8 +71,13 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // narrow. Besides maximized->restored detection, a short conformance lease may
   // opt a tiled HWND into location observation while an app finishes startup.
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
-    if (!tracked ||
-        (!IsWindowSuspendedMaximized(hwnd) && !HasActiveConformanceLease(hwnd))) {
+    if (!tracked) return;
+
+    const bool stateOrLeaseNeedsObservation =
+        IsWindowSuspendedMaximized(hwnd) ||
+        HasActiveConformanceLease(hwnd);
+    if (!stateOrLeaseNeedsObservation &&
+        !HasTrackedMonitorOwnershipMismatch(hwnd)) {
       return;
     }
     QueueWindowEvent(event, hwnd);

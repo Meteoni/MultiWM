@@ -312,13 +312,7 @@ static bool GetObservedWorkspaceKey(
   }
 
   if (HasReconcileScope(scope, ReconcileScope::Monitor)) {
-    HMONITOR monitor = nullptr;
-    RECT frame{};
-    if (GetWindowFrameRect(hwnd, &frame) &&
-        frame.right > frame.left && frame.bottom > frame.top) {
-      monitor = MonitorFromRect(&frame, MONITOR_DEFAULTTONULL);
-    }
-    if (!monitor) monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
     if (monitor) {
       observed.monitor = monitor;
       observedAnything = true;
@@ -484,13 +478,14 @@ static void ReconcileKnownWindows(
 }
 
 static void AddUniqueMonitor(std::vector<HMONITOR>& monitors, HMONITOR monitor) {
-  if (monitor && std::find(monitors.begin(), monitors.end(), monitor) == monitors.end()) {
+  if (IsLiveMonitorHandle(monitor) &&
+      std::find(monitors.begin(), monitors.end(), monitor) == monitors.end()) {
     monitors.push_back(monitor);
   }
 }
 
 static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) {
-  if (!monitor) return;
+  if (!IsLiveMonitorHandle(monitor)) return;
   // Only if not scheduled already
   auto it = std::find_if(
       g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
@@ -511,7 +506,7 @@ static bool DiscoverWorkspaceWindows(
     HMONITOR monitor, const GUID& desktopId, const std::vector<HWND>& snapshot,
     DesktopMonitorKey* outKey,
     std::vector<DesktopMonitorKey>* ownershipChangedKeys = nullptr) {
-  if (!monitor) return false;
+  if (!IsLiveMonitorHandle(monitor)) return false;
 
   DesktopMonitorKey key{desktopId, monitor};
   if (outKey) *outKey = key;
@@ -557,16 +552,23 @@ static bool DiscoverCurrentWorkspaceOnMonitor(HMONITOR monitor) {
   }
 
   std::vector<HWND> snapshot = CollectTileWindows(monitor);
-  DesktopMonitorKey key{};
-  if (!DiscoverWorkspaceWindows(monitor, currentDesktop, snapshot, &key)) {
-    return false;
-  }
+  DesktopMonitorKey key{currentDesktop, monitor};
+  const bool changed =
+      DiscoverWorkspaceWindows(monitor, currentDesktop, snapshot, &key);
+
+  // "No model mutation" is not the same as "no workspace". Startup, mode changes,
+  // and explicit monitor passes may need to reinforce already-correct membership.
+  Workspace existing;
+  const bool hasWorkspace = changed || g_workspaces.Load(key, &existing);
+  if (!hasWorkspace) return false;
 
   ArrangeWorkspace(key);
   return true;
 }
 
 static void EnumerateCurrentMonitors(std::vector<HMONITOR>& monitors) {
+  // This helper means "current OS topology", not "merge more monitor handles".
+  monitors.clear();
   EnumDisplayMonitors(
       nullptr, nullptr,
       [](HMONITOR monitor, HDC, LPRECT, LPARAM lParam) WINAPI -> BOOL {
@@ -607,13 +609,7 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
           return TRUE;
         }
 
-        RECT frameRect{};
-        if (!GetWindowFrameRect(hwnd, &frameRect) ||
-            frameRect.right <= frameRect.left || frameRect.bottom <= frameRect.top) {
-          return TRUE;
-        }
-
-        if (MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == ctx->targetMonitor) {
+        if (GetWindowPhysicalMonitor(hwnd) == ctx->targetMonitor) {
           ctx->windowList->push_back(hwnd);
           ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
         }
@@ -783,16 +779,24 @@ static void ReconcileDeferredLifecycle() {
     ReconcileKnownWindows(ReconcileScope::Desktop, &globallyChanged, hwnd);
   }
 
-  std::vector<HMONITOR> monitors = g_workspaces.MonitorsOnDesktop(currentDesktop);
+  std::vector<HMONITOR> monitors;
   if (fallbackDesktopChange || g_wm.forceMonitorReconcile) {
-    // Desktop transitions, display/work-area changes, and platform recovery are
-    // all authoritative reasons to softly reinforce existing current workspaces,
-    // even when logical membership itself did not change.
-    for (HMONITOR monitor : monitors) {
-      AddPendingWorkspaceArrange(currentDesktop, monitor);
-    }
+    // Authoritative desktop/topology passes derive their boundary set from the OS,
+    // not from whatever workspace keys happened to exist before the transition.
     EnumerateCurrentMonitors(monitors);
+    for (HMONITOR monitor : monitors) {
+      DesktopMonitorKey key{currentDesktop, monitor};
+      Workspace existing;
+      if (g_workspaces.Load(key, &existing)) {
+        AddPendingWorkspaceArrange(currentDesktop, monitor);
+      }
+    }
+  } else {
+    // Incremental lifecycle work stays cheap: start from known live workspace
+    // boundaries and add only monitors implicated by this burst.
+    monitors = g_workspaces.MonitorsOnDesktop(currentDesktop);
   }
+
   if (g_wm.forceMonitorReconcile) {
     ReconcileKnownWindows(ReconcileScope::Monitor, &globallyChanged);
     g_wm.forceMonitorReconcile = false;
@@ -804,7 +808,7 @@ static void ReconcileDeferredLifecycle() {
     if (!hwnd || !IsWindow(hwnd)) continue;
     BOOL onCurrent = FALSE;
     if (!IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) continue;
-    AddUniqueMonitor(monitors, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL));
+    AddUniqueMonitor(monitors, GetWindowPhysicalMonitor(hwnd));
   }
 
   // One top-level enumeration is enough for every monitor involved in this burst.
@@ -850,9 +854,10 @@ static void ReconcileDeferredLifecycle() {
   TrayUi::RefreshForCurrentWorkspace();
 }
 
-static void ReconcileManagedWindowStateNow(HWND hwnd) {
+static void ReconcileManagedWindowStateNow(
+    HWND hwnd, ReconcileScope scope = ReconcileScope::Participation) {
   std::vector<DesktopMonitorKey> changedKeys;
-  ReconcileKnownWindows(ReconcileScope::Participation, &changedKeys, hwnd);
+  ReconcileKnownWindows(scope, &changedKeys, hwnd);
   for (const auto& key : changedKeys) ArrangeWorkspace(key);
 }
 
@@ -910,10 +915,15 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
 
     case EVENT_OBJECT_LOCATIONCHANGE:
       // A leased tiled window may have accepted our placement and moved itself
-      // later during startup/session restore. Consume that narrow case before the
-      // normal participation fallback used for maximize/restore transitions.
+      // later during startup/session restore. Consume that narrow case first.
       if (HandleConformanceLeaseLocationChange(hwnd)) break;
-      ReconcileManagedWindowStateNow(hwnd);
+
+      // LOCATIONCHANGE is normally suppressed because our own SetWindowPos emits
+      // it. The WinEvent adapter only lets this non-lease path through for a
+      // maximized/restored tracked window or an actual monitor-owner mismatch, so
+      // repairing monitor ownership here is both cheap and non-recursive.
+      ReconcileManagedWindowStateNow(
+          hwnd, ReconcileScope::Participation | ReconcileScope::Monitor);
       ScheduleLifecycleReconcile(hwnd);
       break;
 

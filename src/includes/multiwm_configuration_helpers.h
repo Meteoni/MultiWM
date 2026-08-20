@@ -69,6 +69,31 @@ bool GetWindowFrameRect(HWND hwnd, RECT* outRect) {
   return GetWindowRect(hwnd, outRect) != FALSE;
 }
 
+// One authoritative HWND -> physical-monitor observation for routing workspace
+// ownership. Restored/maximized windows prefer the DWM frame so every caller uses
+// the same monitor-boundary rule. Minimized windows deliberately fall back to
+// MonitorFromWindow(), which Windows resolves from the pre-minimize rectangle.
+static HMONITOR GetWindowPhysicalMonitor(HWND hwnd) {
+  if (!hwnd || !IsWindow(hwnd)) return nullptr;
+
+  if (!IsIconic(hwnd)) {
+    RECT frame{};
+    if (GetWindowFrameRect(hwnd, &frame) &&
+        frame.right > frame.left && frame.bottom > frame.top) {
+      HMONITOR monitor = MonitorFromRect(&frame, MONITOR_DEFAULTTONULL);
+      if (monitor) return monitor;
+    }
+  }
+
+  return MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+}
+
+static bool IsLiveMonitorHandle(HMONITOR monitor) {
+  if (!monitor) return false;
+  MONITORINFO monitorInfo{sizeof(monitorInfo)};
+  return GetMonitorInfoW(monitor, &monitorInfo) != FALSE;
+}
+
 bool GetMonitorWorkArea(HMONITOR monitor, RECT* outRect) {
   if (!monitor || !outRect) return false;
   MONITORINFO monitorInfo = {sizeof(monitorInfo)};
@@ -214,8 +239,6 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     const HMONITOR floatingMonitor = existing.floatingMonitor;
     const UINT floatingDpi = existing.floatingDpi;
     const bool hasFloatingRect = existing.hasFloatingRect;
-    const uint64_t tilingGeneration = existing.tilingGeneration;
-    const WindowConstraints constraints = existing.constraints;
     const ManageState state = existing.state;
     const SuspensionReason suspension = existing.suspensionReason;
     const SuspendedSlot slot = existing.savedSlot;
@@ -227,10 +250,6 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     existing.lastPlacementResult = lastResult;
     existing.lastRequestedRect = lastRequested;
     existing.lastObservedRect = lastObserved;
-    existing.tilingGeneration = tilingGeneration;
-    if (!existing.constraints.valid && constraints.valid) {
-      existing.constraints = constraints;
-    }
     if (hasFloatingRect) {
       existing.floatingRect = floatingRect;
       existing.floatingMonitor = floatingMonitor;
@@ -250,7 +269,6 @@ bool Workspace::ActivateTiled(HWND hwnd, bool resetPlacementFailures) {
   WindowRecord* record = FindMutable(hwnd);
   if (!record) return false;
 
-  const ManageState previousState = record->state;
   bool changed = false;
   if (record->state != ManageState::Tiled || record->hasSavedSlot ||
       record->suspensionReason != SuspensionReason::None) {
@@ -258,11 +276,6 @@ bool Workspace::ActivateTiled(HWND hwnd, bool resetPlacementFailures) {
     record->suspensionReason = SuspensionReason::None;
     record->savedSlot = {};
     record->hasSavedSlot = false;
-    if (previousState == ManageState::Floating || previousState == ManageState::Ignored) {
-      record->tilingGeneration = Model::NextTilingGeneration();
-    } else if (!record->tilingGeneration) {
-      record->tilingGeneration = Model::NextTilingGeneration();
-    }
     changed = true;
   }
   if (resetPlacementFailures && record->placementFailures != 0) {
@@ -282,9 +295,6 @@ bool Workspace::AdmitTiled(WindowRecord record, bool resetPlacementFailures) {
   if (!record.hwnd) return false;
   const HWND hwnd = record.hwnd;
   const bool existed = HasRecord(hwnd);
-  if (!existed && !record.tilingGeneration) {
-    record.tilingGeneration = Model::NextTilingGeneration();
-  }
   UpsertRecord(std::move(record));
   const bool activated = ActivateTiled(hwnd, resetPlacementFailures);
   return !existed || activated;
@@ -297,45 +307,6 @@ bool Workspace::ResetPlacementFailures(HWND hwnd) {
   record->placementFailures = 0;
   DebugValidateMutation(L"Workspace::ResetPlacementFailures");
   return true;
-}
-
-bool Workspace::UpdateConstraints(
-    HWND hwnd, const WindowConstraints& constraints) {
-  AssertWmThread(L"Workspace::UpdateConstraints");
-  WindowRecord* record = FindMutable(hwnd);
-  if (!record) return false;
-
-  const WindowConstraints& old = record->constraints;
-  if (!record->tilingGeneration) {
-    record->tilingGeneration = Model::NextTilingGeneration();
-  }
-  const bool changed =
-      old.minWidth != constraints.minWidth ||
-      old.minHeight != constraints.minHeight ||
-      old.maxWidth != constraints.maxWidth ||
-      old.maxHeight != constraints.maxHeight ||
-      old.dpi != constraints.dpi ||
-      old.valid != constraints.valid ||
-      old.maxWidthBounded != constraints.maxWidthBounded ||
-      old.maxHeightBounded != constraints.maxHeightBounded ||
-      old.lastProbeTimedOut != constraints.lastProbeTimedOut ||
-      old.lastProbeError != constraints.lastProbeError;
-  record->constraints = constraints;
-  return changed;
-}
-
-HWND Workspace::NewestTiledWindow() const {
-  HWND newest = nullptr;
-  uint64_t newestGeneration = 0;
-  for (HWND hwnd : windows_) {
-    const WindowRecord* record = Find(hwnd);
-    if (!record) continue;
-    if (!newest || record->tilingGeneration >= newestGeneration) {
-      newest = hwnd;
-      newestGeneration = record->tilingGeneration;
-    }
-  }
-  return newest ? newest : (windows_.empty() ? nullptr : windows_.back());
 }
 
 bool Workspace::RememberFloatingGeometry(
@@ -374,12 +345,8 @@ Workspace Workspace::AdoptGeometry(
   Workspace workspace;
   workspace.layout_ = layout;
   for (const auto& item : items) {
-    WindowRecord record = item.record;
-    if (!record.tilingGeneration) {
-      record.tilingGeneration = Model::NextTilingGeneration();
-    }
-    workspace.windows_.push_back(record.hwnd);
-    workspace.records_.emplace(record.hwnd, std::move(record));
+    workspace.windows_.push_back(item.record.hwnd);
+    workspace.records_.emplace(item.record.hwnd, item.record);
   }
   if (items.empty()) return workspace;
 

@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.14.0
+// @version         1.13.1
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -32,7 +32,7 @@ resize-adjusted ratios per virtual desktop.
 - Optional per-layout .ico overrides with generated text fallback
 - Compact Win32 status flyout appears on layout/desktop changes and Automatic/Manual mode switches
 - Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
-- Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate
+- Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate; every connected monitor is visited at startup and authoritative topology passes
 - Maximized windows preserve their saved tile and use a targeted location-change fallback to detect restore transitions reliably
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
@@ -41,7 +41,6 @@ resize-adjusted ratios per virtual desktop.
 - New-workspace initialization discovers visible minimized/maximized windows as suspended logical members instead of losing them
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
-- Constraint-aware layout measurement respects reported minimum/meaningful maximum tracking sizes; unsatisfiable layouts float the newest tiled window and retry
 
 ## Default Hotkeys
 - Tile windows: Alt + D
@@ -56,7 +55,6 @@ resize-adjusted ratios per virtual desktop.
 - Floating exists both as a workspace mode and as a per-window managed state; remembered floating geometry is restored on migration, explicit floating, and workspace layout transitions into Floating.
 - Private virtual-desktop manager and notification ABIs are selected automatically from the actual Explorer build/revision; unknown manager generations are rejected instead of guessed.
 - If Virtual Desktop APIs are unavailable, tiling still works but per-desktop memory is disabled.
-- A window floated because its size constraints cannot fit becomes an ordinary managed Floating window; it is not automatically re-tiled later.
 */
 // ==/WindhawkModReadme==
 
