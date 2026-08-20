@@ -1024,7 +1024,7 @@ static void WriteDiagnosticReport() {
   report.Line(L"============================================================");
   report.Line(L"TILING HELPER DIAGNOSTIC REPORT");
   report.Line(L"============================================================");
-  report.Line(L"Mod version: 1.13.1");
+  report.Line(L"Mod version: %ls", WH_MOD_VERSION);
   report.Line(L"Report sequence: %llu", static_cast<unsigned long long>(reportSequence));
   report.Line(L"Generated local: %ls", DiagnosticSystemTimeString(local).c_str());
   report.Line(L"Generated UTC:   %ls", DiagnosticSystemTimeString(utc).c_str());

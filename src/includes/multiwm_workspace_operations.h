@@ -727,6 +727,13 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
   WindowRecord* record = FindMutable(hwnd);
   if (!record) return PlacementAction::Forget;
 
+  // placementFailures is a consecutive-failure streak for materially the same
+  // authoritative target, not a lifetime bad-window score. Compare against the
+  // previous request before overwriting the diagnostic snapshot below.
+  const bool sameFailureTarget =
+      record->placementFailures > 0 &&
+      RectsNear(record->lastRequestedRect, observation.requested);
+
   record->lastRequestedRect = observation.requested;
   record->lastObservedRect = observation.observed;
   record->lastPlacementResult = observation.result;
@@ -740,7 +747,8 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
     case PlacementResult::AdjustedByWindow:
     case PlacementResult::AccessDenied:
     case PlacementResult::Refused:
-      ++record->placementFailures;
+      record->placementFailures =
+          sameFailureTarget ? record->placementFailures + 1 : 1;
       DebugValidateMutation(L"Workspace::ApplyPlacementObservation");
       return record->placementFailures >= Model::kPlacementFailureLimit
                  ? PlacementAction::Float
