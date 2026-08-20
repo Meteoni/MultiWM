@@ -729,10 +729,11 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
 
   // placementFailures is a consecutive-failure streak for materially the same
   // authoritative target, not a lifetime bad-window score. Compare against the
-  // previous request before overwriting the diagnostic snapshot below.
+  // fixed streak anchor rather than lastRequestedRect so repeated small target
+  // changes cannot walk the streak beyond the placement tolerance.
   const bool sameFailureTarget =
       record->placementFailures > 0 &&
-      RectsNear(record->lastRequestedRect, observation.requested);
+      RectsNear(record->placementFailureTarget, observation.requested);
 
   record->lastRequestedRect = observation.requested;
   record->lastObservedRect = observation.observed;
@@ -741,14 +742,19 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
   switch (observation.result) {
     case PlacementResult::Success:
       record->placementFailures = 0;
+      record->placementFailureTarget = {};
       DebugValidateMutation(L"Workspace::ApplyPlacementObservation");
       return PlacementAction::None;
 
     case PlacementResult::AdjustedByWindow:
     case PlacementResult::AccessDenied:
     case PlacementResult::Refused:
-      record->placementFailures =
-          sameFailureTarget ? record->placementFailures + 1 : 1;
+      if (sameFailureTarget) {
+        ++record->placementFailures;
+      } else {
+        record->placementFailures = 1;
+        record->placementFailureTarget = observation.requested;
+      }
       DebugValidateMutation(L"Workspace::ApplyPlacementObservation");
       return record->placementFailures >= Model::kPlacementFailureLimit
                  ? PlacementAction::Float

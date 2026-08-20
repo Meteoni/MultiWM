@@ -551,6 +551,10 @@ struct WindowRecord {
   bool topmost = false;
 
   int placementFailures = 0;
+  // Anchor of the current consecutive-failure streak. Unlike lastRequestedRect,
+  // this does not walk forward with each near-equal request; it changes only
+  // when a materially different failed target starts a new streak.
+  RECT placementFailureTarget{};
   PlacementResult lastPlacementResult = PlacementResult::Success;
   RECT lastRequestedRect{};
   RECT lastObservedRect{};

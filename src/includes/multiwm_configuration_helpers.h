@@ -232,6 +232,7 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     WindowRecord& existing = it->second;
     const DWORD pid = it->second.pid;
     const int failures = existing.placementFailures;
+    const RECT failureTarget = existing.placementFailureTarget;
     const PlacementResult lastResult = existing.lastPlacementResult;
     const RECT lastRequested = existing.lastRequestedRect;
     const RECT lastObserved = existing.lastObservedRect;
@@ -247,6 +248,7 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     existing = std::move(record);
     existing.pid = existing.pid ? existing.pid : pid;
     existing.placementFailures = failures;
+    existing.placementFailureTarget = failureTarget;
     existing.lastPlacementResult = lastResult;
     existing.lastRequestedRect = lastRequested;
     existing.lastObservedRect = lastObserved;
@@ -280,6 +282,7 @@ bool Workspace::ActivateTiled(HWND hwnd, bool resetPlacementFailures) {
   }
   if (resetPlacementFailures && record->placementFailures != 0) {
     record->placementFailures = 0;
+    record->placementFailureTarget = {};
     changed = true;
   }
   if (!ContainsWindow(windows_, hwnd)) {
@@ -305,6 +308,7 @@ bool Workspace::ResetPlacementFailures(HWND hwnd) {
   WindowRecord* record = FindMutable(hwnd);
   if (!record || record->placementFailures == 0) return false;
   record->placementFailures = 0;
+  record->placementFailureTarget = {};
   DebugValidateMutation(L"Workspace::ResetPlacementFailures");
   return true;
 }

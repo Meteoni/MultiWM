@@ -493,6 +493,11 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
   report.Line(
       L"      placement: result=%ls failures=%d",
       DiagnosticPlacementResultName(record.lastPlacementResult), record.placementFailures);
+  if (record.placementFailures > 0) {
+    report.Line(
+        L"      failureTarget=%ls",
+        DiagnosticRectString(record.placementFailureTarget).c_str());
+  }
   report.Line(L"      lastRequested=%ls", DiagnosticRectString(record.lastRequestedRect).c_str());
   report.Line(L"      lastObserved =%ls", DiagnosticRectString(record.lastObservedRect).c_str());
 
