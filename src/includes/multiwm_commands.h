@@ -73,7 +73,7 @@ void FloatFocusedWindow() {
 // geometry. Automatic events never call this with adoptCurrentGeometry=true.
 void TileWindows() {
   ++Diagnostics::g_runtime.counters.tileCommands;
-  HMONITOR monitor = GetTargetMonitor();
+  HMONITOR monitor = GetWorkspaceCommandMonitor();
   if (!monitor) return;
 
   std::vector<DesktopMonitorKey> changedKeys;
@@ -99,7 +99,7 @@ void TileWindows() {
 // suspended slots before persisting, arranging, and updating UI feedback.
 void CycleCurrentWorkspaceLayout() {
   ++Diagnostics::g_runtime.counters.layoutCycleCommands;
-  HMONITOR monitor = GetTargetMonitor();
+  HMONITOR monitor = GetWorkspaceCommandMonitor();
   if (!monitor) return;
   DesktopMonitorKey key{};
   if (!GetCurrentWorkspaceKey(monitor, &key)) return;
@@ -118,7 +118,7 @@ void CycleCurrentWorkspaceLayout() {
   g_workspaces.Save(key, state);
   ArrangeWorkspace(key);
   TrayUi::UpdateIcon(state.Layout());
-  TrayUi::ShowLayoutFlyout(state.Layout());
+  TrayUi::ShowLayoutFlyout(state.Layout(), monitor);
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.Layout()));
   Diagnostics::RecordEvent(
       L"layout cycle desktop=%08X monitor=%p from=%d to=%d", key.desktopId.Data1,

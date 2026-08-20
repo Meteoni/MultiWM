@@ -17,16 +17,25 @@ static inline long long WindowAreaOnWorkArea(HWND hwnd, const RECT& workArea) {
   return RectAreaLL(inter);
 }
 
-static HMONITOR GetTargetMonitor() {
+// Monitor targeting policy is intentionally explicit:
+// - workspace-level user commands follow the cursor, because this mod doesn't
+//   maintain a separate WM "focused monitor" state;
+// - window-level commands derive ownership from the focused HWND itself;
+// - passive UI refreshes use the foreground window's monitor.
+static HMONITOR GetCursorMonitor() {
+  POINT cursorPos{};
+  if (!GetCursorPos(&cursorPos)) return nullptr;
+  return MonitorFromPoint(cursorPos, MONITOR_DEFAULTTONEAREST);
+}
+
+static HMONITOR GetForegroundMonitor() {
   HWND foregroundWindow = GetForegroundWindow();
-  HMONITOR monitor = foregroundWindow ? GetWindowPhysicalMonitor(foregroundWindow) : nullptr;
-  if (!monitor) {
-    POINT cursorPos{};
-    if (GetCursorPos(&cursorPos)) {
-      monitor = MonitorFromPoint(cursorPos, MONITOR_DEFAULTTONEAREST);
-    }
-  }
-  return monitor;
+  return foregroundWindow ? GetWindowPhysicalMonitor(foregroundWindow) : nullptr;
+}
+
+static HMONITOR GetWorkspaceCommandMonitor() {
+  HMONITOR monitor = GetCursorMonitor();
+  return monitor ? monitor : GetForegroundMonitor();
 }
 
 static LONG GetWorkspaceGapPixels(HMONITOR monitor) {
@@ -549,7 +558,7 @@ static void LoadSettings();
 static bool Initialize();
 static void Shutdown();
 static void UpdateIcon(TileLayout layout);
-static void ShowLayoutFlyout(TileLayout layout);
+static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor = nullptr);
 static void ShowManagementModeFlyout(bool automatic);
 static void RefreshForCurrentWorkspace();
 }  // namespace TrayUi

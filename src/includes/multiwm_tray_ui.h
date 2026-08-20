@@ -336,9 +336,9 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
   return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-static void ShowStatusFlyout(const wchar_t* text) {
+static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
   if (!g_flyoutWindow || !text || !*text) return;
-  HMONITOR monitor = GetTargetMonitor();
+  if (!monitor) monitor = GetWorkspaceCommandMonitor();
   RECT workArea{};
   if (!monitor || !GetMonitorWorkArea(monitor, &workArea)) return;
 
@@ -382,13 +382,15 @@ static void ShowStatusFlyout(const wchar_t* text) {
   }
 }
 
-static void ShowLayoutFlyout(TileLayout layout) {
+static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor) {
   if (layout == TileLayout::COUNT) return;
-  ShowStatusFlyout(LayoutFlyoutText(layout));
+  ShowStatusFlyout(LayoutFlyoutText(layout), monitor);
 }
 
 static void ShowManagementModeFlyout(bool automatic) {
-  ShowStatusFlyout(automatic ? L"Automatic Mode" : L"Manual Mode");
+  ShowStatusFlyout(
+      automatic ? L"Automatic Mode" : L"Manual Mode",
+      GetWorkspaceCommandMonitor());
 }
 
 //-----------------------------------------------------------------------------
@@ -399,7 +401,8 @@ static void ShowManagementModeFlyout(bool automatic) {
 // the refresh observes a transition between known virtual desktops.
 static void RefreshForCurrentWorkspace() {
   TileLayout layout = g_settings.defaultLayout;
-  HMONITOR monitor = GetTargetMonitor();
+  HMONITOR monitor = GetForegroundMonitor();
+  if (!monitor) monitor = GetCursorMonitor();
   DesktopMonitorKey key{};
   Workspace state;
   bool haveKey = monitor && GetCurrentWorkspaceKey(monitor, &key);
@@ -412,7 +415,7 @@ static void RefreshForCurrentWorkspace() {
     g_haveDisplayedDesktopId = true;
   }
   UpdateIcon(layout);
-  if (desktopChanged) ShowLayoutFlyout(layout);
+  if (desktopChanged) ShowLayoutFlyout(layout, monitor);
 }
 
 static void HandleThemeChanged() {
