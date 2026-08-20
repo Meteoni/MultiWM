@@ -168,6 +168,7 @@ constexpr UINT WM_APP_LAYOUT_CYCLE = WM_APP + 5;
 constexpr UINT WM_APP_RECONCILE_NOW = WM_APP + 6;
 constexpr UINT WM_APP_LAYOUT_SET = WM_APP + 7;
 constexpr UINT WM_APP_MANAGEMENT_MODE_SET = WM_APP + 8;
+constexpr UINT WM_APP_TILE_WORKSPACE = WM_APP + 9;
 
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
 enum class MouseMoveBehavior { Float, Swap };

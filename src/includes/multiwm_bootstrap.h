@@ -318,6 +318,10 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
           reinterpret_cast<HMONITOR>(msg.wParam));
       return WmMessageDisposition::Handled;
 
+    case WM_APP_TILE_WORKSPACE:
+      Commands::TileWindows(reinterpret_cast<HMONITOR>(msg.wParam));
+      return WmMessageDisposition::Handled;
+
     case WM_APP_LAYOUT_SET:
       Commands::SetCurrentWorkspaceLayout(
           static_cast<TileLayout>(msg.lParam),

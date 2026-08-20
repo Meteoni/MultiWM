@@ -17,8 +17,8 @@ constexpr wchar_t kTrayWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
 constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkTilingHelperStatusFlyout";
 constexpr UINT kTrayCallbackMessage = WM_APP + 20;
 constexpr UINT kIconId = 1;
-constexpr UINT kContextAutomaticMode = 41001;
-constexpr UINT kContextManualMode = 41002;
+constexpr UINT kContextTileWorkspace = 41001;
+constexpr UINT kContextToggleMode = 41002;
 constexpr UINT kContextLayoutBase = 41100;
 constexpr int kIconCanvasSize = 32;
 constexpr int kTrayFontHeight = 26;
@@ -562,29 +562,24 @@ static void ShowContextMenu() {
   HMENU menu = CreatePopupMenu();
   if (!menu) return;
 
-  AppendMenuW(menu, MF_STRING, kContextAutomaticMode, L"Automatic Mode");
-  AppendMenuW(menu, MF_STRING, kContextManualMode, L"Manual Mode");
-  CheckMenuRadioItem(
-      menu, kContextAutomaticMode, kContextManualMode,
-      IsAutomaticMode() ? kContextAutomaticMode : kContextManualMode,
-      MF_BYCOMMAND);
+  AppendMenuW(menu, MF_STRING, kContextTileWorkspace, L"Tile Workspace");
+  AppendMenuW(
+      menu, MF_STRING, kContextToggleMode,
+      IsAutomaticMode() ? L"Switch to Manual Mode" : L"Switch to Automatic Mode");
 
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
   const TileLayout currentLayout = GetMonitorLayoutOrDefault(monitor);
-  UINT checkedLayoutCommand = 0;
   for (size_t i = 0; i < g_settings.layoutCycle.size(); ++i) {
     const TileLayout layout = g_settings.layoutCycle[i];
     const UINT command = kContextLayoutBase + static_cast<UINT>(i);
-    AppendMenuW(menu, MF_STRING, command, LayoutDisplayName(layout));
-    if (layout == currentLayout) checkedLayoutCommand = command;
-  }
-
-  if (!g_settings.layoutCycle.empty() && checkedLayoutCommand) {
-    CheckMenuRadioItem(
-        menu, kContextLayoutBase,
-        kContextLayoutBase + static_cast<UINT>(g_settings.layoutCycle.size() - 1),
-        checkedLayoutCommand, MF_BYCOMMAND);
+    UINT flags = MF_STRING;
+    if (layout == currentLayout) {
+      // Only the active layout carries a marker. Disable it as selecting the
+      // current layout would be a no-op, and let the native menu render it grey.
+      flags |= MF_CHECKED | MF_GRAYED;
+    }
+    AppendMenuW(menu, flags, command, LayoutDisplayName(layout));
   }
 
   POINT point{};
@@ -604,10 +599,17 @@ static void ShowContextMenu() {
   const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
   if (!threadId || !command) return;
 
-  if (command == kContextAutomaticMode || command == kContextManualMode) {
-    const ManagementMode mode = command == kContextAutomaticMode
-                                    ? ManagementMode::Automatic
-                                    : ManagementMode::Manual;
+  if (command == kContextTileWorkspace) {
+    PostThreadMessageW(
+        threadId, WM_APP_TILE_WORKSPACE,
+        reinterpret_cast<WPARAM>(monitor), 0);
+    return;
+  }
+
+  if (command == kContextToggleMode) {
+    const ManagementMode mode = IsAutomaticMode()
+                                    ? ManagementMode::Manual
+                                    : ManagementMode::Automatic;
     PostThreadMessageW(
         threadId, WM_APP_MANAGEMENT_MODE_SET,
         static_cast<WPARAM>(mode), 0);

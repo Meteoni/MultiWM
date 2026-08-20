@@ -71,9 +71,9 @@ void FloatFocusedWindow() {
 
 // Manual tile: reconcile membership and explicitly adopt the user's current
 // geometry. Automatic events never call this with adoptCurrentGeometry=true.
-void TileWindows() {
+void TileWindows(HMONITOR monitor = nullptr) {
   ++Diagnostics::g_runtime.counters.tileCommands;
-  HMONITOR monitor = GetWorkspaceCommandMonitor();
+  if (!monitor) monitor = GetWorkspaceCommandMonitor();
   if (!monitor) return;
 
   std::vector<DesktopMonitorKey> changedKeys;
