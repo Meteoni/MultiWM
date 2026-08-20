@@ -643,7 +643,7 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Floating geometry repairs", c.floatingGeometryRepairs, previous.floatingGeometryRepairs, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance leases started", c.conformanceLeasesStarted, previous.conformanceLeasesStarted, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance lease reinforcement attempts", c.conformanceLeaseRepairs, previous.conformanceLeaseRepairs, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Conformance lease exhausted", c.conformanceLeaseExhausted, previous.conformanceLeaseExhausted, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Conformance lease deferred burst repairs", c.conformanceLeaseDeferredRepairs, previous.conformanceLeaseDeferredRepairs, uptimeMs, intervalMs);
 
   report.Line();
   report.Line(L"Virtual desktop / runtime lifecycle / user commands");
@@ -1078,6 +1078,7 @@ static void WriteDiagnosticReport() {
   report.Line(L"Master percent: %ld", g_settings.masterPercent);
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
   report.Line(L"Tiled conformance lease: %u ms", g_settings.conformanceLeaseMs);
+  report.Line(L"Conformance repair min interval: %u ms", kConformanceRepairMinIntervalMs);
   report.Line(L"Lifecycle settle delay: %u ms", g_settings.reconcileDelayMs);
   report.Line(L"Exclusion rules: %zu", g_settings.exclusionRules.size());
   report.TextLine(L"Diagnostic output setting: ", g_settings.diagnosticsOutputPath);

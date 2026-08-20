@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.8
+// @version         1.13.9
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -24,7 +24,7 @@ resize-adjusted ratios per virtual desktop.
 - DPI-aware workspace insets/window gaps and independent master size
 - Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
 - Uses native virtual-desktop notifications with centralized transient-failure retry; settled cloak/visibility reconciliation independently detects missed desktop switches as a safety fallback
-- Checked placement with per-window failure tracking, a configurable short conformance lease for late application self-moves, and automatic floating for repeatedly non-compliant windows
+- Checked placement with per-window failure tracking, a configurable deadline-bounded conformance lease for late application self-moves, and automatic floating for repeatedly non-compliant windows
 - Manual or Automatic management modes: Manual keeps Alt+D groups inert, while Automatic continuously discovers and migrates windows
 - Configurable mouse drag behavior: float the moved window or swap it with the tiled window under the pointer
 - Dedicated optional hotkey to float the focused tiled window
@@ -191,7 +191,7 @@ resize-adjusted ratios per virtual desktop.
 
 - ConformanceLeaseMs: 1500
   $name: '[Advanced] Tiled Window Conformance Lease (ms)'
-  $description: 'After an authoritative tiled placement, briefly reinforce the assigned rectangle if the application moves itself again. User move/resize gestures cancel the lease immediately. Set to 0 to disable (0-10000 ms). [Default 1500]'
+  $description: 'After an authoritative tiled placement, briefly reinforce the assigned rectangle if the application moves itself again. The configured duration is a hard deadline: repeating the same authoritative placement does not extend it. User move/resize gestures cancel the lease immediately. Set to 0 to disable (0-10000 ms). [Default 1500]'
 
 - ReconcileDelayMs: 80
   $name: '[Advanced] Lifecycle Settle Delay (ms)'

@@ -350,6 +350,11 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
         RuntimeLifecycle::RunMaintenanceNow();
         return WmMessageDisposition::Handled;
       }
+      if (g_wm.conformanceTimer &&
+          static_cast<UINT_PTR>(msg.wParam) == g_wm.conformanceTimer) {
+        ProcessPendingConformanceRepairs();
+        return WmMessageDisposition::Handled;
+      }
       return WmMessageDisposition::DispatchToWindows;
 
     case WM_HOTKEY:
@@ -419,6 +424,10 @@ static void CleanupWmThread() {
   if (g_wm.maintenanceTimer) {
     KillTimer(nullptr, g_wm.maintenanceTimer);
     g_wm.maintenanceTimer = 0;
+  }
+  if (g_wm.conformanceTimer) {
+    KillTimer(nullptr, g_wm.conformanceTimer);
+    g_wm.conformanceTimer = 0;
   }
   g_wm.lifecycleDirtyWindows.clear();
   g_wm.pendingDesktopArranges.clear();

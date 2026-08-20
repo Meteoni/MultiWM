@@ -876,47 +876,56 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
 
   if (!IsWindow(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd) ||
       !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd)) {
-    CancelConformanceLease(hwnd);
+    CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
 
   const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
   if (owners.size() != 1 || !IsWorkspaceOnActiveDesktop(owners.front())) {
-    CancelConformanceLease(hwnd);
+    CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
 
   Workspace workspace;
   if (!g_workspaces.Load(owners.front(), &workspace)) {
-    CancelConformanceLease(hwnd);
+    CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record || record->state != ManageState::Tiled ||
       workspace.Layout() == TileLayout::Floating) {
-    CancelConformanceLease(hwnd);
+    CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
 
   RECT current{};
   if (!GetWindowFrameRect(hwnd, &current)) {
-    CancelConformanceLease(hwnd);
+    CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
   if (RectsNear(current, lease.expectedRect)) {
     return true;  // Our own placement/event echo; nothing to repair.
   }
 
-  if (lease.repairs >= kConformanceLeaseMaxRepairs) {
-    CancelConformanceLease(hwnd);
-    ++Diagnostics::g_runtime.counters.conformanceLeaseExhausted;
-    Diagnostics::RecordEvent(
-        L"conformance lease exhausted hwnd=%p expected=[%ld,%ld,%ld,%ld] actual=[%ld,%ld,%ld,%ld]",
-        hwnd, lease.expectedRect.left, lease.expectedRect.top,
-        lease.expectedRect.right, lease.expectedRect.bottom,
-        current.left, current.top, current.right, current.bottom);
-    return true;
+  const ULONGLONG now = GetTickCount64();
+  if (lease.lastRepairTickMs &&
+      now - lease.lastRepairTickMs < kConformanceRepairMinIntervalMs) {
+    const ULONGLONG due =
+        lease.lastRepairTickMs + kConformanceRepairMinIntervalMs;
+    // Do not simply drop a bursty snap-back event: schedule one delayed re-check
+    // so a final app move inside the rate window cannot leave the tile displaced.
+    if (DeferConformanceLeaseRepair(hwnd, lease.generation, due)) {
+      ++Diagnostics::g_runtime.counters.conformanceLeaseDeferredRepairs;
+      return true;
+    }
+    return false;
   }
+
+  // A copied observation must still refer to the same active lease immediately
+  // before we act. MOVESIZESTART/topology/lifecycle cancellation can happen from
+  // another thread after the initial read; a generation check prevents stale work
+  // from deliberately reviving or accounting against a replacement lease.
+  if (!IsCurrentConformanceLease(hwnd, lease.generation)) return false;
 
   PlacementObservation observation =
       PlaceWindowChecked(hwnd, record->canMove, lease.expectedRect);
@@ -928,14 +937,14 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
       hwnd, lease.repairs + 1, static_cast<int>(observation.result));
 
   if (action == Workspace::PlacementAction::Forget) {
-    CancelConformanceLease(hwnd);
+    CancelConformanceLease(hwnd, lease.generation);
     workspace.Forget(hwnd);
     g_workspaces.Save(owners.front(), workspace);
     ArrangeWorkspace(owners.front());
     return true;
   }
   if (action == Workspace::PlacementAction::Float) {
-    CancelConformanceLease(hwnd);
+    CancelConformanceLease(hwnd, lease.generation);
     workspace.Float(hwnd);
     g_workspaces.Save(owners.front(), workspace);
     ArrangeWorkspace(owners.front());
@@ -944,11 +953,41 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
 
   g_workspaces.Save(owners.front(), workspace);
   if (observation.result == PlacementResult::Success) {
-    RecordConformanceLeaseRepair(hwnd, nullptr);
+    RecordConformanceLeaseRepair(hwnd, lease.generation);
   } else {
-    CancelConformanceLease(hwnd);
+    CancelConformanceLease(hwnd, lease.generation);
   }
   return true;
+}
+
+static void ProcessPendingConformanceRepairs() {
+  AssertWmThread(L"ProcessPendingConformanceRepairs");
+  if (g_wm.conformanceTimer) {
+    KillTimer(nullptr, g_wm.conformanceTimer);
+    g_wm.conformanceTimer = 0;
+  }
+
+  const ULONGLONG now = GetTickCount64();
+  std::vector<HWND> dueWindows;
+  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
+  for (auto it = g_conformanceLeases.leases.begin();
+       it != g_conformanceLeases.leases.end();) {
+    if (now >= it->second.expiresAtTickMs) {
+      it = g_conformanceLeases.leases.erase(it);
+      continue;
+    }
+    if (it->second.repairDueTickMs && it->second.repairDueTickMs <= now) {
+      dueWindows.push_back(it->first);
+      it->second.repairDueTickMs = 0;
+    }
+    ++it;
+  }
+  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+
+  for (HWND hwnd : dueWindows) {
+    HandleConformanceLeaseLocationChange(hwnd);
+  }
+  ScheduleNextConformanceRepairTimer();
 }
 
 // Uses aggregate work-area coverage as a coarse guard against learning arbitrary
