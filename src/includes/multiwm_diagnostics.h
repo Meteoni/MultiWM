@@ -1067,6 +1067,10 @@ static void WriteDiagnosticReport() {
       static_cast<unsigned long long>(counters.reportWriteFailures));
 
   report.Section(L"Configuration snapshot");
+  report.Line(
+      L"Default management mode (next start): %ls",
+      g_settings.defaultManagementMode == ManagementMode::Automatic
+          ? L"Automatic" : L"Manual");
   report.Line(L"Default layout: %ls", DiagnosticLayoutName(g_settings.defaultLayout));
   report.TextLine(L"Layout cycle: ", DiagnosticLayoutCycleString(g_settings.layoutCycle));
   report.Line(

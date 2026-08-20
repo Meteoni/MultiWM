@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.9
+// @version         1.13.10
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -39,6 +39,7 @@ resize-adjusted ratios per virtual desktop.
 - Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
+- Settings hot-reload in bulk on the existing WM actor, avoiding worker/COM/hook/tray teardown for ordinary configuration edits
 - Hotkey diagnostics write a timestamped UTF-8 text report with runtime/churn counters, diagnostic self-cost accounting, significant/lifecycle histories, platform health, telemetry/invariant audits, and deterministic per-workspace/window state
 - New-workspace initialization discovers visible minimized/maximized windows as suspended logical members instead of losing them
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
@@ -64,7 +65,7 @@ resize-adjusted ratios per virtual desktop.
 /*
 - DefaultWindowManagementMode: manual
   $name: '[General] Default Window Management Mode'
-  $description: 'Choose membership policy after startup. Manual keeps Alt+D groups inert: new windows are not admitted, minimizing releases membership, and moving a managed window to another virtual desktop does not carry it into that desktop. Maximized windows still preserve their slot. Automatic continuously discovers and migrates managed windows.'
+  $description: 'Choose the startup membership policy. Manual keeps Alt+D groups inert: new windows are not admitted, minimizing releases membership, and moving a managed window to another virtual desktop does not carry it into that desktop. Maximized windows still preserve their slot. Automatic continuously discovers and migrates managed windows. Changing this setting while the mod is running updates the next-start default; use the hotkey or tray menu to change the live mode.'
   $options:
     - manual: Manual
     - automatic: Automatic
@@ -231,6 +232,7 @@ BOOL WhTool_ModInit() {
   Diagnostics::InitializeProcessRuntime();
   Wh_Log(L"Tiling Helper mod initializing...");
   LoadSettings();
+  g_wm.managementMode = g_settings.defaultManagementMode;
   if (!StartHotkeyThread()) {
     Wh_Log(L"Failed to start hotkey thread");
     return FALSE;
@@ -250,24 +252,20 @@ void WhTool_ModUninit() {
 }
 
 void WhTool_ModSettingsChanged() {
-  Wh_Log(L"Settings changed, reloading...");
+  Wh_Log(L"Settings changed; queueing actor-side bulk reload");
 
-  // Join the old diagnostics/model owner before touching lifetime telemetry.
-  // If it cannot stop, keep the old worker/settings rather than allowing two WM
-  // actors to overlap inside the dedicated tool-mod process.
-  if (!StopHotkeyThread()) {
-    Wh_Log(L"Settings reload aborted because the existing WM worker is still alive");
+  // Do not touch g_settings from Windhawk's callback thread. The existing WM actor
+  // owns configuration and reload side effects just like it owns model mutation.
+  const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+  if (!threadId) {
+    Wh_Log(L"Settings hot reload skipped because no WM actor is active");
     return;
   }
-
-  ++Diagnostics::g_runtime.counters.settingsReloads;
-  Diagnostics::RecordEvent(L"settings reload requested");
-
-  // Settings reload changes defaults/policies but does not destroy per-desktop
-  // workspace identity, layout mode, ordering, or learned ratios.
-  LoadSettings();
-  if (!StartHotkeyThread()) {
-    Wh_Log(L"Failed to restart WM worker after settings change");
+  if (!PostThreadMessageW(threadId, WM_APP_SETTINGS_RELOAD, 0, 0)) {
+    Wh_Log(
+        L"Failed to queue settings hot reload (thread=%lu error=%lu); "
+        L"current settings remain active until the next successful reload/start",
+        threadId, GetLastError());
   }
 }
 

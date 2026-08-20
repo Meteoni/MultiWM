@@ -669,6 +669,19 @@ static void RefreshForCurrentWorkspace() {
   if (monitor) RefreshForMonitor(monitor);
 }
 
+// Bulk settings reload already refreshed flyout geometry and custom icon paths.
+// Rebuild only the cheap UI resources that depend on those values; keep the tray
+// windows, shell icon registration, and flyout instances alive.
+static void ReloadAppearance() {
+  RebuildIcons();
+  RefreshDisplayedMonitor();
+  for (FlyoutInstance* instance : g_flyouts) {
+    if (instance && instance->hwnd && IsWindowVisible(instance->hwnd)) {
+      InvalidateRect(instance->hwnd, nullptr, TRUE);
+    }
+  }
+}
+
 static void HandleThemeChanged() {
   bool light = ReadSystemLightTheme();
   if (light == g_systemLightTheme) return;

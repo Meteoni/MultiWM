@@ -555,6 +555,7 @@ void WorkspaceRepository::ClearAfterWmStopped() {
 // visible to the WM core.
 namespace TrayUi {
 static void LoadSettings();
+static void ReloadAppearance();
 static bool Initialize();
 static void Shutdown();
 static void UpdateIcon(TileLayout layout, HMONITOR monitor = nullptr);
