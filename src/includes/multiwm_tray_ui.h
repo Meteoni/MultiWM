@@ -693,8 +693,12 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
   if (message == kTrayCallbackMessage) {
     const UINT event = LOWORD(lParam);
     const UINT iconId = HIWORD(lParam);
-    if (iconId == kIconId &&
-        (event == WM_CONTEXTMENU || event == WM_RBUTTONUP)) {
+    // NOTIFYICON_VERSION_4 reports the semantic context-menu activation as
+    // WM_CONTEXTMENU. Do not also react to the legacy WM_RBUTTONUP notification:
+    // one physical right-click can otherwise open two menus back-to-back, and the
+    // second menu can appear before the first menu's asynchronous WM command is
+    // consumed by the WM actor.
+    if (iconId == kIconId && event == WM_CONTEXTMENU) {
       ShowContextMenu();
       return 0;
     }
