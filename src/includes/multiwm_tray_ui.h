@@ -24,7 +24,6 @@ constexpr DWORD kFlyoutHoldMs = 850;
 constexpr DWORD kFlyoutFadeMs = 180;
 
 static HWND g_trayWindow = nullptr;
-static HWND g_flyoutWindow = nullptr;
 static ATOM g_trayWindowClass = 0;
 static ATOM g_flyoutWindowClass = 0;
 static UINT g_taskbarCreatedMessage = 0;
@@ -36,8 +35,16 @@ static int g_flyoutOffsetY = 0;
 static TileLayout g_displayedLayout = TileLayout::COUNT;
 static GUID g_displayedDesktopId{};
 static bool g_haveDisplayedDesktopId = false;
-static std::wstring g_flyoutText;
-static DWORD g_flyoutShownTick = 0;
+static HMONITOR g_displayedMonitor = nullptr;
+
+struct FlyoutInstance {
+  HWND hwnd = nullptr;
+  HMONITOR monitor = nullptr;
+  std::wstring text;
+  DWORD shownTick = 0;
+};
+
+static std::vector<FlyoutInstance*> g_flyouts;
 static NOTIFYICONDATAW g_notifyData{};
 static std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> g_icons{};
 static std::array<std::wstring, static_cast<size_t>(TileLayout::COUNT)>
@@ -215,9 +222,62 @@ static HICON GetLayoutIcon(TileLayout layout) {
   return LoadIconW(nullptr, IDI_APPLICATION);
 }
 
+static std::wstring MonitorTooltipLabel(HMONITOR monitor, size_t fallbackIndex) {
+  MONITORINFOEXW info{};
+  info.cbSize = sizeof(info);
+  if (monitor && GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&info))) {
+    std::wstring device = info.szDevice;
+    constexpr wchar_t kDevicePrefix[] = L"\\\\.\\";
+    if (device.rfind(kDevicePrefix, 0) == 0) device.erase(0, 4);
+    if (!device.empty()) return device;
+  }
+
+  wchar_t fallback[32]{};
+  swprintf(fallback, ARRAYSIZE(fallback), L"Monitor %zu", fallbackIndex + 1);
+  return fallback;
+}
+
 static void SetTooltip(TileLayout layout) {
-  std::wstring tooltip = L"Tiling Helper - ";
-  tooltip += LayoutDisplayName(layout);
+  std::vector<HMONITOR> monitors;
+  Reconcile::EnumerateCurrentMonitors(monitors);
+
+  // Preserve the compact historical tooltip exactly on a single-display system.
+  // The richer summary is useful only when there are multiple local workspaces to
+  // distinguish and would otherwise be pure visual clutter.
+  std::wstring tooltip;
+  if (monitors.size() <= 1) {
+    tooltip = L"Tiling Helper - ";
+    tooltip += LayoutDisplayName(layout);
+  } else {
+    GUID desktopId{};
+    bool haveDesktop = GetCurrentDesktopId(&desktopId);
+    if (!haveDesktop && g_haveDisplayedDesktopId) {
+      desktopId = g_displayedDesktopId;
+      haveDesktop = true;
+    }
+
+    if (!haveDesktop) {
+      tooltip = L"Tiling Helper - ";
+      tooltip += LayoutDisplayName(layout);
+    } else {
+      tooltip = L"Tiling Helper";
+      for (size_t i = 0; i < monitors.size(); ++i) {
+        const HMONITOR monitor = monitors[i];
+        TileLayout monitorLayout = g_settings.defaultLayout;
+        Workspace state;
+        if (g_workspaces.Load({desktopId, monitor}, &state)) {
+          monitorLayout = state.Layout();
+        }
+
+        tooltip += L"\n";
+        tooltip += monitor == g_displayedMonitor ? L"\x25B8 " : L"  ";
+        tooltip += MonitorTooltipLabel(monitor, i);
+        tooltip += L": ";
+        tooltip += LayoutFlyoutText(monitorLayout);
+      }
+    }
+  }
+
   wcsncpy(g_notifyData.szTip, tooltip.c_str(), ARRAYSIZE(g_notifyData.szTip) - 1);
   g_notifyData.szTip[ARRAYSIZE(g_notifyData.szTip) - 1] = L'\0';
 }
@@ -244,9 +304,10 @@ static bool AddIconToShell() {
   return true;
 }
 
-static void UpdateIcon(TileLayout layout) {
+static void UpdateIcon(TileLayout layout, HMONITOR monitor) {
   if (!g_trayWindow || layout == TileLayout::COUNT) return;
   g_displayedLayout = layout;
+  if (monitor) g_displayedMonitor = monitor;
   if (!g_iconAdded) {
     AddIconToShell();
     return;
@@ -269,7 +330,7 @@ static void RebuildIcons() {
   }
   auto old = g_icons;
   g_icons = icons;
-  if (g_displayedLayout != TileLayout::COUNT) UpdateIcon(g_displayedLayout);
+  if (g_displayedLayout != TileLayout::COUNT) UpdateIcon(g_displayedLayout, g_displayedMonitor);
   DestroyIconSet(old);
 }
 
@@ -288,8 +349,26 @@ static HFONT CreateFlyoutFont(UINT dpi) {
                      DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 }
 
+static FlyoutInstance* GetFlyoutInstance(HWND hwnd) {
+  return reinterpret_cast<FlyoutInstance*>(
+      GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+}
+
 static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
                                          LPARAM lParam) {
+  if (message == WM_NCCREATE) {
+    auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+    auto* instance = create
+        ? reinterpret_cast<FlyoutInstance*>(create->lpCreateParams)
+        : nullptr;
+    if (instance) {
+      instance->hwnd = hwnd;
+      SetWindowLongPtrW(
+          hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(instance));
+    }
+  }
+
+  FlyoutInstance* instance = GetFlyoutInstance(hwnd);
   switch (message) {
     case WM_NCHITTEST:
       return HTTRANSPARENT;
@@ -308,7 +387,8 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
       HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
       SetBkMode(dc, TRANSPARENT);
       SetTextColor(dc, ForegroundColor());
-      DrawTextW(dc, g_flyoutText.c_str(), -1, &client,
+      const wchar_t* text = instance ? instance->text.c_str() : L"";
+      DrawTextW(dc, text, -1, &client,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
       if (oldFont) SelectObject(dc, oldFont);
       if (font) DeleteObject(font);
@@ -316,8 +396,8 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
       return 0;
     }
     case WM_TIMER:
-      if (wParam == kFlyoutTimerId) {
-        DWORD elapsed = GetTickCount() - g_flyoutShownTick;
+      if (wParam == kFlyoutTimerId && instance) {
+        DWORD elapsed = GetTickCount() - instance->shownTick;
         if (elapsed >= kFlyoutHoldMs + kFlyoutFadeMs) {
           KillTimer(hwnd, kFlyoutTimerId);
           ShowWindow(hwnd, SW_HIDE);
@@ -332,28 +412,64 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
         return 0;
       }
       break;
+    case WM_NCDESTROY:
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+      break;
   }
   return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+static FlyoutInstance* FindFlyoutForMonitor(HMONITOR monitor) {
+  for (FlyoutInstance* instance : g_flyouts) {
+    if (instance && instance->monitor == monitor && instance->hwnd) {
+      return instance;
+    }
+  }
+  return nullptr;
+}
+
+static FlyoutInstance* GetOrCreateFlyoutForMonitor(HMONITOR monitor) {
+  if (!monitor) return nullptr;
+  if (FlyoutInstance* existing = FindFlyoutForMonitor(monitor)) return existing;
+
+  auto* instance = new (std::nothrow) FlyoutInstance;
+  if (!instance) return nullptr;
+  instance->monitor = monitor;
+
+  HINSTANCE module = GetModuleHandleW(nullptr);
+  instance->hwnd = CreateWindowExW(
+      WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+      kFlyoutWindowClassName, L"", WS_POPUP, 0, 0, 0, 0,
+      nullptr, nullptr, module, instance);
+  if (!instance->hwnd) {
+    delete instance;
+    return nullptr;
+  }
+
+  g_flyouts.push_back(instance);
+  return instance;
+}
+
 static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
-  if (!g_flyoutWindow || !text || !*text) return;
+  if (!text || !*text) return;
   if (!monitor) monitor = GetWorkspaceCommandMonitor();
   RECT workArea{};
   if (!monitor || !GetMonitorWorkArea(monitor, &workArea)) return;
 
-  g_flyoutText = text;
+  FlyoutInstance* instance = GetOrCreateFlyoutForMonitor(monitor);
+  if (!instance || !instance->hwnd) return;
+  instance->text = text;
 
   UINT dpi = GetMonitorEffectiveDpi(monitor);
   HFONT font = CreateFlyoutFont(dpi);
-  HDC dc = GetDC(g_flyoutWindow);
+  HDC dc = GetDC(instance->hwnd);
   HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
   SIZE textSize{};
-  GetTextExtentPoint32W(dc, g_flyoutText.c_str(),
-                        static_cast<int>(g_flyoutText.size()), &textSize);
+  GetTextExtentPoint32W(dc, instance->text.c_str(),
+                        static_cast<int>(instance->text.size()), &textSize);
   if (oldFont) SelectObject(dc, oldFont);
   if (font) DeleteObject(font);
-  ReleaseDC(g_flyoutWindow, dc);
+  ReleaseDC(instance->hwnd, dc);
 
   int width = std::max(ScaleForDpi(128, dpi),
                        static_cast<int>(textSize.cx) + ScaleForDpi(48, dpi));
@@ -368,17 +484,17 @@ static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
   int radius = ScaleForDpi(8, dpi);
   HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
                                    radius * 2, radius * 2);
-  if (region && !SetWindowRgn(g_flyoutWindow, region, TRUE)) DeleteObject(region);
+  if (region && !SetWindowRgn(instance->hwnd, region, TRUE)) DeleteObject(region);
 
-  g_flyoutShownTick = GetTickCount();
-  SetLayeredWindowAttributes(g_flyoutWindow, 0, 255, LWA_ALPHA);
-  SetWindowPos(g_flyoutWindow, HWND_TOPMOST, x, y, width, height,
+  instance->shownTick = GetTickCount();
+  SetLayeredWindowAttributes(instance->hwnd, 0, 255, LWA_ALPHA);
+  SetWindowPos(instance->hwnd, HWND_TOPMOST, x, y, width, height,
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
-  InvalidateRect(g_flyoutWindow, nullptr, TRUE);
-  UpdateWindow(g_flyoutWindow);
-  if (!SetTimer(g_flyoutWindow, kFlyoutTimerId, 16, nullptr)) {
+  InvalidateRect(instance->hwnd, nullptr, TRUE);
+  UpdateWindow(instance->hwnd);
+  if (!SetTimer(instance->hwnd, kFlyoutTimerId, 16, nullptr)) {
     // A cosmetic timer failure must not leave a permanently visible overlay.
-    ShowWindow(g_flyoutWindow, SW_HIDE);
+    ShowWindow(instance->hwnd, SW_HIDE);
   }
 }
 
@@ -393,29 +509,59 @@ static void ShowManagementModeFlyout(bool automatic) {
       GetWorkspaceCommandMonitor());
 }
 
+static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
+  std::vector<HMONITOR> monitors;
+  Reconcile::EnumerateCurrentMonitors(monitors);
+  for (HMONITOR monitor : monitors) {
+    TileLayout layout = g_settings.defaultLayout;
+    Workspace state;
+    if (g_workspaces.Load({desktopId, monitor}, &state)) {
+      layout = state.Layout();
+    }
+    ShowLayoutFlyout(layout, monitor);
+  }
+}
+
 //-----------------------------------------------------------------------------
 // Lifecycle / shell integration
 //-----------------------------------------------------------------------------
 
-// Synchronizes the tray with the target workspace and shows the flyout only when
-// the refresh observes a transition between known virtual desktops.
-static void RefreshForCurrentWorkspace() {
+// Updates the single shell notification icon for one explicit monitor boundary.
+// The icon is intentionally a view onto one workspace, while the tooltip can
+// summarize all current monitor workspaces when multiple displays are connected.
+static void RefreshForMonitor(HMONITOR monitor) {
+  if (!monitor) return;
+
   TileLayout layout = g_settings.defaultLayout;
-  HMONITOR monitor = GetForegroundMonitor();
-  if (!monitor) monitor = GetCursorMonitor();
   DesktopMonitorKey key{};
   Workspace state;
-  bool haveKey = monitor && GetCurrentWorkspaceKey(monitor, &key);
+  const bool haveKey = GetCurrentWorkspaceKey(monitor, &key);
   if (haveKey && g_workspaces.Load(key, &state)) layout = state.Layout();
 
-  bool desktopChanged = haveKey && g_haveDisplayedDesktopId &&
-                        !IsEqualGUID(key.desktopId, g_displayedDesktopId);
   if (haveKey) {
     g_displayedDesktopId = key.desktopId;
     g_haveDisplayedDesktopId = true;
   }
-  UpdateIcon(layout);
-  if (desktopChanged) ShowLayoutFlyout(layout, monitor);
+  UpdateIcon(layout, monitor);
+}
+
+static void RefreshDisplayedMonitor() {
+  HMONITOR monitor = g_displayedMonitor;
+  MONITORINFO info{sizeof(info)};
+  if (!monitor || !GetMonitorInfoW(monitor, &info)) {
+    monitor = GetForegroundMonitor();
+    if (!monitor) monitor = GetCursorMonitor();
+  }
+  if (monitor) RefreshForMonitor(monitor);
+}
+
+// Foreground changes deliberately retarget the one physical tray icon. Explicit
+// workspace commands call RefreshForMonitor directly with their cursor-selected
+// monitor instead of going through this focus-driven path.
+static void RefreshForCurrentWorkspace() {
+  HMONITOR monitor = GetForegroundMonitor();
+  if (!monitor) monitor = GetCursorMonitor();
+  if (monitor) RefreshForMonitor(monitor);
 }
 
 static void HandleThemeChanged() {
@@ -423,8 +569,10 @@ static void HandleThemeChanged() {
   if (light == g_systemLightTheme) return;
   g_systemLightTheme = light;
   RebuildIcons();
-  if (g_flyoutWindow && IsWindowVisible(g_flyoutWindow)) {
-    InvalidateRect(g_flyoutWindow, nullptr, TRUE);
+  for (FlyoutInstance* instance : g_flyouts) {
+    if (instance && instance->hwnd && IsWindowVisible(instance->hwnd)) {
+      InvalidateRect(instance->hwnd, nullptr, TRUE);
+    }
   }
 }
 
@@ -445,7 +593,14 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
       // Emit the exact same action as the layout hotkey; layout mutation stays
       // serialized on the WM thread and is implemented in one place only.
       const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
-      if (threadId) PostThreadMessageW(threadId, WM_APP_LAYOUT_CYCLE, 0, 0);
+      if (threadId) {
+        // The tray lives on the primary taskbar, but its icon represents the
+        // active/last-targeted monitor. Preserve that semantic when clicked
+        // instead of letting the cursor's primary-monitor location retarget it.
+        PostThreadMessageW(
+            threadId, WM_APP_LAYOUT_CYCLE,
+            reinterpret_cast<WPARAM>(g_displayedMonitor), 0);
+      }
     }
     return 0;
   }
@@ -488,19 +643,16 @@ static bool Initialize() {
   flyoutClass.hInstance = instance;
   flyoutClass.lpszClassName = kFlyoutWindowClassName;
   g_flyoutWindowClass = RegisterClassW(&flyoutClass);
-  bool haveFlyoutClass = g_flyoutWindowClass != 0 ||
-                         GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+  const bool haveFlyoutClass = g_flyoutWindowClass != 0 ||
+                               GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 
   g_trayWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayWindowClassName, L"",
                                  WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
                                  instance, nullptr);
   if (!g_trayWindow) return false;
 
-  if (haveFlyoutClass) {
-    g_flyoutWindow = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-        kFlyoutWindowClassName, L"", WS_POPUP, 0, 0, 0, 0,
-        nullptr, nullptr, instance, nullptr);
+  if (!haveFlyoutClass) {
+    Wh_Log(L"Status flyout window class unavailable; tray indicator remains active");
   }
 
   g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
@@ -515,11 +667,16 @@ static void Shutdown() {
     Shell_NotifyIconW(NIM_DELETE, &g_notifyData);
   }
   g_iconAdded = false;
-  if (g_flyoutWindow) {
-    KillTimer(g_flyoutWindow, kFlyoutTimerId);
-    DestroyWindow(g_flyoutWindow);
-    g_flyoutWindow = nullptr;
+  for (FlyoutInstance* instance : g_flyouts) {
+    if (!instance) continue;
+    if (instance->hwnd) {
+      KillTimer(instance->hwnd, kFlyoutTimerId);
+      DestroyWindow(instance->hwnd);
+      instance->hwnd = nullptr;
+    }
+    delete instance;
   }
+  g_flyouts.clear();
   if (g_trayWindow) {
     DestroyWindow(g_trayWindow);
     g_trayWindow = nullptr;
@@ -534,6 +691,7 @@ static void Shutdown() {
   g_displayedLayout = TileLayout::COUNT;
   g_displayedDesktopId = {};
   g_haveDisplayedDesktopId = false;
+  g_displayedMonitor = nullptr;
   g_notifyData = {};
 }
 

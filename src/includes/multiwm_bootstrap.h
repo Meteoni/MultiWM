@@ -309,7 +309,8 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       return WmMessageDisposition::Handled;
 
     case WM_APP_LAYOUT_CYCLE:
-      Commands::CycleCurrentWorkspaceLayout();
+      Commands::CycleCurrentWorkspaceLayout(
+          reinterpret_cast<HMONITOR>(msg.wParam));
       return WmMessageDisposition::Handled;
 
     case WM_APP_RECONCILE_NOW:
@@ -405,6 +406,7 @@ static void CleanupWmThread() {
   g_wm.forceMonitorReconcile = false;
   g_wm.reconciledDesktop = {};
   g_wm.reconciledDesktopValid = false;
+  g_wm.pendingDesktopSwitchFlyouts = false;
   ClearAllConformanceLeases();
   ClearAllMoveSizeSamples();
   InterlockedExchange(&g_vd.changeQueued, 0);

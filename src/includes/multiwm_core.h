@@ -270,6 +270,7 @@ struct WmRuntime {
   bool comInitialized = false;
   GUID reconciledDesktop{};
   bool reconciledDesktopValid = false;
+  bool pendingDesktopSwitchFlyouts = false;
   std::vector<HWND> lifecycleDirtyWindows;
   std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
   ManagementMode managementMode = ManagementMode::Manual;

@@ -557,9 +557,12 @@ namespace TrayUi {
 static void LoadSettings();
 static bool Initialize();
 static void Shutdown();
-static void UpdateIcon(TileLayout layout);
+static void UpdateIcon(TileLayout layout, HMONITOR monitor = nullptr);
 static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor = nullptr);
 static void ShowManagementModeFlyout(bool automatic);
+static void ShowDesktopSwitchFlyouts(const GUID& desktopId);
+static void RefreshForMonitor(HMONITOR monitor);
+static void RefreshDisplayedMonitor();
 static void RefreshForCurrentWorkspace();
 }  // namespace TrayUi
 

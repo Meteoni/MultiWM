@@ -90,16 +90,16 @@ void TileWindows() {
     if (!Reconcile::SameWorkspaceKey(key, targetKey)) ArrangeWorkspace(key);
   }
 
-  TrayUi::RefreshForCurrentWorkspace();
+  TrayUi::RefreshForMonitor(monitor);
   Wh_Log(L"Manual tile/global reconcile completed");
   Diagnostics::RecordEvent(L"Tile Workspace command completed monitor=%p", monitor);
 }
 
 // Advances the current workspace layout and invalidates layout-specific hints in
 // suspended slots before persisting, arranging, and updating UI feedback.
-void CycleCurrentWorkspaceLayout() {
+void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
   ++Diagnostics::g_runtime.counters.layoutCycleCommands;
-  HMONITOR monitor = GetWorkspaceCommandMonitor();
+  if (!monitor) monitor = GetWorkspaceCommandMonitor();
   if (!monitor) return;
   DesktopMonitorKey key{};
   if (!GetCurrentWorkspaceKey(monitor, &key)) return;
@@ -117,7 +117,7 @@ void CycleCurrentWorkspaceLayout() {
   }
   g_workspaces.Save(key, state);
   ArrangeWorkspace(key);
-  TrayUi::UpdateIcon(state.Layout());
+  TrayUi::UpdateIcon(state.Layout(), monitor);
   TrayUi::ShowLayoutFlyout(state.Layout(), monitor);
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.Layout()));
   Diagnostics::RecordEvent(

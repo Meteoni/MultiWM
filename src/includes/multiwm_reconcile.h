@@ -637,8 +637,16 @@ static void HandleVirtualDesktopChanged() {
 
   Diagnostics::RecordEvent(
       L"virtual desktop changed currentDesktop=%08X", currentDesktop.Data1);
+  const bool desktopActuallyChanged =
+      !g_wm.reconciledDesktopValid ||
+      !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
   g_wm.reconciledDesktop = currentDesktop;
   g_wm.reconciledDesktopValid = true;
+  // The visual transition belongs to the settled desktop state, not the raw COM
+  // callback. Coalesce rapid switches and emit one monitor-local OSD per connected
+  // display after reconciliation has finished. Duplicate callbacks for the already
+  // represented desktop do not generate another visual transition.
+  if (desktopActuallyChanged) g_wm.pendingDesktopSwitchFlyouts = true;
 
   // A native VD transition is an authoritative reason to repair desktop ownership.
   // Do not infer monitor migration here; defer visibility/window-state participation
@@ -679,7 +687,6 @@ static void HandleVirtualDesktopChanged() {
   // Coalesce the remaining shell burst for discovery/fallback and the unconditional
   // incoming-desktop reinforcement. The settled pass may also repair physical state.
   ScheduleLifecycleReconcile(nullptr);
-  TrayUi::RefreshForCurrentWorkspace();
 }
 
 // Coalesce shell visibility bursts for discovery and deferred placement. Generic
@@ -760,6 +767,7 @@ static void ReconcileDeferredLifecycle() {
     // A missed native callback is also a high-confidence signal that an exhausted
     // subscription retry burst deserves one fresh attempt sequence.
     if (!g_vd.notificationsRegistered) RuntimeLifecycle::RequestMaintenance(true);
+    g_wm.pendingDesktopSwitchFlyouts = true;
   }
   g_wm.reconciledDesktop = currentDesktop;
   g_wm.reconciledDesktopValid = true;
@@ -851,7 +859,14 @@ static void ReconcileDeferredLifecycle() {
       g_wm.pendingDesktopArranges.end());
 
   g_wm.lifecycleRetryAfterPlatformRecovery = false;
-  TrayUi::RefreshForCurrentWorkspace();
+  if (g_wm.pendingDesktopSwitchFlyouts) {
+    g_wm.pendingDesktopSwitchFlyouts = false;
+    TrayUi::ShowDesktopSwitchFlyouts(currentDesktop);
+  }
+  // Ordinary lifecycle work updates the icon/tooltip for the monitor the tray is
+  // already representing. Only a foreground event or explicit workspace command
+  // retargets that single shell icon to another monitor.
+  TrayUi::RefreshDisplayedMonitor();
 }
 
 static void ReconcileManagedWindowStateNow(

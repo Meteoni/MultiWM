@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.2
+// @version         1.13.3
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -28,9 +28,9 @@ resize-adjusted ratios per virtual desktop.
 - Manual or Automatic management modes: Manual keeps Alt+D groups inert, while Automatic continuously discovers and migrates windows
 - Configurable mouse drag behavior: float the moved window or swap it with the tiled window under the pointer
 - Dedicated optional hotkey to float the focused tiled window
-- Theme-aware notification-area text icon shows the current workspace layout (MV/MH/CL/RW/BS/MN/FL)
+- Theme-aware notification-area text icon shows the active/last-targeted monitor workspace layout (MV/MH/CL/RW/BS/MN/FL), with a multi-monitor tooltip summary when more than one display is connected
 - Optional per-layout .ico overrides with generated text fallback
-- Compact Win32 status flyout appears on layout/desktop changes and Automatic/Manual mode switches
+- Compact Win32 status flyouts appear on the affected monitor for layout/mode changes and on every monitor after a settled virtual-desktop switch
 - Workspace-level hotkeys target the monitor under the mouse cursor; focused-window commands continue to target the focused window's physical monitor
 - Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
 - Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate; every connected monitor is visited at startup and authoritative topology passes
