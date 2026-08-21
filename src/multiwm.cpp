@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.14
+// @version         1.13.15
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -130,7 +130,7 @@ resize-adjusted ratios per virtual desktop.
   $description: Optional exclusions. Process/class are case-insensitive exact matches; title is a case-insensitive substring.
 
 - TilingModifier: alt
-  $name: '[Hotkeys] Modifier'
+  $name: '[Hotkeys - General] Modifier'
   $description: Modifier used by all window-manager hotkeys.
   $options:
     - alt: Alt
@@ -140,31 +140,31 @@ resize-adjusted ratios per virtual desktop.
     - ctrl+shift: Ctrl + Shift
 
 - TileKey: "D"
-  $name: '[Hotkeys] Tile Workspace'
+  $name: '[Hotkeys - Workspace] Tile Workspace'
   $description: 'Reconcile and tile windows on the current monitor. Leave blank to disable. Examples: D, T, Space, `, -'
 
 - LayoutKey: "L"
-  $name: '[Hotkeys] Cycle Layout'
+  $name: '[Hotkeys - Workspace] Cycle Layout'
   $description: 'Cycle the current workspace layout. Leave blank to disable. Examples: L, Tab, =, ], /'
 
 - SwapMasterKey: "M"
-  $name: '[Hotkeys] Set Master Window'
+  $name: '[Hotkeys - Window] Set Master Window'
   $description: 'Set another tiled window as the master. Leave blank to disable.'
 
 - PromoteWindowKey: "["
-  $name: '[Hotkeys] Promote Focused Window'
+  $name: '[Hotkeys - Window] Promote Focused Window'
   $description: 'Move the focused tiled window one logical slot earlier. Does nothing in the first slot. Leave blank to disable.'
 
 - DemoteWindowKey: "]"
-  $name: '[Hotkeys] Demote Focused Window'
+  $name: '[Hotkeys - Window] Demote Focused Window'
   $description: 'Move the focused tiled window one logical slot later. Does nothing in the last slot. Leave blank to disable.'
 
 - ManagementModeToggleKey: "U"
-  $name: '[Hotkeys] Toggle Window Management Mode'
+  $name: '[Hotkeys - General] Toggle Window Management Mode'
   $description: 'Switch between Automatic and Manual modes at runtime. Leave blank to disable.'
 
 - FloatFocusedKey: ""
-  $name: '[Hotkeys] Float Focused Window'
+  $name: '[Hotkeys - Window] Float Focused Window'
   $description: 'Float the focused tiled window. Leave blank to disable.'
 
 - FlyoutPosition: bottom
@@ -211,7 +211,7 @@ resize-adjusted ratios per virtual desktop.
   $description: 'Directory for timestamped UTF-8 .txt diagnostic reports. Environment variables such as %USERPROFILE% are supported and missing directories are created. Reports include window titles and executable paths, so review them before sharing.'
 
 - DiagnosticDumpKey: "I"
-  $name: '[Diagnostics] Write Diagnostic Report'
+  $name: '[Hotkeys - General] Write Diagnostic Report'
   $description: 'Write a formatted state, health, churn, and invariant report to the configured output directory. Uses the configured modifier. Leave blank to disable.'
 */
 // ==/WindhawkModSettings==
