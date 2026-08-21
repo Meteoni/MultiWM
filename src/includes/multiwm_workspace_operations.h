@@ -918,6 +918,17 @@ static bool GetCurrentAuthoritativeTiledRect(
   return true;
 }
 
+// HWND values can be reused. Conformance is allowed to act only on the same
+// process identity that owns the authoritative WindowRecord; normal settled
+// reconciliation remains responsible for forgetting a stale reused handle.
+static bool ConformanceWindowMatchesRecordIdentity(
+    HWND hwnd, const WindowRecord& record) {
+  if (!hwnd || !record.pid) return false;
+  DWORD livePid = 0;
+  return GetWindowThreadProcessId(hwnd, &livePid) != 0 &&
+         livePid != 0 && livePid == record.pid;
+}
+
 // The deadline is a final passive verdict, not one more fight with the app. If
 // this exact lease still describes the current tile and the HWND is materially
 // elsewhere, concede that it is unsuitable for tiling: float it and close the
@@ -945,6 +956,12 @@ static void FinalizeExpiredConformanceLease(
 
   Workspace workspace;
   if (!g_workspaces.Load(owners.front(), &workspace)) {
+    stale();
+    return;
+  }
+
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record || !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
     stale();
     return;
   }
@@ -1013,7 +1030,19 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
   }
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record || record->state != ManageState::Tiled ||
-      workspace.Layout() == TileLayout::Floating) {
+      workspace.Layout() == TileLayout::Floating ||
+      !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
+    CancelConformanceLease(hwnd, lease.generation);
+    return false;
+  }
+
+  // A lease is target-specific. Layout/order/weight changes can alter a tile
+  // without necessarily issuing SetWindowPos for this HWND, so never reinforce
+  // the copied target until it is checked against the current layout plan.
+  RECT authoritative{};
+  if (!GetCurrentAuthoritativeTiledRect(
+          owners.front(), workspace, hwnd, &authoritative) ||
+      !RectsNear(authoritative, lease.expectedRect)) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
@@ -1023,7 +1052,7 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
-  if (RectsNear(current, lease.expectedRect)) {
+  if (RectsNear(current, authoritative)) {
     return true;  // Our own placement/event echo; nothing to repair.
   }
 
@@ -1048,7 +1077,7 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
   if (!IsCurrentConformanceLease(hwnd, lease.generation)) return false;
 
   PlacementObservation observation =
-      PlaceWindowChecked(hwnd, record->canMove, lease.expectedRect);
+      PlaceWindowChecked(hwnd, record->canMove, authoritative);
 
   // Count every issued reinforcement attempt, not only successful ones. A failed
   // checked placement is still part of the lease's cadence and must not look like

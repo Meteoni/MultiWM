@@ -124,6 +124,7 @@ void NotifyShellRestarted() {
   // A shell replacement can move/recreate windows asynchronously. Never let a
   // pre-restart conformance rectangle fight the replacement shell.
   ClearAllConformanceLeases();
+  ScheduleNextConformanceTimer();
   g_wm.forceMonitorReconcile = true;
   const bool platformNeedsRecovery =
       !Platform::WindowEvents::AllWinEventHooksInstalled() ||
@@ -141,6 +142,7 @@ void NotifyDisplayTopologyChanged() {
   // Every existing lease was computed against the old work-area/monitor topology.
   // Cancel it before Windows' own topology-induced LOCATIONCHANGE burst arrives.
   ClearAllConformanceLeases();
+  ScheduleNextConformanceTimer();
   g_wm.pendingDesktopArranges.erase(
       std::remove_if(
           g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),

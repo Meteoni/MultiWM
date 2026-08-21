@@ -632,6 +632,11 @@ static void HandleVirtualDesktopChanged() {
 
   GUID currentDesktop{};
   if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&currentDesktop)) {
+    // The native callback is an authoritative transition signal, but without a
+    // current GUID we cannot prove that an existing placement lease still belongs
+    // to the active desktop. Drop those short-lived contracts and retry normally.
+    ClearAllConformanceLeases();
+    ScheduleNextConformanceTimer();
     Wh_Log(L"Native VD change received but current desktop query failed");
     Diagnostics::RecordEvent(L"virtual desktop notification: current desktop query failed");
     ScheduleLifecycleReconcile(nullptr);
@@ -643,6 +648,13 @@ static void HandleVirtualDesktopChanged() {
   const bool desktopActuallyChanged =
       !g_wm.reconciledDesktopValid ||
       !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
+  if (desktopActuallyChanged) {
+    // A lease describes post-placement behavior on one active desktop. Never carry
+    // it across DWM's cloak/uncloak transition; the incoming settled arrange pass
+    // will establish fresh leases for any placements it actually has to issue.
+    ClearAllConformanceLeases();
+    ScheduleNextConformanceTimer();
+  }
   g_wm.reconciledDesktop = currentDesktop;
   g_wm.reconciledDesktopValid = true;
   // The visual transition belongs to the settled desktop state, not the raw COM
@@ -764,6 +776,11 @@ static void ReconcileDeferredLifecycle() {
       g_wm.reconciledDesktopValid &&
       !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
   if (fallbackDesktopChange) {
+    // The native callback was missed, so this is the first point where the WM can
+    // prove that the active desktop changed. Discard any lease created on the old
+    // desktop before doing ownership repair or incoming-workspace reinforcement.
+    ClearAllConformanceLeases();
+    ScheduleNextConformanceTimer();
     ++Diagnostics::g_runtime.counters.virtualDesktopFallbackChanges;
     Diagnostics::RecordEvent(
         L"virtual desktop change recovered from settled WinEvents currentDesktop=%08X",
