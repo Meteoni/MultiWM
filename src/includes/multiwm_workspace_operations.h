@@ -932,12 +932,20 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
 
   PlacementObservation observation =
       PlaceWindowChecked(hwnd, record->canMove, lease.expectedRect);
+
+  // Count every issued reinforcement attempt, not only successful ones. A failed
+  // checked placement is still part of the lease's cadence and must not look like
+  // repeated "repair=1" telemetry. This does not extend the original deadline.
+  unsigned attemptNumber = lease.attempts + 1;
+  const bool leaseRetained =
+      RecordConformanceLeaseAttempt(hwnd, lease.generation, &attemptNumber);
+
   Workspace::PlacementAction action =
       workspace.ApplyPlacementObservation(hwnd, observation);
   ++Diagnostics::g_runtime.counters.conformanceLeaseRepairs;
   Diagnostics::RecordEvent(
-      L"conformance lease reinforced hwnd=%p repair=%u result=%d",
-      hwnd, lease.repairs + 1, static_cast<int>(observation.result));
+      L"conformance lease reinforced hwnd=%p attempt=%u result=%d",
+      hwnd, attemptNumber, static_cast<int>(observation.result));
 
   if (action == Workspace::PlacementAction::Forget) {
     CancelConformanceLease(hwnd, lease.generation);
@@ -955,10 +963,17 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
   }
 
   g_workspaces.Save(owners.front(), workspace);
-  if (observation.result == PlacementResult::Success) {
-    RecordConformanceLeaseRepair(hwnd, lease.generation);
-  } else {
-    CancelConformanceLease(hwnd, lease.generation);
+  if (observation.result != PlacementResult::Success && leaseRetained) {
+    // Adjusted/refused placements are exactly the cases where relying on another
+    // LOCATIONCHANGE is unsafe: the application may already be sitting at its
+    // final self-selected rectangle. Keep the lease alive and schedule one more
+    // checked attempt at the normal cadence. The existing placement-failure policy
+    // remains the authority that eventually Floats a persistently nonconforming
+    // window; the lease itself still ends only at its original deadline.
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG due = std::min(
+        lease.expiresAtTickMs, now + kConformanceRepairMinIntervalMs);
+    DeferConformanceLeaseRepair(hwnd, lease.generation, due);
   }
   return true;
 }

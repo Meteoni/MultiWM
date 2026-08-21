@@ -788,10 +788,10 @@ static WinEventHooks g_hooks;
 struct ConformanceLease {
   RECT expectedRect{};
   ULONGLONG expiresAtTickMs = 0;
-  // Diagnostic only. Repair count never controls lease lifetime or policy.
-  unsigned repairs = 0;
-  // Successful reinforcement cadence. repairDueTickMs coalesces a burst into one
-  // delayed re-check instead of dropping the last nonconforming observation.
+  // Diagnostic only. Attempt count never controls lease lifetime or policy.
+  unsigned attempts = 0;
+  // Reinforcement cadence. repairDueTickMs coalesces a burst, and also schedules
+  // another checked attempt when the application remains nonconforming.
   ULONGLONG lastRepairTickMs = 0;
   ULONGLONG repairDueTickMs = 0;
   // Distinguishes an old copied lease from a later replacement/cancellation.
@@ -993,7 +993,8 @@ static bool IsCurrentConformanceLease(HWND hwnd, uint64_t generation) {
          current.generation == generation;
 }
 
-static bool RecordConformanceLeaseRepair(HWND hwnd, uint64_t generation) {
+static bool RecordConformanceLeaseAttempt(
+    HWND hwnd, uint64_t generation, unsigned* outAttemptNumber = nullptr) {
   if (!hwnd || generation == 0) return false;
 
   const ULONGLONG now = GetTickCount64();
@@ -1004,9 +1005,10 @@ static bool RecordConformanceLeaseRepair(HWND hwnd, uint64_t generation) {
     if (now >= it->second.expiresAtTickMs) {
       g_conformanceLeases.leases.erase(it);
     } else if (it->second.generation == generation) {
-      ++it->second.repairs;
+      ++it->second.attempts;
       it->second.lastRepairTickMs = now;
       it->second.repairDueTickMs = 0;
+      if (outAttemptNumber) *outAttemptNumber = it->second.attempts;
       retained = true;
     }
   }
