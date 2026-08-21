@@ -157,6 +157,8 @@ enum HotkeyIds {
   HK_MANAGEMENT_MODE_TOGGLE = 4,
   HK_FLOAT_FOCUSED = 5,
   HK_DIAGNOSTIC_DUMP = 6,
+  HK_PROMOTE_WINDOW = 7,
+  HK_DEMOTE_WINDOW = 8,
 };
 
 // Messages consumed by the serialized WM thread.
@@ -213,6 +215,8 @@ struct SettingsState {
   UINT tileKey = 'D';
   UINT layoutKey = 'L';
   UINT swapMasterKey = 'M';
+  UINT promoteWindowKey = VK_OEM_4;  // [
+  UINT demoteWindowKey = VK_OEM_6;   // ]
   UINT managementModeToggleKey = 'U';
   UINT floatFocusedKey = 0;
   UINT diagnosticDumpKey = 'I';
@@ -365,6 +369,8 @@ struct Counters {
   uint64_t layoutCycleCommands = 0;
   uint64_t floatFocusedCommands = 0;
   uint64_t swapMasterCommands = 0;
+  uint64_t promoteWindowCommands = 0;
+  uint64_t demoteWindowCommands = 0;
 
   uint64_t reportsWritten = 0;
   uint64_t reportWriteFailures = 0;

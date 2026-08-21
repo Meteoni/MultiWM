@@ -187,6 +187,10 @@ void LoadSettings() {
   g_settings.tileKey = ReadHotkeySetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
   g_settings.layoutKey = ReadHotkeySetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
   g_settings.swapMasterKey = ReadHotkeySetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
+  g_settings.promoteWindowKey =
+      ReadHotkeySetting(L"PromoteWindowKey", ParseSingleCharKey, (UINT)VK_OEM_4);
+  g_settings.demoteWindowKey =
+      ReadHotkeySetting(L"DemoteWindowKey", ParseSingleCharKey, (UINT)VK_OEM_6);
   g_settings.managementModeToggleKey = ReadHotkeySetting(L"ManagementModeToggleKey", ParseSingleCharKey, (UINT)'U');
   g_settings.floatFocusedKey = ReadHotkeySetting(L"FloatFocusedKey", ParseSingleCharKey, (UINT)'F');
   g_settings.diagnosticDumpKey = ReadHotkeySetting(L"DiagnosticDumpKey", ParseSingleCharKey, (UINT)'I');
@@ -215,6 +219,10 @@ static void RegisterConfiguredHotkeys() {
   registerOne(HK_TILE, g_settings.tilingModifiers, g_settings.tileKey, L"Tile");
   registerOne(HK_SWAP_MASTER, g_settings.tilingModifiers,
               g_settings.swapMasterKey, L"Swap master");
+  registerOne(HK_PROMOTE_WINDOW, g_settings.tilingModifiers,
+              g_settings.promoteWindowKey, L"Promote window");
+  registerOne(HK_DEMOTE_WINDOW, g_settings.tilingModifiers,
+              g_settings.demoteWindowKey, L"Demote window");
   registerOne(HK_MANAGEMENT_MODE_TOGGLE, g_settings.tilingModifiers,
               g_settings.managementModeToggleKey, L"Management mode");
   registerOne(HK_FLOAT_FOCUSED, g_settings.tilingModifiers,
@@ -228,6 +236,8 @@ static void RegisterConfiguredHotkeys() {
 static void UnregisterConfiguredHotkeys() {
   UnregisterHotKey(nullptr, HK_TILE);
   UnregisterHotKey(nullptr, HK_SWAP_MASTER);
+  UnregisterHotKey(nullptr, HK_PROMOTE_WINDOW);
+  UnregisterHotKey(nullptr, HK_DEMOTE_WINDOW);
   UnregisterHotKey(nullptr, HK_MANAGEMENT_MODE_TOGGLE);
   UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
   UnregisterHotKey(nullptr, HK_LAYOUT);
@@ -367,6 +377,12 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
           break;
         case HK_SWAP_MASTER:
           Commands::SwapMaster();
+          break;
+        case HK_PROMOTE_WINDOW:
+          Commands::PromoteFocusedWindow();
+          break;
+        case HK_DEMOTE_WINDOW:
+          Commands::DemoteFocusedWindow();
           break;
         case HK_FLOAT_FOCUSED:
           Commands::FloatFocusedWindow();

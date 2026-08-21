@@ -2,11 +2,10 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.13
+// @version         1.13.14
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
-// @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lversion -lgdi32 -ladvapi32
 // ==/WindhawkMod==
 
@@ -48,6 +47,8 @@ resize-adjusted ratios per virtual desktop.
 - Tile windows: Alt + D
 - Cycle layout: Alt + L
 - Switch master window: Alt + M
+- Promote focused window one slot: Alt + [
+- Demote focused window one slot: Alt + ]
 - Float focused window: unbound by default
 - Toggle Automatic/Manual mode: Alt + U
 - Write diagnostic report: Alt + I
@@ -149,6 +150,14 @@ resize-adjusted ratios per virtual desktop.
 - SwapMasterKey: "M"
   $name: '[Hotkeys] Set Master Window'
   $description: 'Set another tiled window as the master. Leave blank to disable.'
+
+- PromoteWindowKey: "["
+  $name: '[Hotkeys] Promote Focused Window'
+  $description: 'Move the focused tiled window one logical slot earlier. Does nothing in the first slot. Leave blank to disable.'
+
+- DemoteWindowKey: "]"
+  $name: '[Hotkeys] Demote Focused Window'
+  $description: 'Move the focused tiled window one logical slot later. Does nothing in the last slot. Leave blank to disable.'
 
 - ManagementModeToggleKey: "U"
   $name: '[Hotkeys] Toggle Window Management Mode'

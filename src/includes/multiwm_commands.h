@@ -36,6 +36,68 @@ void SwapMaster() {
       L"Swap Master old=%p new=%p", oldMaster, resolved);
 }
 
+// Moves the focused tiled window one slot toward or away from the front of the
+// workspace's logical order. The operation is deliberately non-wrapping so the
+// first and last slots remain stable boundaries.
+static void MoveFocusedWindowOneSlot(bool promote) {
+  if (promote) {
+    ++Diagnostics::g_runtime.counters.promoteWindowCommands;
+  } else {
+    ++Diagnostics::g_runtime.counters.demoteWindowCommands;
+  }
+
+  HWND fg = GetForegroundWindow();
+  if (!fg) return;
+
+  HMONITOR monitor = GetWindowPhysicalMonitor(fg);
+  if (!monitor) return;
+
+  GUID desktopId{};
+  if (!GetWindowDesktopIdSafe(fg, &desktopId)) return;
+
+  DesktopMonitorKey key{};
+  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
+
+  Workspace workspace;
+  if (!g_workspaces.Load(key, &workspace) || workspace.ActiveCount() < 2 ||
+      workspace.Layout() == TileLayout::Floating) {
+    return;
+  }
+
+  HWND resolved = ResolveToTiledWindow(fg, workspace.TiledWindows());
+  if (!resolved) return;
+
+  const size_t index = workspace.TiledIndex(resolved);
+  const size_t count = workspace.ActiveCount();
+  if (index >= count) return;
+
+  if ((promote && index == 0) || (!promote && index + 1 >= count)) {
+    return;
+  }
+
+  const size_t otherIndex = promote ? index - 1 : index + 1;
+  HWND other = workspace.TiledWindows()[otherIndex];
+  if (!workspace.SwapTiled(resolved, other)) return;
+
+  g_workspaces.Save(key, workspace);
+  ClearMoveSizeSamples(resolved);
+  ClearMoveSizeSamples(other);
+  ArrangeWorkspace(key);
+
+  Diagnostics::RecordEvent(
+      promote ? L"Promote Window hwnd=%p from=%zu to=%zu"
+              : L"Demote Window hwnd=%p from=%zu to=%zu",
+      resolved, index, otherIndex);
+}
+
+void PromoteFocusedWindow() {
+  MoveFocusedWindowOneSlot(true);
+}
+
+void DemoteFocusedWindow() {
+  MoveFocusedWindowOneSlot(false);
+}
+
 void FloatFocusedWindow() {
   ++Diagnostics::g_runtime.counters.floatFocusedCommands;
   HWND hwnd = GetForegroundWindow();
