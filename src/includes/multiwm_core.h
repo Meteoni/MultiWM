@@ -357,6 +357,9 @@ struct Counters {
   uint64_t conformanceLeasesStarted = 0;
   uint64_t conformanceLeaseRepairs = 0;
   uint64_t conformanceLeaseDeferredRepairs = 0;
+  uint64_t conformanceLeaseExpiredCompliant = 0;
+  uint64_t conformanceLeaseExpiredFloats = 0;
+  uint64_t conformanceLeaseExpiredStale = 0;
 
   uint64_t tileCommands = 0;
   uint64_t layoutCycleCommands = 0;
@@ -815,27 +818,24 @@ enum class ConformanceLeaseReadResult {
   Expired,
 };
 
-// Reads and, if necessary, removes one expired lease under the same exclusive
-// lock. This avoids an expired reader erasing a newly-installed lease after it
-// drops a shared lock.
+// Reads lease state without consuming expiry. Expired leases stay present until
+// the WM actor performs the final passive conformance verdict; foreign WinEvent
+// readers must never silently erase the evidence needed for that deadline action.
 static ConformanceLeaseReadResult ReadConformanceLease(
     HWND hwnd, ConformanceLease* outLease) {
   if (!hwnd) return ConformanceLeaseReadResult::Missing;
 
   const ULONGLONG now = GetTickCount64();
   ConformanceLeaseReadResult result = ConformanceLeaseReadResult::Missing;
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
+  AcquireSRWLockShared(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
   if (it != g_conformanceLeases.leases.end()) {
     if (outLease) *outLease = it->second;
-    if (now < it->second.expiresAtTickMs) {
-      result = ConformanceLeaseReadResult::Active;
-    } else {
-      g_conformanceLeases.leases.erase(it);
-      result = ConformanceLeaseReadResult::Expired;
-    }
+    result = now < it->second.expiresAtTickMs
+                 ? ConformanceLeaseReadResult::Active
+                 : ConformanceLeaseReadResult::Expired;
   }
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+  ReleaseSRWLockShared(&g_conformanceLeases.lock);
   return result;
 }
 
@@ -876,22 +876,16 @@ static void ClearAllConformanceLeases() {
 static size_t CountActiveConformanceLeases() {
   const ULONGLONG now = GetTickCount64();
   size_t count = 0;
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
-  for (auto it = g_conformanceLeases.leases.begin();
-       it != g_conformanceLeases.leases.end();) {
-    if (now < it->second.expiresAtTickMs) {
-      ++count;
-      ++it;
-    } else {
-      it = g_conformanceLeases.leases.erase(it);
-    }
+  AcquireSRWLockShared(&g_conformanceLeases.lock);
+  for (const auto& kv : g_conformanceLeases.leases) {
+    if (now < kv.second.expiresAtTickMs) ++count;
   }
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+  ReleaseSRWLockShared(&g_conformanceLeases.lock);
   return count;
 }
 
-static void ScheduleNextConformanceRepairTimer() {
-  AssertWmThread(L"ScheduleNextConformanceRepairTimer");
+static void ScheduleNextConformanceTimer() {
+  AssertWmThread(L"ScheduleNextConformanceTimer");
   if (g_wm.conformanceTimer) {
     KillTimer(nullptr, g_wm.conformanceTimer);
     g_wm.conformanceTimer = 0;
@@ -899,27 +893,23 @@ static void ScheduleNextConformanceRepairTimer() {
 
   const ULONGLONG now = GetTickCount64();
   ULONGLONG earliestDue = 0;
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
-  for (auto it = g_conformanceLeases.leases.begin();
-       it != g_conformanceLeases.leases.end();) {
-    if (now >= it->second.expiresAtTickMs) {
-      it = g_conformanceLeases.leases.erase(it);
-      continue;
+  AcquireSRWLockShared(&g_conformanceLeases.lock);
+  for (const auto& kv : g_conformanceLeases.leases) {
+    const ConformanceLease& lease = kv.second;
+    ULONGLONG due = lease.expiresAtTickMs;
+    if (lease.repairDueTickMs && lease.repairDueTickMs < due) {
+      due = lease.repairDueTickMs;
     }
-    if (it->second.repairDueTickMs &&
-        (!earliestDue || it->second.repairDueTickMs < earliestDue)) {
-      earliestDue = it->second.repairDueTickMs;
-    }
-    ++it;
+    if (!earliestDue || due < earliestDue) earliestDue = due;
   }
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+  ReleaseSRWLockShared(&g_conformanceLeases.lock);
 
   if (!earliestDue) return;
   const ULONGLONG remaining = earliestDue > now ? earliestDue - now : 1;
   const UINT delayMs = static_cast<UINT>(std::min<ULONGLONG>(remaining, 0x7FFFFFFFULL));
   g_wm.conformanceTimer = SetTimer(nullptr, 0, std::max<UINT>(1, delayMs), nullptr);
   if (!g_wm.conformanceTimer) {
-    Wh_Log(L"Failed to schedule conformance repair timer");
+    Wh_Log(L"Failed to schedule conformance repair/deadline timer");
   }
 }
 
@@ -931,19 +921,17 @@ static bool DeferConformanceLeaseRepair(
   bool retained = false;
   AcquireSRWLockExclusive(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
-  if (it != g_conformanceLeases.leases.end()) {
-    if (now >= it->second.expiresAtTickMs) {
-      g_conformanceLeases.leases.erase(it);
-    } else if (it->second.generation == generation) {
-      if (!it->second.repairDueTickMs || dueTickMs < it->second.repairDueTickMs) {
-        it->second.repairDueTickMs = dueTickMs;
-      }
-      retained = true;
+  if (it != g_conformanceLeases.leases.end() &&
+      now < it->second.expiresAtTickMs &&
+      it->second.generation == generation) {
+    if (!it->second.repairDueTickMs || dueTickMs < it->second.repairDueTickMs) {
+      it->second.repairDueTickMs = dueTickMs;
     }
+    retained = true;
   }
   ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
 
-  if (retained) ScheduleNextConformanceRepairTimer();
+  if (retained) ScheduleNextConformanceTimer();
   return retained;
 }
 
@@ -973,6 +961,7 @@ static void BeginConformanceLease(HWND hwnd, const RECT& expectedRect) {
       now < it->second.expiresAtTickMs &&
       EqualRect(&it->second.expectedRect, &expectedRect)) {
     ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+    ScheduleNextConformanceTimer();
     return;
   }
 
@@ -984,6 +973,7 @@ static void BeginConformanceLease(HWND hwnd, const RECT& expectedRect) {
   ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
 
   ++Diagnostics::g_runtime.counters.conformanceLeasesStarted;
+  ScheduleNextConformanceTimer();
 }
 
 static bool IsCurrentConformanceLease(HWND hwnd, uint64_t generation) {
@@ -1001,16 +991,14 @@ static bool RecordConformanceLeaseAttempt(
   bool retained = false;
   AcquireSRWLockExclusive(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
-  if (it != g_conformanceLeases.leases.end()) {
-    if (now >= it->second.expiresAtTickMs) {
-      g_conformanceLeases.leases.erase(it);
-    } else if (it->second.generation == generation) {
-      ++it->second.attempts;
-      it->second.lastRepairTickMs = now;
-      it->second.repairDueTickMs = 0;
-      if (outAttemptNumber) *outAttemptNumber = it->second.attempts;
-      retained = true;
-    }
+  if (it != g_conformanceLeases.leases.end() &&
+      now < it->second.expiresAtTickMs &&
+      it->second.generation == generation) {
+    ++it->second.attempts;
+    it->second.lastRepairTickMs = now;
+    it->second.repairDueTickMs = 0;
+    if (outAttemptNumber) *outAttemptNumber = it->second.attempts;
+    retained = true;
   }
   ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
   return retained;

@@ -83,6 +83,15 @@ static MoveSizeGesture PeekMoveSizeGesture(HWND hwnd) {
   return gesture;
 }
 
+static bool IsMoveSizeGestureInProgress(HWND hwnd) {
+  if (!hwnd) return false;
+  AcquireSRWLockShared(&g_moveSize.lock);
+  const bool started = g_moveSize.startRects.find(hwnd) != g_moveSize.startRects.end();
+  const bool ended = g_moveSize.endRects.find(hwnd) != g_moveSize.endRects.end();
+  ReleaseSRWLockShared(&g_moveSize.lock);
+  return started && !ended;
+}
+
 
 
 

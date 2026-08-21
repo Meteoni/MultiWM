@@ -869,6 +869,123 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   }
 }
 
+// Atomically consumes one expired generation. A user gesture, migration, or new
+// authoritative placement that cancelled/replaced it wins if it happens first.
+static bool TakeExpiredConformanceLease(
+    HWND hwnd, uint64_t generation, ConformanceLease* outLease) {
+  if (!hwnd || generation == 0 || !outLease) return false;
+
+  const ULONGLONG now = GetTickCount64();
+  bool taken = false;
+  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
+  auto it = g_conformanceLeases.leases.find(hwnd);
+  if (it != g_conformanceLeases.leases.end() &&
+      it->second.generation == generation &&
+      now >= it->second.expiresAtTickMs) {
+    *outLease = it->second;
+    g_conformanceLeases.leases.erase(it);
+    taken = true;
+  }
+  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+  return taken;
+}
+
+// Recomputes the target from the current workspace rather than trusting a copied
+// lease blindly. This makes expiry harmless if a layout/work-area change replaced
+// the authoritative tile without issuing another SetWindowPos for this HWND.
+static bool GetCurrentAuthoritativeTiledRect(
+    const DesktopMonitorKey& key, const Workspace& workspace, HWND hwnd,
+    RECT* outRect) {
+  if (!outRect || !hwnd || workspace.Layout() == TileLayout::Floating) return false;
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record || record->state != ManageState::Tiled) return false;
+
+  const size_t tiledIndex = workspace.TiledIndex(hwnd);
+  if (tiledIndex == static_cast<size_t>(-1)) return false;
+
+  HMONITOR monitor = key.ResolveMonitor();
+  if (!monitor) return false;
+  RECT workArea{};
+  if (!GetWorkspaceWorkArea(monitor, &workArea)) return false;
+
+  std::vector<RECT> rects;
+  if (!BuildWorkspaceLayoutPlan(
+          workspace, workArea, GetWorkspaceGapPixels(monitor), &rects) ||
+      tiledIndex >= rects.size()) {
+    return false;
+  }
+  *outRect = rects[tiledIndex];
+  return true;
+}
+
+// The deadline is a final passive verdict, not one more fight with the app. If
+// this exact lease still describes the current tile and the HWND is materially
+// elsewhere, concede that it is unsuitable for tiling: float it and close the
+// remaining layout around it. Stale/replaced state is simply discarded.
+static void FinalizeExpiredConformanceLease(
+    HWND hwnd, const ConformanceLease& lease) {
+  AssertWmThread(L"FinalizeExpiredConformanceLease");
+
+  auto stale = [&] {
+    ++Diagnostics::g_runtime.counters.conformanceLeaseExpiredStale;
+  };
+
+  if (!IsWindow(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd) ||
+      !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd) ||
+      IsMoveSizeGestureInProgress(hwnd)) {
+    stale();
+    return;
+  }
+
+  const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
+  if (owners.size() != 1 || !IsWorkspaceOnActiveDesktop(owners.front())) {
+    stale();
+    return;
+  }
+
+  Workspace workspace;
+  if (!g_workspaces.Load(owners.front(), &workspace)) {
+    stale();
+    return;
+  }
+
+  RECT authoritative{};
+  if (!GetCurrentAuthoritativeTiledRect(
+          owners.front(), workspace, hwnd, &authoritative) ||
+      !RectsNear(authoritative, lease.expectedRect)) {
+    stale();
+    return;
+  }
+
+  RECT current{};
+  if (!GetWindowFrameRect(hwnd, &current)) {
+    stale();
+    return;
+  }
+  if (RectsNear(current, authoritative)) {
+    ++Diagnostics::g_runtime.counters.conformanceLeaseExpiredCompliant;
+    Diagnostics::RecordEvent(
+        L"conformance lease completed compliant hwnd=%p attempts=%u",
+        hwnd, lease.attempts);
+    return;
+  }
+
+  if (!workspace.Float(hwnd)) {
+    stale();
+    return;
+  }
+
+  ++Diagnostics::g_runtime.counters.conformanceLeaseExpiredFloats;
+  Diagnostics::RecordEvent(
+      L"conformance lease expired nonconforming; floated hwnd=%p attempts=%u",
+      hwnd, lease.attempts);
+  Wh_Log(
+      L"Window %p remained outside its assigned tile at conformance deadline; switching it to Floating",
+      hwnd);
+  g_workspaces.Save(owners.front(), workspace);
+  ArrangeWorkspace(owners.front());
+}
+
 // During a short post-placement lease, an application may accept our rectangle
 // synchronously and then restore its own startup/session geometry later. Repair
 // only that unexpected late movement; explicit user gestures cancel the lease at
@@ -967,9 +1084,9 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
     // Adjusted/refused placements are exactly the cases where relying on another
     // LOCATIONCHANGE is unsafe: the application may already be sitting at its
     // final self-selected rectangle. Keep the lease alive and schedule one more
-    // checked attempt at the normal cadence. The existing placement-failure policy
-    // remains the authority that eventually Floats a persistently nonconforming
-    // window; the lease itself still ends only at its original deadline.
+    // checked attempt at the normal cadence. Repeated checked failures may Float
+    // early; otherwise the hard deadline performs one passive final conformance
+    // verdict and Floats only if the HWND is still materially off its current tile.
     const ULONGLONG now = GetTickCount64();
     const ULONGLONG due = std::min(
         lease.expiresAtTickMs, now + kConformanceRepairMinIntervalMs);
@@ -978,34 +1095,46 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
   return true;
 }
 
-static void ProcessPendingConformanceRepairs() {
-  AssertWmThread(L"ProcessPendingConformanceRepairs");
+static void ProcessConformanceTimer() {
+  AssertWmThread(L"ProcessConformanceTimer");
   if (g_wm.conformanceTimer) {
     KillTimer(nullptr, g_wm.conformanceTimer);
     g_wm.conformanceTimer = 0;
   }
 
+  struct ExpiredCandidate {
+    HWND hwnd = nullptr;
+    uint64_t generation = 0;
+  };
+
   const ULONGLONG now = GetTickCount64();
+  std::vector<ExpiredCandidate> expired;
   std::vector<HWND> dueWindows;
   AcquireSRWLockExclusive(&g_conformanceLeases.lock);
-  for (auto it = g_conformanceLeases.leases.begin();
-       it != g_conformanceLeases.leases.end();) {
-    if (now >= it->second.expiresAtTickMs) {
-      it = g_conformanceLeases.leases.erase(it);
+  for (auto& kv : g_conformanceLeases.leases) {
+    ConformanceLease& lease = kv.second;
+    if (now >= lease.expiresAtTickMs) {
+      expired.push_back({kv.first, lease.generation});
       continue;
     }
-    if (it->second.repairDueTickMs && it->second.repairDueTickMs <= now) {
-      dueWindows.push_back(it->first);
-      it->second.repairDueTickMs = 0;
+    if (lease.repairDueTickMs && lease.repairDueTickMs <= now) {
+      dueWindows.push_back(kv.first);
+      lease.repairDueTickMs = 0;
     }
-    ++it;
   }
   ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
 
+  for (const ExpiredCandidate& candidate : expired) {
+    ConformanceLease lease;
+    if (TakeExpiredConformanceLease(
+            candidate.hwnd, candidate.generation, &lease)) {
+      FinalizeExpiredConformanceLease(candidate.hwnd, lease);
+    }
+  }
   for (HWND hwnd : dueWindows) {
     HandleConformanceLeaseLocationChange(hwnd);
   }
-  ScheduleNextConformanceRepairTimer();
+  ScheduleNextConformanceTimer();
 }
 
 // Uses aggregate work-area coverage as a coarse guard against learning arbitrary

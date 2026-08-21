@@ -644,6 +644,9 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Conformance leases started", c.conformanceLeasesStarted, previous.conformanceLeasesStarted, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance lease reinforcement attempts", c.conformanceLeaseRepairs, previous.conformanceLeaseRepairs, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Conformance lease deferred burst repairs", c.conformanceLeaseDeferredRepairs, previous.conformanceLeaseDeferredRepairs, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Conformance deadlines completed compliant", c.conformanceLeaseExpiredCompliant, previous.conformanceLeaseExpiredCompliant, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Conformance deadlines floated window", c.conformanceLeaseExpiredFloats, previous.conformanceLeaseExpiredFloats, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Conformance deadline stale/cancelled verdicts", c.conformanceLeaseExpiredStale, previous.conformanceLeaseExpiredStale, uptimeMs, intervalMs);
 
   report.Line();
   report.Line(L"Virtual desktop / runtime lifecycle / user commands");

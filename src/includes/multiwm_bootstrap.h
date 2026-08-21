@@ -352,7 +352,7 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       }
       if (g_wm.conformanceTimer &&
           static_cast<UINT_PTR>(msg.wParam) == g_wm.conformanceTimer) {
-        ProcessPendingConformanceRepairs();
+        ProcessConformanceTimer();
         return WmMessageDisposition::Handled;
       }
       return WmMessageDisposition::DispatchToWindows;
