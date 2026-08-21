@@ -74,7 +74,20 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // narrow. Besides maximized->restored detection, a short conformance lease may
   // opt a tiled HWND into location observation while an app finishes startup.
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
-    if (!tracked) return;
+    if (!tracked) {
+      // A newly created window can already be minimized/maximized before the
+      // ordinary discovery snapshot ever sees it. Admit only those inactive
+      // physical states through this otherwise-noisy event; settled discovery
+      // re-checks eligibility, desktop, monitor and management mode.
+      const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
+      if ((reason != SuspensionReason::Minimized &&
+           reason != SuspensionReason::Maximized) ||
+          !WindowCanBeManaged(hwnd)) {
+        return;
+      }
+      QueueWindowEvent(event, hwnd);
+      return;
+    }
 
     const bool stateOrLeaseNeedsObservation =
         IsWindowSuspendedMaximized(hwnd) ||
@@ -93,11 +106,10 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   if (!tracked) {
     const bool discoveryEvent =
         event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED ||
-        event == EVENT_OBJECT_STATECHANGE;
-    const bool restoredCandidate =
-        event != EVENT_OBJECT_STATECHANGE ||
-        (IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsZoomed(hwnd));
-    if (!discoveryEvent || !restoredCandidate || !WindowCanBeManaged(hwnd)) {
+        event == EVENT_OBJECT_STATECHANGE ||
+        event == EVENT_SYSTEM_MINIMIZESTART ||
+        event == EVENT_SYSTEM_MINIMIZEEND;
+    if (!discoveryEvent || !WindowCanBeManaged(hwnd)) {
       return;
     }
   }

@@ -94,6 +94,30 @@ static bool AdmitUntrackedSnapshot(
   return changed;
 }
 
+// Automatic discovery can observe a new window while Windows still reports it as
+// minimized or maximized. Such HWNDs belong to the workspace logically but must not
+// enter the active tiling set until restored. Re-check physical state at admission
+// time so a stale dirty-event snapshot cannot suspend a window that has since moved
+// back to Restored/Hidden.
+static bool AdmitUntrackedSuspendedSnapshot(
+    Workspace& workspace, const std::vector<HWND>& snapshot, bool allowAdmission) {
+  if (!allowAdmission) return false;
+
+  bool changed = false;
+  for (HWND hwnd : snapshot) {
+    if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) continue;
+
+    const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
+    if (reason != SuspensionReason::Minimized &&
+        reason != SuspensionReason::Maximized) {
+      continue;
+    }
+
+    changed |= workspace.AdmitInitial(MakeWindowRecord(hwnd), reason);
+  }
+  return changed;
+}
+
 static bool AdoptSnapshotGeometryIfEligible(
     Workspace& workspace, const std::vector<HWND>& snapshot,
     const RECT& workArea, HMONITOR monitor) {
@@ -500,13 +524,55 @@ static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) 
 
 static void ScheduleLifecycleReconcile(HWND hwnd);
 
+// Build only the extra inactive candidates implicated by this settled lifecycle
+// burst. This deliberately does not add another EnumWindows pass: normal restored
+// discovery still comes from the one-pass per-monitor snapshot, while newly
+// observed minimized/maximized HWNDs are classified from the already-dirty set.
+static std::vector<std::vector<HWND>> CollectDirtySuspendedWindowsForMonitors(
+    const std::vector<HWND>& dirtyWindows,
+    const std::vector<HMONITOR>& monitors,
+    const GUID& desktopId) {
+  std::vector<std::vector<HWND>> snapshots(monitors.size());
+  if (!IsAutomaticMode() || dirtyWindows.empty() || monitors.empty()) {
+    return snapshots;
+  }
+
+  for (HWND hwnd : dirtyWindows) {
+    if (!hwnd || !IsWindow(hwnd) || IsWindowTrackedInAnyState(hwnd)) continue;
+    if (!IsWindowVisible(hwnd) || !WindowCanBeManaged(hwnd) || !IsWindowEnabled(hwnd)) {
+      continue;
+    }
+
+    const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
+    if (reason != SuspensionReason::Minimized &&
+        reason != SuspensionReason::Maximized) {
+      continue;
+    }
+
+    GUID windowDesktop{};
+    if (!GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+        !IsEqualGUID(windowDesktop, desktopId)) {
+      continue;
+    }
+
+    const HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
+    auto it = std::find(monitors.begin(), monitors.end(), monitor);
+    if (it == monitors.end()) continue;
+
+    snapshots[static_cast<size_t>(it - monitors.begin())].push_back(hwnd);
+  }
+
+  return snapshots;
+}
+
 // Current-desktop discovery has two separate jobs: reconcile already-managed
 // HWND ownership according to the active management policy, and optionally admit
 // truly new windows while Automatic mode is active.
 static bool DiscoverWorkspaceWindows(
     HMONITOR monitor, const GUID& desktopId, const std::vector<HWND>& snapshot,
     DesktopMonitorKey* outKey,
-    std::vector<DesktopMonitorKey>* ownershipChangedKeys = nullptr) {
+    std::vector<DesktopMonitorKey>* ownershipChangedKeys = nullptr,
+    const std::vector<HWND>* suspendedSnapshot = nullptr) {
   if (!IsLiveMonitorHandle(monitor)) return false;
 
   DesktopMonitorKey key{};
@@ -533,6 +599,11 @@ static bool DiscoverWorkspaceWindows(
   }
   changed |= RestoreSuspendedSnapshot(workspace, snapshot);
   if (AdmitUntrackedSnapshot(workspace, snapshot, admitUntracked)) {
+    hasState = true;
+    changed = true;
+  }
+  if (suspendedSnapshot &&
+      AdmitUntrackedSuspendedSnapshot(workspace, *suspendedSnapshot, admitUntracked)) {
     hasState = true;
     changed = true;
   }
@@ -843,14 +914,18 @@ static void ReconcileDeferredLifecycle() {
 
   // One top-level enumeration is enough for every monitor involved in this burst.
   std::vector<std::vector<HWND>> snapshots = CollectTileWindowsForMonitors(monitors);
+  std::vector<std::vector<HWND>> suspendedSnapshots =
+      CollectDirtySuspendedWindowsForMonitors(dirtyWindows, monitors, currentDesktop);
 
   std::vector<DesktopMonitorKey> arrangedKeys;
   for (size_t monitorIndex = 0; monitorIndex < monitors.size(); ++monitorIndex) {
     HMONITOR monitor = monitors[monitorIndex];
     DesktopMonitorKey key{};
     const std::vector<HWND>& snapshot = snapshots[monitorIndex];
+    const std::vector<HWND>& suspendedSnapshot = suspendedSnapshots[monitorIndex];
     bool changed = DiscoverWorkspaceWindows(
-        monitor, currentDesktop, snapshot, &key, &globallyChanged);
+        monitor, currentDesktop, snapshot, &key, &globallyChanged,
+        &suspendedSnapshot);
     bool pendingArrange = std::any_of(
         g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
         [&](const PendingWorkspaceArrange& pending) {

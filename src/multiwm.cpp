@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.15
+// @version         1.13.16
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -39,7 +39,7 @@ resize-adjusted ratios per virtual desktop.
 - Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
 - Optional process/class/title exclusion rules keep user-selected windows out of management
 - Hotkey diagnostics write a timestamped UTF-8 text report with runtime/churn counters, diagnostic self-cost accounting, significant/lifecycle histories, platform health, telemetry/invariant audits, and deterministic per-workspace/window state
-- New-workspace initialization discovers visible minimized/maximized windows as suspended logical members instead of losing them
+- Automatic discovery admits newly observed visible minimized/maximized windows as suspended logical members, including after a workspace already exists
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
 
@@ -63,7 +63,7 @@ resize-adjusted ratios per virtual desktop.
 
 // ==WindhawkModSettings==
 /*
-- DefaultWindowManagementMode: manual
+- DefaultWindowManagementMode: automatic
   $name: '[General] Default Window Management Mode'
   $description: 'Choose membership policy after startup. Manual keeps Alt+D groups inert: new windows are not admitted, minimizing releases membership, and moving a managed window to another virtual desktop does not carry it into that desktop. Maximized windows still preserve their slot. Automatic continuously discovers and migrates managed windows.'
   $options:
@@ -82,7 +82,7 @@ resize-adjusted ratios per virtual desktop.
     - monocle: Monocle (Fullscreen)
     - floating: Floating (managed, no automatic placement)
 
-- LayoutCycle: [master_stack, columns, rows, master_stack_h, bsp, monocle, floating]
+- LayoutCycle: [master_stack, master_stack_h, bsp, columns, rows,  monocle, floating]
   $name: '[Workspace] Layout Cycle'
   $description: 'Layouts visited by the Cycle Layout hotkey, in order. Remove layouts you never want to cycle through or drag entries to reorder them. If the current layout is not in the list, the next cycle starts at the first entry.'
   $options:
@@ -94,11 +94,11 @@ resize-adjusted ratios per virtual desktop.
     - monocle: Monocle (Fullscreen)
     - floating: Floating (managed, no automatic placement)
 
-- TileGap: 4
+- TileGap: 6
   $name: '[Workspace] Window Gap (DPI-scaled pixels)'
   $description: Gap between adjacent tiled windows at 96 DPI (0-100); scaled per monitor.
 
-- WorkspaceInsets: "4, 4, 4, 4"
+- WorkspaceInsets: "6, 6, 6, 6"
   $name: '[Workspace] Insets (DPI-scaled pixels)'
   $description: 'Left, Top, Right, Bottom at 96 DPI. Positive values inset the workspace from that edge; each value must be 0-500 and is scaled per monitor. Example: 4, 4, 4, 4'
 
@@ -139,7 +139,7 @@ resize-adjusted ratios per virtual desktop.
     - ctrl+alt: Ctrl + Alt
     - ctrl+shift: Ctrl + Shift
 
-- TileKey: "D"
+- TileKey: "T"
   $name: '[Hotkeys - Workspace] Tile Workspace'
   $description: 'Reconcile and tile windows on the current monitor. Leave blank to disable. Examples: D, T, Space, `, -'
 
@@ -151,23 +151,23 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Hotkeys - Window] Set Master Window'
   $description: 'Set another tiled window as the master. Leave blank to disable.'
 
-- PromoteWindowKey: "["
+- PromoteWindowKey: ","
   $name: '[Hotkeys - Window] Promote Focused Window'
   $description: 'Move the focused tiled window one logical slot earlier. Does nothing in the first slot. Leave blank to disable.'
 
-- DemoteWindowKey: "]"
+- DemoteWindowKey: "."
   $name: '[Hotkeys - Window] Demote Focused Window'
   $description: 'Move the focused tiled window one logical slot later. Does nothing in the last slot. Leave blank to disable.'
 
-- ManagementModeToggleKey: "U"
+- ManagementModeToggleKey: "R"
   $name: '[Hotkeys - General] Toggle Window Management Mode'
   $description: 'Switch between Automatic and Manual modes at runtime. Leave blank to disable.'
 
-- FloatFocusedKey: ""
+- FloatFocusedKey: "F"
   $name: '[Hotkeys - Window] Float Focused Window'
   $description: 'Float the focused tiled window. Leave blank to disable.'
 
-- FlyoutPosition: bottom
+- FlyoutPosition: top
   $name: '[Appearance] Status Flyout Position'
   $description: Show layout and mode feedback at the top or bottom center of the active monitor.
   $options:
@@ -198,11 +198,11 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Appearance] Custom Tray Layout Icons'
   $description: Optional per-layout .ico overrides. Failed or empty paths use the generated text icon.
 
-- ConformanceLeaseMs: 1500
+- ConformanceLeaseMs: 3000
   $name: '[Advanced] Tiled Window Conformance Lease (ms)'
   $description: 'After an authoritative tiled placement, briefly reinforce the assigned rectangle if the application moves itself again. The configured duration is a hard deadline: repeating the same authoritative placement does not extend it. At the deadline, a still-tiled window that remains materially outside its current assigned tile is switched to Floating and the remaining layout reflows. User move/resize gestures cancel the lease immediately. Set to 0 to disable (0-10000 ms). [Default 1500]'
 
-- ReconcileDelayMs: 80
+- ReconcileDelayMs: 150
   $name: '[Advanced] Lifecycle Settle Delay (ms)'
   $description: Delay before visibility/lifecycle bursts are reconciled. Increase only if shell transitions are unusually slow (20-2000 ms).
 
