@@ -303,29 +303,78 @@ static bool AddIconToShell() {
   SetTooltip(g_displayedLayout);
   if (!Shell_NotifyIconW(NIM_ADD, &g_notifyData)) {
     g_iconAdded = false;
+    Wh_Log(L"Tray icon NIM_ADD failed");
     return false;
   }
+
   g_iconAdded = true;
   g_notifyData.uVersion = NOTIFYICON_VERSION_4;
-  Shell_NotifyIconW(NIM_SETVERSION, &g_notifyData);
+  if (!Shell_NotifyIconW(NIM_SETVERSION, &g_notifyData)) {
+    Wh_Log(L"Tray icon NIM_SETVERSION failed after NIM_ADD");
+  }
   return true;
 }
 
 static void UpdateIcon(TileLayout layout, HMONITOR monitor) {
   if (!g_trayWindow || layout == TileLayout::COUNT) return;
+
   g_displayedLayout = layout;
   if (monitor) g_displayedMonitor = monitor;
+
   if (!g_iconAdded) {
-    AddIconToShell();
+    if (AddIconToShell()) return;
+
+    // TaskbarCreated can be broadcast even when Explorer kept the existing tray
+    // entry. In that state NIM_ADD fails because the icon already exists, so try
+    // updating that surviving entry instead of permanently wedging on NIM_ADD.
+    g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    g_notifyData.hIcon = GetLayoutIcon(layout);
+    SetTooltip(layout);
+    if (Shell_NotifyIconW(NIM_MODIFY, &g_notifyData)) {
+      g_iconAdded = true;
+      g_notifyData.uVersion = NOTIFYICON_VERSION_4;
+      if (!Shell_NotifyIconW(NIM_SETVERSION, &g_notifyData)) {
+        Wh_Log(L"Tray icon NIM_SETVERSION failed after NIM_MODIFY recovery");
+      }
+      Wh_Log(L"Tray icon recovered by NIM_MODIFY after NIM_ADD failed");
+      return;
+    }
+
+    Wh_Log(L"Tray icon recovery failed: both NIM_ADD and NIM_MODIFY failed");
     return;
   }
+
   g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
   g_notifyData.hIcon = GetLayoutIcon(layout);
   SetTooltip(layout);
   if (!Shell_NotifyIconW(NIM_MODIFY, &g_notifyData)) {
+    // The shell may have discarded the entry while our local state still says it
+    // exists. Reverse the recovery direction and recreate it with NIM_ADD.
+    Wh_Log(L"Tray icon NIM_MODIFY failed; trying NIM_ADD");
     g_iconAdded = false;
-    AddIconToShell();
+    if (!AddIconToShell()) {
+      Wh_Log(L"Tray icon recovery failed after NIM_MODIFY");
+    }
   }
+}
+
+// TaskbarCreated is a shell/taskbar lifecycle hint, not proof that the old tray
+// entry vanished. Remove any surviving entry first, then rebuild from current
+// model state. UpdateIcon still has ADD/MODIFY recovery for shell-state races.
+static void RecreateIconInShell() {
+  if (!g_trayWindow) return;
+
+  NOTIFYICONDATAW identity{};
+  identity.cbSize = sizeof(identity);
+  identity.hWnd = g_trayWindow;
+  identity.uID = kIconId;
+  Shell_NotifyIconW(NIM_DELETE, &identity);
+
+  g_iconAdded = false;
+  if (g_displayedLayout == TileLayout::COUNT) {
+    g_displayedLayout = g_settings.defaultLayout;
+  }
+  UpdateIcon(g_displayedLayout, g_displayedMonitor);
 }
 
 // Repoints the live tray entry to a complete new icon set before destroying the
@@ -688,8 +737,7 @@ static void HandleThemeChanged() {
 static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
                                        LPARAM lParam) {
   if (g_taskbarCreatedMessage && message == g_taskbarCreatedMessage) {
-    g_iconAdded = false;
-    AddIconToShell();
+    RecreateIconInShell();
     RuntimeLifecycle::NotifyShellRestarted();
     return 0;
   }
