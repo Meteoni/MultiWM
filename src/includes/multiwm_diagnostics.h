@@ -1082,7 +1082,7 @@ static void WriteDiagnosticReport() {
   report.Line(L"Master percent: %ld", g_settings.masterPercent);
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
   report.Line(
-      L"Automatic new-window position: %ls",
+      L"Automatic insertion position: %ls",
       g_settings.automaticNewWindowPosition ==
               AutomaticNewWindowPosition::AfterFocused
           ? L"After focused window"

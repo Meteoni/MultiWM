@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.18
+// @version         1.13.19
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -40,7 +40,7 @@ resize-adjusted ratios per virtual desktop.
 - Optional process/class/title exclusion rules keep user-selected windows out of management
 - Hotkey diagnostics write a timestamped UTF-8 text report with runtime/churn counters, diagnostic self-cost accounting, significant/lifecycle histories, platform health, telemetry/invariant audits, and deterministic per-workspace/window state
 - Automatic discovery admits newly observed visible minimized/maximized windows as suspended logical members, including after a workspace already exists
-- Automatic new-window placement can append at the last slot or insert immediately after the most recently focused managed window in that workspace
+- Automatic insertion can place newly discovered or migrated windows at the last slot or immediately after the destination workspace's most recently focused managed window
 - Newly discovered restored windows entering a Floating workspace use the configured default floating size and centered placement instead of stale application-restored geometry
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
@@ -73,8 +73,8 @@ resize-adjusted ratios per virtual desktop.
     - automatic: Automatic
 
 - AutomaticNewWindowPosition: last_slot
-  $name: '[Automatic] New Window Position'
-  $description: 'Choose where Automatic mode inserts newly discovered windows. After focused window uses the most recently focused managed window in the same desktop + monitor workspace and falls back to Last slot when no tiled focus anchor exists.'
+  $name: '[Automatic] Window Insertion Position'
+  $description: 'Choose where Automatic mode inserts newly discovered windows and managed windows migrating into another workspace. Suspended windows restored in place keep their saved logical slot. After focused window uses the most recently focused tiled window in the destination desktop + monitor workspace and falls back to Last slot when no tiled focus anchor exists.'
   $options:
     - last_slot: Last slot
     - after_focused: After focused window

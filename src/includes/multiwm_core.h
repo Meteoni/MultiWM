@@ -692,7 +692,7 @@ class Workspace {
   bool Float(HWND hwnd);
   bool Forget(HWND hwnd);
   bool ExtractForMigration(HWND hwnd, WindowRecord* outRecord);
-  void AdmitMigrated(WindowRecord record);
+  void AdmitMigrated(WindowRecord record, HWND anchor = nullptr);
   void MergeRememberedFloatingGeometryFrom(const Workspace& source);
   void MergeNonTiledRecordsFrom(const Workspace& source);
   void RepairForArrangement(

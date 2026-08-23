@@ -415,11 +415,29 @@ bool Workspace::ExtractForMigration(HWND hwnd, WindowRecord* outRecord) {
   return Forget(hwnd);
 }
 
-void Workspace::AdmitMigrated(WindowRecord record) {
+void Workspace::AdmitMigrated(WindowRecord record, HWND anchor) {
   AssertWmThread(L"Workspace::AdmitMigrated");
   const HWND hwnd = record.hwnd;
   if (!hwnd) return;
   Forget(hwnd);
+
+  // Automatic cross-workspace insertion follows the same destination-anchor
+  // policy as fresh admission. The caller supplies no anchor for Last slot or
+  // for Manual-mode migration, preserving the previous append behavior.
+  if (anchor && anchor != hwnd && IsTiled(anchor)) {
+    if (record.state == ManageState::Tiled) {
+      AdmitTiledAfter(std::move(record), anchor);
+      return;
+    }
+
+    if (record.state == ManageState::Suspended &&
+        record.suspensionReason != SuspensionReason::None &&
+        record.suspensionReason != SuspensionReason::Hidden) {
+      const SuspensionReason reason = record.suspensionReason;
+      AdmitInitialAfter(std::move(record), reason, anchor);
+      return;
+    }
+  }
 
   if (record.state == ManageState::Tiled) {
     record.suspensionReason = SuspensionReason::None;

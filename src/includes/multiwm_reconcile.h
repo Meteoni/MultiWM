@@ -281,7 +281,16 @@ static bool MigrateManagedWindow(
     target.SetLayout(g_settings.defaultLayout);
     target.SetMasterRatio(g_settings.masterPercent / 100.0);
   }
-  target.AdmitMigrated(std::move(record));
+
+  HWND insertionAnchor = nullptr;
+  if (IsAutomaticMode() &&
+      g_settings.automaticNewWindowPosition ==
+          AutomaticNewWindowPosition::AfterFocused) {
+    insertionAnchor = target.LastFocusedTiledWindow();
+    if (insertionAnchor == hwnd) insertionAnchor = nullptr;
+  }
+
+  target.AdmitMigrated(std::move(record), insertionAnchor);
   if (wasFocused) target.RememberFocusedWindow(hwnd);
 
   if (sourceLayout != TileLayout::Floating &&
