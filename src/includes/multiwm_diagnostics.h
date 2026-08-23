@@ -1081,6 +1081,12 @@ static void WriteDiagnosticReport() {
       g_settings.floatingDefaultSizeDip.height);
   report.Line(L"Master percent: %ld", g_settings.masterPercent);
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
+  report.Line(
+      L"Automatic new-window position: %ls",
+      g_settings.automaticNewWindowPosition ==
+              AutomaticNewWindowPosition::AfterFocused
+          ? L"After focused window"
+          : L"Last slot");
   report.Line(L"Tiled conformance lease: %u ms", g_settings.conformanceLeaseMs);
   report.Line(L"Conformance repair min interval: %u ms", kConformanceRepairMinIntervalMs);
   report.Line(L"Lifecycle settle delay: %u ms", g_settings.reconcileDelayMs);
@@ -1205,6 +1211,9 @@ static void WriteDiagnosticReport() {
         report.Line(L"  - %ls", error.c_str());
       }
     }
+    report.Line(
+        L"retainedFocus=%p tiledAdmissionAnchor=%p",
+        state.LastFocusedWindow(), state.LastFocusedTiledWindow());
     report.Line(L"stackWeights: %ls", DiagnosticWeightsString(state.StackWeights()).c_str());
     report.Line(L"gridWeights:  %ls", DiagnosticWeightsString(state.GridWeights()).c_str());
 

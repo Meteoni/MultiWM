@@ -69,6 +69,7 @@ static bool GetWorkspaceWorkArea(HMONITOR monitor, RECT* outWorkArea) {
 enum class FloatingPlacementIntent {
   PassiveRestore,
   PreserveAnchor,
+  NewWindowDefault,
 };
 
 struct FloatingPlacementHint {
@@ -163,9 +164,12 @@ static bool RepairFloatingGeometry(
                            current.bottom > current.top;
   const UINT targetDpi = GetMonitorEffectiveDpi(monitor);
 
+  const bool useNewWindowDefault =
+      hint.intent == FloatingPlacementIntent::NewWindowDefault;
+
   LONG width = 0;
   LONG height = 0;
-  if (record->hasFloatingRect) {
+  if (!useNewWindowDefault && record->hasFloatingRect) {
     const UINT sourceDpi = record->floatingDpi ? record->floatingDpi : 96;
     width = MulDiv(
         record->floatingRect.right - record->floatingRect.left,
@@ -186,7 +190,7 @@ static bool RepairFloatingGeometry(
   POINT center{};
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     center = hint.anchor;
-  } else if (record->hasFloatingRect &&
+  } else if (!useNewWindowDefault && record->hasFloatingRect &&
              ResolveRememberedFloatingMonitor(*record) == monitor) {
     center = RectCenter(record->floatingRect);
   } else {

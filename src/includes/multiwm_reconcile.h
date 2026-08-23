@@ -84,12 +84,36 @@ static bool ReadoptFloatingSnapshot(
 }
 
 static bool AdmitUntrackedSnapshot(
-    Workspace& workspace, const std::vector<HWND>& snapshot, bool allowAdmission) {
+    Workspace& workspace, const std::vector<HWND>& snapshot, bool allowAdmission,
+    bool useAutomaticPositionPolicy = false,
+    std::vector<HWND>* admittedWindows = nullptr) {
   if (!allowAdmission) return false;
+
+  const bool afterFocused =
+      useAutomaticPositionPolicy &&
+      g_settings.automaticNewWindowPosition ==
+          AutomaticNewWindowPosition::AfterFocused;
+  HWND anchor = afterFocused ? workspace.LastFocusedTiledWindow() : nullptr;
+
   bool changed = false;
   for (HWND hwnd : snapshot) {
     if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) continue;
-    changed |= workspace.AdmitTiled(MakeWindowRecord(hwnd, ManageState::Tiled));
+
+    bool admitted = false;
+    WindowRecord record = MakeWindowRecord(hwnd, ManageState::Tiled);
+    if (anchor) {
+      admitted = workspace.AdmitTiledAfter(std::move(record), anchor);
+    } else {
+      admitted = workspace.AdmitTiled(std::move(record));
+    }
+
+    if (!admitted) continue;
+    changed = true;
+    if (admittedWindows) admittedWindows->push_back(hwnd);
+
+    // Preserve enumeration order when one reconciliation burst discovers several
+    // windows without changing the retained user-focus anchor.
+    if (afterFocused) anchor = hwnd;
   }
   return changed;
 }
@@ -100,20 +124,40 @@ static bool AdmitUntrackedSnapshot(
 // time so a stale dirty-event snapshot cannot suspend a window that has since moved
 // back to Restored/Hidden.
 static bool AdmitUntrackedSuspendedSnapshot(
-    Workspace& workspace, const std::vector<HWND>& snapshot, bool allowAdmission) {
+    Workspace& workspace, const std::vector<HWND>& snapshot, bool allowAdmission,
+    bool useAutomaticPositionPolicy = false) {
   if (!allowAdmission) return false;
 
-  bool changed = false;
-  for (HWND hwnd : snapshot) {
-    if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) continue;
+  const bool afterFocused =
+      useAutomaticPositionPolicy &&
+      g_settings.automaticNewWindowPosition ==
+          AutomaticNewWindowPosition::AfterFocused;
+  const HWND anchor = afterFocused ? workspace.LastFocusedTiledWindow() : nullptr;
+
+  auto admitOne = [&](HWND hwnd) {
+    if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) return false;
 
     const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
     if (reason != SuspensionReason::Minimized &&
         reason != SuspensionReason::Maximized) {
-      continue;
+      return false;
     }
 
-    changed |= workspace.AdmitInitial(MakeWindowRecord(hwnd), reason);
+    if (anchor) {
+      return workspace.AdmitInitialAfter(MakeWindowRecord(hwnd), reason, anchor);
+    }
+    return workspace.AdmitInitial(MakeWindowRecord(hwnd), reason);
+  };
+
+  bool changed = false;
+  if (anchor) {
+    // Each suspended member targets the same logical point after the anchor.
+    // Reverse traversal preserves the snapshot's original order.
+    for (auto it = snapshot.rbegin(); it != snapshot.rend(); ++it) {
+      changed |= admitOne(*it);
+    }
+  } else {
+    for (HWND hwnd : snapshot) changed |= admitOne(hwnd);
   }
   return changed;
 }
@@ -134,8 +178,10 @@ static bool AdoptSnapshotGeometryIfEligible(
   Workspace captured = Workspace::AdoptGeometry(
       workspace.Layout(), workArea, GetWorkspaceGapPixels(monitor),
       g_settings.masterPercent / 100.0, geometry, preferredMaster);
+  const HWND retainedFocus = workspace.LastFocusedWindow();
   captured.MergeRememberedFloatingGeometryFrom(workspace);
   captured.MergeNonTiledRecordsFrom(workspace);
+  captured.RememberFocusedWindow(retainedFocus);
   workspace = std::move(captured);
   return true;
 }
@@ -165,7 +211,7 @@ static bool EnsureWorkspaceFromSnapshot(
 
   RestoreSuspendedSnapshot(workspace, snapshot);
   if (adoptCurrentGeometry) ReadoptFloatingSnapshot(workspace, snapshot);
-  AdmitUntrackedSnapshot(workspace, snapshot, true);
+  AdmitUntrackedSnapshot(workspace, snapshot, true, false);
 
   if (adoptCurrentGeometry) {
     AdoptSnapshotGeometryIfEligible(workspace, snapshot, workArea, monitor);
@@ -223,6 +269,7 @@ static bool MigrateManagedWindow(
   Workspace source;
   if (!g_workspaces.Load(sourceKey, &source)) return false;
   const TileLayout sourceLayout = source.Layout();
+  const bool wasFocused = source.LastFocusedWindow() == hwnd;
 
   WindowRecord record;
   if (!source.ExtractForMigration(hwnd, &record)) return false;
@@ -235,6 +282,7 @@ static bool MigrateManagedWindow(
     target.SetMasterRatio(g_settings.masterPercent / 100.0);
   }
   target.AdmitMigrated(std::move(record));
+  if (wasFocused) target.RememberFocusedWindow(hwnd);
 
   if (sourceLayout != TileLayout::Floating &&
       sourceState != ManageState::Floating &&
@@ -598,14 +646,37 @@ static bool DiscoverWorkspaceWindows(
     changed = true;
   }
   changed |= RestoreSuspendedSnapshot(workspace, snapshot);
-  if (AdmitUntrackedSnapshot(workspace, snapshot, admitUntracked)) {
+
+  std::vector<HWND> newlyAdmittedWindows;
+  if (AdmitUntrackedSnapshot(
+          workspace, snapshot, admitUntracked, true,
+          &newlyAdmittedWindows)) {
     hasState = true;
     changed = true;
   }
   if (suspendedSnapshot &&
-      AdmitUntrackedSuspendedSnapshot(workspace, *suspendedSnapshot, admitUntracked)) {
+      AdmitUntrackedSuspendedSnapshot(
+          workspace, *suspendedSnapshot, admitUntracked, true)) {
     hasState = true;
     changed = true;
+  }
+
+  // Automatic discovery owns the first floating geometry of a genuinely new
+  // restored window. Ignore the app/Windows stale restore rectangle and apply
+  // the configured default size centered in this workspace instead.
+  if (admitUntracked && workspace.Layout() == TileLayout::Floating) {
+    FloatingPlacementHint newWindowHint;
+    newWindowHint.intent = FloatingPlacementIntent::NewWindowDefault;
+    for (HWND hwnd : newlyAdmittedWindows) {
+      RepairFloatingGeometry(key, workspace, hwnd, newWindowHint);
+    }
+  }
+
+  // Selection used the retained pre-admission focus. Once membership is stable,
+  // let a newly admitted foreground HWND become the next retained focus anchor.
+  HWND foreground = GetForegroundWindow();
+  if (foreground && workspace.HasRecord(foreground)) {
+    workspace.RememberFocusedWindow(foreground);
   }
 
   if (!hasState || !changed) return false;

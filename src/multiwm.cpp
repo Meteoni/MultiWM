@@ -2,7 +2,7 @@
 // @id              tiling-helper-experimental
 // @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
-// @version         1.13.17
+// @version         1.13.18
 // @author          u2x1, meteoni
 // @github          https://github.com/u2x1
 // @include         windhawk.exe
@@ -40,6 +40,8 @@ resize-adjusted ratios per virtual desktop.
 - Optional process/class/title exclusion rules keep user-selected windows out of management
 - Hotkey diagnostics write a timestamped UTF-8 text report with runtime/churn counters, diagnostic self-cost accounting, significant/lifecycle histories, platform health, telemetry/invariant audits, and deterministic per-workspace/window state
 - Automatic discovery admits newly observed visible minimized/maximized windows as suspended logical members, including after a workspace already exists
+- Automatic new-window placement can append at the last slot or insert immediately after the most recently focused managed window in that workspace
+- Newly discovered restored windows entering a Floating workspace use the configured default floating size and centered placement instead of stale application-restored geometry
 - Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
 - Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
 
@@ -70,6 +72,13 @@ resize-adjusted ratios per virtual desktop.
     - manual: Manual
     - automatic: Automatic
 
+- AutomaticNewWindowPosition: last_slot
+  $name: '[Automatic] New Window Position'
+  $description: 'Choose where Automatic mode inserts newly discovered windows. After focused window uses the most recently focused managed window in the same desktop + monitor workspace and falls back to Last slot when no tiled focus anchor exists.'
+  $options:
+    - last_slot: Last slot
+    - after_focused: After focused window
+
 - DefaultLayout: master_stack
   $name: '[General] Default Workspace Layout'
   $description: Initial layout used when a new desktop + monitor workspace is created.
@@ -80,7 +89,7 @@ resize-adjusted ratios per virtual desktop.
     - rows: Rows
     - bsp: BSP (Binary Space Partition)
     - monocle: Monocle (Fullscreen)
-    - floating: Floating (managed, no automatic placement)
+    - floating: Floating (managed, no tiling)
 
 - LayoutCycle: [master_stack, master_stack_h, bsp, columns, rows,  monocle, floating]
   $name: '[Workspace] Layout Cycle'
@@ -92,7 +101,7 @@ resize-adjusted ratios per virtual desktop.
     - rows: Rows
     - bsp: BSP (Binary Space Partition)
     - monocle: Monocle (Fullscreen)
-    - floating: Floating (managed, no automatic placement)
+    - floating: Floating (managed, no tiling)
 
 - TileGap: 6
   $name: '[Workspace] Window Gap (DPI-scaled pixels)'
@@ -115,7 +124,7 @@ resize-adjusted ratios per virtual desktop.
 
 - FloatingDefaultSize: "960, 640"
   $name: '[Floating] Default Size (DPI-scaled pixels)'
-  $description: 'Fallback Width, Height at 96 DPI when no remembered floating size exists. Each value must be 100-4000 and is scaled per monitor. Example: 960, 640'
+  $description: 'Width, Height at 96 DPI used for newly discovered windows in Floating workspaces and as the fallback when no remembered floating size exists. Each value must be 100-4000 and is scaled per monitor. Example: 960, 640'
 
 - Exclusions:
     - - Match: process

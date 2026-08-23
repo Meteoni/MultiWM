@@ -171,11 +171,13 @@ constexpr UINT WM_APP_RECONCILE_NOW = WM_APP + 6;
 constexpr UINT WM_APP_LAYOUT_SET = WM_APP + 7;
 constexpr UINT WM_APP_MANAGEMENT_MODE_SET = WM_APP + 8;
 constexpr UINT WM_APP_TILE_WORKSPACE = WM_APP + 9;
+constexpr UINT WM_APP_FOREGROUND_CHANGED = WM_APP + 10;
 
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
 enum class MouseMoveBehavior { Float, Swap };
 enum class ExclusionMatch { Process, Class, Title };
 enum class ManagementMode { Manual, Automatic };
+enum class AutomaticNewWindowPosition { LastSlot, AfterFocused };
 
 static std::vector<TileLayout> MakeBuiltInLayoutCycle() {
   return {
@@ -229,6 +231,8 @@ struct SettingsState {
   LONG masterPercent = 50;
 
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
+  AutomaticNewWindowPosition automaticNewWindowPosition =
+      AutomaticNewWindowPosition::LastSlot;
   TileLayout defaultLayout = TileLayout::MasterStack;
   std::vector<TileLayout> layoutCycle = MakeBuiltInLayoutCycle();
   std::vector<ExclusionRule> exclusionRules;
@@ -660,6 +664,11 @@ class Workspace {
   bool IsTiled(HWND hwnd) const;
   size_t TiledIndex(HWND hwnd) const;
   size_t LogicalIndex(HWND hwnd) const;
+  HWND LastFocusedWindow() const { return lastFocusedWindow_; }
+  HWND LastFocusedTiledWindow() const {
+    return IsTiled(lastFocusedWindow_) ? lastFocusedWindow_ : nullptr;
+  }
+  bool RememberFocusedWindow(HWND hwnd);
   bool HasSuspended() const;
   bool AllTiledVisible(const std::vector<HWND>& snapshot) const;
 
@@ -674,7 +683,10 @@ class Workspace {
 
   bool ActivateTiled(HWND hwnd, bool resetPlacementFailures = false);
   bool AdmitTiled(WindowRecord record, bool resetPlacementFailures = false);
+  bool AdmitTiledAfter(WindowRecord record, HWND anchor);
   bool AdmitInitial(WindowRecord record, SuspensionReason reason);
+  bool AdmitInitialAfter(
+      WindowRecord record, SuspensionReason reason, HWND anchor);
   bool Suspend(HWND hwnd, SuspensionReason reason);
   bool Restore(HWND hwnd);
   bool Float(HWND hwnd);
@@ -725,6 +737,7 @@ class Workspace {
   double masterRatio_ = 0.5;
   std::vector<double> stackWeights_;
   std::vector<double> gridWeights_;
+  HWND lastFocusedWindow_ = nullptr;
 };
 
 constexpr int kPlacementFailureLimit = 3;

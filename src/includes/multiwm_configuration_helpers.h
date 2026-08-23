@@ -277,6 +277,13 @@ size_t Workspace::LogicalIndex(HWND hwnd) const {
   return static_cast<size_t>(-1);
 }
 
+bool Workspace::RememberFocusedWindow(HWND hwnd) {
+  AssertWmThread(L"Workspace::RememberFocusedWindow");
+  if (!hwnd || !HasRecord(hwnd) || lastFocusedWindow_ == hwnd) return false;
+  lastFocusedWindow_ = hwnd;
+  return true;
+}
+
 bool Workspace::HasSuspended() const {
   return std::any_of(
       records_.begin(), records_.end(), [](const auto& kv) {
@@ -369,6 +376,58 @@ bool Workspace::AdmitTiled(WindowRecord record, bool resetPlacementFailures) {
   UpsertRecord(std::move(record));
   const bool activated = ActivateTiled(hwnd, resetPlacementFailures);
   return !existed || activated;
+}
+
+// Fresh Automatic admission can insert relative to the retained managed focus.
+// Shift suspended logical slots first so every member keeps a unique position.
+bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
+  AssertWmThread(L"Workspace::AdmitTiledAfter");
+  const HWND hwnd = record.hwnd;
+  if (!hwnd || HasRecord(hwnd) || !IsTiled(anchor)) {
+    return AdmitTiled(std::move(record));
+  }
+
+  const size_t anchorActiveIndex = TiledIndex(anchor);
+  if (anchorActiveIndex == static_cast<size_t>(-1)) {
+    return AdmitTiled(std::move(record));
+  }
+
+  const size_t insertionLogicalIndex =
+      ActiveIndexToLogicalIndex(anchorActiveIndex) + 1;
+  for (auto& kv : records_) {
+    WindowRecord& existing = kv.second;
+    if (existing.state == ManageState::Suspended &&
+        existing.hasSavedSlot &&
+        existing.savedSlot.index >= insertionLogicalIndex) {
+      ++existing.savedSlot.index;
+    }
+  }
+
+  EnsureWeights();
+  const size_t insertionActiveIndex =
+      std::min(anchorActiveIndex + 1, windows_.size());
+  windows_.insert(windows_.begin() + insertionActiveIndex, hwnd);
+
+  if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
+    gridWeights_.insert(
+        gridWeights_.begin() + std::min(insertionActiveIndex, gridWeights_.size()),
+        1.0);
+  } else if ((layout_ == TileLayout::MasterStack ||
+              layout_ == TileLayout::MasterStackH) &&
+             insertionActiveIndex > 0) {
+    const size_t stackIndex =
+        std::min(insertionActiveIndex - 1, stackWeights_.size());
+    stackWeights_.insert(stackWeights_.begin() + stackIndex, 1.0);
+  }
+
+  record.state = ManageState::Tiled;
+  record.suspensionReason = SuspensionReason::None;
+  record.savedSlot = {};
+  record.hasSavedSlot = false;
+  records_.emplace(hwnd, std::move(record));
+  EnsureWeights();
+  DebugValidateMutation(L"Workspace::AdmitTiledAfter");
+  return true;
 }
 
 bool Workspace::ResetPlacementFailures(HWND hwnd) {

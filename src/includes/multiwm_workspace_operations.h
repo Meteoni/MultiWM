@@ -231,6 +231,54 @@ bool Workspace::AdmitInitial(
   return true;
 }
 
+bool Workspace::AdmitInitialAfter(
+    WindowRecord record, SuspensionReason reason, HWND anchor) {
+  AssertWmThread(L"Workspace::AdmitInitialAfter");
+  if (reason == SuspensionReason::None) {
+    return AdmitTiledAfter(std::move(record), anchor);
+  }
+
+  const HWND hwnd = record.hwnd;
+  if (!hwnd || HasRecord(hwnd) || reason == SuspensionReason::Hidden ||
+      !IsTiled(anchor)) {
+    return AdmitInitial(std::move(record), reason);
+  }
+
+  const size_t anchorActiveIndex = TiledIndex(anchor);
+  if (anchorActiveIndex == static_cast<size_t>(-1)) {
+    return AdmitInitial(std::move(record), reason);
+  }
+
+  const size_t insertionLogicalIndex =
+      ActiveIndexToLogicalIndex(anchorActiveIndex) + 1;
+  for (auto& kv : records_) {
+    WindowRecord& existing = kv.second;
+    if (existing.state == ManageState::Suspended &&
+        existing.hasSavedSlot &&
+        existing.savedSlot.index >= insertionLogicalIndex) {
+      ++existing.savedSlot.index;
+    }
+  }
+
+  record.state = ManageState::Suspended;
+  record.suspensionReason = reason;
+  record.savedSlot.index = insertionLogicalIndex;
+  if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
+    record.savedSlot.weight = 1.0;
+    record.savedSlot.hasWeight = true;
+  } else if (layout_ == TileLayout::MasterStack ||
+             layout_ == TileLayout::MasterStackH) {
+    record.savedSlot.weight = 1.0;
+    record.savedSlot.hasWeight = true;
+  }
+  record.hasSavedSlot = true;
+
+  records_.emplace(hwnd, std::move(record));
+  EnsureWeights();
+  DebugValidateMutation(L"Workspace::AdmitInitialAfter");
+  return true;
+}
+
 static bool IsWindowSuspendedMaximized(HWND hwnd) {
   return g_workspaces.IsSuspendedMaximized(hwnd);
 }
@@ -304,6 +352,7 @@ bool Workspace::Float(HWND hwnd) {
 
 bool Workspace::Forget(HWND hwnd) {
   AssertWmThread(L"Workspace::Forget");
+  if (lastFocusedWindow_ == hwnd) lastFocusedWindow_ = nullptr;
   auto activeIt = std::find(windows_.begin(), windows_.end(), hwnd);
   if (activeIt != windows_.end()) {
     const size_t activeIndex = static_cast<size_t>(activeIt - windows_.begin());

@@ -57,11 +57,17 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
       return;
   }
 
-  // Foreground changes only affect which per-monitor workspace the tray icon
-  // represents. Keep that UI refresh serialized on the WM thread as well.
+  // Retain foreground state on the serialized WM thread. Unknown HWNDs
+  // deliberately do not clear managed focus: a just-created window can become
+  // foreground before Automatic discovery admits it, matching FancyWM's
+  // race-safe focus semantics.
   if (event == EVENT_SYSTEM_FOREGROUND) {
     const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
-    if (threadId) PostThreadMessage(threadId, WM_APP_TRAY_REFRESH, 0, 0);
+    if (threadId) {
+      PostThreadMessage(
+          threadId, WM_APP_FOREGROUND_CHANGED,
+          reinterpret_cast<WPARAM>(hwnd), 0);
+    }
     return;
   }
 

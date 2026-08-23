@@ -149,6 +149,15 @@ void LoadSettings() {
                             : MouseMoveBehavior::Float;
   Wh_FreeStringSetting(mouseBehavior);
 
+  PCWSTR automaticNewWindowPosition =
+      Wh_GetStringSetting(L"AutomaticNewWindowPosition");
+  g_settings.automaticNewWindowPosition =
+      automaticNewWindowPosition &&
+              _wcsicmp(automaticNewWindowPosition, L"after_focused") == 0
+          ? AutomaticNewWindowPosition::AfterFocused
+          : AutomaticNewWindowPosition::LastSlot;
+  Wh_FreeStringSetting(automaticNewWindowPosition);
+
   PCWSTR managementMode = Wh_GetStringSetting(L"DefaultWindowManagementMode");
   g_wm.managementMode =
       managementMode && _wcsicmp(managementMode, L"automatic") == 0
@@ -244,12 +253,26 @@ static void UnregisterConfiguredHotkeys() {
   UnregisterHotKey(nullptr, HK_DIAGNOSTIC_DUMP);
 }
 
+static void RememberManagedForeground(HWND hwnd) {
+  AssertWmThread(L"RememberManagedForeground");
+  if (!hwnd) return;
+
+  const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
+  for (const auto& key : owners) {
+    Workspace workspace;
+    if (!g_workspaces.Load(key, &workspace)) continue;
+    if (!workspace.RememberFocusedWindow(hwnd)) continue;
+    g_workspaces.Save(key, workspace);
+  }
+}
+
 static void InitializeCurrentDesktopWorkspaces() {
   std::vector<HMONITOR> monitors;
   Reconcile::EnumerateCurrentMonitors(monitors);
   for (HMONITOR monitor : monitors) {
     Reconcile::DiscoverCurrentWorkspaceOnMonitor(monitor);
   }
+  RememberManagedForeground(GetForegroundWindow());
 
   Wh_Log(
       L"Window management mode at startup: %s (%zu connected monitor%s)",
@@ -274,6 +297,7 @@ static void SetWindowManagementMode(ManagementMode mode) {
     for (HMONITOR monitor : monitors) {
       Reconcile::DiscoverCurrentWorkspaceOnMonitor(monitor);
     }
+    RememberManagedForeground(GetForegroundWindow());
     Reconcile::ScheduleLifecycleReconcile(nullptr);
   }
 }
@@ -319,6 +343,12 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       return WmMessageDisposition::Handled;
 
     case WM_APP_TRAY_REFRESH:
+      ++Diagnostics::g_runtime.counters.trayRefreshMessages;
+      TrayUi::RefreshForCurrentWorkspace();
+      return WmMessageDisposition::Handled;
+
+    case WM_APP_FOREGROUND_CHANGED:
+      RememberManagedForeground(reinterpret_cast<HWND>(msg.wParam));
       ++Diagnostics::g_runtime.counters.trayRefreshMessages;
       TrayUi::RefreshForCurrentWorkspace();
       return WmMessageDisposition::Handled;
