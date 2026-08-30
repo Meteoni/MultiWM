@@ -2,6 +2,10 @@
 // Workspace reconciliation
 //=============================================================================
 
+namespace Platform::WindowEvents {
+static bool HasTrackedMonitorOwnershipMismatch(HWND hwnd);
+}
+
 namespace Reconcile {
 
 static bool SameWorkspaceKey(const DesktopMonitorKey& a, const DesktopMonitorKey& b);
@@ -77,7 +81,7 @@ static bool ReadoptFloatingSnapshot(
   for (HWND hwnd : snapshot) {
     const WindowRecord* record = workspace.Find(hwnd);
     if (record && record->state == ManageState::Floating) {
-      changed |= workspace.ActivateTiled(hwnd, true);
+      changed |= workspace.ActivateTiled(hwnd);
     }
   }
   return changed;
@@ -164,7 +168,7 @@ static bool AdmitUntrackedSuspendedSnapshot(
 
 static bool AdoptSnapshotGeometryIfEligible(
     Workspace& workspace, const std::vector<HWND>& snapshot,
-    const RECT& workArea, HMONITOR monitor) {
+    const RECT& workArea, LONG gap, HMONITOR monitor) {
   if (workspace.Layout() == TileLayout::Floating || workspace.HasSuspended() ||
       !workspace.AllTiledVisible(snapshot) ||
       !SnapshotLooksTiled(workspace.TiledWindows(), workArea)) {
@@ -176,8 +180,8 @@ static bool AdoptSnapshotGeometryIfEligible(
   std::vector<WorkspaceGeometryItem> geometry = CaptureWorkspaceGeometry(
       workspace.TiledWindows(), monitor, workArea);
   Workspace captured = Workspace::AdoptGeometry(
-      workspace.Layout(), workArea, GetWorkspaceGapPixels(monitor),
-      g_settings.masterPercent / 100.0, geometry, preferredMaster);
+      workspace.Layout(), workArea, gap, g_settings.masterPercent / 100.0,
+      geometry, preferredMaster);
   const HWND retainedFocus = workspace.LastFocusedWindow();
   captured.MergeRememberedFloatingGeometryFrom(workspace);
   captured.MergeNonTiledRecordsFrom(workspace);
@@ -193,8 +197,9 @@ static bool EnsureWorkspaceFromSnapshot(
     HMONITOR monitor, bool adoptCurrentGeometry,
     std::vector<DesktopMonitorKey>* ownershipChangedKeys = nullptr) {
   DesktopMonitorKey key{};
-  RECT workArea{};
-  if (!GetCurrentWorkspaceKey(monitor, &key, &workArea)) return false;
+  if (!GetCurrentWorkspaceKey(monitor, &key)) return false;
+  WorkspaceMetrics metrics;
+  if (!GetWorkspaceMetrics(monitor, &metrics)) return false;
 
   const std::vector<HWND> snapshot = CollectTileWindows(monitor);
   Workspace workspace;
@@ -214,7 +219,8 @@ static bool EnsureWorkspaceFromSnapshot(
   AdmitUntrackedSnapshot(workspace, snapshot, true, false);
 
   if (adoptCurrentGeometry) {
-    AdoptSnapshotGeometryIfEligible(workspace, snapshot, workArea, monitor);
+    AdoptSnapshotGeometryIfEligible(
+        workspace, snapshot, metrics.workArea, metrics.gap, monitor);
   }
 
   g_workspaces.Save(key, workspace);
@@ -455,13 +461,13 @@ static std::vector<DesktopMonitorKey> ReconcileWindowOwnership(
 static void ReconcileWindowParticipation(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
-  const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
+  const SuspensionReason physicalReason = GetPhysicalSuspensionReason(hwnd);
 
-  // In Manual mode, minimizing is an explicit departure from the Alt+D group.
+  // In Manual mode, minimizing is an explicit departure from the managed group.
   // Forget the logical member entirely; restoring the HWND won't re-admit it
   // because Manual discovery remains closed. Maximization is intentionally
   // different: suspend it so restore returns to the exact saved slot/weight.
-  if (IsManualMode() && reason == SuspensionReason::Minimized) {
+  if (IsManualMode() && physicalReason == SuspensionReason::Minimized) {
     ForgetWindowFromOwners(hwnd, ownerKeys, changedKeys);
     return;
   }
@@ -472,6 +478,23 @@ static void ReconcileWindowParticipation(
 
     const WindowRecord* record = workspace.Find(hwnd);
     if (!record) continue;
+
+    SuspensionReason reason = physicalReason;
+    if (reason == SuspensionReason::Maximized && !IsZoomed(hwnd) &&
+        record->state == ManageState::Tiled) {
+      // FancyWM's full-monitor fallback can also describe a legitimate
+      // borderless tile when the work area, gaps and insets consume no space.
+      // If this window already occupies its authoritative tile, there is no
+      // layout violation to suspend or repair.
+      RECT authoritative{};
+      RECT current{};
+      if (GetCurrentAuthoritativeTiledRect(
+              ownerKey, workspace, hwnd, &authoritative) &&
+          GetWindowFrameRect(hwnd, &current) &&
+          RectsNear(current, authoritative)) {
+        reason = SuspensionReason::None;
+      }
+    }
 
     bool changed = false;
     bool restoredIntoFloatingLayout = false;
@@ -671,12 +694,12 @@ static bool DiscoverWorkspaceWindows(
   }
 
   // Automatic discovery owns the first floating geometry of a genuinely new
-  // restored window. Ignore the app/Windows stale restore rectangle and apply
-  // the configured default size centered in this workspace instead.
+  // restored window. Center it in this workspace, applying the configured
+  // default size unless a matching placement override preserves or replaces it.
   if (admitUntracked && workspace.Layout() == TileLayout::Floating) {
-    FloatingPlacementHint newWindowHint;
-    newWindowHint.intent = FloatingPlacementIntent::NewWindowDefault;
     for (HWND hwnd : newlyAdmittedWindows) {
+      FloatingPlacementHint newWindowHint;
+      newWindowHint.intent = FloatingPlacementIntent::NewWindowCenter;
       RepairFloatingGeometry(key, workspace, hwnd, newWindowHint);
     }
   }
@@ -753,7 +776,7 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
         ++Diagnostics::g_runtime.counters.enumWindowsVisited;
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
 
-        if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return TRUE;
+        if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) return TRUE;
         if (!WindowCanBeManaged(hwnd)) return TRUE;
         if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
 
@@ -797,7 +820,7 @@ static void HandleVirtualDesktopChanged() {
   Diagnostics::RecordEvent(
       L"virtual desktop changed currentDesktop=%08X", currentDesktop.Data1);
   const bool desktopActuallyChanged =
-      !g_wm.reconciledDesktopValid ||
+      g_wm.reconciledDesktopState == ReconciledDesktopState::Unknown ||
       !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
   if (desktopActuallyChanged) {
     // A lease describes post-placement behavior on one active desktop. Never carry
@@ -807,7 +830,7 @@ static void HandleVirtualDesktopChanged() {
     ScheduleNextConformanceTimer();
   }
   g_wm.reconciledDesktop = currentDesktop;
-  g_wm.reconciledDesktopValid = true;
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
   // The visual transition belongs to the settled desktop state, not the raw COM
   // callback. Coalesce rapid switches and emit one monitor-local OSD per connected
   // display after reconciliation has finished. Duplicate callbacks for the already
@@ -924,7 +947,7 @@ static void ReconcileDeferredLifecycle() {
   // change as a real desktop transition: repair global desktop ownership and
   // reinforce all known/current monitors on the incoming desktop.
   const bool fallbackDesktopChange =
-      g_wm.reconciledDesktopValid &&
+      g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown &&
       !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
   if (fallbackDesktopChange) {
     // The native callback was missed, so this is the first point where the WM can
@@ -938,14 +961,17 @@ static void ReconcileDeferredLifecycle() {
         currentDesktop.Data1);
     // A missed native callback is also a high-confidence signal that an exhausted
     // subscription retry burst deserves one fresh attempt sequence.
-    if (!g_vd.notificationsRegistered) RuntimeLifecycle::RequestMaintenance(true);
+    if (g_vd.abi.notification.methodCount > 0 &&
+        !g_vd.notificationsRegistered) {
+      RuntimeLifecycle::RequestMaintenance(true);
+    }
     g_wm.pendingDesktopSwitchFlyouts = true;
   }
   g_wm.reconciledDesktop = currentDesktop;
-  g_wm.reconciledDesktopValid = true;
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
 
-  // Repair liveness/exclusions and settled hidden/minimized/maximized participation
-  // globally before doing current-desktop discovery.
+  // Repair liveness/exclusions and settled suspended participation globally
+  // before doing current-desktop discovery.
   std::vector<DesktopMonitorKey> globallyChanged;
   ReconcileKnownWindows(ReconcileScope::Participation, &globallyChanged);
   if (fallbackDesktopChange) {
@@ -1095,7 +1121,7 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
 
     case EVENT_SYSTEM_MINIMIZESTART:
       if (IsManualMode()) {
-        // Minimize is an explicit exit from an inert Manual Alt+D group. Act on
+        // Minimize is an explicit exit from an inert Manual group. Act on
         // the event itself so a very fast minimize/restore cannot outrun the
         // settled IsIconic() check and accidentally retain membership.
         ForgetManagedWindow(hwnd);
@@ -1106,14 +1132,16 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
       break;
 
     case EVENT_OBJECT_LOCATIONCHANGE:
-      // A leased tiled window may have accepted our placement and moved itself
-      // later during startup/session restore. Consume that narrow case first.
-      if (HandleConformanceLeaseLocationChange(hwnd)) break;
+      // Cross-monitor movement remains ownership migration, not conformance drift.
+      // Otherwise a tiled HWND that leaves its authoritative rectangle opens or
+      // reuses one bounded lease; expected SetWindowPos echoes are consumed there.
+      if (!Platform::WindowEvents::HasTrackedMonitorOwnershipMismatch(hwnd) &&
+          HandleTiledWindowLocationChange(hwnd)) {
+        break;
+      }
 
-      // LOCATIONCHANGE is normally suppressed because our own SetWindowPos emits
-      // it. The WinEvent adapter only lets this non-lease path through for a
-      // maximized/restored tracked window or an actual monitor-owner mismatch, so
-      // repairing monitor ownership here is both cheap and non-recursive.
+      // Non-tiled/state transitions and monitor migration retain ordinary
+      // participation/ownership reconciliation.
       ReconcileManagedWindowStateNow(
           hwnd, ReconcileScope::Participation | ReconcileScope::Monitor);
       ScheduleLifecycleReconcile(hwnd);
@@ -1142,12 +1170,12 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
 
 }  // namespace Reconcile
 
-// Atomically consumes and clears the WinEvent samples for one completed gesture.
+// Consumes and clears the WinEvent samples for one completed gesture.
 // The WM core never reads these caches piecemeal after this boundary.
 static MoveSizeGesture ConsumeMoveSizeGesture(HWND hwnd) {
+  AssertWmThread(L"ConsumeMoveSizeGesture");
   MoveSizeGesture gesture;
 
-  AcquireSRWLockExclusive(&g_moveSize.lock);
   auto startIt = g_moveSize.startRects.find(hwnd);
   auto endIt = g_moveSize.endRects.find(hwnd);
   auto pointIt = g_moveSize.endPoints.find(hwnd);
@@ -1156,7 +1184,6 @@ static MoveSizeGesture ConsumeMoveSizeGesture(HWND hwnd) {
     gesture.start = startIt->second;
     gesture.end = endIt->second;
     gesture.hasRects = true;
-    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
   }
   if (pointIt != g_moveSize.endPoints.end()) {
     gesture.dropPoint = pointIt->second;
@@ -1166,7 +1193,9 @@ static MoveSizeGesture ConsumeMoveSizeGesture(HWND hwnd) {
   g_moveSize.startRects.erase(hwnd);
   g_moveSize.endRects.erase(hwnd);
   g_moveSize.endPoints.erase(hwnd);
-  ReleaseSRWLockExclusive(&g_moveSize.lock);
+  if (gesture.hasRects) {
+    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
+  }
   return gesture;
 }
 

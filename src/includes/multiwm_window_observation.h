@@ -20,10 +20,10 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
 
     RECT frame{};
     HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
-    // Only a restored window exposes meaningful natural/floating geometry.
-    // Minimized/maximized admission should fall back to the configured size
-    // rather than remembering an iconic or maximized rectangle.
-    if (monitor && IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsZoomed(hwnd) &&
+    // Only a participating restored window exposes meaningful natural/floating
+    // geometry. Suspended admission should fall back to the configured size.
+    if (monitor &&
+        GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
         GetWindowFrameRect(hwnd, &frame) &&
         frame.right > frame.left && frame.bottom > frame.top) {
       record.floatingRect = frame;
@@ -36,48 +36,8 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
   return record;
 }
 
-// Best-effort bridge for apps that replace one top-level HWND with another.
-// Candidates must share the PID and class; an exact title match wins, otherwise
-// the first PID/class match is returned from the caller's scoped candidate set.
-HWND ResolveEquivalentWindow(HWND hwnd, const std::vector<HWND>& candidates) {
-  if (!hwnd || !IsWindow(hwnd)) return nullptr;
-
-  DWORD pid = 0;
-  GetWindowThreadProcessId(hwnd, &pid);
-
-  wchar_t className[128] = {};
-  GetClassNameW(hwnd, className, ARRAYSIZE(className));
-
-  wchar_t title[256] = {};
-  GetWindowTextW(hwnd, title, ARRAYSIZE(title));
-
-  HWND bestMatch = nullptr;
-  for (HWND candidate : candidates) {
-    if (!candidate || candidate == hwnd || !IsWindow(candidate)) continue;
-
-    DWORD candPid = 0;
-    GetWindowThreadProcessId(candidate, &candPid);
-    if (candPid != pid) continue;
-
-    wchar_t candClass[128] = {};
-    GetClassNameW(candidate, candClass, ARRAYSIZE(candClass));
-    if (_wcsicmp(candClass, className) != 0) continue;
-
-    wchar_t candTitle[256] = {};
-    GetWindowTextW(candidate, candTitle, ARRAYSIZE(candTitle));
-
-    if (_wcsicmp(candTitle, title) == 0 || (candTitle[0] == 0 && title[0] == 0)) {
-      return candidate;
-    }
-
-    if (!bestMatch) bestMatch = candidate;
-  }
-
-  return bestMatch;
-}
-
-// Maps an event or foreground HWND to its active tile, preferring exact and
-// ownership relationships before falling back to the looser equivalence check.
+// Maps an event or foreground HWND to its active tile using only unambiguous
+// HWND identity and ownership relationships.
 HWND ResolveToTiledWindow(HWND hwnd, const std::vector<HWND>& candidates) {
   if (!hwnd || !IsWindow(hwnd)) return nullptr;
 
@@ -98,7 +58,7 @@ HWND ResolveToTiledWindow(HWND hwnd, const std::vector<HWND>& candidates) {
     owner = GetWindow(owner, GW_OWNER);
   }
 
-  return ResolveEquivalentWindow(hwnd, candidates);
+  return nullptr;
 }
 
 std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
@@ -178,11 +138,11 @@ static std::vector<WorkspaceGeometryItem> CaptureWorkspaceGeometry(
 }
 
 static const wchar_t* kIgnoredWindowClasses[] = {
-  L"Progman", 
-  L"WorkerW", 
-  L"Shell_TrayWnd", 
+  L"Progman",
+  L"WorkerW",
+  L"Shell_TrayWnd",
   L"Shell_SecondaryTrayWnd",
-  L"Windows.UI.Core.CoreWindow", 
+  L"Windows.UI.Core.CoreWindow",
   L"OperationStatusWindow",
 };
 
@@ -231,8 +191,9 @@ static std::wstring GetWindowProcessName(HWND hwnd) {
   return result;
 }
 
-static bool IsWindowExcludedByRules(HWND hwnd) {
-  if (!hwnd || g_settings.exclusionRules.empty()) return false;
+static const WindowRule* FindMatchingWindowRule(
+    HWND hwnd, WindowRuleTreatment treatment) {
+  if (!hwnd || g_settings.windowRules.empty()) return nullptr;
 
   std::wstring processName;
   std::wstring className;
@@ -241,36 +202,42 @@ static bool IsWindowExcludedByRules(HWND hwnd) {
   bool haveClass = false;
   bool haveTitle = false;
 
-  for (const auto& rule : g_settings.exclusionRules) {
-    switch (rule.match) {
-      case ExclusionMatch::Process:
-        if (!haveProcess) {
-          processName = GetWindowProcessName(hwnd);
-          haveProcess = true;
-        }
-        if (!processName.empty() && EqualsInsensitive(processName, rule.value)) return true;
-        break;
+  for (const auto& rule : g_settings.windowRules) {
+    if (rule.treatment != treatment) continue;
 
-      case ExclusionMatch::Class:
-        if (!haveClass) {
-          wchar_t buffer[256]{};
-          if (GetClassNameW(hwnd, buffer, ARRAYSIZE(buffer))) className = buffer;
-          haveClass = true;
-        }
-        if (!className.empty() && EqualsInsensitive(className, rule.value)) return true;
-        break;
-
-      case ExclusionMatch::Title:
-        if (!haveTitle) {
-          wchar_t buffer[512]{};
-          if (GetWindowTextW(hwnd, buffer, ARRAYSIZE(buffer))) title = buffer;
-          haveTitle = true;
-        }
-        if (!title.empty() && ContainsInsensitive(title, rule.value)) return true;
-        break;
+    if (!rule.className.empty()) {
+      if (!haveClass) {
+        wchar_t buffer[256]{};
+        if (GetClassNameW(hwnd, buffer, ARRAYSIZE(buffer))) className = buffer;
+        haveClass = true;
+      }
+      if (!EqualsInsensitive(className, rule.className)) continue;
     }
+
+    if (!rule.titleContains.empty()) {
+      if (!haveTitle) {
+        wchar_t buffer[512]{};
+        if (GetWindowTextW(hwnd, buffer, ARRAYSIZE(buffer))) title = buffer;
+        haveTitle = true;
+      }
+      if (!ContainsInsensitive(title, rule.titleContains)) continue;
+    }
+
+    if (!rule.process.empty()) {
+      if (!haveProcess) {
+        processName = GetWindowProcessName(hwnd);
+        haveProcess = true;
+      }
+      if (!EqualsInsensitive(processName, rule.process)) continue;
+    }
+
+    return &rule;
   }
-  return false;
+  return nullptr;
+}
+
+static bool IsWindowExcludedByRules(HWND hwnd) {
+  return FindMatchingWindowRule(hwnd, WindowRuleTreatment::Exclude) != nullptr;
 }
 
 // Applies stable structural and exclusion policy only; visibility, show state,
@@ -311,9 +278,9 @@ static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd) {
   // (example: VSCode unstaged commit dialog)
   if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return nullptr;
 
-  // FancyWM only tiles windows in the Restored state. Maximized windows remain
-  // managed logically but do not participate until Windows reports Restored.
-  if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd)) return nullptr;
+  // FancyWM only tiles windows in the Restored state. Minimized, maximized and
+  // native-fullscreen windows remain managed logically until they are restored.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) return nullptr;
   if (!WindowCanBeManaged(hwnd)) return nullptr;
   if (IsWindowCloaked(hwnd)) return nullptr;
 
@@ -327,11 +294,6 @@ static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd) {
   }
 
   return GetWindowPhysicalMonitor(hwnd);
-}
-
-// Determines whether an HWND can actively participate on targetMonitor now.
-bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor) {
-  return targetMonitor && GetCurrentManagedWindowMonitor(hwnd) == targetMonitor;
 }
 
 static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPlacementTolerancePx) {
@@ -382,6 +344,10 @@ static PlacementObservation PlaceWindowChecked(
     return finish(PlacementResult::Dead);
   }
   if (!canMove) {
+    ++Diagnostics::g_runtime.counters.placementPreflightStops;
+    return finish(PlacementResult::Refused);
+  }
+  if (IsHungAppWindow(hwnd)) {
     ++Diagnostics::g_runtime.counters.placementPreflightStops;
     return finish(PlacementResult::Refused);
   }
@@ -438,19 +404,17 @@ static PlacementObservation PlaceWindowChecked(
 static void ArrangeWorkspace(const DesktopMonitorKey& key);
 
 static void ClearMoveSizeSamples(HWND hwnd) {
-  AcquireSRWLockExclusive(&g_moveSize.lock);
+  AssertWmThread(L"ClearMoveSizeSamples");
   g_moveSize.startRects.erase(hwnd);
   g_moveSize.endRects.erase(hwnd);
   g_moveSize.endPoints.erase(hwnd);
-  ReleaseSRWLockExclusive(&g_moveSize.lock);
 }
 
 static void ClearAllMoveSizeSamples() {
-  AcquireSRWLockExclusive(&g_moveSize.lock);
+  AssertWmThread(L"ClearAllMoveSizeSamples");
   g_moveSize.startRects.clear();
   g_moveSize.endRects.clear();
   g_moveSize.endPoints.clear();
-  ReleaseSRWLockExclusive(&g_moveSize.lock);
 }
 
 

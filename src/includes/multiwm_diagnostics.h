@@ -206,7 +206,10 @@ static std::wstring ExpandDiagnosticPath(const std::wstring& raw) {
 }
 
 static bool EnsureDiagnosticDirectory(std::wstring path) {
-  if (path.empty()) return false;
+  if (path.empty()) {
+    SetLastError(ERROR_PATH_NOT_FOUND);
+    return false;
+  }
   for (wchar_t& ch : path) {
     if (ch == L'/') ch = L'\\';
   }
@@ -215,7 +218,9 @@ static bool EnsureDiagnosticDirectory(std::wstring path) {
 
   DWORD attributes = GetFileAttributesW(path.c_str());
   if (attributes != INVALID_FILE_ATTRIBUTES) {
-    return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY) return true;
+    SetLastError(ERROR_DIRECTORY);
+    return false;
   }
 
   size_t scanFrom = 0;
@@ -224,7 +229,10 @@ static bool EnsureDiagnosticDirectory(std::wstring path) {
   } else if (path.rfind(L"\\\\", 0) == 0) {
     // Skip the \\server\share portion of a UNC path before creating children.
     size_t serverEnd = path.find(L'\\', 2);
-    if (serverEnd == std::wstring::npos) return false;
+    if (serverEnd == std::wstring::npos) {
+      SetLastError(ERROR_BAD_NETPATH);
+      return false;
+    }
     size_t shareEnd = path.find(L'\\', serverEnd + 1);
     scanFrom = shareEnd == std::wstring::npos ? path.size() : shareEnd + 1;
   }
@@ -261,46 +269,63 @@ static bool WriteUtf8DiagnosticFile(
     return false;
   }
 
-  bool success = true;
+  DWORD writeError = ERROR_SUCCESS;
+  auto writeAll = [&](const void* data, size_t size) {
+    const BYTE* cursor = static_cast<const BYTE*>(data);
+    while (size > 0) {
+      const DWORD chunk = static_cast<DWORD>(
+          std::min<size_t>(size, static_cast<size_t>(0x7ffff000)));
+      DWORD chunkWritten = 0;
+      if (!WriteFile(file, cursor, chunk, &chunkWritten, nullptr)) {
+        writeError = GetLastError();
+        if (writeError == ERROR_SUCCESS) writeError = ERROR_WRITE_FAULT;
+        return false;
+      }
+      if (chunkWritten == 0) {
+        writeError = ERROR_WRITE_FAULT;
+        return false;
+      }
+      cursor += chunkWritten;
+      size -= chunkWritten;
+    }
+    return true;
+  };
+
   const BYTE bom[] = {0xEF, 0xBB, 0xBF};
-  DWORD written = 0;
-  if (!WriteFile(file, bom, sizeof(bom), &written, nullptr) || written != sizeof(bom)) {
-    success = false;
-  }
+  bool success = writeAll(bom, sizeof(bom));
 
   if (success && !text.empty()) {
+    SetLastError(ERROR_SUCCESS);
     int byteCount = WideCharToMultiByte(
         CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0,
         nullptr, nullptr);
     if (byteCount <= 0) {
+      writeError = GetLastError();
+      if (writeError == ERROR_SUCCESS) {
+        writeError = ERROR_NO_UNICODE_TRANSLATION;
+      }
       success = false;
     } else {
       std::vector<char> utf8(static_cast<size_t>(byteCount));
+      SetLastError(ERROR_SUCCESS);
       int converted = WideCharToMultiByte(
           CP_UTF8, 0, text.data(), static_cast<int>(text.size()), utf8.data(),
           byteCount, nullptr, nullptr);
       if (converted != byteCount) {
+        writeError = GetLastError();
+        if (writeError == ERROR_SUCCESS) {
+          writeError = ERROR_NO_UNICODE_TRANSLATION;
+        }
         success = false;
       } else {
-        const char* cursor = utf8.data();
-        size_t remaining = utf8.size();
-        while (success && remaining > 0) {
-          DWORD chunk = static_cast<DWORD>(
-              std::min<size_t>(remaining, static_cast<size_t>(0x7ffff000)));
-          DWORD chunkWritten = 0;
-          if (!WriteFile(file, cursor, chunk, &chunkWritten, nullptr) ||
-              chunkWritten != chunk) {
-            success = false;
-            break;
-          }
-          cursor += chunkWritten;
-          remaining -= chunkWritten;
-        }
+        success = writeAll(utf8.data(), utf8.size());
       }
     }
   }
 
-  if (!success && outError) *outError = GetLastError();
+  if (!success && outError) {
+    *outError = writeError != ERROR_SUCCESS ? writeError : ERROR_WRITE_FAULT;
+  }
   CloseHandle(file);
   if (!success) DeleteFileW(path.c_str());
   return success;
@@ -322,7 +347,7 @@ static bool WriteReportToConfiguredDirectory(
   wchar_t baseName[128]{};
   swprintf(
       baseName, ARRAYSIZE(baseName),
-      L"TilingHelper-Diagnostics-%04u%02u%02u-%02u%02u%02u",
+      L"MultiWM-Diagnostics-%04u%02u%02u-%02u%02u%02u",
       local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute,
       local.wSecond);
 
@@ -462,8 +487,8 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
   DiagnosticWindowIdentity identity = DiagnosticReadWindowIdentity(mapHwnd, record.pid);
   audit.deadHwnd = !identity.hwndAlive;
   audit.pidMismatch = identity.hwndAlive && record.pid != 0 && !identity.pidMatchesRecord;
-  audit.hasPlacementFailure = record.placementFailures > 0 ||
-                              record.lastPlacementResult != PlacementResult::Success;
+  audit.hasPlacementFailure =
+      record.lastPlacementResult != PlacementResult::Success;
 
   report.Line(
       L"      identity: hwndAlive=%d livePid=%lu pidMatchesRecord=%d process=%ls",
@@ -491,13 +516,8 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
       L"      capabilities: move=%d resize=%d topmost=%d",
       record.canMove ? 1 : 0, record.canResize ? 1 : 0, record.topmost ? 1 : 0);
   report.Line(
-      L"      placement: result=%ls failures=%d",
-      DiagnosticPlacementResultName(record.lastPlacementResult), record.placementFailures);
-  if (record.placementFailures > 0) {
-    report.Line(
-        L"      failureTarget=%ls",
-        DiagnosticRectString(record.placementFailureTarget).c_str());
-  }
+      L"      placement: result=%ls",
+      DiagnosticPlacementResultName(record.lastPlacementResult));
   report.Line(L"      lastRequested=%ls", DiagnosticRectString(record.lastRequestedRect).c_str());
   report.Line(L"      lastObserved =%ls", DiagnosticRectString(record.lastObservedRect).c_str());
 
@@ -893,11 +913,9 @@ static void DumpPlatformHealth(ReportBuilder& report) {
       g_hooks.state ? 1 : 0);
 
   size_t moveStarts = 0, moveEnds = 0, movePoints = 0;
-  AcquireSRWLockShared(&g_moveSize.lock);
   moveStarts = g_moveSize.startRects.size();
   moveEnds = g_moveSize.endRects.size();
   movePoints = g_moveSize.endPoints.size();
-  ReleaseSRWLockShared(&g_moveSize.lock);
   report.Line(
       L"Move/size cache: starts=%zu ends=%zu endPoints=%zu", moveStarts,
       moveEnds, movePoints);
@@ -1031,7 +1049,7 @@ static void WriteDiagnosticReport() {
 
   ReportBuilder report;
   report.Line(L"============================================================");
-  report.Line(L"TILING HELPER DIAGNOSTIC REPORT");
+  report.Line(L"MULTIWM DIAGNOSTIC REPORT");
   report.Line(L"============================================================");
   report.Line(L"Mod version: %ls", WH_MOD_VERSION);
   report.Line(L"Report sequence: %llu", static_cast<unsigned long long>(reportSequence));
@@ -1088,9 +1106,11 @@ static void WriteDiagnosticReport() {
           ? L"After focused window"
           : L"Last slot");
   report.Line(L"Tiled conformance lease: %u ms", g_settings.conformanceLeaseMs);
-  report.Line(L"Conformance repair min interval: %u ms", kConformanceRepairMinIntervalMs);
+  report.Line(
+      L"Conformance repair interval: %u ms",
+      g_settings.conformanceRepairIntervalMs);
   report.Line(L"Lifecycle settle delay: %u ms", g_settings.reconcileDelayMs);
-  report.Line(L"Exclusion rules: %zu", g_settings.exclusionRules.size());
+  report.Line(L"Window rules: %zu", g_settings.windowRules.size());
   report.TextLine(L"Diagnostic output setting: ", g_settings.diagnosticsOutputPath);
   report.TextLine(L"Diagnostic output resolved: ", ExpandDiagnosticPath(g_settings.diagnosticsOutputPath));
 

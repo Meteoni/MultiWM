@@ -37,21 +37,22 @@ TileLayout ParseLayoutSetting(PCWSTR str) {
 }
 
 template <typename T, typename Parser>
-T ReadHotkeySetting(PCWSTR name, Parser parser, T defaultVal) {
-  PCWSTR str = Wh_GetStringSetting(name);
-  if (!str || !*str) {
-    Wh_FreeStringSetting(str);
-    return T{};  // Blank hotkey = unused.
+T ReadHotkeySetting(PCWSTR name, Parser parser) {
+  auto value = WindhawkUtils::StringSetting::make(name);
+  if (!*value.get()) return T{};  // Blank hotkey = unused.
+
+  T result = parser(value.get());
+  if (!result) {
+    Wh_Log(
+        L"Invalid %ls hotkey setting '%ls'; hotkey disabled", name,
+        value.get());
   }
-  T result = parser(str);
-  Wh_FreeStringSetting(str);
-  return result ? result : defaultVal;
+  return result;
 }
 
 UINT ReadModifierSetting(PCWSTR name, UINT defaultVal) {
-  PCWSTR str = Wh_GetStringSetting(name);
-  UINT result = ParseModifiers(str);
-  Wh_FreeStringSetting(str);
+  auto value = WindhawkUtils::StringSetting::make(name);
+  UINT result = ParseModifiers(value.get());
   return result ? result : defaultVal;
 }
 
@@ -104,6 +105,16 @@ static void NormalizeMonitorIdentityToken(std::wstring* value) {
 bool Model::MonitorId::FromHMonitor(HMONITOR monitor, MonitorId* out) {
   if (!out || !IsLiveMonitorHandle(monitor)) return false;
 
+  auto cached = std::find_if(
+      g_monitorIdentityCache.begin(), g_monitorIdentityCache.end(),
+      [&](const MonitorIdentityCacheEntry& entry) {
+        return entry.monitor == monitor;
+      });
+  if (cached != g_monitorIdentityCache.end()) {
+    *out = cached->id;
+    return true;
+  }
+
   MONITORINFOEXW monitorInfo{};
   monitorInfo.cbSize = sizeof(monitorInfo);
   if (!GetMonitorInfoW(
@@ -134,11 +145,18 @@ bool Model::MonitorId::FromHMonitor(HMONITOR monitor, MonitorId* out) {
 
   NormalizeMonitorIdentityToken(&identity);
   out->deviceId = std::move(identity);
+  g_monitorIdentityCache.push_back({monitor, *out});
   return true;
 }
 
 HMONITOR Model::MonitorId::Resolve() const {
   if (deviceId.empty()) return nullptr;
+
+  for (const auto& entry : g_monitorIdentityCache) {
+    if (entry.id == *this && IsLiveMonitorHandle(entry.monitor)) {
+      return entry.monitor;
+    }
+  }
 
   struct ResolveContext {
     const MonitorId* target = nullptr;
@@ -171,7 +189,7 @@ bool GetMonitorWorkArea(HMONITOR monitor, RECT* outRect) {
 }
 
 static UINT GetMonitorEffectiveDpi(HMONITOR monitor) {
-  if (!monitor) return 96;
+  if (!monitor || !IsLiveMonitorHandle(monitor)) return 96;
 
   using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
   using GetScaleFactorForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int*);
@@ -181,7 +199,8 @@ static UINT GetMonitorEffectiveDpi(HMONITOR monitor) {
   };
   static const DpiApis apis = [] {
     DpiApis result;
-    HMODULE shcore = LoadLibraryW(L"Shcore.dll");
+    HMODULE shcore = LoadLibraryExW(
+        L"Shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (shcore) {
       result.getDpi = reinterpret_cast<GetDpiForMonitorFn>(
           GetProcAddress(shcore, "GetDpiForMonitor"));
@@ -194,11 +213,12 @@ static UINT GetMonitorEffectiveDpi(HMONITOR monitor) {
   UINT dpiX = 96;
   UINT dpiY = 96;
   // MDT_EFFECTIVE_DPI == 0. Keep the enum types local so no Shcore import
-  // library is required. GetScaleFactorForMonitor also guards against hosts
-  // whose DPI-awareness context makes GetDpiForMonitor report 96.
+  // library is required. DPI is observed fresh at the operation boundary.
   const bool haveDpi = apis.getDpi &&
       SUCCEEDED(apis.getDpi(monitor, 0, &dpiX, &dpiY)) && dpiX;
 
+  // Also correct a virtualized 96-DPI result when the host process awareness
+  // differs from this per-monitor-aware WM thread.
   int scalePercent = 100;
   const bool haveScale = apis.getScale &&
       SUCCEEDED(apis.getScale(monitor, &scalePercent)) && scalePercent > 0;
@@ -212,19 +232,10 @@ static LONG ScaleDip(LONG value, UINT dpi) {
   return MulDiv(value, static_cast<int>(dpi ? dpi : 96), 96);
 }
 
-bool AreSameWindows(const std::vector<HWND>& a, const std::vector<HWND>& b) {
-  if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); ++i) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
-}
-
 std::vector<double> DefaultWeights(size_t count) {
   return std::vector<double>(count, 1.0);
 }
 
-bool IsCurrentlyManagedWindow(HWND hwnd, HMONITOR targetMonitor);
 static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd);
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd);
 static bool WindowCanBeManaged(HWND hwnd);
@@ -306,8 +317,6 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     // capabilities/identity for an already-known record.
     WindowRecord& existing = it->second;
     const DWORD pid = it->second.pid;
-    const int failures = existing.placementFailures;
-    const RECT failureTarget = existing.placementFailureTarget;
     const PlacementResult lastResult = existing.lastPlacementResult;
     const RECT lastRequested = existing.lastRequestedRect;
     const RECT lastObserved = existing.lastObservedRect;
@@ -322,8 +331,6 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
 
     existing = std::move(record);
     existing.pid = existing.pid ? existing.pid : pid;
-    existing.placementFailures = failures;
-    existing.placementFailureTarget = failureTarget;
     existing.lastPlacementResult = lastResult;
     existing.lastRequestedRect = lastRequested;
     existing.lastObservedRect = lastObserved;
@@ -341,7 +348,7 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
   return it->second;
 }
 
-bool Workspace::ActivateTiled(HWND hwnd, bool resetPlacementFailures) {
+bool Workspace::ActivateTiled(HWND hwnd) {
   AssertWmThread(L"Workspace::ActivateTiled");
   WindowRecord* record = FindMutable(hwnd);
   if (!record) return false;
@@ -355,11 +362,6 @@ bool Workspace::ActivateTiled(HWND hwnd, bool resetPlacementFailures) {
     record->hasSavedSlot = false;
     changed = true;
   }
-  if (resetPlacementFailures && record->placementFailures != 0) {
-    record->placementFailures = 0;
-    record->placementFailureTarget = {};
-    changed = true;
-  }
   if (!ContainsWindow(windows_, hwnd)) {
     AppendTiledWithDefaultWeight(hwnd);
     changed = true;
@@ -368,13 +370,13 @@ bool Workspace::ActivateTiled(HWND hwnd, bool resetPlacementFailures) {
   return changed;
 }
 
-bool Workspace::AdmitTiled(WindowRecord record, bool resetPlacementFailures) {
+bool Workspace::AdmitTiled(WindowRecord record) {
   AssertWmThread(L"Workspace::AdmitTiled");
   if (!record.hwnd) return false;
   const HWND hwnd = record.hwnd;
   const bool existed = HasRecord(hwnd);
   UpsertRecord(std::move(record));
-  const bool activated = ActivateTiled(hwnd, resetPlacementFailures);
+  const bool activated = ActivateTiled(hwnd);
   return !existed || activated;
 }
 
@@ -427,16 +429,6 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
   records_.emplace(hwnd, std::move(record));
   EnsureWeights();
   DebugValidateMutation(L"Workspace::AdmitTiledAfter");
-  return true;
-}
-
-bool Workspace::ResetPlacementFailures(HWND hwnd) {
-  AssertWmThread(L"Workspace::ResetPlacementFailures");
-  WindowRecord* record = FindMutable(hwnd);
-  if (!record || record->placementFailures == 0) return false;
-  record->placementFailures = 0;
-  record->placementFailureTarget = {};
-  DebugValidateMutation(L"Workspace::ResetPlacementFailures");
   return true;
 }
 

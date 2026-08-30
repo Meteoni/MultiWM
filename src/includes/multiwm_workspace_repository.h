@@ -38,38 +38,51 @@ static HMONITOR GetWorkspaceCommandMonitor() {
   return monitor ? monitor : GetForegroundMonitor();
 }
 
-static LONG GetWorkspaceGapPixels(HMONITOR monitor) {
-  return ScaleDip(g_settings.gapDip, GetMonitorEffectiveDpi(monitor));
-}
+struct WorkspaceMetrics {
+  RECT workArea{};
+  UINT dpi = 96;
+  LONG gap = 0;
+};
 
-static WorkspaceInsets GetWorkspaceInsetsPixels(HMONITOR monitor) {
+static bool GetWorkspaceMetrics(HMONITOR monitor, WorkspaceMetrics* out) {
+  if (!monitor || !out) return false;
+
+  RECT monitorWork{};
+  if (!GetMonitorWorkArea(monitor, &monitorWork)) return false;
+
   const UINT dpi = GetMonitorEffectiveDpi(monitor);
-  return {
+  const WorkspaceInsets insets{
       ScaleDip(g_settings.insetsDip.left, dpi),
       ScaleDip(g_settings.insetsDip.top, dpi),
       ScaleDip(g_settings.insetsDip.right, dpi),
       ScaleDip(g_settings.insetsDip.bottom, dpi)};
-}
-
-static bool GetWorkspaceWorkArea(HMONITOR monitor, RECT* outWorkArea) {
-  if (!monitor || !outWorkArea) return false;
-  RECT monitorWork{};
-  if (!GetMonitorWorkArea(monitor, &monitorWork)) return false;
-  const WorkspaceInsets insets = GetWorkspaceInsetsPixels(monitor);
-
-  *outWorkArea = {
+  const RECT workArea{
       monitorWork.left + insets.left,
       monitorWork.top + insets.top,
       monitorWork.right - insets.right,
       monitorWork.bottom - insets.bottom};
-  return outWorkArea->right > outWorkArea->left &&
-         outWorkArea->bottom > outWorkArea->top;
+  if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) {
+    return false;
+  }
+
+  out->workArea = workArea;
+  out->dpi = dpi;
+  out->gap = ScaleDip(g_settings.gapDip, dpi);
+  return true;
+}
+
+static bool GetWorkspaceWorkArea(HMONITOR monitor, RECT* outWorkArea) {
+  if (!outWorkArea) return false;
+  WorkspaceMetrics metrics;
+  if (!GetWorkspaceMetrics(monitor, &metrics)) return false;
+  *outWorkArea = metrics.workArea;
+  return true;
 }
 
 enum class FloatingPlacementIntent {
   PassiveRestore,
   PreserveAnchor,
-  NewWindowDefault,
+  NewWindowCenter,
 };
 
 struct FloatingPlacementHint {
@@ -155,21 +168,38 @@ static bool RepairFloatingGeometry(
   HMONITOR monitor = key.ResolveMonitor();
   if (!monitor) return false;
 
-  RECT workArea{};
-  if (!GetWorkspaceWorkArea(monitor, &workArea)) return false;
+  WorkspaceMetrics metrics;
+  if (!GetWorkspaceMetrics(monitor, &metrics)) return false;
+  const RECT& workArea = metrics.workArea;
+  const UINT targetDpi = metrics.dpi;
 
   RECT current{};
   const bool haveCurrent = GetWindowFrameRect(hwnd, &current) &&
                            current.right > current.left &&
                            current.bottom > current.top;
-  const UINT targetDpi = GetMonitorEffectiveDpi(monitor);
 
-  const bool useNewWindowDefault =
-      hint.intent == FloatingPlacementIntent::NewWindowDefault;
+  const bool centerNewWindow =
+      hint.intent == FloatingPlacementIntent::NewWindowCenter;
+  const bool needsFallbackSize = centerNewWindow || !record->hasFloatingRect;
+  const WindowRule* placementOverride =
+      IsAutomaticMode() && needsFallbackSize
+          ? FindMatchingWindowRule(
+                hwnd, WindowRuleTreatment::FloatingPlacementOverride)
+          : nullptr;
+  const bool preserveCurrentSize =
+      placementOverride && placementOverride->preserveFloatingSize;
+  const bool useCustomSize =
+      placementOverride && !placementOverride->preserveFloatingSize;
 
   LONG width = 0;
   LONG height = 0;
-  if (!useNewWindowDefault && record->hasFloatingRect) {
+  if (preserveCurrentSize && haveCurrent) {
+    width = current.right - current.left;
+    height = current.bottom - current.top;
+  } else if (useCustomSize) {
+    width = ScaleDip(placementOverride->floatingSizeDip.width, targetDpi);
+    height = ScaleDip(placementOverride->floatingSizeDip.height, targetDpi);
+  } else if (!centerNewWindow && record->hasFloatingRect) {
     const UINT sourceDpi = record->floatingDpi ? record->floatingDpi : 96;
     width = MulDiv(
         record->floatingRect.right - record->floatingRect.left,
@@ -190,7 +220,7 @@ static bool RepairFloatingGeometry(
   POINT center{};
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     center = hint.anchor;
-  } else if (!useNewWindowDefault && record->hasFloatingRect &&
+  } else if (!centerNewWindow && record->hasFloatingRect &&
              ResolveRememberedFloatingMonitor(*record) == monitor) {
     center = RectCenter(record->floatingRect);
   } else {
@@ -199,6 +229,9 @@ static bool RepairFloatingGeometry(
 
   RECT target = ClampFloatingRectToWorkArea(
       CenteredRect(center, width, height), workArea);
+  // The window can enter a suspended physical state while the placement target
+  // is being calculated. Never overwrite that newer application-owned state.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) return false;
   PlacementObservation observation =
       PlaceWindowChecked(hwnd, record->canMove, target);
   if (observation.result != PlacementResult::Success &&
@@ -253,20 +286,21 @@ static void RestoreWorkspaceFloatingGeometry(
   }
 }
 
-// Resolves a monitor on the current virtual desktop to its workspace key and,
-// when requested, returns the configured workspace-inset work area.
-static bool GetCurrentWorkspaceKey(HMONITOR monitor, DesktopMonitorKey* outKey, RECT* outWorkArea = nullptr) {
+// Resolves a monitor on the current virtual desktop to its workspace key.
+static bool GetCurrentWorkspaceKey(
+    HMONITOR monitor, DesktopMonitorKey* outKey) {
   if (!outKey || !IsLiveMonitorHandle(monitor)) return false;
   GUID desktopId{};
-  // Never collapse separate desktops into a zero-GUID workspace when the
-  // private API is temporarily unavailable; let the caller retry after recovery.
-  if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&desktopId)) {
-    return false;
+  if (g_wm.reconciledDesktopState == ReconciledDesktopState::Settled) {
+    desktopId = g_wm.reconciledDesktop;
+  } else {
+    // Never collapse separate desktops into a zero-GUID workspace when the
+    // private API is temporarily unavailable; let the caller retry after recovery.
+    if (!InitializeVirtualDesktopAPI() || !GetCurrentDesktopId(&desktopId)) {
+      return false;
+    }
   }
-  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, outKey)) return false;
-
-  if (outWorkArea && !GetWorkspaceWorkArea(monitor, outWorkArea)) return false;
-  return true;
+  return DesktopMonitorKey::FromHMonitor(desktopId, monitor, outKey);
 }
 
 bool Workspace::Validate(
@@ -381,7 +415,7 @@ bool Workspace::Validate(
 }
 
 void Workspace::DebugValidateMutation(const wchar_t* operation) const {
-#ifdef WH_EDITING
+#ifdef MULTIWM_DEBUG_VALIDATE
   DesktopMonitorKey unknownKey{};
   const bool valid = Validate(unknownKey, operation ? operation : L"mutation");
   assert(valid);
@@ -458,6 +492,26 @@ bool WorkspaceRepository::IsTracked(HWND hwnd) const {
   const bool tracked = it != ownersByWindow_.end() && !it->second.empty();
   ReleaseSRWLockShared(&lock_);
   return tracked;
+}
+
+bool WorkspaceRepository::IsTiled(HWND hwnd) const {
+  if (!hwnd) return false;
+  bool found = false;
+  AcquireSRWLockShared(&lock_);
+
+  auto ownersIt = ownersByWindow_.find(hwnd);
+  if (ownersIt != ownersByWindow_.end()) {
+    for (const auto& key : ownersIt->second) {
+      auto stateIt = states_.find(key);
+      if (stateIt != states_.end() && stateIt->second.IsTiled(hwnd)) {
+        found = true;
+        break;
+      }
+    }
+  }
+
+  ReleaseSRWLockShared(&lock_);
+  return found;
 }
 
 bool WorkspaceRepository::IsSuspendedMaximized(HWND hwnd) const {
@@ -547,15 +601,6 @@ WorkspaceRepository::OwnershipIndexSnapshot() const {
   for (const auto& kv : ownersByWindow_) snapshot.push_back(kv);
   ReleaseSRWLockShared(&lock_);
   return snapshot;
-}
-
-void WorkspaceRepository::ClearAfterWmStopped() {
-  // This operation is intentionally permitted only when no WM actor exists.
-  assert(!g_wm.thread || g_wm.threadId.load(std::memory_order_acquire) == 0);
-  AcquireSRWLockExclusive(&lock_);
-  states_.clear();
-  ownersByWindow_.clear();
-  ReleaseSRWLockExclusive(&lock_);
 }
 
 // UI is intentionally implemented later so the complete workspace model and

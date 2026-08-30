@@ -1,227 +1,236 @@
 // ==WindhawkMod==
-// @id              tiling-helper-experimental
-// @name            Tiling Helper Experimental
-// @description     Tile windows on the current monitor with customizable layouts and hotkeys
+// @id              multiwm
+// @name            MultiWM
+// @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
 // @version         1.13.19
-// @author          u2x1, meteoni
-// @github          https://github.com/u2x1
-// @include         windhawk.exe
+// @author          meteoni
+// @github          https://github.com/Meteony
+// @license         MIT
+// @include         explorer.exe
+// @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lversion -lgdi32 -ladvapi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
-# Tiling Helper
+# MultiWM
 
-A focused window tiling tool for Windows 10/11. Tile windows on the current monitor, cycle layouts, and keep
-resize-adjusted ratios per virtual desktop.
+MultiWM is a continuation of the original [Tiling Helper](https://windhawk.net/mods/tiling-helper) by [U2X1](https://github.com/u2x1).
 
-## Features
-- Manual tiling hotkey
-- Layout cycle hotkey with a user-configurable per-layout cycle order
-- 7 per-workspace modes: Master+Stack (Vertical/Horizontal), Columns, Rows, BSP, Monocle, Floating
-- DPI-aware workspace insets/window gaps and independent master size
-- Remembers layout mode, ordering, and resize adjustments per virtual desktop + monitor
-- Uses native virtual-desktop notifications with centralized transient-failure retry; settled cloak/visibility reconciliation independently detects missed desktop switches as a safety fallback
-- Checked placement with per-window failure tracking and a configurable deadline-bounded conformance lease; persistently nonconforming tiled windows are floated rather than leaving a broken layout
-- Manual or Automatic management modes: Manual keeps Alt+D groups inert, while Automatic continuously discovers and migrates windows
-- Configurable mouse drag behavior: float the moved window or swap it with the tiled window under the pointer
-- Dedicated optional hotkey to float the focused tiled window
-- Theme-aware notification-area text icon shows the active/last-targeted monitor workspace layout (MV/MH/CL/RW/BS/MN/FL), with a multi-monitor tooltip summary when more than one display is connected
-- Standard Win32 tray context menu tiles the represented workspace, offers one management-mode switch action, and selects layouts directly in the user-configured cycle order
-- Optional per-layout .ico overrides with generated text fallback
-- Compact Win32 status flyouts appear on the affected monitor for layout/mode changes and on every monitor after a settled virtual-desktop switch
-- Workspace-level hotkeys target the monitor under the mouse cursor; focused-window commands continue to target the focused window's physical monitor
-- Manual Tile globally reconciles known windows, then adopts current tiled geometry when the full tiled set is visible
-- Scoped reconciliation keeps lifecycle, virtual-desktop, and monitor ownership repair separate; every connected monitor is visited at startup and authoritative topology passes
-- Maximized windows preserve their saved tile and use a targeted location-change fallback to detect restore transitions reliably
-- Cross-workspace repair preserves unaffected resize weights; only the migrated window gets a default destination weight
-- Known HWND ownership is globally unique; current-desktop discovery migrates existing records instead of duplicating them across workspaces
-- Optional process/class/title exclusion rules keep user-selected windows out of management
-- Hotkey diagnostics write a timestamped UTF-8 text report with runtime/churn counters, diagnostic self-cost accounting, significant/lifecycle histories, platform health, telemetry/invariant audits, and deterministic per-workspace/window state
-- Automatic discovery admits newly observed visible minimized/maximized windows as suspended logical members, including after a workspace already exists
-- Automatic insertion can place newly discovered or migrated windows at the last slot or immediately after the destination workspace's most recently focused managed window
-- Newly discovered restored windows entering a Floating workspace use the configured default floating size and centered placement instead of stale application-restored geometry
-- Hidden, minimized, and maximized tiled windows preserve their exact logical slot/weight while temporarily leaving active layout
-- Native VD switches settle shell state, then softly reinforce every known workspace on the incoming desktop
+A lightweight, low-cortisol window manager for Windows 11 with true per-virtual-desktop layouts - 
+including floating - and simple, predictable controls. 
 
-## Default Hotkeys
-- Tile windows: Alt + D
-- Cycle layout: Alt + L
-- Switch master window: Alt + M
-- Promote focused window one slot: Alt + [
-- Demote focused window one slot: Alt + ]
-- Float focused window: unbound by default
-- Toggle Automatic/Manual mode: Alt + U
-- Write diagnostic report: Alt + I
+![GIF](https://raw.githubusercontent.com/Meteony/meteoni-assets/main/MultiWM/MultiWM.gif)
 
 ## Notes
-- Layout mode, ordering, and resize state are stored per virtual desktop + monitor.
-- Floating exists both as a workspace mode and as a per-window managed state; remembered floating geometry is restored on migration, explicit floating, and workspace layout transitions into Floating.
-- Private virtual-desktop manager and notification ABIs are selected automatically from the actual Explorer build/revision; unknown manager generations are rejected instead of guessed.
-- If Virtual Desktop APIs are unavailable, tiling still works but per-desktop memory is disabled.
+- *Windhawk 2.0 (or higher) users can change the target process (`explorer.exe` -> `windhawk.exe`) for better stability and workspace preservation across Explorer restarts.*
+- *MultiWM's virtual-desktop notification integration is based on [Taskbar Desktop Indicator by Simon Benedict](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/taskbar-desktop-indicator.wh.cpp) (MIT).*
+
+## Features
+- **First-class floating** - use Floating as a whole-workspace layout 
+or float individual windows while retaining useful geometry.
+- **Automatic or Manual management** - let MultiWM continuously discover 
+and migrate windows, or keep explicitly tiled groups under your control.
+- **True virtual-desktop layouts** - uses Windows' existing virtual desktops 
+instead of implementing a separate desktop system.
+- **Event-driven** - changes are signaled through native events rather than 
+continuous polling.
+
+## Layouts
+- Floating
+- Master + Stack (vertical or horizontal)
+- Binary Space Partitioning (BSP)
+- Columns / Rows
+- Monocle
+
+## Getting Started
+Move a tiled window to **float it** or **swap it with the window underneath**. 
+
+By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
+moving windows through the logical order (Alt+, / .), floating a window (Alt+F), and switching between Automatic
+and Manual management (Alt+R).
+
+A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
+
+
+## Also check out
+- [Virtual Desktop Helper by u2x1](https://windhawk.net/mods/virtual-desktop-helper)
+- [Taskbar Desktop Indicator by Simon Benedict](https://windhawk.net/mods/taskbar-desktop-indicator)
+
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
-- DefaultWindowManagementMode: automatic
-  $name: '[General] Default Window Management Mode'
-  $description: 'Choose membership policy after startup. Manual keeps Alt+D groups inert: new windows are not admitted, minimizing releases membership, and moving a managed window to another virtual desktop does not carry it into that desktop. Maximized windows still preserve their slot. Automatic continuously discovers and migrates managed windows.'
-  $options:
-    - manual: Manual
-    - automatic: Automatic
+- general:
+  - DefaultWindowManagementMode: automatic
+    $name: Default Window Management Mode
+    $description: 'Choose membership policy after startup. Manual keeps Alt+T groups contained: new windows are not admitted, minimizing / moving to another desktop releases membership. Maximized windows still preserve their slot. Automatic continuously discovers and migrates managed windows.'
+    $options:
+      - manual: Manual
+      - automatic: Automatic
+  - AutomaticNewWindowPosition: last_slot
+    $name: Automatic Window Insertion Position
+    $description: 'Choose where Automatic mode inserts newly discovered windows and migrated windows from another workspace. Maximized / minimized windows are restored in-place.'
+    $options:
+      - last_slot: Last slot
+      - after_focused: After focused window
+  $name: General
 
-- AutomaticNewWindowPosition: last_slot
-  $name: '[Automatic] Window Insertion Position'
-  $description: 'Choose where Automatic mode inserts newly discovered windows and managed windows migrating into another workspace. Suspended windows restored in place keep their saved logical slot. After focused window uses the most recently focused tiled window in the destination desktop + monitor workspace and falls back to Last slot when no tiled focus anchor exists.'
-  $options:
-    - last_slot: Last slot
-    - after_focused: After focused window
+- workspace:
+  - DefaultLayout: master_stack
+    $name: Default Layout
+    $description: Initial layout used when a new desktop + monitor workspace is created.
+    $options:
+      - master_stack: Master + Stack (Vertical)
+      - master_stack_h: Master + Stack (Horizontal)
+      - columns: Columns
+      - rows: Rows
+      - bsp: BSP (Binary Space Partitioning)
+      - monocle: Monocle (Fullscreen)
+      - floating: Floating (No tiling)
+  - LayoutCycle: [master_stack, master_stack_h, bsp, columns, rows, monocle, floating]
+    $name: Layout Cycle
+    $description: 'Layouts visited by the Cycle Layout hotkey, in order. Remove layouts you never want to cycle through, or re-order entries as you wish.'
+    $options:
+      - master_stack: Master + Stack (Vertical)
+      - master_stack_h: Master + Stack (Horizontal)
+      - columns: Columns
+      - rows: Rows
+      - bsp: BSP (Binary Space Partitioning)
+      - monocle: Monocle (Fullscreen)
+      - floating: Floating (No tiling)
+  - TileGap: 6
+    $name: Window Gap (DPI-scaled pixels)
+    $description: Gap between adjacent tiled windows, scaled per monitor.
+  - WorkspaceInsets: "6, 6, 6, 6"
+    $name: Insets (DPI-scaled pixels)
+    $description: 'Left, Top, Right, Bottom (0-500), scaled per monitor. Positive values inset the workspace from that edge. Example: 4, 4, 4, 4'
+  - MasterPercent: 50
+    $name: Master Size (%)
+    $description: Default master share in Master + Stack layouts (1-99).
+  $name: Workspace
 
-- DefaultLayout: master_stack
-  $name: '[General] Default Workspace Layout'
-  $description: Initial layout used when a new desktop + monitor workspace is created.
-  $options:
-    - master_stack: Master + Stack (Vertical)
-    - master_stack_h: Master + Stack (Horizontal)
-    - columns: Columns
-    - rows: Rows
-    - bsp: BSP (Binary Space Partition)
-    - monocle: Monocle (Fullscreen)
-    - floating: Floating (managed, no tiling)
+- appearance:
+  - FlyoutPosition: top
+    $name: Status Flyout Position
+    $description: Show layout and mode flyout at the top or bottom center of the active monitor.
+    $options:
+      - top: Top
+      - bottom: Bottom
+  - FlyoutOffsetX: 0
+    $name: Status Flyout X Offset
+    $description: Horizontal offset in DPI-scaled pixels (positive moves right).
+  - FlyoutOffsetY: 0
+    $name: Status Flyout Y Offset
+    $description: Vertical offset in DPI-scaled pixels (positive moves down).
+  - CustomIcons:
+      - - Layout: master_stack
+          $name: Layout
+          $options:
+            - master_stack: Master + Stack (Vertical)
+            - master_stack_h: Master + Stack (Horizontal)
+            - columns: Columns
+            - rows: Rows
+            - bsp: BSP
+            - monocle: Monocle
+            - floating: Floating
+        - Path: ""
+          $name: Icon path (.ico)
+    $name: Custom Tray Layout Icons
+    $description: Optional per-layout .ico overrides. Failed or empty paths use the generated text icon.
+  $name: Appearance
 
-- LayoutCycle: [master_stack, master_stack_h, bsp, columns, rows,  monocle, floating]
-  $name: '[Workspace] Layout Cycle'
-  $description: 'Layouts visited by the Cycle Layout hotkey, in order. Remove layouts you never want to cycle through or drag entries to reorder them. If the current layout is not in the list, the next cycle starts at the first entry.'
-  $options:
-    - master_stack: Master + Stack (Vertical)
-    - master_stack_h: Master + Stack (Horizontal)
-    - columns: Columns
-    - rows: Rows
-    - bsp: BSP (Binary Space Partition)
-    - monocle: Monocle (Fullscreen)
-    - floating: Floating (managed, no tiling)
+- hotkeys:
+  - TilingModifier: alt
+    $name: Modifier
+    $description: "Modifier used by all window-manager hotkeys. \nNote: Alt+letter shortcuts can override application menu mnemonics. Choose Alt+Shift or Ctrl+Alt if this is disruptive. "
+    $options:
+      - alt: Alt
+      - ctrl: Ctrl
+      - alt+shift: Alt + Shift
+      - ctrl+alt: Ctrl + Alt
+      - ctrl+shift: Ctrl + Shift
+  - TileKey: "T"
+    $name: Tile Workspace
+    $description: 'Reconcile and tile windows on the current monitor. Leave blank to disable. Examples: T, D, Space, `, -'
+  - LayoutKey: "L"
+    $name: Cycle Layout
+    $description: 'Cycle the current workspace layout. Leave blank to disable. Examples: L, Tab, =, ], /'
+  - SwapMasterKey: "M"
+    $name: Set Master Window
+    $description: 'Set another tiled window as the master. Leave blank to disable.'
+  - PromoteWindowKey: ","
+    $name: Promote Focused Window
+    $description: 'Move the focused tiled window one logical slot earlier. Does nothing in the first slot. Leave blank to disable.'
+  - DemoteWindowKey: "."
+    $name: Demote Focused Window
+    $description: 'Move the focused tiled window one logical slot later. Does nothing in the last slot. Leave blank to disable.'
+  - ManagementModeToggleKey: "R"
+    $name: Toggle Window Management Mode
+    $description: 'Switch between Automatic and Manual modes at runtime. Leave blank to disable.'
+  - FloatFocusedKey: "F"
+    $name: Float Focused Window
+    $description: 'Float the focused tiled window. Leave blank to disable.'
+  - DiagnosticDumpKey: ""
+    $name: Write Diagnostic Report
+    $description: 'Write a formatted state, health, churn, and invariant report to the configured output directory. Uses the configured modifier. Leave blank to disable.'
+  $name: Hotkeys
 
-- TileGap: 6
-  $name: '[Workspace] Window Gap (DPI-scaled pixels)'
-  $description: Gap between adjacent tiled windows at 96 DPI (0-100); scaled per monitor.
+- diagnostics:
+  - DiagnosticsOutputPath: "%USERPROFILE%\\Documents\\MultiWMDiagnostics"
+    $name: Output Directory
+    $description: 'Directory for timestamped UTF-8 .txt diagnostic reports. Environment variables such as %USERPROFILE% are supported and missing directories are created. Reports include window titles and executable paths, so review them before sharing.'
+  $name: Diagnostics
 
-- WorkspaceInsets: "6, 6, 6, 6"
-  $name: '[Workspace] Insets (DPI-scaled pixels)'
-  $description: 'Left, Top, Right, Bottom at 96 DPI. Positive values inset the workspace from that edge; each value must be 0-500 and is scaled per monitor. Example: 4, 4, 4, 4'
+- windowBehavior:
+  - MouseMoveBehavior: float
+    $name: Tiled Window Drag Action
+    $description: Action when a tiled window is dragged without resizing.
+    $options:
+      - float: Float moved window
+      - swap: Swap with tiled window under pointer
+  - FloatingDefaultSize: "960, 640"
+    $name: Floating Default Size (DPI-scaled pixels)
+    $description: 'Width, Height used for newly discovered windows in Floating workspaces (Automatic mode only). Values must be 100-4000. Scaled per monitor. Example: 960, 640'
+  $name: Window Behavior
 
-- MasterPercent: 50
-  $name: '[Workspace] Master Size (%)'
-  $description: Default master share in Master + Stack layouts (1-99).
+- windowRules:
+  - Rules:
+      - - Process: ""
+          $name: Process name
+          $description: Case-insensitive exact match. Leave blank to match any process.
+        - Class: ""
+          $name: Window class
+          $description: Case-insensitive exact match. Leave blank to match any class.
+        - TitleContains: ""
+          $name: Window title contains
+          $description: Case-insensitive substring. Leave blank to match any title.
+        - Treatment: exclude
+          $name: Treatment
+          $options:
+            - exclude: Exclude
+            - trace_to_owner: Trace to owner
+            - preserve_size_when_centering: Preserve size when centering
+            - override_size_when_centering: Override size when centering
+        - Size: ""
+          $name: Centering size override
+          $description: 'Only effective when "Override size" is selected. Example: 720, 480'
+    $name: Rules
+    $description: 'All populated match fields in a rule must match. Separate rules are alternatives. Exclude prevents management. Trace to owner retargets move/size boundaries from a matching helper window to its already-managed root owner. Centering treatments apply when Automatic mode centers a newly admitted window or must replace missing floating geometry. The first matching centering treatment wins.'
+  $name: Window Rules
 
-- MouseMoveBehavior: float
-  $name: '[Window Behavior] Tiled Window Drag Action'
-  $description: Action when a tiled window is moved without resizing.
-  $options:
-    - float: Float moved window
-    - swap: Swap with tiled window under pointer
-
-- FloatingDefaultSize: "960, 640"
-  $name: '[Floating] Default Size (DPI-scaled pixels)'
-  $description: 'Width, Height at 96 DPI used for newly discovered windows in Floating workspaces and as the fallback when no remembered floating size exists. Each value must be 100-4000 and is scaled per monitor. Example: 960, 640'
-
-- Exclusions:
-    - - Match: process
-        $name: Match by
-        $options:
-          - process: Process name
-          - class: Window class
-          - title: Window title contains
-      - Value: ""
-        $name: Value
-  $name: '[Window Rules] Window Exclusions'
-  $description: Optional exclusions. Process/class are case-insensitive exact matches; title is a case-insensitive substring.
-
-- TilingModifier: alt
-  $name: '[Hotkeys - General] Modifier'
-  $description: Modifier used by all window-manager hotkeys.
-  $options:
-    - alt: Alt
-    - ctrl: Ctrl
-    - alt+shift: Alt + Shift
-    - ctrl+alt: Ctrl + Alt
-    - ctrl+shift: Ctrl + Shift
-
-- TileKey: "T"
-  $name: '[Hotkeys - Workspace] Tile Workspace'
-  $description: 'Reconcile and tile windows on the current monitor. Leave blank to disable. Examples: D, T, Space, `, -'
-
-- LayoutKey: "L"
-  $name: '[Hotkeys - Workspace] Cycle Layout'
-  $description: 'Cycle the current workspace layout. Leave blank to disable. Examples: L, Tab, =, ], /'
-
-- SwapMasterKey: "M"
-  $name: '[Hotkeys - Window] Set Master Window'
-  $description: 'Set another tiled window as the master. Leave blank to disable.'
-
-- PromoteWindowKey: ","
-  $name: '[Hotkeys - Window] Promote Focused Window'
-  $description: 'Move the focused tiled window one logical slot earlier. Does nothing in the first slot. Leave blank to disable.'
-
-- DemoteWindowKey: "."
-  $name: '[Hotkeys - Window] Demote Focused Window'
-  $description: 'Move the focused tiled window one logical slot later. Does nothing in the last slot. Leave blank to disable.'
-
-- ManagementModeToggleKey: "R"
-  $name: '[Hotkeys - General] Toggle Window Management Mode'
-  $description: 'Switch between Automatic and Manual modes at runtime. Leave blank to disable.'
-
-- FloatFocusedKey: "F"
-  $name: '[Hotkeys - Window] Float Focused Window'
-  $description: 'Float the focused tiled window. Leave blank to disable.'
-
-- FlyoutPosition: top
-  $name: '[Appearance] Status Flyout Position'
-  $description: Show layout and mode feedback at the top or bottom center of the active monitor.
-  $options:
-    - top: Top
-    - bottom: Bottom
-
-- FlyoutOffsetX: 0
-  $name: '[Appearance] Status Flyout X Offset'
-  $description: Horizontal offset in DPI-scaled pixels (positive moves right).
-
-- FlyoutOffsetY: 0
-  $name: '[Appearance] Status Flyout Y Offset'
-  $description: Vertical offset in DPI-scaled pixels (positive moves down).
-
-- CustomIcons:
-    - - Layout: master_stack
-        $name: Layout
-        $options:
-          - master_stack: Master + Stack (Vertical)
-          - master_stack_h: Master + Stack (Horizontal)
-          - columns: Columns
-          - rows: Rows
-          - bsp: BSP
-          - monocle: Monocle
-          - floating: Floating
-      - Path: ""
-        $name: Icon path (.ico)
-  $name: '[Appearance] Custom Tray Layout Icons'
-  $description: Optional per-layout .ico overrides. Failed or empty paths use the generated text icon.
-
-- ConformanceLeaseMs: 3000
-  $name: '[Advanced] Tiled Window Conformance Lease (ms)'
-  $description: 'After an authoritative tiled placement, briefly reinforce the assigned rectangle if the application moves itself again. The configured duration is a hard deadline: repeating the same authoritative placement does not extend it. At the deadline, a still-tiled window that remains materially outside its current assigned tile is switched to Floating and the remaining layout reflows. User move/resize gestures cancel the lease immediately. Set to 0 to disable (0-10000 ms). [Default 1500]'
-
-- ReconcileDelayMs: 150
-  $name: '[Advanced] Lifecycle Settle Delay (ms)'
-  $description: Delay before visibility/lifecycle bursts are reconciled. Increase only if shell transitions are unusually slow (20-2000 ms).
-
-- DiagnosticsOutputPath: "%USERPROFILE%\\Documents\\TilingHelperDiagnostics"
-  $name: '[Diagnostics] Output Directory'
-  $description: 'Directory for timestamped UTF-8 .txt diagnostic reports. Environment variables such as %USERPROFILE% are supported and missing directories are created. Reports include window titles and executable paths, so review them before sharing.'
-
-- DiagnosticDumpKey: "I"
-  $name: '[Hotkeys - General] Write Diagnostic Report'
-  $description: 'Write a formatted state, health, churn, and invariant report to the configured output directory. Uses the configured modifier. Leave blank to disable.'
+- advanced:
+  - ConformanceLeaseMs: 3000
+    $name: Tiled Window Conformance Lease (ms)
+    $description: 'Briefly reinforces the assigned rectangle after placement in case the application moves itself again. A still-tiled window that remains outside its tile is floated and the remaining layout reflows. Set to 0 to disable (0-10000 ms). [Default 3000]'
+  - ConformanceRepairIntervalMs: 75
+    $name: Conformance Repair Interval (ms)
+    $description: 'Minimum delay between attempts to return a tiled window to its assigned rectangle during the conformance lease (20-2000 ms). [Default 75]'
+  - ReconcileDelayMs: 50
+    $name: Lifecycle Settle Delay (ms)
+    $description: Delay before visibility/lifecycle bursts are reconciled. Increase only if shell transitions are unusually slow (20-2000 ms).
+  $name: Advanced
 */
 // ==/WindhawkModSettings==
 
@@ -247,24 +256,24 @@ resize-adjusted ratios per virtual desktop.
 
 BOOL WhTool_ModInit() {
   Diagnostics::InitializeProcessRuntime();
-  Wh_Log(L"Tiling Helper mod initializing...");
+  Wh_Log(L"MultiWM mod initializing...");
   LoadSettings();
   if (!StartHotkeyThread()) {
     Wh_Log(L"Failed to start hotkey thread");
     return FALSE;
   }
-  Wh_Log(L"Tiling Helper mod initialized successfully");
+  Wh_Log(L"MultiWM mod initialized successfully");
   return TRUE;
 }
 
 void WhTool_ModUninit() {
-  Wh_Log(L"Tiling Helper mod uninitializing...");
+  Wh_Log(L"MultiWM mod uninitializing...");
   if (!StopHotkeyThread()) {
     // The standard tool-mod wrapper exits this dedicated process immediately
     // after WhTool_ModUninit returns, so never create a second owner here.
     Wh_Log(L"WM worker did not join before tool-process shutdown");
   }
-  Wh_Log(L"Tiling Helper mod uninitialized");
+  Wh_Log(L"MultiWM mod uninitialized");
 }
 
 void WhTool_ModSettingsChanged() {

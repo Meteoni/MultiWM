@@ -13,8 +13,8 @@ namespace TrayUi {
 // Settings + naming
 //-----------------------------------------------------------------------------
 
-constexpr wchar_t kTrayWindowClassName[] = L"WindhawkTilingHelperTrayWindow";
-constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkTilingHelperStatusFlyout";
+constexpr wchar_t kTrayWindowClassName[] = L"WindhawkMultiWMTrayWindow";
+constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkMultiWMStatusFlyout";
 constexpr UINT kTrayCallbackMessage = WM_APP + 20;
 constexpr UINT kIconId = 1;
 constexpr UINT kContextTileWorkspace = 41001;
@@ -94,16 +94,17 @@ static const wchar_t* LayoutFlyoutText(TileLayout layout) {
 
 static void LoadSettings() {
   using WindhawkUtils::StringSetting;
-  auto position = StringSetting::make(L"FlyoutPosition");
+  auto position = StringSetting::make(L"appearance.FlyoutPosition");
   g_flyoutTop = _wcsicmp(position.get(), L"top") == 0;
-  g_flyoutOffsetX = Wh_GetIntSetting(L"FlyoutOffsetX");
-  g_flyoutOffsetY = Wh_GetIntSetting(L"FlyoutOffsetY");
+  g_flyoutOffsetX = Wh_GetIntSetting(L"appearance.FlyoutOffsetX");
+  g_flyoutOffsetY = Wh_GetIntSetting(L"appearance.FlyoutOffsetY");
 
   for (auto& path : g_customIconPaths) path.clear();
   for (int i = 0; i < 32; ++i) {
-    auto layoutName = StringSetting::make(L"CustomIcons[%d].Layout", i);
+    auto layoutName =
+        StringSetting::make(L"appearance.CustomIcons[%d].Layout", i);
     if (!*layoutName.get()) break;
-    auto path = StringSetting::make(L"CustomIcons[%d].Path", i);
+    auto path = StringSetting::make(L"appearance.CustomIcons[%d].Path", i);
     size_t index = static_cast<size_t>(ParseLayoutSetting(layoutName.get()));
     if (*path.get() && index < g_customIconPaths.size() &&
         g_customIconPaths[index].empty()) {
@@ -249,21 +250,27 @@ static void SetTooltip(TileLayout layout) {
   // distinguish and would otherwise be pure visual clutter.
   std::wstring tooltip;
   if (monitors.size() <= 1) {
-    tooltip = L"Tiling Helper - ";
+    tooltip = L"MultiWM - ";
     tooltip += LayoutDisplayName(layout);
   } else {
     GUID desktopId{};
-    bool haveDesktop = GetCurrentDesktopId(&desktopId);
+    bool haveDesktop = false;
+    if (g_wm.reconciledDesktopState == ReconciledDesktopState::Settled) {
+      desktopId = g_wm.reconciledDesktop;
+      haveDesktop = true;
+    } else {
+      haveDesktop = GetCurrentDesktopId(&desktopId);
+    }
     if (!haveDesktop && g_haveDisplayedDesktopId) {
       desktopId = g_displayedDesktopId;
       haveDesktop = true;
     }
 
     if (!haveDesktop) {
-      tooltip = L"Tiling Helper - ";
+      tooltip = L"MultiWM - ";
       tooltip += LayoutDisplayName(layout);
     } else {
-      tooltip = L"Tiling Helper";
+      tooltip = L"MultiWM";
       for (size_t i = 0; i < monitors.size(); ++i) {
         const HMONITOR monitor = monitors[i];
         TileLayout monitorLayout = g_settings.defaultLayout;
@@ -318,6 +325,11 @@ static bool AddIconToShell() {
 static void UpdateIcon(TileLayout layout, HMONITOR monitor) {
   if (!g_trayWindow || layout == TileLayout::COUNT) return;
 
+  const TileLayout previousLayout = g_displayedLayout;
+  const HMONITOR previousMonitor = g_displayedMonitor;
+  const HICON previousIcon = g_notifyData.hIcon;
+  const std::wstring previousTooltip = g_notifyData.szTip;
+
   g_displayedLayout = layout;
   if (monitor) g_displayedMonitor = monitor;
 
@@ -347,6 +359,12 @@ static void UpdateIcon(TileLayout layout, HMONITOR monitor) {
   g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
   g_notifyData.hIcon = GetLayoutIcon(layout);
   SetTooltip(layout);
+  if (previousLayout == g_displayedLayout &&
+      previousMonitor == g_displayedMonitor &&
+      previousIcon == g_notifyData.hIcon &&
+      previousTooltip == g_notifyData.szTip) {
+    return;
+  }
   if (!Shell_NotifyIconW(NIM_MODIFY, &g_notifyData)) {
     // The shell may have discarded the entry while our local state still says it
     // exists. Reverse the recovery direction and recreate it with NIM_ADD.
@@ -606,6 +624,21 @@ static TileLayout GetMonitorLayoutOrDefault(HMONITOR monitor) {
   return layout;
 }
 
+// TrackPopupMenuEx runs a modal loop which otherwise retrieves and discards
+// hwnd-less actor messages. Process only messages owned by the WM and leave all
+// menu/system traffic to the next hook and the menu loop.
+static LRESULT CALLBACK TrayMenuMessageFilterProc(
+    int code, WPARAM wParam, LPARAM lParam) {
+  if (code == MSGF_MENU && lParam) {
+    const MSG& msg = *reinterpret_cast<const MSG*>(lParam);
+    if (!msg.hwnd &&
+        HandleWmThreadMessage(msg) == WmMessageDisposition::Handled) {
+      return 1;
+    }
+  }
+  return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
 static void ShowContextMenu() {
   if (!g_trayWindow) return;
 
@@ -616,9 +649,13 @@ static void ShowContextMenu() {
   if (!menu) return;
 
   AppendMenuW(menu, MF_STRING, kContextTileWorkspace, L"Tile Workspace");
+  const ManagementMode targetMode = IsAutomaticMode()
+                                        ? ManagementMode::Manual
+                                        : ManagementMode::Automatic;
   AppendMenuW(
       menu, MF_STRING, kContextToggleMode,
-      IsAutomaticMode() ? L"Switch to Manual Mode" : L"Switch to Automatic Mode");
+      targetMode == ManagementMode::Manual ? L"Switch to Manual Mode"
+                                           : L"Switch to Automatic Mode");
 
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
@@ -641,11 +678,22 @@ static void ShowContextMenu() {
     return;
   }
 
+  HHOOK menuMessageHook = SetWindowsHookExW(
+      WH_MSGFILTER, TrayMenuMessageFilterProc, nullptr, GetCurrentThreadId());
+  if (!menuMessageHook) {
+    Wh_Log(L"Failed to install tray menu message filter: %lu", GetLastError());
+    DestroyMenu(menu);
+    return;
+  }
+
   // Required for reliable dismissal of notification-area popup menus.
   SetForegroundWindow(g_trayWindow);
   const UINT command = TrackPopupMenuEx(
       menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
       point.x, point.y, g_trayWindow, nullptr);
+  if (!UnhookWindowsHookEx(menuMessageHook)) {
+    Wh_Log(L"Failed to remove tray menu message filter: %lu", GetLastError());
+  }
   PostMessageW(g_trayWindow, WM_NULL, 0, 0);
   DestroyMenu(menu);
 
@@ -660,12 +708,9 @@ static void ShowContextMenu() {
   }
 
   if (command == kContextToggleMode) {
-    const ManagementMode mode = IsAutomaticMode()
-                                    ? ManagementMode::Manual
-                                    : ManagementMode::Automatic;
     PostThreadMessageW(
         threadId, WM_APP_MANAGEMENT_MODE_SET,
-        static_cast<WPARAM>(mode), 0);
+        static_cast<WPARAM>(targetMode), 0);
     return;
   }
 

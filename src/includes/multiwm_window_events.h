@@ -35,10 +35,11 @@ static bool HasTrackedMonitorOwnershipMismatch(HWND hwnd) {
       [&](const DesktopMonitorKey& owner) { return owner.monitor != observedId; });
 }
 
-// Treats out-of-context WinEvents as edge-triggered observations: filter noise,
-// cache move/resize boundaries, and post accepted work to the hotkey thread.
-// Workspace state is never mutated from this callback.
+// Out-of-context WinEvents are delivered on this WM thread. Keep the callback
+// observation-only and post accepted work so reentrant delivery can't recursively
+// mutate workspace state.
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+  AssertWmThread(L"WinEventProc");
   switch (event) {
     case EVENT_SYSTEM_FOREGROUND:
     case EVENT_SYSTEM_MOVESIZESTART:
@@ -74,11 +75,24 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // For window-level events only.
   if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
 
+  // Opt-in rules can bridge custom frame/helper HWNDs to an already-managed root
+  // owner for native move/size boundaries. Lifecycle events retain exact identity.
+  if ((event == EVENT_SYSTEM_MOVESIZESTART ||
+       event == EVENT_SYSTEM_MOVESIZEEND) &&
+      !IsWindowTrackedInAnyState(hwnd) &&
+      FindMatchingWindowRule(
+          hwnd, WindowRuleTreatment::TraceToOwner)) {
+    HWND rootOwner = GetAncestor(hwnd, GA_ROOTOWNER);
+    if (rootOwner && IsWindowTrackedInAnyState(rootOwner)) {
+      hwnd = rootOwner;
+    }
+  }
+
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
 
-  // Normal layout placement itself produces LOCATIONCHANGE, so keep this path
-  // narrow. Besides maximized->restored detection, a short conformance lease may
-  // opt a tiled HWND into location observation while an app finishes startup.
+  // A tiled LOCATIONCHANGE is classified later on the WM actor. Expected placement
+  // echoes are cheap no-ops there; unexpected same-monitor drift opens a bounded
+  // conformance lease instead of being silently discarded.
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
     if (!tracked) {
       // A newly created window can already be minimized/maximized before the
@@ -97,11 +111,13 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
     const bool stateOrLeaseNeedsObservation =
         IsWindowSuspendedMaximized(hwnd) ||
-        HasActiveConformanceLease(hwnd);
+        HasActiveConformanceLease(hwnd) ||
+        g_workspaces.IsTiled(hwnd);
     if (!stateOrLeaseNeedsObservation &&
         !HasTrackedMonitorOwnershipMismatch(hwnd)) {
       return;
     }
+
     QueueWindowEvent(event, hwnd);
     return;
   }
@@ -121,8 +137,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   }
 
   // Explicit user manipulation always wins over a transient placement lease.
-  // Cancellation is lock-protected because this callback is outside the model
-  // mutation boundary.
+  // Lease cancellation is actor-local; workspace mutation remains deferred until
+  // normal message dispatch.
   if (event == EVENT_SYSTEM_MOVESIZESTART) {
     CancelConformanceLease(hwnd);
   }
@@ -130,7 +146,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // Cache user move/resize boundaries. The callback only records facts; model
   // mutation and layout work happen later on the WM thread.
   if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
-    AcquireSRWLockExclusive(&g_moveSize.lock);
     RECT r{};
     if (GetWindowFrameRect(hwnd, &r)) {
       if (event == EVENT_SYSTEM_MOVESIZESTART) {
@@ -141,14 +156,21 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
         if (GetCursorPos(&pt)) g_moveSize.endPoints[hwnd] = pt;
       }
     }
-    ReleaseSRWLockExclusive(&g_moveSize.lock);
-
     if (event == EVENT_SYSTEM_MOVESIZEEND) OnWindowMoveSizeEnd(hwnd);
     return;
   }
 
   // Accepted lifecycle events are serialized on the WM thread.
   // PostThreadMessage keeps model mutation out of the WinEvent callback.
+  if (event == EVENT_OBJECT_CLOAKED || event == EVENT_OBJECT_UNCLOAKED) {
+    // Older notification ABIs rely on the settled cloak/uncloak fallback to
+    // discover desktop switches. Until that pass completes, preserve the current
+    // behavior by making active-desktop checks query Explorer directly.
+    if (g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown) {
+      g_wm.reconciledDesktopState =
+          ReconciledDesktopState::TransitionPending;
+    }
+  }
   QueueWindowEvent(event, hwnd);
 }
 
@@ -158,6 +180,7 @@ bool AllWinEventHooksInstalled() {
 }
 
 bool InstallWinEventHooks() {
+  AssertWmThread(L"Platform::WindowEvents::InstallWinEventHooks");
   auto noteFailure = [](const wchar_t* name) {
     ++Diagnostics::g_runtime.counters.winEventHookInstallFailures;
     Wh_Log(L"Failed to install %s WinEvent hook: %lu", name, GetLastError());

@@ -63,8 +63,8 @@ MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LON
 }
 
 static MoveSizeGesture PeekMoveSizeGesture(HWND hwnd) {
+  AssertWmThread(L"PeekMoveSizeGesture");
   MoveSizeGesture gesture;
-  AcquireSRWLockShared(&g_moveSize.lock);
   auto startIt = g_moveSize.startRects.find(hwnd);
   auto endIt = g_moveSize.endRects.find(hwnd);
   auto pointIt = g_moveSize.endPoints.find(hwnd);
@@ -73,22 +73,22 @@ static MoveSizeGesture PeekMoveSizeGesture(HWND hwnd) {
     gesture.start = startIt->second;
     gesture.end = endIt->second;
     gesture.hasRects = true;
-    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
   }
   if (pointIt != g_moveSize.endPoints.end()) {
     gesture.dropPoint = pointIt->second;
     gesture.hasDropPoint = true;
   }
-  ReleaseSRWLockShared(&g_moveSize.lock);
+  if (gesture.hasRects) {
+    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
+  }
   return gesture;
 }
 
 static bool IsMoveSizeGestureInProgress(HWND hwnd) {
+  AssertWmThread(L"IsMoveSizeGestureInProgress");
   if (!hwnd) return false;
-  AcquireSRWLockShared(&g_moveSize.lock);
   const bool started = g_moveSize.startRects.find(hwnd) != g_moveSize.startRects.end();
   const bool ended = g_moveSize.endRects.find(hwnd) != g_moveSize.endRects.end();
-  ReleaseSRWLockShared(&g_moveSize.lock);
   return started && !ended;
 }
 

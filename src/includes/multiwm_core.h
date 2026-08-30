@@ -173,33 +173,39 @@ constexpr UINT WM_APP_MANAGEMENT_MODE_SET = WM_APP + 8;
 constexpr UINT WM_APP_TILE_WORKSPACE = WM_APP + 9;
 constexpr UINT WM_APP_FOREGROUND_CHANGED = WM_APP + 10;
 
+enum class WmMessageDisposition {
+  Handled,
+  DispatchToWindows,
+};
+
+static WmMessageDisposition HandleWmThreadMessage(const MSG& msg);
+
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
 enum class MouseMoveBehavior { Float, Swap };
-enum class ExclusionMatch { Process, Class, Title };
+enum class WindowRuleTreatment {
+  Exclude,
+  TraceToOwner,
+  FloatingPlacementOverride,
+};
 enum class ManagementMode { Manual, Automatic };
 enum class AutomaticNewWindowPosition { LastSlot, AfterFocused };
 
 static std::vector<TileLayout> MakeBuiltInLayoutCycle() {
   return {
       TileLayout::MasterStack,
-      TileLayout::Columns,
-      TileLayout::Rows,
       TileLayout::MasterStackH,
       TileLayout::BSP,
+      TileLayout::Columns,
+      TileLayout::Rows,
       TileLayout::Monocle,
       TileLayout::Floating};
 }
 
-struct ExclusionRule {
-  ExclusionMatch match = ExclusionMatch::Process;
-  std::wstring value;
-};
-
 struct WorkspaceInsets {
-  LONG left = 4;
-  LONG top = 4;
-  LONG right = 4;
-  LONG bottom = 4;
+  LONG left = 6;
+  LONG top = 6;
+  LONG right = 6;
+  LONG bottom = 6;
 };
 
 struct FloatingDefaultSize {
@@ -207,26 +213,36 @@ struct FloatingDefaultSize {
   LONG height = 640;
 };
 
+struct WindowRule {
+  WindowRuleTreatment treatment = WindowRuleTreatment::Exclude;
+  std::wstring process;
+  std::wstring className;
+  std::wstring titleContains;
+  bool preserveFloatingSize = true;
+  FloatingDefaultSize floatingSizeDip{};
+};
+
 // Windhawk settings and immutable-at-runtime policy values. Settings reloads
 // replace these fields; transient WM state lives in WmRuntime instead.
 struct SettingsState {
-  UINT reconcileDelayMs = 80;
-  UINT conformanceLeaseMs = 1500;
+  UINT reconcileDelayMs = 50;
+  UINT conformanceLeaseMs = 3000;
+  UINT conformanceRepairIntervalMs = 75;
 
   UINT tilingModifiers = MOD_ALT;
-  UINT tileKey = 'D';
+  UINT tileKey = 'T';
   UINT layoutKey = 'L';
   UINT swapMasterKey = 'M';
-  UINT promoteWindowKey = VK_OEM_4;  // [
-  UINT demoteWindowKey = VK_OEM_6;   // ]
-  UINT managementModeToggleKey = 'U';
-  UINT floatFocusedKey = 0;
-  UINT diagnosticDumpKey = 'I';
+  UINT promoteWindowKey = VK_OEM_COMMA;
+  UINT demoteWindowKey = VK_OEM_PERIOD;
+  UINT managementModeToggleKey = 'R';
+  UINT floatFocusedKey = 'F';
+  UINT diagnosticDumpKey = 0;
 
   // User-facing pixel values are logical pixels at 96 DPI; scale only at a
   // concrete monitor/window boundary so stored screen geometry remains physical.
   WorkspaceInsets insetsDip{};
-  LONG gapDip = 4;
+  LONG gapDip = 6;
   FloatingDefaultSize floatingDefaultSizeDip{};
   LONG masterPercent = 50;
 
@@ -235,9 +251,9 @@ struct SettingsState {
       AutomaticNewWindowPosition::LastSlot;
   TileLayout defaultLayout = TileLayout::MasterStack;
   std::vector<TileLayout> layoutCycle = MakeBuiltInLayoutCycle();
-  std::vector<ExclusionRule> exclusionRules;
+  std::vector<WindowRule> windowRules;
   std::wstring diagnosticsOutputPath =
-      L"%USERPROFILE%\\Documents\\TilingHelperDiagnostics";
+      L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";
 };
 
 // Private virtual-desktop COM state. This entire object belongs to the STA WM
@@ -264,6 +280,12 @@ struct VirtualDesktopRuntime {
   bool initialized = false;
 };
 
+enum class ReconciledDesktopState {
+  Unknown,
+  Settled,
+  TransitionPending,
+};
+
 // Serialized actor/thread state. Management mode affects admission/retention
 // policy only; observation, reconciliation, resize learning, and arrangement
 // remain live in both modes. Only threadId is observed outside the actor.
@@ -281,11 +303,12 @@ struct WmRuntime {
   bool forceMonitorReconcile = false;
   bool comInitialized = false;
   GUID reconciledDesktop{};
-  bool reconciledDesktopValid = false;
+  ReconciledDesktopState reconciledDesktopState =
+      ReconciledDesktopState::Unknown;
   bool pendingDesktopSwitchFlyouts = false;
   std::vector<HWND> lifecycleDirtyWindows;
   std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
-  ManagementMode managementMode = ManagementMode::Manual;
+  ManagementMode managementMode = ManagementMode::Automatic;
 };
 
 namespace Diagnostics {
@@ -603,11 +626,6 @@ struct WindowRecord {
   bool canResize = true;
   bool topmost = false;
 
-  int placementFailures = 0;
-  // Anchor of the current consecutive-failure streak. Unlike lastRequestedRect,
-  // this does not walk forward with each near-equal request; it changes only
-  // when a materially different failed target starts a new streak.
-  RECT placementFailureTarget{};
   PlacementResult lastPlacementResult = PlacementResult::Success;
   RECT lastRequestedRect{};
   RECT lastObservedRect{};
@@ -677,12 +695,11 @@ class Workspace {
   void SetMasterRatio(double ratio);
   bool MakeMaster(HWND hwnd, HWND* oldMaster = nullptr);
   bool SwapTiled(HWND first, HWND second);
-  bool ResetPlacementFailures(HWND hwnd);
   bool RememberFloatingGeometry(
       HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
 
-  bool ActivateTiled(HWND hwnd, bool resetPlacementFailures = false);
-  bool AdmitTiled(WindowRecord record, bool resetPlacementFailures = false);
+  bool ActivateTiled(HWND hwnd);
+  bool AdmitTiled(WindowRecord record);
   bool AdmitTiledAfter(WindowRecord record, HWND anchor);
   bool AdmitInitial(WindowRecord record, SuspensionReason reason);
   bool AdmitInitialAfter(
@@ -740,19 +757,20 @@ class Workspace {
   HWND lastFocusedWindow_ = nullptr;
 };
 
-constexpr int kPlacementFailureLimit = 3;
 constexpr LONG kPlacementTolerancePx = 4;
 
 using WorkspaceMap = std::unordered_map<
     DesktopMonitorKey, Workspace, DesktopMonitorKeyHash, DesktopMonitorKeyEqual>;
 
-// Synchronization boundary for the workspace graph. Writers are restricted to
-// the serialized WM thread; WinEvent callbacks may perform lock-protected reads.
+// Access boundary for the workspace graph. All current callers, including
+// WinEvent callbacks, run on the serialized WM thread; the repository keeps its
+// workspace snapshots and reverse ownership index consistent.
 class WorkspaceRepository {
  public:
   bool Load(const DesktopMonitorKey& key, Workspace* workspace) const;
   void Save(const DesktopMonitorKey& key, const Workspace& workspace);
   bool IsTracked(HWND hwnd) const;
+  bool IsTiled(HWND hwnd) const;
   bool IsSuspendedMaximized(HWND hwnd) const;
   std::vector<DesktopMonitorKey> OwnersOf(HWND hwnd) const;
   std::vector<HWND> KnownWindows() const;
@@ -760,7 +778,6 @@ class WorkspaceRepository {
   std::vector<std::pair<DesktopMonitorKey, Workspace>> Snapshot() const;
   std::vector<std::pair<HWND, std::vector<DesktopMonitorKey>>>
       OwnershipIndexSnapshot() const;
-  void ClearAfterWmStopped();
 
  private:
   mutable SRWLOCK lock_ = SRWLOCK_INIT;
@@ -786,8 +803,20 @@ using Model::Workspace;
 using Model::WorkspaceGeometryItem;
 using Model::WorkspaceRepository;
 
+struct MonitorIdentityCacheEntry {
+  HMONITOR monitor = nullptr;
+  Model::MonitorId id;
+};
+
+// HMONITOR <-> stable monitor identity is valid for one display-topology
+// generation. DPI and work-area observations deliberately aren't cached here.
+static std::vector<MonitorIdentityCacheEntry> g_monitorIdentityCache;
+
+static void ClearMonitorIdentityCache() {
+  g_monitorIdentityCache.clear();
+}
+
 struct MoveSizeTracker {
-  SRWLOCK lock = SRWLOCK_INIT;
   std::unordered_map<HWND, RECT> startRects;
   std::unordered_map<HWND, RECT> endRects;
   std::unordered_map<HWND, POINT> endPoints;
@@ -821,15 +850,11 @@ struct ConformanceLease {
 };
 
 struct ConformanceLeaseTracker {
-  SRWLOCK lock = SRWLOCK_INIT;
   std::unordered_map<HWND, ConformanceLease> leases;
   uint64_t nextGeneration = 1;
 };
 
 static ConformanceLeaseTracker g_conformanceLeases;
-// Cap repeated app-vs-WM ping-pong at roughly 13 reinforcements/second without
-// turning the cadence into another user-facing policy knob.
-static constexpr UINT kConformanceRepairMinIntervalMs = 75;
 
 enum class ConformanceLeaseReadResult {
   Missing,
@@ -838,15 +863,15 @@ enum class ConformanceLeaseReadResult {
 };
 
 // Reads lease state without consuming expiry. Expired leases stay present until
-// the WM actor performs the final passive conformance verdict; foreign WinEvent
-// readers must never silently erase the evidence needed for that deadline action.
+// the WM actor performs the final passive conformance verdict; WinEvent
+// observations must never silently erase the evidence needed for that action.
 static ConformanceLeaseReadResult ReadConformanceLease(
     HWND hwnd, ConformanceLease* outLease) {
+  AssertWmThread(L"ReadConformanceLease");
   if (!hwnd) return ConformanceLeaseReadResult::Missing;
 
   const ULONGLONG now = GetTickCount64();
   ConformanceLeaseReadResult result = ConformanceLeaseReadResult::Missing;
-  AcquireSRWLockShared(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
   if (it != g_conformanceLeases.leases.end()) {
     if (outLease) *outLease = it->second;
@@ -854,7 +879,6 @@ static ConformanceLeaseReadResult ReadConformanceLease(
                  ? ConformanceLeaseReadResult::Active
                  : ConformanceLeaseReadResult::Expired;
   }
-  ReleaseSRWLockShared(&g_conformanceLeases.lock);
   return result;
 }
 
@@ -873,33 +897,30 @@ static bool HasActiveConformanceLease(HWND hwnd) {
 // topology/lifecycle teardown, migration, etc.). A nonzero generation lets a
 // stale WM-thread observation avoid deleting a newer lease.
 static bool CancelConformanceLease(HWND hwnd, uint64_t generation = 0) {
+  AssertWmThread(L"CancelConformanceLease");
   if (!hwnd) return false;
   bool erased = false;
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
   if (it != g_conformanceLeases.leases.end() &&
       (generation == 0 || it->second.generation == generation)) {
     g_conformanceLeases.leases.erase(it);
     erased = true;
   }
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
   return erased;
 }
 
 static void ClearAllConformanceLeases() {
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
+  AssertWmThread(L"ClearAllConformanceLeases");
   g_conformanceLeases.leases.clear();
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
 }
 
 static size_t CountActiveConformanceLeases() {
+  AssertWmThread(L"CountActiveConformanceLeases");
   const ULONGLONG now = GetTickCount64();
   size_t count = 0;
-  AcquireSRWLockShared(&g_conformanceLeases.lock);
   for (const auto& kv : g_conformanceLeases.leases) {
     if (now < kv.second.expiresAtTickMs) ++count;
   }
-  ReleaseSRWLockShared(&g_conformanceLeases.lock);
   return count;
 }
 
@@ -912,7 +933,6 @@ static void ScheduleNextConformanceTimer() {
 
   const ULONGLONG now = GetTickCount64();
   ULONGLONG earliestDue = 0;
-  AcquireSRWLockShared(&g_conformanceLeases.lock);
   for (const auto& kv : g_conformanceLeases.leases) {
     const ConformanceLease& lease = kv.second;
     ULONGLONG due = lease.expiresAtTickMs;
@@ -921,8 +941,6 @@ static void ScheduleNextConformanceTimer() {
     }
     if (!earliestDue || due < earliestDue) earliestDue = due;
   }
-  ReleaseSRWLockShared(&g_conformanceLeases.lock);
-
   if (!earliestDue) return;
   const ULONGLONG remaining = earliestDue > now ? earliestDue - now : 1;
   const UINT delayMs = static_cast<UINT>(std::min<ULONGLONG>(remaining, 0x7FFFFFFFULL));
@@ -934,11 +952,11 @@ static void ScheduleNextConformanceTimer() {
 
 static bool DeferConformanceLeaseRepair(
     HWND hwnd, uint64_t generation, ULONGLONG dueTickMs) {
+  AssertWmThread(L"DeferConformanceLeaseRepair");
   if (!hwnd || generation == 0 || !dueTickMs) return false;
 
   const ULONGLONG now = GetTickCount64();
   bool retained = false;
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
   if (it != g_conformanceLeases.leases.end() &&
       now < it->second.expiresAtTickMs &&
@@ -948,13 +966,12 @@ static bool DeferConformanceLeaseRepair(
     }
     retained = true;
   }
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
-
   if (retained) ScheduleNextConformanceTimer();
   return retained;
 }
 
-static uint64_t AllocateConformanceLeaseGenerationLocked() {
+static uint64_t AllocateConformanceLeaseGeneration() {
+  AssertWmThread(L"AllocateConformanceLeaseGeneration");
   uint64_t generation = g_conformanceLeases.nextGeneration++;
   if (generation == 0) {
     generation = g_conformanceLeases.nextGeneration++;
@@ -962,7 +979,9 @@ static uint64_t AllocateConformanceLeaseGenerationLocked() {
   return generation;
 }
 
-static void BeginConformanceLease(HWND hwnd, const RECT& expectedRect) {
+static void BeginConformanceLease(
+    HWND hwnd, const RECT& expectedRect, bool scheduleRepair = false) {
+  AssertWmThread(L"BeginConformanceLease");
   if (!hwnd || g_settings.conformanceLeaseMs == 0 ||
       expectedRect.right <= expectedRect.left ||
       expectedRect.bottom <= expectedRect.top) {
@@ -971,7 +990,6 @@ static void BeginConformanceLease(HWND hwnd, const RECT& expectedRect) {
   }
 
   const ULONGLONG now = GetTickCount64();
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
 
   // Re-observing the same authoritative target while its lease is still active
@@ -979,7 +997,11 @@ static void BeginConformanceLease(HWND hwnd, const RECT& expectedRect) {
   if (it != g_conformanceLeases.leases.end() &&
       now < it->second.expiresAtTickMs &&
       EqualRect(&it->second.expectedRect, &expectedRect)) {
-    ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
+    if (scheduleRepair && !it->second.repairDueTickMs) {
+      it->second.repairDueTickMs = std::min(
+          it->second.expiresAtTickMs,
+          now + g_settings.conformanceRepairIntervalMs);
+    }
     ScheduleNextConformanceTimer();
     return;
   }
@@ -987,9 +1009,13 @@ static void BeginConformanceLease(HWND hwnd, const RECT& expectedRect) {
   ConformanceLease lease;
   lease.expectedRect = expectedRect;
   lease.expiresAtTickMs = now + g_settings.conformanceLeaseMs;
-  lease.generation = AllocateConformanceLeaseGenerationLocked();
+  if (scheduleRepair) {
+    lease.repairDueTickMs = std::min(
+        lease.expiresAtTickMs,
+        now + g_settings.conformanceRepairIntervalMs);
+  }
+  lease.generation = AllocateConformanceLeaseGeneration();
   g_conformanceLeases.leases[hwnd] = lease;
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
 
   ++Diagnostics::g_runtime.counters.conformanceLeasesStarted;
   ScheduleNextConformanceTimer();
@@ -1004,11 +1030,11 @@ static bool IsCurrentConformanceLease(HWND hwnd, uint64_t generation) {
 
 static bool RecordConformanceLeaseAttempt(
     HWND hwnd, uint64_t generation, unsigned* outAttemptNumber = nullptr) {
+  AssertWmThread(L"RecordConformanceLeaseAttempt");
   if (!hwnd || generation == 0) return false;
 
   const ULONGLONG now = GetTickCount64();
   bool retained = false;
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
   if (it != g_conformanceLeases.leases.end() &&
       now < it->second.expiresAtTickMs &&
@@ -1019,7 +1045,6 @@ static bool RecordConformanceLeaseAttempt(
     if (outAttemptNumber) *outAttemptNumber = it->second.attempts;
     retained = true;
   }
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
   return retained;
 }
 

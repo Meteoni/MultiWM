@@ -133,6 +133,28 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (IsIconic(hwnd)) return SuspensionReason::Minimized;
   if (!IsWindowVisible(hwnd)) return SuspensionReason::Hidden;
   if (IsZoomed(hwnd)) return SuspensionReason::Maximized;
+
+  // Match FancyWM's native-fullscreen fallback: Chromium and similar apps can
+  // cover a complete display while Windows still reports the HWND as Restored.
+  // Maximized is the right model reason because both states have identical
+  // suspend/save-slot/restore semantics here.
+  RECT windowRect{};
+  if (GetWindowRect(hwnd, &windowRect)) {
+    HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONULL);
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    constexpr LONG kFullscreenTolerancePx = 2;
+    if (monitor && GetMonitorInfoW(monitor, &monitorInfo) &&
+        !Differs(windowRect.left, monitorInfo.rcMonitor.left,
+                 kFullscreenTolerancePx) &&
+        !Differs(windowRect.top, monitorInfo.rcMonitor.top,
+                 kFullscreenTolerancePx) &&
+        !Differs(windowRect.right, monitorInfo.rcMonitor.right,
+                 kFullscreenTolerancePx) &&
+        !Differs(windowRect.bottom, monitorInfo.rcMonitor.bottom,
+                 kFullscreenTolerancePx)) {
+      return SuspensionReason::Maximized;
+    }
+  }
   return SuspensionReason::None;
 }
 
@@ -567,6 +589,14 @@ static bool IsWorkspaceOnActiveDesktop(const DesktopMonitorKey& key) {
   GUID zeroGuid{};
   if (IsEqualGUID(key.desktopId, zeroGuid)) return false;
 
+  // The reconciled desktop is actor-owned and authoritative between transition
+  // signals. Avoid re-querying Explorer from high-frequency placement and
+  // LOCATIONCHANGE paths; a dirty transition deliberately retains the old GUID
+  // for comparison while falling through to the existing live query.
+  if (g_wm.reconciledDesktopState == ReconciledDesktopState::Settled) {
+    return IsEqualGUID(g_wm.reconciledDesktop, key.desktopId);
+  }
+
   GUID currentDesktop{};
   if (!GetCurrentDesktopId(&currentDesktop)) return false;
   return IsEqualGUID(currentDesktop, key.desktopId);
@@ -794,38 +824,19 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
   WindowRecord* record = FindMutable(hwnd);
   if (!record) return PlacementAction::Forget;
 
-  // placementFailures is a consecutive-failure streak for materially the same
-  // authoritative target, not a lifetime bad-window score. Compare against the
-  // fixed streak anchor rather than lastRequestedRect so repeated small target
-  // changes cannot walk the streak beyond the placement tolerance.
-  const bool sameFailureTarget =
-      record->placementFailures > 0 &&
-      RectsNear(record->placementFailureTarget, observation.requested);
-
   record->lastRequestedRect = observation.requested;
   record->lastObservedRect = observation.observed;
   record->lastPlacementResult = observation.result;
+  DebugValidateMutation(L"Workspace::ApplyPlacementObservation");
 
   switch (observation.result) {
     case PlacementResult::Success:
-      record->placementFailures = 0;
-      record->placementFailureTarget = {};
-      DebugValidateMutation(L"Workspace::ApplyPlacementObservation");
+    case PlacementResult::AdjustedByWindow:
+    case PlacementResult::Refused:
       return PlacementAction::None;
 
-    case PlacementResult::AdjustedByWindow:
     case PlacementResult::AccessDenied:
-    case PlacementResult::Refused:
-      if (sameFailureTarget) {
-        ++record->placementFailures;
-      } else {
-        record->placementFailures = 1;
-        record->placementFailureTarget = observation.requested;
-      }
-      DebugValidateMutation(L"Workspace::ApplyPlacementObservation");
-      return record->placementFailures >= Model::kPlacementFailureLimit
-                 ? PlacementAction::Float
-                 : PlacementAction::None;
+      return PlacementAction::Float;
 
     case PlacementResult::Dead:
       return PlacementAction::Forget;
@@ -847,11 +858,12 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   HMONITOR monitor = key.ResolveMonitor();
   if (!monitor) return;  // Detached monitor: keep workspace state dormant.
 
-  RECT workArea{};
-  if (!GetWorkspaceWorkArea(monitor, &workArea)) return;
+  WorkspaceMetrics metrics;
+  if (!GetWorkspaceMetrics(monitor, &metrics)) return;
+  const RECT& workArea = metrics.workArea;
+  const LONG gap = metrics.gap;
 
   ObserveAndRepairWorkspaceForArrangement(workspace);
-  const LONG gap = GetWorkspaceGapPixels(monitor);
   const size_t maxPasses = workspace.ActiveCount() + 1;
   for (size_t pass = 0; pass < maxPasses; ++pass) {
     ++Diagnostics::g_runtime.counters.arrangePasses;
@@ -880,8 +892,8 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
 
       if (!IsWindow(hwnd)) {
         action = Workspace::PlacementAction::Forget;
-      } else if (!IsIconic(hwnd) && IsWindowVisible(hwnd) && !IsWindowCloaked(hwnd) &&
-                 !IsZoomed(hwnd)) {
+      } else if (GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
+                 !IsWindowCloaked(hwnd)) {
         const WindowRecord* record = workspace.Find(hwnd);
         if (!record) {
           action = Workspace::PlacementAction::Forget;
@@ -889,13 +901,23 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
           PlacementObservation observation =
               PlaceWindowChecked(hwnd, record->canMove, rects[i]);
           action = workspace.ApplyPlacementObservation(hwnd, observation);
-          if (observation.result == PlacementResult::Success &&
-              observation.placementIssued &&
-              action == Workspace::PlacementAction::None) {
-            BeginConformanceLease(hwnd, rects[i]);
-          } else if (observation.result != PlacementResult::Success ||
-                     action != Workspace::PlacementAction::None) {
+          if (action != Workspace::PlacementAction::None) {
             CancelConformanceLease(hwnd);
+          } else {
+            switch (observation.result) {
+              case PlacementResult::Success:
+                if (observation.placementIssued) {
+                  BeginConformanceLease(hwnd, rects[i]);
+                }
+                break;
+              case PlacementResult::AdjustedByWindow:
+              case PlacementResult::Refused:
+                BeginConformanceLease(hwnd, rects[i], true);
+                break;
+              case PlacementResult::AccessDenied:
+              case PlacementResult::Dead:
+                break;
+            }
           }
         }
       }
@@ -921,12 +943,11 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
       const WindowRecord* record = workspace.Find(hwnd);
       if (!record || record->state != ManageState::Tiled) continue;
       Wh_Log(
-          L"Window %p failed checked placement %d times (last result=%d); switching it to Floating",
-          hwnd, record->placementFailures,
-          static_cast<int>(record->lastPlacementResult));
+          L"Window %p cannot be placed (result=%d); switching it to Floating",
+          hwnd, static_cast<int>(record->lastPlacementResult));
       Diagnostics::RecordEvent(
-          L"placement failures forced hwnd=%p to per-window Floating (failures=%d result=%d)",
-          hwnd, record->placementFailures, static_cast<int>(record->lastPlacementResult));
+          L"placement failure forced hwnd=%p to per-window Floating (result=%d)",
+          hwnd, static_cast<int>(record->lastPlacementResult));
       CancelConformanceLease(hwnd);
       participationChanged |= workspace.Float(hwnd);
     }
@@ -936,15 +957,15 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
   }
 }
 
-// Atomically consumes one expired generation. A user gesture, migration, or new
+// Consumes one expired generation. A user gesture, migration, or new
 // authoritative placement that cancelled/replaced it wins if it happens first.
 static bool TakeExpiredConformanceLease(
     HWND hwnd, uint64_t generation, ConformanceLease* outLease) {
+  AssertWmThread(L"TakeExpiredConformanceLease");
   if (!hwnd || generation == 0 || !outLease) return false;
 
   const ULONGLONG now = GetTickCount64();
   bool taken = false;
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
   auto it = g_conformanceLeases.leases.find(hwnd);
   if (it != g_conformanceLeases.leases.end() &&
       it->second.generation == generation &&
@@ -953,7 +974,6 @@ static bool TakeExpiredConformanceLease(
     g_conformanceLeases.leases.erase(it);
     taken = true;
   }
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
   return taken;
 }
 
@@ -972,12 +992,12 @@ static bool GetCurrentAuthoritativeTiledRect(
 
   HMONITOR monitor = key.ResolveMonitor();
   if (!monitor) return false;
-  RECT workArea{};
-  if (!GetWorkspaceWorkArea(monitor, &workArea)) return false;
+  WorkspaceMetrics metrics;
+  if (!GetWorkspaceMetrics(monitor, &metrics)) return false;
 
   std::vector<RECT> rects;
   if (!BuildWorkspaceLayoutPlan(
-          workspace, workArea, GetWorkspaceGapPixels(monitor), &rects) ||
+          workspace, metrics.workArea, metrics.gap, &rects) ||
       tiledIndex >= rects.size()) {
     return false;
   }
@@ -1008,8 +1028,9 @@ static void FinalizeExpiredConformanceLease(
     ++Diagnostics::g_runtime.counters.conformanceLeaseExpiredStale;
   };
 
-  if (!IsWindow(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd) ||
-      !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd) ||
+  if (!IsWindow(hwnd) ||
+      GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      IsWindowCloaked(hwnd) ||
       IsMoveSizeGestureInProgress(hwnd)) {
     stale();
     return;
@@ -1054,6 +1075,14 @@ static void FinalizeExpiredConformanceLease(
     return;
   }
 
+  // Expiry processing performs several live queries after its initial preflight.
+  // A window that entered fullscreen/maximized meanwhile must remain suspended,
+  // not be permanently converted to Floating by this stale lease verdict.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+    stale();
+    return;
+  }
+
   if (!workspace.Float(hwnd)) {
     stale();
     return;
@@ -1070,36 +1099,44 @@ static void FinalizeExpiredConformanceLease(
   ArrangeWorkspace(owners.front());
 }
 
-// During a short post-placement lease, an application may accept our rectangle
-// synchronously and then restore its own startup/session geometry later. Repair
-// only that unexpected late movement; explicit user gestures cancel the lease at
-// MOVESIZESTART and normal tiled placement remains the authoritative source.
-static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
-  ConformanceLease lease;
-  if (!ReadActiveConformanceLease(hwnd, &lease)) return false;
+// A tracked tiled HWND either confirms its authoritative rectangle or opens/reuses
+// one bounded conformance lease. Native user gestures remain authoritative and
+// are handled separately after MOVESIZEEND.
+static bool HandleTiledWindowLocationChange(HWND hwnd) {
+  if (IsMoveSizeGestureInProgress(hwnd)) return true;
 
-  if (!IsWindow(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd) ||
-      !IsWindowVisible(hwnd) || IsWindowCloaked(hwnd)) {
-    CancelConformanceLease(hwnd, lease.generation);
+  ConformanceLease lease;
+  const ConformanceLeaseReadResult leaseState =
+      ReadConformanceLease(hwnd, &lease);
+  if (leaseState == ConformanceLeaseReadResult::Expired) {
+    ScheduleNextConformanceTimer();
+    return true;
+  }
+  const bool hasLease = leaseState == ConformanceLeaseReadResult::Active;
+
+  if (!IsWindow(hwnd) ||
+      GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      IsWindowCloaked(hwnd)) {
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
 
   const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
   if (owners.size() != 1 || !IsWorkspaceOnActiveDesktop(owners.front())) {
-    CancelConformanceLease(hwnd, lease.generation);
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
 
   Workspace workspace;
   if (!g_workspaces.Load(owners.front(), &workspace)) {
-    CancelConformanceLease(hwnd, lease.generation);
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record || record->state != ManageState::Tiled ||
       workspace.Layout() == TileLayout::Floating ||
       !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
-    CancelConformanceLease(hwnd, lease.generation);
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
 
@@ -1108,26 +1145,34 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
   // the copied target until it is checked against the current layout plan.
   RECT authoritative{};
   if (!GetCurrentAuthoritativeTiledRect(
-          owners.front(), workspace, hwnd, &authoritative) ||
-      !RectsNear(authoritative, lease.expectedRect)) {
-    CancelConformanceLease(hwnd, lease.generation);
+          owners.front(), workspace, hwnd, &authoritative)) {
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
 
   RECT current{};
   if (!GetWindowFrameRect(hwnd, &current)) {
-    CancelConformanceLease(hwnd, lease.generation);
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
   if (RectsNear(current, authoritative)) {
     return true;  // Our own placement/event echo; nothing to repair.
   }
 
+  if (!hasLease || !RectsNear(authoritative, lease.expectedRect)) {
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
+    BeginConformanceLease(hwnd, authoritative, true);
+    return true;
+  }
+
   const ULONGLONG now = GetTickCount64();
+  if (lease.repairDueTickMs && now < lease.repairDueTickMs) {
+    return true;
+  }
   if (lease.lastRepairTickMs &&
-      now - lease.lastRepairTickMs < kConformanceRepairMinIntervalMs) {
+      now - lease.lastRepairTickMs < g_settings.conformanceRepairIntervalMs) {
     const ULONGLONG due =
-        lease.lastRepairTickMs + kConformanceRepairMinIntervalMs;
+        lease.lastRepairTickMs + g_settings.conformanceRepairIntervalMs;
     // Do not simply drop a bursty snap-back event: schedule one delayed re-check
     // so a final app move inside the rate window cannot leave the tile displaced.
     if (DeferConformanceLeaseRepair(hwnd, lease.generation, due)) {
@@ -1138,10 +1183,16 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
   }
 
   // A copied observation must still refer to the same active lease immediately
-  // before we act. MOVESIZESTART/topology/lifecycle cancellation can happen from
-  // another thread after the initial read; a generation check prevents stale work
-  // from deliberately reviving or accounting against a replacement lease.
+  // before we act. Earlier actor work can have cancelled or replaced it; the
+  // generation check prevents stale work from accounting against the replacement.
   if (!IsCurrentConformanceLease(hwnd, lease.generation)) return false;
+
+  // Re-check at the mutation boundary: Chromium can finish entering fullscreen
+  // while the ownership/layout queries above are in progress.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+    CancelConformanceLease(hwnd, lease.generation);
+    return false;
+  }
 
   PlacementObservation observation =
       PlaceWindowChecked(hwnd, record->canMove, authoritative);
@@ -1180,12 +1231,13 @@ static bool HandleConformanceLeaseLocationChange(HWND hwnd) {
     // Adjusted/refused placements are exactly the cases where relying on another
     // LOCATIONCHANGE is unsafe: the application may already be sitting at its
     // final self-selected rectangle. Keep the lease alive and schedule one more
-    // checked attempt at the normal cadence. Repeated checked failures may Float
-    // early; otherwise the hard deadline performs one passive final conformance
-    // verdict and Floats only if the HWND is still materially off its current tile.
+    // checked attempt at the configured cadence. The hard deadline performs the
+    // passive final verdict and Floats only if the HWND is still materially off
+    // its current tile. AccessDenied remains an immediate terminal result above.
     const ULONGLONG now = GetTickCount64();
     const ULONGLONG due = std::min(
-        lease.expiresAtTickMs, now + kConformanceRepairMinIntervalMs);
+        lease.expiresAtTickMs,
+        now + g_settings.conformanceRepairIntervalMs);
     DeferConformanceLeaseRepair(hwnd, lease.generation, due);
   }
   return true;
@@ -1206,7 +1258,6 @@ static void ProcessConformanceTimer() {
   const ULONGLONG now = GetTickCount64();
   std::vector<ExpiredCandidate> expired;
   std::vector<HWND> dueWindows;
-  AcquireSRWLockExclusive(&g_conformanceLeases.lock);
   for (auto& kv : g_conformanceLeases.leases) {
     ConformanceLease& lease = kv.second;
     if (now >= lease.expiresAtTickMs) {
@@ -1218,8 +1269,6 @@ static void ProcessConformanceTimer() {
       lease.repairDueTickMs = 0;
     }
   }
-  ReleaseSRWLockExclusive(&g_conformanceLeases.lock);
-
   for (const ExpiredCandidate& candidate : expired) {
     ConformanceLease lease;
     if (TakeExpiredConformanceLease(
@@ -1228,7 +1277,7 @@ static void ProcessConformanceTimer() {
     }
   }
   for (HWND hwnd : dueWindows) {
-    HandleConformanceLeaseLocationChange(hwnd);
+    HandleTiledWindowLocationChange(hwnd);
   }
   ScheduleNextConformanceTimer();
 }

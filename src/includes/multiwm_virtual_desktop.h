@@ -123,7 +123,10 @@ static bool SelectVirtualDesktopAbiProfile(
     return false;
   }
 
-  // Mirrors Windhawk's Taskbar Desktop Indicator notification ABI table.
+  // Mirrors Windhawk's Taskbar Desktop Indicator notification ABI table. Its
+  // manually assembled sink relies on the unified x64 calling convention; x86
+  // keeps the core desktop API but uses settled cloak/uncloak reconciliation.
+#if defined(_WIN64)
   if (build >= 22000) {
     if (build < 22483 ||
         (build == 22621 && revision < 2215)) {
@@ -136,6 +139,7 @@ static bool SelectVirtualDesktopAbiProfile(
       profile.notification = {IID_IVirtualDesktopNotification_Current, 14, 10, false};
     }
   }
+#endif
 
   *outProfile = profile;
   return true;
@@ -214,6 +218,13 @@ static void QueueVirtualDesktopChangedNotification() {
   const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
   if (!threadId) return;
 
+  // The callback is the transition boundary. Keep using the live shell query until
+  // the queued handler has reconciled the new desktop into actor-owned state.
+  if (g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown) {
+    g_wm.reconciledDesktopState =
+        ReconciledDesktopState::TransitionPending;
+  }
+
   // COM can emit redundant desktop notifications. Collapse them before they
   // reach the WM core, just as FancyWM coalesces layout invalidations.
   if (InterlockedExchange(&g_vd.changeQueued, 1) != 0) return;
@@ -262,7 +273,7 @@ static HRESULT STDMETHODCALLTYPE VirtualDesktopNotification_NoOp() {
 // GUID through its already-versioned manager interface. This follows Windhawk's
 // compatibility pattern and avoids COM lifetime/cross-thread pointer hazards.
 static HRESULT STDMETHODCALLTYPE VirtualDesktopNotification_CurrentChanged(
-    VirtualDesktopNotificationObject*) {
+    VirtualDesktopNotificationObject*, void*, void*) {
   QueueVirtualDesktopChangedNotification();
   return S_OK;
 }
@@ -348,7 +359,9 @@ bool RegisterVirtualDesktopNotifications() {
 
   NotificationInterfaceConfig config = GetNotificationInterfaceConfig();
   if (config.methodCount == 0) {
-    return true;  // Supported core API with no known native notification ABI (Win10).
+    // Win10 has no selected native notification ABI. x86 also deliberately uses
+    // settled cloak/uncloak reconciliation instead of the x64-only manual sink.
+    return true;
   }
 
   ++Diagnostics::g_runtime.counters.vdNotificationRegisterAttempts;

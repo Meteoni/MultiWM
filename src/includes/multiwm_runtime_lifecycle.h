@@ -118,7 +118,7 @@ void NotifyShellRestarted() {
   if (shellReplaced) {
     Platform::VirtualDesktop::AbandonVirtualDesktopAPIForShellRestart();
     g_wm.reconciledDesktop = {};
-    g_wm.reconciledDesktopValid = false;
+    g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
   }
 
   // A shell replacement can move/recreate windows asynchronously. Never let a
@@ -138,6 +138,7 @@ void NotifyDisplayTopologyChanged() {
   AssertWmThread(L"RuntimeLifecycle::NotifyDisplayTopologyChanged");
   ++Diagnostics::g_runtime.counters.displayTopologySignals;
   Diagnostics::RecordEvent(L"display/work-area topology changed");
+  ClearMonitorIdentityCache();
 
   // Every existing lease was computed against the old work-area/monitor topology.
   // Cancel it before Windows' own topology-induced LOCATIONCHANGE burst arrives.

@@ -2,9 +2,45 @@
 // Settings parsing + serialized WM thread
 //=============================================================================
 
-// Parse single character to virtual key code
-UINT ParseSingleCharKey(PCWSTR str) {
+UINT ParseHotkeyKey(PCWSTR str) {
   if (!str || !str[0]) return 0;
+
+  static const std::pair<PCWSTR, UINT> kNamedKeys[] = {
+      {L"Space", VK_SPACE},
+      {L"Tab", VK_TAB},
+      {L"Enter", VK_RETURN},
+      {L"Return", VK_RETURN},
+      {L"Esc", VK_ESCAPE},
+      {L"Escape", VK_ESCAPE},
+      {L"Backspace", VK_BACK},
+      {L"Insert", VK_INSERT},
+      {L"Ins", VK_INSERT},
+      {L"Delete", VK_DELETE},
+      {L"Del", VK_DELETE},
+      {L"Home", VK_HOME},
+      {L"End", VK_END},
+      {L"PageUp", VK_PRIOR},
+      {L"PgUp", VK_PRIOR},
+      {L"PageDown", VK_NEXT},
+      {L"PgDn", VK_NEXT},
+      {L"Left", VK_LEFT},
+      {L"Right", VK_RIGHT},
+      {L"Up", VK_UP},
+      {L"Down", VK_DOWN},
+  };
+  for (const auto& namedKey : kNamedKeys) {
+    if (_wcsicmp(str, namedKey.first) == 0) return namedKey.second;
+  }
+
+  if ((str[0] == L'F' || str[0] == L'f') && str[1]) {
+    wchar_t* end = nullptr;
+    long functionKey = std::wcstol(str + 1, &end, 10);
+    if (*end == L'\0' && functionKey >= 1 && functionKey <= 12) {
+      return VK_F1 + static_cast<UINT>(functionKey - 1);
+    }
+  }
+
+  if (str[1] != L'\0') return 0;
   wchar_t c = str[0];
 
   if (c >= L'A' && c <= L'Z') return c;
@@ -93,39 +129,41 @@ static bool ParseFloatingDefaultSizeSetting(
 }
 
 void LoadSettings() {
-  g_settings.tilingModifiers = ReadModifierSetting(L"TilingModifier", MOD_ALT);
+  using WindhawkUtils::StringSetting;
 
-  PCWSTR insets = Wh_GetStringSetting(L"WorkspaceInsets");
+  g_settings.tilingModifiers =
+      ReadModifierSetting(L"hotkeys.TilingModifier", MOD_ALT);
+
+  auto insets = StringSetting::make(L"workspace.WorkspaceInsets");
   WorkspaceInsets parsedInsets{};
-  if (ParseWorkspaceInsetsSetting(insets, &parsedInsets)) {
+  if (ParseWorkspaceInsetsSetting(insets.get(), &parsedInsets)) {
     g_settings.insetsDip = parsedInsets;
   } else {
     g_settings.insetsDip = {};
-    Wh_Log(L"Invalid WorkspaceInsets setting; using 4, 4, 4, 4");
+    Wh_Log(L"Invalid WorkspaceInsets setting; using 6, 6, 6, 6");
   }
-  Wh_FreeStringSetting(insets);
-  g_settings.gapDip = Wh_GetIntSetting(L"TileGap");
-  if (g_settings.gapDip < 0 || g_settings.gapDip > 100) g_settings.gapDip = 4;
+  g_settings.gapDip = Wh_GetIntSetting(L"workspace.TileGap");
+  if (g_settings.gapDip < 0 || g_settings.gapDip > 100) g_settings.gapDip = 6;
 
-  PCWSTR floatingSize = Wh_GetStringSetting(L"FloatingDefaultSize");
+  auto floatingSize =
+      StringSetting::make(L"windowBehavior.FloatingDefaultSize");
   FloatingDefaultSize parsedFloatingSize{};
-  if (ParseFloatingDefaultSizeSetting(floatingSize, &parsedFloatingSize)) {
+  if (ParseFloatingDefaultSizeSetting(floatingSize.get(), &parsedFloatingSize)) {
     g_settings.floatingDefaultSizeDip = parsedFloatingSize;
   } else {
     g_settings.floatingDefaultSizeDip = {};
     Wh_Log(L"Invalid FloatingDefaultSize setting; using 960, 640");
   }
-  Wh_FreeStringSetting(floatingSize);
-  g_settings.masterPercent = Wh_GetIntSetting(L"MasterPercent");
+  g_settings.masterPercent = Wh_GetIntSetting(L"workspace.MasterPercent");
   if (g_settings.masterPercent < 1 || g_settings.masterPercent > 99) g_settings.masterPercent = 50;
 
-  PCWSTR layout = Wh_GetStringSetting(L"DefaultLayout");
-  g_settings.defaultLayout = ParseLayoutSetting(layout);
-  Wh_FreeStringSetting(layout);
+  auto layout = StringSetting::make(L"workspace.DefaultLayout");
+  g_settings.defaultLayout = ParseLayoutSetting(layout.get());
 
   g_settings.layoutCycle.clear();
   for (int i = 0; i < 32; ++i) {
-    auto cycleEntry = WindhawkUtils::StringSetting::make(L"LayoutCycle[%d]", i);
+    auto cycleEntry =
+        StringSetting::make(L"workspace.LayoutCycle[%d]", i);
     if (!*cycleEntry.get()) break;
 
     TileLayout cycleLayout{};
@@ -143,83 +181,125 @@ void LoadSettings() {
     Wh_Log(L"LayoutCycle is empty or invalid; using the built-in layout sequence");
   }
 
-  PCWSTR mouseBehavior = Wh_GetStringSetting(L"MouseMoveBehavior");
-  g_settings.mouseMoveBehavior = mouseBehavior && _wcsicmp(mouseBehavior, L"swap") == 0
-                            ? MouseMoveBehavior::Swap
-                            : MouseMoveBehavior::Float;
-  Wh_FreeStringSetting(mouseBehavior);
+  auto mouseBehavior =
+      StringSetting::make(L"windowBehavior.MouseMoveBehavior");
+  g_settings.mouseMoveBehavior =
+      _wcsicmp(mouseBehavior.get(), L"swap") == 0
+          ? MouseMoveBehavior::Swap
+          : MouseMoveBehavior::Float;
 
-  PCWSTR automaticNewWindowPosition =
-      Wh_GetStringSetting(L"AutomaticNewWindowPosition");
+  auto automaticNewWindowPosition =
+      StringSetting::make(L"general.AutomaticNewWindowPosition");
   g_settings.automaticNewWindowPosition =
-      automaticNewWindowPosition &&
-              _wcsicmp(automaticNewWindowPosition, L"after_focused") == 0
+      _wcsicmp(automaticNewWindowPosition.get(), L"after_focused") == 0
           ? AutomaticNewWindowPosition::AfterFocused
           : AutomaticNewWindowPosition::LastSlot;
-  Wh_FreeStringSetting(automaticNewWindowPosition);
 
-  PCWSTR managementMode = Wh_GetStringSetting(L"DefaultWindowManagementMode");
+  auto managementMode =
+      StringSetting::make(L"general.DefaultWindowManagementMode");
   g_wm.managementMode =
-      managementMode && _wcsicmp(managementMode, L"automatic") == 0
-          ? ManagementMode::Automatic
-          : ManagementMode::Manual;
-  Wh_FreeStringSetting(managementMode);
+      _wcsicmp(managementMode.get(), L"manual") == 0
+          ? ManagementMode::Manual
+          : ManagementMode::Automatic;
 
-  int conformanceLease = Wh_GetIntSetting(L"ConformanceLeaseMs");
-  if (conformanceLease < 0 || conformanceLease > 10000) conformanceLease = 1500;
+  int conformanceLease = Wh_GetIntSetting(L"advanced.ConformanceLeaseMs");
+  if (conformanceLease < 0 || conformanceLease > 10000) conformanceLease = 3000;
   g_settings.conformanceLeaseMs = static_cast<UINT>(conformanceLease);
 
-  int reconcileDelay = Wh_GetIntSetting(L"ReconcileDelayMs");
-  if (reconcileDelay < 20 || reconcileDelay > 2000) reconcileDelay = 80;
+  int conformanceRepairInterval =
+      Wh_GetIntSetting(L"advanced.ConformanceRepairIntervalMs");
+  if (conformanceRepairInterval < 20 || conformanceRepairInterval > 2000) {
+    conformanceRepairInterval = 75;
+  }
+  g_settings.conformanceRepairIntervalMs =
+      static_cast<UINT>(conformanceRepairInterval);
+
+  int reconcileDelay = Wh_GetIntSetting(L"advanced.ReconcileDelayMs");
+  if (reconcileDelay < 20 || reconcileDelay > 2000) reconcileDelay = 50;
   g_settings.reconcileDelayMs = static_cast<UINT>(reconcileDelay);
 
-  g_settings.exclusionRules.clear();
-  using WindhawkUtils::StringSetting;
+  g_settings.windowRules.clear();
   for (int i = 0; i < 64; ++i) {
-    auto match = StringSetting::make(L"Exclusions[%d].Match", i);
-    auto value = StringSetting::make(L"Exclusions[%d].Value", i);
-    if (!*match.get() && !*value.get()) break;
-    if (!*value.get()) continue;
-
-    ExclusionRule rule;
-    if (_wcsicmp(match.get(), L"class") == 0) {
-      rule.match = ExclusionMatch::Class;
-    } else if (_wcsicmp(match.get(), L"title") == 0) {
-      rule.match = ExclusionMatch::Title;
-    } else {
-      rule.match = ExclusionMatch::Process;
+    auto process =
+        StringSetting::make(L"windowRules.Rules[%d].Process", i);
+    auto className =
+        StringSetting::make(L"windowRules.Rules[%d].Class", i);
+    auto titleContains =
+        StringSetting::make(L"windowRules.Rules[%d].TitleContains", i);
+    auto treatment =
+        StringSetting::make(L"windowRules.Rules[%d].Treatment", i);
+    auto size = StringSetting::make(L"windowRules.Rules[%d].Size", i);
+    if (!*process.get() && !*className.get() && !*titleContains.get()) {
+      Wh_Log(
+          L"Window rule %d is blank; later rules will not be loaded",
+          i + 1);
+      break;
     }
-    rule.value = value.get();
-    g_settings.exclusionRules.push_back(std::move(rule));
+
+    WindowRule rule;
+    if (_wcsicmp(treatment.get(), L"trace_to_owner") == 0) {
+      rule.treatment = WindowRuleTreatment::TraceToOwner;
+    } else if (_wcsicmp(
+                   treatment.get(), L"preserve_size_when_centering") == 0) {
+      rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
+      rule.preserveFloatingSize = true;
+    } else if (_wcsicmp(
+                   treatment.get(), L"override_size_when_centering") == 0) {
+      rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
+      if (!ParseFloatingDefaultSizeSetting(
+              size.get(), &rule.floatingSizeDip)) {
+        Wh_Log(
+            L"Ignoring invalid centered size override at rule %d: %s",
+            i + 1, size.get());
+        continue;
+      }
+      rule.preserveFloatingSize = false;
+    } else {
+      rule.treatment = WindowRuleTreatment::Exclude;
+    }
+    rule.process = process.get();
+    rule.className = className.get();
+    rule.titleContains = titleContains.get();
+    g_settings.windowRules.push_back(std::move(rule));
   }
 
-  g_settings.tileKey = ReadHotkeySetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
-  g_settings.layoutKey = ReadHotkeySetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
-  g_settings.swapMasterKey = ReadHotkeySetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
+  g_settings.tileKey =
+      ReadHotkeySetting<UINT>(L"hotkeys.TileKey", ParseHotkeyKey);
+  g_settings.layoutKey =
+      ReadHotkeySetting<UINT>(L"hotkeys.LayoutKey", ParseHotkeyKey);
+  g_settings.swapMasterKey =
+      ReadHotkeySetting<UINT>(L"hotkeys.SwapMasterKey", ParseHotkeyKey);
   g_settings.promoteWindowKey =
-      ReadHotkeySetting(L"PromoteWindowKey", ParseSingleCharKey, (UINT)VK_OEM_4);
+      ReadHotkeySetting<UINT>(L"hotkeys.PromoteWindowKey", ParseHotkeyKey);
   g_settings.demoteWindowKey =
-      ReadHotkeySetting(L"DemoteWindowKey", ParseSingleCharKey, (UINT)VK_OEM_6);
-  g_settings.managementModeToggleKey = ReadHotkeySetting(L"ManagementModeToggleKey", ParseSingleCharKey, (UINT)'U');
-  g_settings.floatFocusedKey = ReadHotkeySetting(L"FloatFocusedKey", ParseSingleCharKey, (UINT)'F');
-  g_settings.diagnosticDumpKey = ReadHotkeySetting(L"DiagnosticDumpKey", ParseSingleCharKey, (UINT)'I');
+      ReadHotkeySetting<UINT>(L"hotkeys.DemoteWindowKey", ParseHotkeyKey);
+  g_settings.managementModeToggleKey =
+      ReadHotkeySetting<UINT>(L"hotkeys.ManagementModeToggleKey", ParseHotkeyKey);
+  g_settings.floatFocusedKey =
+      ReadHotkeySetting<UINT>(L"hotkeys.FloatFocusedKey", ParseHotkeyKey);
+  g_settings.diagnosticDumpKey =
+      ReadHotkeySetting<UINT>(L"hotkeys.DiagnosticDumpKey", ParseHotkeyKey);
 
-  PCWSTR diagnosticsPath = Wh_GetStringSetting(L"DiagnosticsOutputPath");
-  if (diagnosticsPath && *diagnosticsPath) {
-    g_settings.diagnosticsOutputPath = diagnosticsPath;
+  auto diagnosticsPath =
+      StringSetting::make(L"diagnostics.DiagnosticsOutputPath");
+  if (*diagnosticsPath.get()) {
+    g_settings.diagnosticsOutputPath = diagnosticsPath.get();
   } else {
     g_settings.diagnosticsOutputPath =
-        L"%USERPROFILE%\\Documents\\TilingHelperDiagnostics";
+        L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";
   }
-  Wh_FreeStringSetting(diagnosticsPath);
 
   TrayUi::LoadSettings();
 }
 
 static void RegisterConfiguredHotkeys() {
-  auto registerOne = [](int id, UINT modifiers, UINT key, const wchar_t* name) {
+  auto registerOne = [](
+      int id, UINT modifiers, UINT key, const wchar_t* name,
+      bool allowRepeat = false) {
     if (!key) return;
-    if (!RegisterHotKey(nullptr, id, modifiers, key)) {
+    const UINT registrationModifiers =
+        allowRepeat ? modifiers : modifiers | MOD_NOREPEAT;
+    if (!RegisterHotKey(nullptr, id, registrationModifiers, key)) {
       Wh_Log(L"Failed to register %s hotkey (id=%d error=%lu)",
              name, id, GetLastError());
     }
@@ -229,9 +309,9 @@ static void RegisterConfiguredHotkeys() {
   registerOne(HK_SWAP_MASTER, g_settings.tilingModifiers,
               g_settings.swapMasterKey, L"Swap master");
   registerOne(HK_PROMOTE_WINDOW, g_settings.tilingModifiers,
-              g_settings.promoteWindowKey, L"Promote window");
+              g_settings.promoteWindowKey, L"Promote window", true);
   registerOne(HK_DEMOTE_WINDOW, g_settings.tilingModifiers,
-              g_settings.demoteWindowKey, L"Demote window");
+              g_settings.demoteWindowKey, L"Demote window", true);
   registerOne(HK_MANAGEMENT_MODE_TOGGLE, g_settings.tilingModifiers,
               g_settings.managementModeToggleKey, L"Management mode");
   registerOne(HK_FLOAT_FOCUSED, g_settings.tilingModifiers,
@@ -319,11 +399,6 @@ static void HandleMoveSizeEndMessage(HWND hwnd) {
   Reconcile::ScheduleLifecycleReconcile(hwnd);
 }
 
-enum class WmMessageDisposition {
-  Handled,
-  DispatchToWindows,
-};
-
 // Converts one serialized thread message into a domain command. Messages not
 // owned by the WM are explicitly returned to Windows so STA COM's hidden window
 // continues receiving cross-apartment calls.
@@ -380,6 +455,10 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       return WmMessageDisposition::Handled;
 
     case WM_TIMER:
+      // Actor timers are created with SetTimer(nullptr, ...). A window timer can
+      // use the same numeric ID and must still reach its WndProc.
+      if (msg.hwnd) return WmMessageDisposition::DispatchToWindows;
+
       if (g_wm.lifecycleTimer &&
           static_cast<UINT_PTR>(msg.wParam) == g_wm.lifecycleTimer) {
         Reconcile::ReconcileDeferredLifecycle();
@@ -455,9 +534,8 @@ static void RunWmMessageLoop() {
 }
 
 static void CleanupWmThread() {
-  // Stop external producers before clearing their transient caches. In particular,
-  // an out-of-context MOVESIZE callback can otherwise repopulate move samples after
-  // they were cleared, leaking gesture state into the next settings-reload session.
+  // Unhook WinEvent delivery before clearing transient callback observations so
+  // no reentrant delivery can repopulate the next settings-reload session.
   UnregisterConfiguredHotkeys();
   TrayUi::Shutdown();
   Platform::WindowEvents::RemoveWinEventHooks();
@@ -482,10 +560,11 @@ static void CleanupWmThread() {
   g_wm.lifecycleRetryAfterPlatformRecovery = false;
   g_wm.forceMonitorReconcile = false;
   g_wm.reconciledDesktop = {};
-  g_wm.reconciledDesktopValid = false;
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
   g_wm.pendingDesktopSwitchFlyouts = false;
   ClearAllConformanceLeases();
   ClearAllMoveSizeSamples();
+  ClearMonitorIdentityCache();
   InterlockedExchange(&g_vd.changeQueued, 0);
 }
 
@@ -493,6 +572,9 @@ static void CleanupWmThread() {
 // to narrow helpers. All workspace mutations reachable from this thread remain
 // serialized; foreign STA messages are dispatched back to Windows.
 DWORD WINAPI HotkeyThreadProc(LPVOID) {
+  SetThreadDpiAwarenessContext(
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
   const DWORD threadId = GetCurrentThreadId();
   g_wm.threadId.store(threadId, std::memory_order_release);
   Diagnostics::BeginWmSession();
@@ -526,8 +608,8 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
   RunWmMessageLoop();
 
-  // Stop out-of-context callbacks from queueing new work as soon as the actor stops
-  // consuming messages. Cleanup then unhooks producers before clearing their caches.
+  // Stop callbacks from queueing new work as soon as the actor stops consuming
+  // messages. Cleanup then unhooks delivery before clearing callback observations.
   g_wm.threadId.store(0, std::memory_order_release);
   CleanupWmThread();
 

@@ -125,7 +125,6 @@ void FloatFocusedWindow() {
 
   CancelConformanceLease(tiled);
   if (!workspace.Float(tiled)) return;
-  workspace.ResetPlacementFailures(tiled);
   RepairFloatingGeometry(key, workspace, tiled, hint);
   g_workspaces.Save(key, workspace);
   ArrangeWorkspace(key);
@@ -148,8 +147,8 @@ void TileWindows(HMONITOR monitor = nullptr) {
   if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, true, &changedKeys)) return;
 
   // Ensure other affected current workspaces also lose stale slots. Keep the
-  // target workspace until after geometry adoption so Alt+D does not overwrite
-  // the user's geometry before capturing it.
+  // target workspace until after geometry adoption so manual tiling does not
+  // overwrite the user's geometry before capturing it.
   for (const auto& key : changedKeys) {
     if (!Reconcile::SameWorkspaceKey(key, targetKey)) ArrangeWorkspace(key);
   }
@@ -170,7 +169,14 @@ void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
 
   Workspace state;
   if (!g_workspaces.Load(key, &state)) {
-    if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, false) || !g_workspaces.Load(key, &state)) return;
+    if (IsAutomaticMode()) {
+      if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, false) ||
+          !g_workspaces.Load(key, &state)) {
+        return;
+      }
+    } else {
+      state = Reconcile::MakeDefaultWorkspace();
+    }
   }
 
   const TileLayout previousLayout = state.Layout();
@@ -202,15 +208,22 @@ void SetCurrentWorkspaceLayout(TileLayout layout, HMONITOR monitor = nullptr) {
   if (!GetCurrentWorkspaceKey(monitor, &key)) return;
 
   Workspace state;
+  bool workspaceCreated = false;
   if (!g_workspaces.Load(key, &state)) {
-    if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, false) ||
-        !g_workspaces.Load(key, &state)) {
-      return;
+    if (IsAutomaticMode()) {
+      if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, false) ||
+          !g_workspaces.Load(key, &state)) {
+        return;
+      }
+    } else {
+      state = Reconcile::MakeDefaultWorkspace();
+      workspaceCreated = true;
     }
   }
 
   const TileLayout previousLayout = state.Layout();
   if (previousLayout == layout) {
+    if (workspaceCreated) g_workspaces.Save(key, state);
     // Keep the tray view coherent even if the selected item was already active.
     TrayUi::UpdateIcon(layout, monitor);
     return;
@@ -237,7 +250,6 @@ static void HandleUserMove(
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
     CancelConformanceLease(hwnd);
     if (workspace.Float(hwnd)) {
-      workspace.ResetPlacementFailures(hwnd);
       RepairFloatingGeometry(
           key, workspace, hwnd, MakeFloatingPlacementHintFromGesture(gesture));
       g_workspaces.Save(key, workspace);
@@ -274,7 +286,7 @@ static void HandleUserMove(
 
 static void HandleUserResize(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
-    const RECT& workArea, const MoveSizeGesture& gesture) {
+    const RECT& workArea, LONG gap, const MoveSizeGesture& gesture) {
   if (!gesture.hasRects) {
     ArrangeWorkspace(key);
     return;
@@ -286,21 +298,18 @@ static void HandleUserResize(
     return;
   }
 
-  HMONITOR monitor = key.ResolveMonitor();
-  if (!monitor) return;
-
   bool changed = false;
   switch (workspace.Layout()) {
     case TileLayout::MasterStack:
     case TileLayout::MasterStackH:
       changed = workspace.LearnMasterStackResize(
-          workArea, GetWorkspaceGapPixels(monitor), resizedIndex, gesture);
+          workArea, gap, resizedIndex, gesture);
       break;
 
     case TileLayout::Columns:
     case TileLayout::Rows:
       changed = workspace.LearnGridResize(
-          workArea, GetWorkspaceGapPixels(monitor), resizedIndex, gesture);
+          workArea, gap, resizedIndex, gesture);
       break;
 
     case TileLayout::COUNT:
@@ -375,8 +384,8 @@ void ApplyUserMoveSize(HWND hwnd) {
     return;
   }
 
-  RECT workArea{};
-  if (!GetWorkspaceWorkArea(monitor, &workArea)) return;
+  WorkspaceMetrics metrics;
+  if (!GetWorkspaceMetrics(monitor, &metrics)) return;
 
   HWND tiledHwnd = state.IsTiled(hwnd)
       ? hwnd
@@ -396,7 +405,8 @@ void ApplyUserMoveSize(HWND hwnd) {
       break;
 
     case MoveSizeIntent::Resize:
-      HandleUserResize(key, state, tiledHwnd, workArea, gesture);
+      HandleUserResize(
+          key, state, tiledHwnd, metrics.workArea, metrics.gap, gesture);
       break;
   }
 }
