@@ -58,10 +58,17 @@ void LayoutGridWeighted(
   outRects.resize(windowCount);
   if (windowCount == 0) return;
 
+  const std::vector<double>* effectiveWeights = &weights;
+  std::vector<double> defaultWeights;
+  if (weights.size() != windowCount) {
+    defaultWeights = DefaultWeights(windowCount);
+    effectiveWeights = &defaultWeights;
+  }
+
   LONG totalSize = horizontal ? (area.bottom - area.top) : (area.right - area.left);
   LONG effectiveGap = 0;
   std::vector<LONG> sizes =
-      ComputeWeightedSizes(totalSize, gap, weights, &effectiveGap);
+      ComputeWeightedSizes(totalSize, gap, *effectiveWeights, &effectiveGap);
   LONG position = horizontal ? area.top : area.left;
 
   for (size_t i = 0; i < windowCount; ++i) {

@@ -1135,6 +1135,9 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
       // Cross-monitor movement remains ownership migration, not conformance drift.
       // Otherwise a tiled HWND that leaves its authoritative rectangle opens or
       // reuses one bounded lease; expected SetWindowPos echoes are consumed there.
+      // A native drag remains authoritative until MOVESIZEEND reconciles monitor
+      // ownership for this HWND. Never probe or migrate underneath the user.
+      if (IsMoveSizeGestureInProgress(hwnd)) break;
       if (!Platform::WindowEvents::HasTrackedMonitorOwnershipMismatch(hwnd) &&
           HandleTiledWindowLocationChange(hwnd)) {
         break;

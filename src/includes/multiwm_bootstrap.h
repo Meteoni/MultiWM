@@ -417,11 +417,6 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       Reconcile::HandleVirtualDesktopChanged();
       return WmMessageDisposition::Handled;
 
-    case WM_APP_TRAY_REFRESH:
-      ++Diagnostics::g_runtime.counters.trayRefreshMessages;
-      TrayUi::RefreshForCurrentWorkspace();
-      return WmMessageDisposition::Handled;
-
     case WM_APP_FOREGROUND_CHANGED:
       RememberManagedForeground(reinterpret_cast<HWND>(msg.wParam));
       ++Diagnostics::g_runtime.counters.trayRefreshMessages;

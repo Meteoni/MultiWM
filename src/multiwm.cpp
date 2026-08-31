@@ -299,11 +299,11 @@ void WhTool_ModSettingsChanged() {
 }
 
 //=============================================================================
-// Windhawk tool mod implementation for mods which don't need to inject to other
+// Windhawk tool mod implementation for mods which don't need to inject into other
 // processes or hook other functions. Context:
-// https://github.com/ramensoftware/windhawk-mods/pull/1916
+// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
 //
-// The mod will load and run in a dedicated windhawk.exe process.
+// This mod launches a dedicated copy of its configured host executable.
 //=============================================================================
 
 bool g_isToolModProcessLauncher;
@@ -316,7 +316,7 @@ void WINAPI EntryPoint_Hook() {
   ExitThread(0);
 }
 
-// Routes each windhawk.exe instance into its tool-mod role. Normal instances act
+// Routes each host executable instance into its tool-mod role. Normal instances act
 // as launchers; only the worker tagged with this mod ID enforces singleton
 // ownership and initializes the tiling service.
 BOOL Wh_ModInit() {
@@ -397,7 +397,7 @@ BOOL Wh_ModInit() {
   return TRUE;
 }
 
-// Launcher-side phase: starts a copy of windhawk.exe tagged as this mod's
+// Launcher-side phase: starts a copy of the current host executable tagged as this mod's
 // dedicated tool process, then releases the returned process and thread handles.
 void Wh_ModAfterInit() {
   if (!g_isToolModProcessLauncher) {

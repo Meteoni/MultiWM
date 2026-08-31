@@ -123,9 +123,9 @@ static bool SelectVirtualDesktopAbiProfile(
     return false;
   }
 
-  // Mirrors Windhawk's Taskbar Desktop Indicator notification ABI table. Its
-  // manually assembled sink relies on the unified x64 calling convention; x86
-  // keeps the core desktop API but uses settled cloak/uncloak reconciliation.
+  // Mirrors Windhawk's Taskbar Desktop Indicator notification ABI table. The
+  // architecture metadata guarantees a 64-bit caller-cleanup ABI; retain the
+  // compile guard as a belt-and-braces constraint around the manual sink.
 #if defined(_WIN64)
   if (build >= 22000) {
     if (build < 22483 ||
@@ -359,8 +359,8 @@ bool RegisterVirtualDesktopNotifications() {
 
   NotificationInterfaceConfig config = GetNotificationInterfaceConfig();
   if (config.methodCount == 0) {
-    // Win10 has no selected native notification ABI. x86 also deliberately uses
-    // settled cloak/uncloak reconciliation instead of the x64-only manual sink.
+    // Win10 has no selected native notification ABI and deliberately uses settled
+    // cloak/uncloak reconciliation instead.
     return true;
   }
 
@@ -573,6 +573,20 @@ bool ReinitializeVirtualDesktopAPI() {
   return ready;
 }
 
+// Per-window IVirtualDesktopManager calls can legitimately reject or lose an
+// individual HWND. Rebuild the shared COM stack only when the proxy/server itself
+// is no longer usable.
+static bool IsDeadVirtualDesktopProxy(HRESULT hr) {
+  return hr == RPC_E_DISCONNECTED ||
+         hr == RPC_E_CONNECTION_TERMINATED ||
+         hr == RPC_E_SERVER_DIED ||
+         hr == RPC_E_SERVER_DIED_DNE ||
+         hr == RPC_E_INVALID_IPID ||
+         hr == RPC_E_INVALID_OBJECT ||
+         hr == CO_E_OBJNOTCONNECTED ||
+         hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE);
+}
+
 // Invokes a private manager slot using the Windows-version-specific signature.
 // A failed call forces one core-API reinitialization and retry before returning.
 template <typename TResult>
@@ -647,10 +661,13 @@ bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid) {
   }
 
   HRESULT hr = g_vd.desktopManager->GetWindowDesktopId(hwnd, outGuid);
-  if (FAILED(hr) && ReinitializeVirtualDesktopAPI() && g_vd.desktopManager) {
+  if (FAILED(hr) && IsDeadVirtualDesktopProxy(hr) &&
+      ReinitializeVirtualDesktopAPI() && g_vd.desktopManager) {
     hr = g_vd.desktopManager->GetWindowDesktopId(hwnd, outGuid);
   }
-  if (FAILED(hr)) RuntimeLifecycle::RequestMaintenance(false);
+  if (FAILED(hr) && IsDeadVirtualDesktopProxy(hr)) {
+    RuntimeLifecycle::RequestMaintenance(false);
+  }
   return SUCCEEDED(hr);
 }
 
@@ -662,10 +679,13 @@ bool IsWindowOnCurrentDesktopSafe(HWND hwnd, BOOL* onCurrent) {
   }
 
   HRESULT hr = g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, onCurrent);
-  if (FAILED(hr) && ReinitializeVirtualDesktopAPI() && g_vd.desktopManager) {
+  if (FAILED(hr) && IsDeadVirtualDesktopProxy(hr) &&
+      ReinitializeVirtualDesktopAPI() && g_vd.desktopManager) {
     hr = g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, onCurrent);
   }
-  if (FAILED(hr)) RuntimeLifecycle::RequestMaintenance(false);
+  if (FAILED(hr) && IsDeadVirtualDesktopProxy(hr)) {
+    RuntimeLifecycle::RequestMaintenance(false);
+  }
   return SUCCEEDED(hr);
 }
 

@@ -172,6 +172,7 @@ static HICON CreateTextIcon(TileLayout layout) {
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
   if (oldFont) SelectObject(dc, oldFont);
   if (font) DeleteObject(font);
+  GdiFlush();
 
   auto* pixels = static_cast<uint32_t*>(bits);
   COLORREF fg = ForegroundColor();
@@ -895,8 +896,10 @@ static void Shutdown() {
   DestroyIconSet(g_icons);
 
   HINSTANCE instance = GetModuleHandleW(nullptr);
-  if (g_flyoutWindowClass) UnregisterClassW(kFlyoutWindowClassName, instance);
-  if (g_trayWindowClass) UnregisterClassW(kTrayWindowClassName, instance);
+  // Unregister by name even after recovering from ERROR_CLASS_ALREADY_EXISTS,
+  // where RegisterClassW didn't return an ATOM for us to remember.
+  UnregisterClassW(kFlyoutWindowClassName, instance);
+  UnregisterClassW(kTrayWindowClassName, instance);
   g_flyoutWindowClass = g_trayWindowClass = 0;
   g_taskbarCreatedMessage = 0;
   g_displayedLayout = TileLayout::COUNT;
