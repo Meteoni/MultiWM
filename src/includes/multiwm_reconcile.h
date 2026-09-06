@@ -214,6 +214,11 @@ static bool EnsureWorkspaceFromSnapshot(
   if (!g_workspaces.Load(key, &workspace)) workspace = MakeDefaultWorkspace();
   if (!workspaceExisted) SeedInitialSnapshot(workspace, initialSnapshot);
 
+  // Tile Workspace is the explicit escape hatch for stale empirical proof. It
+  // retries the whole visible set from ordinary geometry; any still-real minimum
+  // immediately proves itself again through checked placement.
+  if (adoptCurrentGeometry) workspace.ResetEnforcedConstraints();
+
   RestoreSuspendedSnapshot(workspace, snapshot);
   if (adoptCurrentGeometry) ReadoptFloatingSnapshot(workspace, snapshot);
   AdmitUntrackedSnapshot(workspace, snapshot, true, false);

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <climits>
 #include <cassert>
 #include <cstdarg>
 #include <deque>
@@ -368,6 +369,13 @@ struct Counters {
   uint64_t placementDead = 0;
   uint64_t floatingGeometryRepairs = 0;
 
+  uint64_t constraintProbeAttempts = 0;
+  uint64_t constraintProbeSuccesses = 0;
+  uint64_t constraintProbeTimeouts = 0;
+  uint64_t constraintProbeFailures = 0;
+  uint64_t constraintUnsatisfiablePlans = 0;
+  uint64_t constraintFloats = 0;
+
   uint64_t virtualDesktopChangesProcessed = 0;
   uint64_t virtualDesktopFallbackChanges = 0;
   uint64_t vdApiInitAttempts = 0;
@@ -614,6 +622,31 @@ enum class PlacementResult {
   Dead,
 };
 
+// Native tracking constraints converted to the DWM extended-frame geometry used
+// by the layout engine. A failed probe is not a hard constraint; callers preserve
+// the last valid observation when one exists.
+struct WindowConstraints {
+  LONG minWidth = 1;
+  LONG minHeight = 1;
+  UINT dpi = 96;
+  bool valid = false;
+
+  // A WM_GETMINMAXINFO minimum is only a report until the HWND actually corrects
+  // a placement that crosses it. Only proven minimum axes participate in tiling;
+  // maximum tracking sizes intentionally don't constrain full-coverage layouts.
+  bool enforceMinWidth = false;
+  bool enforceMinHeight = false;
+
+  DWORD lastProbeError = ERROR_SUCCESS;
+};
+
+static uint64_t NextTilingGeneration() {
+  static uint64_t nextGeneration = 1;
+  uint64_t generation = nextGeneration++;
+  if (generation == 0) generation = nextGeneration++;
+  return generation;
+}
+
 struct WindowRecord {
   HWND hwnd = nullptr;
   DWORD pid = 0;
@@ -624,6 +657,12 @@ struct WindowRecord {
   bool canMove = true;
   bool canResize = true;
   bool topmost = false;
+
+  // Monotonic admission generation mirrors FancyWM's stable overflow policy:
+  // when proven constraints cannot coexist, the newest tiled admission floats.
+  // Reordering never changes this value.
+  uint64_t tilingGeneration = 0;
+  WindowConstraints constraints{};
 
   PlacementResult lastPlacementResult = PlacementResult::Success;
   RECT lastRequestedRect{};
@@ -686,6 +725,9 @@ class Workspace {
     return IsTiled(lastFocusedWindow_) ? lastFocusedWindow_ : nullptr;
   }
   bool RememberFocusedWindow(HWND hwnd);
+  bool UpdateConstraints(HWND hwnd, const WindowConstraints& constraints);
+  bool ResetEnforcedConstraints();
+  HWND NewestTiledWindow() const;
   bool HasSuspended() const;
   bool AllTiledVisible(const std::vector<HWND>& snapshot) const;
 
@@ -694,6 +736,7 @@ class Workspace {
   void SetMasterRatio(double ratio);
   bool MakeMaster(HWND hwnd, HWND* oldMaster = nullptr);
   bool SwapTiled(HWND first, HWND second);
+  bool PromoteTiledToIndex(HWND hwnd, size_t targetIndex);
   bool RememberFloatingGeometry(
       HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
 
@@ -797,6 +840,7 @@ using Model::PlacementObservation;
 using Model::PlacementResult;
 using Model::SuspendedSlot;
 using Model::SuspensionReason;
+using Model::WindowConstraints;
 using Model::WindowRecord;
 using Model::Workspace;
 using Model::WorkspaceGeometryItem;

@@ -5,6 +5,221 @@
 // Win32 observation lives here, outside Model. These helpers translate live HWND
 // properties/geometry into value objects consumed by Workspace and reconciliation.
 
+constexpr UINT kConstraintProbeTimeoutMs = 40;
+
+static int GetSystemMetricForDpiCompat(int index, UINT dpi) {
+  using GetSystemMetricsForDpiFn = int(WINAPI*)(int, UINT);
+  static GetSystemMetricsForDpiFn fn = [] {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    return user32
+        ? reinterpret_cast<GetSystemMetricsForDpiFn>(
+              GetProcAddress(user32, "GetSystemMetricsForDpi"))
+        : nullptr;
+  }();
+  return fn ? fn(index, dpi ? dpi : 96) : GetSystemMetrics(index);
+}
+
+static void GetFrameDecorationSpan(
+    HWND hwnd, LONG* outWidth, LONG* outHeight) {
+  if (outWidth) *outWidth = 0;
+  if (outHeight) *outHeight = 0;
+
+  RECT windowRect{};
+  RECT frame{};
+  if (!hwnd ||
+      !GetWindowRect(hwnd, &windowRect) ||
+      FAILED(DwmGetWindowAttribute(
+          hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+          &frame, sizeof(frame)))) {
+    return;
+  }
+
+  if (outWidth) {
+    *outWidth = std::max<LONG>(
+        0,
+        (frame.left - windowRect.left) +
+        (windowRect.right - frame.right));
+  }
+  if (outHeight) {
+    *outHeight = std::max<LONG>(
+        0,
+        (frame.top - windowRect.top) +
+        (windowRect.bottom - frame.bottom));
+  }
+}
+
+// WM_GETMINMAXINFO can execute target-process window procedure code. Bound the
+// synchronous query so a hung client cannot block the serialized WM actor. A
+// failed probe remains unconstrained; a previously valid observation is retained
+// by the evidence-merge path.
+static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
+  ++Diagnostics::g_runtime.counters.constraintProbeAttempts;
+  WindowConstraints constraints;
+
+  if (!hwnd || !IsWindow(hwnd)) {
+    constraints.lastProbeError = ERROR_INVALID_WINDOW_HANDLE;
+    ++Diagnostics::g_runtime.counters.constraintProbeFailures;
+    return constraints;
+  }
+  if (IsHungAppWindow(hwnd)) {
+    constraints.lastProbeError = ERROR_TIMEOUT;
+    ++Diagnostics::g_runtime.counters.constraintProbeTimeouts;
+    return constraints;
+  }
+
+  HMONITOR monitor =
+      MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  constraints.dpi = GetMonitorEffectiveDpi(monitor);
+
+  const LONG defaultMinWidth = std::max<LONG>(
+      1, GetSystemMetricForDpiCompat(SM_CXMINTRACK, constraints.dpi));
+  const LONG defaultMinHeight = std::max<LONG>(
+      1, GetSystemMetricForDpiCompat(SM_CYMINTRACK, constraints.dpi));
+  const LONG defaultMaxWidth = std::max<LONG>(
+      defaultMinWidth,
+      GetSystemMetricForDpiCompat(SM_CXMAXTRACK, constraints.dpi));
+  const LONG defaultMaxHeight = std::max<LONG>(
+      defaultMinHeight,
+      GetSystemMetricForDpiCompat(SM_CYMAXTRACK, constraints.dpi));
+
+  MINMAXINFO mmi{};
+  mmi.ptMinTrackSize = {defaultMinWidth, defaultMinHeight};
+  mmi.ptMaxTrackSize = {defaultMaxWidth, defaultMaxHeight};
+
+  DWORD_PTR result = 0;
+  SetLastError(ERROR_SUCCESS);
+  const LRESULT delivered =
+      hwnd && IsWindow(hwnd)
+          ? SendMessageTimeoutW(
+                hwnd, WM_GETMINMAXINFO, 0,
+                reinterpret_cast<LPARAM>(&mmi),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+                kConstraintProbeTimeoutMs, &result)
+          : 0;
+  if (!delivered) {
+    DWORD error = GetLastError();
+    if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
+    constraints.lastProbeError = error;
+    if (error == ERROR_TIMEOUT) {
+      ++Diagnostics::g_runtime.counters.constraintProbeTimeouts;
+    } else {
+      ++Diagnostics::g_runtime.counters.constraintProbeFailures;
+    }
+    return constraints;
+  }
+
+  constraints.valid = true;
+  ++Diagnostics::g_runtime.counters.constraintProbeSuccesses;
+
+  LONG decorationWidth = 0;
+  LONG decorationHeight = 0;
+  GetFrameDecorationSpan(
+      hwnd, &decorationWidth, &decorationHeight);
+
+  constraints.minWidth = std::max<LONG>(
+      1,
+      std::max<LONG>(defaultMinWidth, mmi.ptMinTrackSize.x) -
+          decorationWidth);
+  constraints.minHeight = std::max<LONG>(
+      1,
+      std::max<LONG>(defaultMinHeight, mmi.ptMinTrackSize.y) -
+          decorationHeight);
+
+  return constraints;
+}
+
+static bool SameConstraintReport(
+    const WindowConstraints& a, const WindowConstraints& b) {
+  return a.minWidth == b.minWidth &&
+         a.minHeight == b.minHeight &&
+         a.dpi == b.dpi &&
+         a.valid == b.valid;
+}
+
+static bool SameEnforcedConstraintGeometry(
+    const WindowConstraints& a, const WindowConstraints& b) {
+  const bool aEnforced = a.enforceMinWidth || a.enforceMinHeight;
+  const bool bEnforced = b.enforceMinWidth || b.enforceMinHeight;
+  if ((aEnforced || bEnforced) && a.dpi != b.dpi) return false;
+  if (a.enforceMinWidth != b.enforceMinWidth ||
+      a.enforceMinHeight != b.enforceMinHeight) {
+    return false;
+  }
+  if (a.enforceMinWidth && a.minWidth != b.minWidth) return false;
+  if (a.enforceMinHeight && a.minHeight != b.minHeight) return false;
+  return true;
+}
+
+static WindowConstraints MergeConstraintProbeWithCache(
+    const WindowConstraints& cached, WindowConstraints observed) {
+  if (!observed.valid) {
+    if (cached.valid) {
+      const DWORD error = observed.lastProbeError;
+      observed = cached;
+      observed.lastProbeError = error;
+    }
+    return observed;
+  }
+
+  // A proof belongs to the exact reported bound and DPI at which the HWND
+  // demonstrated it. Preserve it only while that native report remains stable.
+  if (cached.valid && cached.dpi == observed.dpi) {
+    observed.enforceMinWidth =
+        cached.enforceMinWidth && cached.minWidth == observed.minWidth;
+    observed.enforceMinHeight =
+        cached.enforceMinHeight && cached.minHeight == observed.minHeight;
+  }
+  return observed;
+}
+
+static LONG RectWidth(const RECT& rect) {
+  return rect.right - rect.left;
+}
+
+static LONG RectHeight(const RECT& rect) {
+  return rect.bottom - rect.top;
+}
+
+// A native minimum report becomes solver policy only after the HWND itself
+// corrects a placement that crosses that exact bound. Requiring the observed
+// frame to land near the reported bound avoids mistaking arbitrary app restores,
+// snap grids, or unrelated self-positioning for a hard tracking constraint.
+static bool PromoteEnforcedConstraintEvidence(
+    const PlacementObservation& placement, WindowConstraints* constraints) {
+  if (!constraints || !constraints->valid) return false;
+
+  const LONG requestedWidth = RectWidth(placement.requested);
+  const LONG requestedHeight = RectHeight(placement.requested);
+  const LONG observedWidth = RectWidth(placement.observed);
+  const LONG observedHeight = RectHeight(placement.observed);
+  if (requestedWidth <= 0 || requestedHeight <= 0 ||
+      observedWidth <= 0 || observedHeight <= 0) {
+    return false;
+  }
+
+  constexpr LONG kEvidenceTolerancePx = Model::kPlacementTolerancePx;
+  auto IsNearConstraintBound = [](LONG value, LONG bound) {
+    const long long delta =
+        static_cast<long long>(value) - static_cast<long long>(bound);
+    return std::llabs(delta) <= Model::kPlacementTolerancePx;
+  };
+
+  bool changed = false;
+  if (!constraints->enforceMinWidth &&
+      requestedWidth + kEvidenceTolerancePx < constraints->minWidth &&
+      IsNearConstraintBound(observedWidth, constraints->minWidth)) {
+    constraints->enforceMinWidth = true;
+    changed = true;
+  }
+  if (!constraints->enforceMinHeight &&
+      requestedHeight + kEvidenceTolerancePx < constraints->minHeight &&
+      IsNearConstraintBound(observedHeight, constraints->minHeight)) {
+    constraints->enforceMinHeight = true;
+    changed = true;
+  }
+  return changed;
+}
+
 static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState::Tiled) {
   WindowRecord record;
   record.hwnd = hwnd;

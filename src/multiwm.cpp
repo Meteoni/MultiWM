@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.20
+// @version         1.13.21
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -23,7 +23,7 @@ including floating - and simple, predictable controls.
 ![GIF](https://raw.githubusercontent.com/Meteony/meteoni-assets/main/MultiWM/MultiWM.gif)
 
 ## Notes
-- *Windhawk 2.0 (or higher) users can change the target process (`explorer.exe` -> `windhawk.exe`) for better stability and workspace preservation across Explorer restarts.*
+- *MultiWM launches a dedicated `explorer.exe -tool-mod` worker for compatibility with Windhawk 1.7.x. Restarting every Explorer process also restarts MultiWM and loses its in-memory workspace state; Windhawk 2.0 (or higher) users can change the target process (`explorer.exe` -> `windhawk.exe`) for better preservation across Explorer restarts.*
 - *MultiWM's virtual-desktop notification integration is based on [Taskbar Desktop Indicator by Simon Benedict](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/taskbar-desktop-indicator.wh.cpp) (MIT).*
 
 ## Features
