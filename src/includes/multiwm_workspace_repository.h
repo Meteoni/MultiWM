@@ -197,8 +197,13 @@ static bool RepairFloatingGeometry(
     width = current.right - current.left;
     height = current.bottom - current.top;
   } else if (useCustomSize) {
-    width = ScaleDip(placementOverride->floatingSizeDip.width, targetDpi);
-    height = ScaleDip(placementOverride->floatingSizeDip.height, targetDpi);
+    if (placementOverride->useWorkspaceSize) {
+      width = workArea.right - workArea.left;
+      height = workArea.bottom - workArea.top;
+    } else {
+      width = ScaleDip(placementOverride->floatingSizeDip.width, targetDpi);
+      height = ScaleDip(placementOverride->floatingSizeDip.height, targetDpi);
+    }
   } else if (!centerNewWindow && record->hasFloatingRect) {
     const UINT sourceDpi = record->floatingDpi ? record->floatingDpi : 96;
     width = MulDiv(

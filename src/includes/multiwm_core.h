@@ -184,6 +184,7 @@ enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, 
 enum class MouseMoveBehavior { Float, Swap };
 enum class WindowRuleTreatment {
   Exclude,
+  DefaultToFloating,
   TraceToOwner,
   FloatingPlacementOverride,
 };
@@ -219,6 +220,7 @@ struct WindowRule {
   std::wstring className;
   std::wstring titleContains;
   bool preserveFloatingSize = true;
+  bool useWorkspaceSize = false;
   FloatingDefaultSize floatingSizeDip{};
 };
 
@@ -741,6 +743,7 @@ class Workspace {
       HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
 
   bool ActivateTiled(HWND hwnd);
+  bool AdmitFloating(WindowRecord record);
   bool AdmitTiled(WindowRecord record);
   bool AdmitTiledAfter(WindowRecord record, HWND anchor);
   bool AdmitInitial(WindowRecord record, SuspensionReason reason);

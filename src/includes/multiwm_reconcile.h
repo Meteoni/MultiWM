@@ -103,6 +103,14 @@ static bool AdmitUntrackedSnapshot(
   for (HWND hwnd : snapshot) {
     if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) continue;
 
+    if (ShouldWindowDefaultToFloating(hwnd)) {
+      if (workspace.AdmitFloating(
+              MakeWindowRecord(hwnd, ManageState::Floating))) {
+        changed = true;
+      }
+      continue;
+    }
+
     bool admitted = false;
     WindowRecord record = MakeWindowRecord(hwnd, ManageState::Tiled);
     if (anchor) {
@@ -145,6 +153,11 @@ static bool AdmitUntrackedSuspendedSnapshot(
     if (reason != SuspensionReason::Minimized &&
         reason != SuspensionReason::Maximized) {
       return false;
+    }
+
+    if (ShouldWindowDefaultToFloating(hwnd)) {
+      return workspace.AdmitFloating(
+          MakeWindowRecord(hwnd, ManageState::Floating));
     }
 
     if (anchor) {

@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.21
+// @version         1.13.22
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -210,14 +210,16 @@ A small tray indicator shows the active workspace layout and provides quick acce
           $name: Treatment
           $options:
             - exclude: Exclude
+            - default_to_floating: Default to floating
             - trace_to_owner: Trace to owner
             - preserve_size_when_centering: Preserve size when centering
             - override_size_when_centering: Override size when centering
         - Size: ""
           $name: Centering size override
-          $description: 'Only effective when "Override size" is selected. Example: 720, 480'
+          $description: 'Only effective when "Override size" is selected. Use Width, Height in DPI-scaled pixels, or "Workspace" to fill the current monitor''s usable workspace. Examples: 720, 480'
     $name: Rules
-    $description: 'All populated match fields in a rule must match. Separate rules are alternatives. Exclude prevents management. Trace to owner retargets move/size boundaries from a matching helper window to its already-managed root owner. Centering treatments apply when Automatic mode centers a newly admitted window or must replace missing floating geometry. The first matching centering treatment wins.'
+    $description: "There's no one-size-fits-all shoe. \n
+      Exclude prevents management. Default to floating admits a matching window as managed Floating during Automatic discovery. Trace to owner retargets move/size to its root owner."
   $name: Window Rules
 
 - advanced:

@@ -438,6 +438,21 @@ bool Workspace::ActivateTiled(HWND hwnd) {
   return changed;
 }
 
+bool Workspace::AdmitFloating(WindowRecord record) {
+  AssertWmThread(L"Workspace::AdmitFloating");
+  const HWND hwnd = record.hwnd;
+  if (!hwnd || HasRecord(hwnd)) return false;
+
+  record.state = ManageState::Floating;
+  record.tilingGeneration = 0;
+  record.suspensionReason = SuspensionReason::None;
+  record.savedSlot = {};
+  record.hasSavedSlot = false;
+  records_.emplace(hwnd, std::move(record));
+  DebugValidateMutation(L"Workspace::AdmitFloating");
+  return true;
+}
+
 bool Workspace::AdmitTiled(WindowRecord record) {
   AssertWmThread(L"Workspace::AdmitTiled");
   if (!record.hwnd) return false;

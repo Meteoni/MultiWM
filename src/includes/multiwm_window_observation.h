@@ -455,6 +455,11 @@ static bool IsWindowExcludedByRules(HWND hwnd) {
   return FindMatchingWindowRule(hwnd, WindowRuleTreatment::Exclude) != nullptr;
 }
 
+static bool ShouldWindowDefaultToFloating(HWND hwnd) {
+  return FindMatchingWindowRule(
+             hwnd, WindowRuleTreatment::DefaultToFloating) != nullptr;
+}
+
 // Applies stable structural and exclusion policy only; visibility, show state,
 // desktop, and monitor participation are checked separately. Tracked windows
 // tolerate a temporarily missing resize style so transient app UI cannot evict them.

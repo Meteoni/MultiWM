@@ -208,6 +208,9 @@ static bool AdmitInitialObservedWindow(Workspace& workspace, HWND hwnd) {
   }
   const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
   if (reason == SuspensionReason::Hidden) return false;
+  if (ShouldWindowDefaultToFloating(hwnd)) {
+    return workspace.AdmitFloating(MakeWindowRecord(hwnd, ManageState::Floating));
+  }
   return workspace.AdmitInitial(MakeWindowRecord(hwnd), reason);
 }
 

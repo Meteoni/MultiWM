@@ -237,7 +237,9 @@ void LoadSettings() {
     }
 
     WindowRule rule;
-    if (_wcsicmp(treatment.get(), L"trace_to_owner") == 0) {
+    if (_wcsicmp(treatment.get(), L"default_to_floating") == 0) {
+      rule.treatment = WindowRuleTreatment::DefaultToFloating;
+    } else if (_wcsicmp(treatment.get(), L"trace_to_owner") == 0) {
       rule.treatment = WindowRuleTreatment::TraceToOwner;
     } else if (_wcsicmp(
                    treatment.get(), L"preserve_size_when_centering") == 0) {
@@ -246,8 +248,10 @@ void LoadSettings() {
     } else if (_wcsicmp(
                    treatment.get(), L"override_size_when_centering") == 0) {
       rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
-      if (!ParseFloatingDefaultSizeSetting(
-              size.get(), &rule.floatingSizeDip)) {
+      if (_wcsicmp(size.get(), L"Workspace") == 0) {
+        rule.useWorkspaceSize = true;
+      } else if (!ParseFloatingDefaultSizeSetting(
+                     size.get(), &rule.floatingSizeDip)) {
         Wh_Log(
             L"Ignoring invalid centered size override at rule %d: %s",
             i + 1, size.get());
