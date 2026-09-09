@@ -122,16 +122,18 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     return;
   }
 
-  // Keep shell/framework noise out of the WM queue. Untracked HWNDs still flow
-  // through the normal discovery pipeline in both modes, but only after they
-  // resemble real windows; Manual mode blocks admission at the model boundary.
+  // Unknown top-level lifecycle events are only discovery prompts. Do not apply
+  // the full eligibility policy inside the callback: a newly shown framework
+  // window can still be acquiring its final styles, owner, title, or desktop
+  // registration. The settled snapshot remains authoritative for admission, and
+  // Manual mode still blocks admission at the model boundary.
   if (!tracked) {
     const bool discoveryEvent =
         event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED ||
         event == EVENT_OBJECT_STATECHANGE ||
         event == EVENT_SYSTEM_MINIMIZESTART ||
         event == EVENT_SYSTEM_MINIMIZEEND;
-    if (!discoveryEvent || !WindowCanBeManaged(hwnd)) {
+    if (!discoveryEvent || GetAncestor(hwnd, GA_ROOT) != hwnd) {
       return;
     }
   }

@@ -925,6 +925,70 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
   }
 }
 
+static void ScheduleNextDiscoveryRetryTimer() {
+  if (g_wm.discoveryRetryTimer) {
+    KillTimer(nullptr, g_wm.discoveryRetryTimer);
+    g_wm.discoveryRetryTimer = 0;
+  }
+  if (g_wm.pendingDiscoveryRetries.empty()) return;
+
+  const ULONGLONG now = GetTickCount64();
+  ULONGLONG earliestDue = g_wm.pendingDiscoveryRetries.front().dueTickMs;
+  for (const auto& pending : g_wm.pendingDiscoveryRetries) {
+    earliestDue = std::min(earliestDue, pending.dueTickMs);
+  }
+  const UINT delayMs = earliestDue > now
+                           ? static_cast<UINT>(earliestDue - now)
+                           : 1;
+  g_wm.discoveryRetryTimer = SetTimer(nullptr, 0, delayMs, nullptr);
+  if (!g_wm.discoveryRetryTimer) {
+    Wh_Log(L"Failed to schedule slow-application discovery timer");
+    g_wm.pendingDiscoveryRetries.clear();
+  }
+}
+
+// This stage owns only untracked HWNDs. Once discovery succeeds,
+// ArrangeWorkspace establishes any needed post-placement conformance lease.
+static void ProcessDiscoveryRetryTimer() {
+  AssertWmThread(L"ProcessDiscoveryRetryTimer");
+  if (g_wm.discoveryRetryTimer) {
+    KillTimer(nullptr, g_wm.discoveryRetryTimer);
+    g_wm.discoveryRetryTimer = 0;
+  }
+  if (!IsAutomaticMode()) {
+    g_wm.pendingDiscoveryRetries.clear();
+    return;
+  }
+
+  const ULONGLONG now = GetTickCount64();
+  std::vector<PendingDiscoveryRetry> due;
+  g_wm.pendingDiscoveryRetries.erase(
+      std::remove_if(
+          g_wm.pendingDiscoveryRetries.begin(),
+          g_wm.pendingDiscoveryRetries.end(),
+          [&](const PendingDiscoveryRetry& pending) {
+            if (pending.dueTickMs > now) return false;
+            due.push_back(pending);
+            return true;
+          }),
+      g_wm.pendingDiscoveryRetries.end());
+  ScheduleNextDiscoveryRetryTimer();
+
+  std::vector<HMONITOR> monitors;
+  for (const auto& pending : due) {
+    if (!pending.hwnd || !IsWindow(pending.hwnd) ||
+        IsWindowTrackedInAnyState(pending.hwnd)) {
+      continue;
+    }
+    DWORD processId = 0;
+    GetWindowThreadProcessId(pending.hwnd, &processId);
+    if (!processId || processId != pending.processId) continue;
+    AddUniqueMonitor(monitors,
+                     GetCurrentManagedWindowMonitor(pending.hwnd));
+  }
+  for (HMONITOR monitor : monitors) DiscoverCurrentWorkspaceOnMonitor(monitor);
+}
+
 // After a lifecycle burst settles, reconcile tracked-window physical and desktop
 // state, discover eligible windows only on the current desktop, then arrange each
 // changed or pending workspace once and refresh the tray.
@@ -1059,6 +1123,44 @@ static void ReconcileDeferredLifecycle() {
     if (changed || pendingArrange) {
       ArrangeWorkspace(key);
       AddUniqueWorkspaceKey(arrangedKeys, key);
+    }
+  }
+
+  // Admission is intentionally decided only after the settled snapshot. If a
+  // plausible Automatic-mode candidate is still unknown, its first observation
+  // may have raced application initialization or shell desktop registration.
+  // Give it one independent re-observation without turning discovery into polling.
+  if (IsAutomaticMode() && g_settings.slowApplicationDelayMs) {
+    bool addedRetry = false;
+    const ULONGLONG dueTickMs =
+        GetTickCount64() + g_settings.slowApplicationDelayMs;
+    for (HWND hwnd : dirtyWindows) {
+      if (hwnd && IsWindow(hwnd) && !IsWindowTrackedInAnyState(hwnd) &&
+          GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
+          GetAncestor(hwnd, GA_ROOT) == hwnd) {
+        DWORD processId = 0;
+        GetWindowThreadProcessId(hwnd, &processId);
+        if (!processId) continue;
+
+        auto existing = std::find_if(
+            g_wm.pendingDiscoveryRetries.begin(),
+            g_wm.pendingDiscoveryRetries.end(),
+            [&](const PendingDiscoveryRetry& pending) {
+              return pending.hwnd == hwnd;
+            });
+        if (existing != g_wm.pendingDiscoveryRetries.end()) {
+          if (existing->processId == processId) continue;
+          *existing = {hwnd, processId, dueTickMs};
+        } else {
+          g_wm.pendingDiscoveryRetries.push_back(
+              {hwnd, processId, dueTickMs});
+        }
+        addedRetry = true;
+      }
+    }
+
+    if (addedRetry) {
+      ScheduleNextDiscoveryRetryTimer();
     }
   }
 

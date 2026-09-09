@@ -232,6 +232,9 @@ A small tray indicator shows the active workspace layout and provides quick acce
   - ReconcileDelayMs: 50
     $name: Lifecycle Settle Delay (ms)
     $description: Delay before visibility/lifecycle bursts are reconciled. Increase only if shell transitions are unusually slow (20-2000 ms).
+  - SlowApplicationDelayMs: 250
+    $name: Slow Application Discovery Delay (ms)
+    $description: 'One-time delay before rechecking an Automatic-mode window that was not ready for admission after lifecycle settling. Set to 0 to disable (0-2000 ms). [Default 250]'
   $name: Advanced
 */
 // ==/WindhawkModSettings==

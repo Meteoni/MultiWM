@@ -1125,6 +1125,8 @@ static void WriteDiagnosticReport() {
       L"Conformance repair interval: %u ms",
       g_settings.conformanceRepairIntervalMs);
   report.Line(L"Lifecycle settle delay: %u ms", g_settings.reconcileDelayMs);
+  report.Line(L"Slow application discovery delay: %u ms",
+              g_settings.slowApplicationDelayMs);
   report.Line(L"Window rules: %zu", g_settings.windowRules.size());
   report.TextLine(L"Diagnostic output setting: ", g_settings.diagnosticsOutputPath);
   report.TextLine(L"Diagnostic output resolved: ", ExpandDiagnosticPath(g_settings.diagnosticsOutputPath));

@@ -218,6 +218,14 @@ void LoadSettings() {
   if (reconcileDelay < 20 || reconcileDelay > 2000) reconcileDelay = 50;
   g_settings.reconcileDelayMs = static_cast<UINT>(reconcileDelay);
 
+  int slowApplicationDelay =
+      Wh_GetIntSetting(L"advanced.SlowApplicationDelayMs");
+  if (slowApplicationDelay < 0 || slowApplicationDelay > 2000) {
+    slowApplicationDelay = 250;
+  }
+  g_settings.slowApplicationDelayMs =
+      static_cast<UINT>(slowApplicationDelay);
+
   g_settings.windowRules.clear();
   for (int i = 0; i < 64; ++i) {
     auto process =
@@ -421,11 +429,26 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       Reconcile::HandleVirtualDesktopChanged();
       return WmMessageDisposition::Handled;
 
-    case WM_APP_FOREGROUND_CHANGED:
-      RememberManagedForeground(reinterpret_cast<HWND>(msg.wParam));
+    case WM_APP_FOREGROUND_CHANGED: {
+      HWND hwnd = reinterpret_cast<HWND>(msg.wParam);
+      RememberManagedForeground(hwnd);
+      // Some frameworks make a top-level HWND foreground without delivering a
+      // usable SHOW event. Foreground is only a discovery prompt; the settled
+      // snapshot remains authoritative for eligibility and admission.
+      if (IsAutomaticMode()) {
+        if (!hwnd || !IsWindow(hwnd)) {
+          // A rapidly replaced foreground HWND can disappear before this posted
+          // message is consumed. Preserve the discovery prompt with one settled
+          // global snapshot, which can observe its live replacement.
+          Reconcile::ScheduleLifecycleReconcile(nullptr);
+        } else if (!IsWindowTrackedInAnyState(hwnd)) {
+          Reconcile::ScheduleLifecycleReconcile(hwnd);
+        }
+      }
       ++Diagnostics::g_runtime.counters.trayRefreshMessages;
       TrayUi::RefreshForCurrentWorkspace();
       return WmMessageDisposition::Handled;
+    }
 
     case WM_APP_LAYOUT_CYCLE:
       Commands::CycleCurrentWorkspaceLayout(
@@ -461,6 +484,11 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       if (g_wm.lifecycleTimer &&
           static_cast<UINT_PTR>(msg.wParam) == g_wm.lifecycleTimer) {
         Reconcile::ReconcileDeferredLifecycle();
+        return WmMessageDisposition::Handled;
+      }
+      if (g_wm.discoveryRetryTimer &&
+          static_cast<UINT_PTR>(msg.wParam) == g_wm.discoveryRetryTimer) {
+        Reconcile::ProcessDiscoveryRetryTimer();
         return WmMessageDisposition::Handled;
       }
       if (g_wm.maintenanceTimer &&
@@ -544,6 +572,10 @@ static void CleanupWmThread() {
     KillTimer(nullptr, g_wm.lifecycleTimer);
     g_wm.lifecycleTimer = 0;
   }
+  if (g_wm.discoveryRetryTimer) {
+    KillTimer(nullptr, g_wm.discoveryRetryTimer);
+    g_wm.discoveryRetryTimer = 0;
+  }
   if (g_wm.maintenanceTimer) {
     KillTimer(nullptr, g_wm.maintenanceTimer);
     g_wm.maintenanceTimer = 0;
@@ -553,6 +585,7 @@ static void CleanupWmThread() {
     g_wm.conformanceTimer = 0;
   }
   g_wm.lifecycleDirtyWindows.clear();
+  g_wm.pendingDiscoveryRetries.clear();
   g_wm.pendingDesktopArranges.clear();
   g_wm.maintenanceAttempts = 0;
   g_wm.maintenanceRunning = false;

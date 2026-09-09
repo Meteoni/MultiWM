@@ -146,6 +146,12 @@ struct PendingWorkspaceArrange {
   HMONITOR monitor = nullptr;
 };
 
+struct PendingDiscoveryRetry {
+  HWND hwnd = nullptr;
+  DWORD processId = 0;
+  ULONGLONG dueTickMs = 0;
+};
+
 //=============================================================================
 // Runtime/configuration state groups
 //=============================================================================
@@ -228,6 +234,7 @@ struct WindowRule {
 // replace these fields; transient WM state lives in WmRuntime instead.
 struct SettingsState {
   UINT reconcileDelayMs = 50;
+  UINT slowApplicationDelayMs = 250;
   UINT conformanceLeaseMs = 3000;
   UINT conformanceRepairIntervalMs = 75;
 
@@ -297,6 +304,7 @@ struct WmRuntime {
   HANDLE readyEvent = nullptr;
 
   UINT_PTR lifecycleTimer = 0;
+  UINT_PTR discoveryRetryTimer = 0;
   UINT_PTR maintenanceTimer = 0;
   UINT_PTR conformanceTimer = 0;
   UINT maintenanceAttempts = 0;
@@ -309,6 +317,7 @@ struct WmRuntime {
       ReconciledDesktopState::Unknown;
   bool pendingDesktopSwitchFlyouts = false;
   std::vector<HWND> lifecycleDirtyWindows;
+  std::vector<PendingDiscoveryRetry> pendingDiscoveryRetries;
   std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
   ManagementMode managementMode = ManagementMode::Automatic;
 };
