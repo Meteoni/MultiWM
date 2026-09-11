@@ -55,10 +55,12 @@ static bool ReconcileTrackedSnapshotOwnership(
 }
 
 static bool SeedInitialSnapshot(
-    Workspace& workspace, const std::vector<HWND>& initialSnapshot) {
+    Workspace& workspace, const std::vector<HWND>& initialSnapshot,
+    bool useAutomaticAdmissionPolicy) {
   bool changed = false;
   for (HWND hwnd : initialSnapshot) {
-    changed |= AdmitInitialObservedWindow(workspace, hwnd);
+    changed |= AdmitInitialObservedWindow(
+        workspace, hwnd, useAutomaticAdmissionPolicy);
   }
   return changed;
 }
@@ -89,12 +91,12 @@ static bool ReadoptFloatingSnapshot(
 
 static bool AdmitUntrackedSnapshot(
     Workspace& workspace, const std::vector<HWND>& snapshot, bool allowAdmission,
-    bool useAutomaticPositionPolicy = false,
+    bool useAutomaticAdmissionPolicy = false,
     std::vector<HWND>* admittedWindows = nullptr) {
   if (!allowAdmission) return false;
 
   const bool afterFocused =
-      useAutomaticPositionPolicy &&
+      useAutomaticAdmissionPolicy &&
       g_settings.automaticNewWindowPosition ==
           AutomaticNewWindowPosition::AfterFocused;
   HWND anchor = afterFocused ? workspace.LastFocusedTiledWindow() : nullptr;
@@ -103,10 +105,12 @@ static bool AdmitUntrackedSnapshot(
   for (HWND hwnd : snapshot) {
     if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) continue;
 
-    if (ShouldWindowDefaultToFloating(hwnd)) {
-      if (workspace.AdmitFloating(
-              MakeWindowRecord(hwnd, ManageState::Floating))) {
+    if (useAutomaticAdmissionPolicy && ShouldWindowDefaultToFloating(hwnd)) {
+      WindowRecord record = MakeWindowRecord(hwnd, ManageState::Floating);
+      record.pendingDefaultFloatingCenter = true;
+      if (workspace.AdmitFloating(std::move(record))) {
         changed = true;
+        if (admittedWindows) admittedWindows->push_back(hwnd);
       }
       continue;
     }
@@ -137,11 +141,11 @@ static bool AdmitUntrackedSnapshot(
 // back to Restored/Hidden.
 static bool AdmitUntrackedSuspendedSnapshot(
     Workspace& workspace, const std::vector<HWND>& snapshot, bool allowAdmission,
-    bool useAutomaticPositionPolicy = false) {
+    bool useAutomaticAdmissionPolicy = false) {
   if (!allowAdmission) return false;
 
   const bool afterFocused =
-      useAutomaticPositionPolicy &&
+      useAutomaticAdmissionPolicy &&
       g_settings.automaticNewWindowPosition ==
           AutomaticNewWindowPosition::AfterFocused;
   const HWND anchor = afterFocused ? workspace.LastFocusedTiledWindow() : nullptr;
@@ -155,9 +159,10 @@ static bool AdmitUntrackedSuspendedSnapshot(
       return false;
     }
 
-    if (ShouldWindowDefaultToFloating(hwnd)) {
-      return workspace.AdmitFloating(
-          MakeWindowRecord(hwnd, ManageState::Floating));
+    if (useAutomaticAdmissionPolicy && ShouldWindowDefaultToFloating(hwnd)) {
+      WindowRecord record = MakeWindowRecord(hwnd, ManageState::Floating);
+      record.pendingDefaultFloatingCenter = true;
+      return workspace.AdmitFloating(std::move(record));
     }
 
     if (anchor) {
@@ -225,7 +230,11 @@ static bool EnsureWorkspaceFromSnapshot(
       key, workspaceExisted ? snapshot : initialSnapshot, ownershipChangedKeys);
 
   if (!g_workspaces.Load(key, &workspace)) workspace = MakeDefaultWorkspace();
-  if (!workspaceExisted) SeedInitialSnapshot(workspace, initialSnapshot);
+  if (!workspaceExisted) {
+    SeedInitialSnapshot(
+        workspace, initialSnapshot,
+        IsAutomaticMode() && !adoptCurrentGeometry);
+  }
 
   // Tile Workspace is the explicit escape hatch for stale empirical proof. It
   // retries the whole visible set from ordinary geometry; any still-real minimum
@@ -691,7 +700,8 @@ static bool DiscoverWorkspaceWindows(
   bool hasState = g_workspaces.Load(key, &workspace);
   if (!hasState) workspace = MakeDefaultWorkspace();
 
-  if (initializing && SeedInitialSnapshot(workspace, initialSnapshot)) {
+  if (initializing &&
+      SeedInitialSnapshot(workspace, initialSnapshot, true)) {
     hasState = true;
     changed = true;
   }
@@ -711,14 +721,44 @@ static bool DiscoverWorkspaceWindows(
     changed = true;
   }
 
+  // A default-floating HWND can be admitted during initial seeding or while it
+  // is minimized/maximized. Once it appears in the restored snapshot, route the
+  // retained centering request through the same placement pass.
+  for (HWND hwnd : snapshot) {
+    const WindowRecord* record = workspace.Find(hwnd);
+    if (record && record->state == ManageState::Floating &&
+        record->pendingDefaultFloatingCenter &&
+        !ContainsWindow(newlyAdmittedWindows, hwnd)) {
+      newlyAdmittedWindows.push_back(hwnd);
+    }
+  }
+
   // Automatic discovery owns the first floating geometry of a genuinely new
-  // restored window. Center it in this workspace, applying the configured
-  // default size unless a matching placement override preserves or replaces it.
-  if (admitUntracked && workspace.Layout() == TileLayout::Floating) {
+  // restored window. A Floating workspace applies its configured sizing policy;
+  // a per-window Floating admission keeps its application-selected size and is
+  // moved only to the center of its workspace.
+  if (admitUntracked) {
     for (HWND hwnd : newlyAdmittedWindows) {
+      const WindowRecord* record = workspace.Find(hwnd);
+      const bool pendingDefaultCenter =
+          record && record->state == ManageState::Floating &&
+          record->pendingDefaultFloatingCenter;
+      if (!record ||
+          (workspace.Layout() != TileLayout::Floating &&
+           !pendingDefaultCenter)) {
+        continue;
+      }
+
       FloatingPlacementHint newWindowHint;
-      newWindowHint.intent = FloatingPlacementIntent::NewWindowCenter;
-      RepairFloatingGeometry(key, workspace, hwnd, newWindowHint);
+      newWindowHint.intent =
+          workspace.Layout() != TileLayout::Floating &&
+                  pendingDefaultCenter
+              ? FloatingPlacementIntent::NewWindowCenterMoveOnly
+              : FloatingPlacementIntent::NewWindowCenter;
+      if (RepairFloatingGeometry(key, workspace, hwnd, newWindowHint)) {
+        workspace.ClearDefaultFloatingCenter(hwnd);
+        changed = true;
+      }
     }
   }
 

@@ -201,15 +201,18 @@ static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
   return windows;
 }
 
-static bool AdmitInitialObservedWindow(Workspace& workspace, HWND hwnd) {
+static bool AdmitInitialObservedWindow(
+    Workspace& workspace, HWND hwnd, bool useAutomaticAdmissionPolicy) {
   if (!hwnd || !IsWindow(hwnd) || workspace.HasRecord(hwnd) ||
       IsWindowTrackedInAnyState(hwnd)) {
     return false;
   }
   const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
   if (reason == SuspensionReason::Hidden) return false;
-  if (ShouldWindowDefaultToFloating(hwnd)) {
-    return workspace.AdmitFloating(MakeWindowRecord(hwnd, ManageState::Floating));
+  if (useAutomaticAdmissionPolicy && ShouldWindowDefaultToFloating(hwnd)) {
+    WindowRecord record = MakeWindowRecord(hwnd, ManageState::Floating);
+    record.pendingDefaultFloatingCenter = true;
+    return workspace.AdmitFloating(std::move(record));
   }
   return workspace.AdmitInitial(MakeWindowRecord(hwnd), reason);
 }
@@ -234,6 +237,7 @@ bool Workspace::AdmitInitial(
   record.state = reason == SuspensionReason::None
                      ? ManageState::Tiled
                      : ManageState::Suspended;
+  record.pendingInsertionPlacement = true;
   if (reason == SuspensionReason::None) {
     windows_.push_back(hwnd);
   } else {
@@ -292,6 +296,7 @@ bool Workspace::AdmitInitialAfter(
     record.tilingGeneration = Model::NextTilingGeneration();
   }
   record.state = ManageState::Suspended;
+  record.pendingInsertionPlacement = true;
   record.suspensionReason = reason;
   record.savedSlot.index = insertionLogicalIndex;
   if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
@@ -376,6 +381,8 @@ bool Workspace::Float(HWND hwnd) {
   WindowRecord* record = FindMutable(hwnd);
   if (!record) return false;
   record->state = ManageState::Floating;
+  record->pendingInsertionPlacement = false;
+  record->pendingDefaultFloatingCenter = false;
   record->suspensionReason = SuspensionReason::None;
   record->savedSlot = {};
   record->hasSavedSlot = false;
@@ -455,9 +462,10 @@ void Workspace::AdmitMigrated(WindowRecord record, HWND anchor) {
   if (!hwnd) return;
   if (record.state == ManageState::Tiled ||
       record.state == ManageState::Suspended) {
-    // A destination workspace admission is newer than its existing members,
-    // matching FancyWM's generation-based overflow victim policy.
+    // A destination workspace admission is newer than its existing members and
+    // receives the first opportunity to find a viable destination slot.
     record.tilingGeneration = Model::NextTilingGeneration();
+    record.pendingInsertionPlacement = true;
   }
   Forget(hwnd);
 
@@ -596,6 +604,77 @@ bool Workspace::PromoteTiledToIndex(HWND hwnd, size_t targetIndex) {
   return true;
 }
 
+bool Workspace::MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex) {
+  AssertWmThread(L"Workspace::MovePendingAdmissionToIndex");
+  auto current = std::find(windows_.begin(), windows_.end(), hwnd);
+  if (current == windows_.end()) return false;
+
+  WindowRecord* record = FindMutable(hwnd);
+  const size_t currentIndex =
+      static_cast<size_t>(std::distance(windows_.begin(), current));
+  if (!record || !record->pendingInsertionPlacement ||
+      targetIndex >= windows_.size() || targetIndex == currentIndex) {
+    return false;
+  }
+
+  EnsureWeights();
+  const size_t oldCount = windows_.size();
+  const size_t oldLogicalIndex = ActiveIndexToLogicalIndex(currentIndex);
+  windows_.erase(current);
+
+  if ((layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) &&
+      gridWeights_.size() == oldCount) {
+    gridWeights_.erase(gridWeights_.begin() + currentIndex);
+  } else if ((layout_ == TileLayout::MasterStack ||
+              layout_ == TileLayout::MasterStackH) &&
+             oldCount > 1 && stackWeights_.size() == oldCount - 1) {
+    const size_t stackIndex = currentIndex == 0 ? 0 : currentIndex - 1;
+    stackWeights_.erase(stackWeights_.begin() + stackIndex);
+  }
+  CloseLogicalGapAfterRemoval(oldLogicalIndex, hwnd);
+
+  const size_t insertionLogicalIndex = ActiveIndexToLogicalIndex(targetIndex);
+  for (auto& kv : records_) {
+    WindowRecord& existing = kv.second;
+    if (existing.state == ManageState::Suspended && existing.hasSavedSlot &&
+        existing.savedSlot.index >= insertionLogicalIndex) {
+      ++existing.savedSlot.index;
+    }
+  }
+
+  windows_.insert(windows_.begin() + targetIndex, hwnd);
+  if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
+    gridWeights_.insert(gridWeights_.begin() + targetIndex, 1.0);
+  } else if ((layout_ == TileLayout::MasterStack ||
+              layout_ == TileLayout::MasterStackH) &&
+             oldCount > 1) {
+    const size_t stackIndex = targetIndex == 0 ? 0 : targetIndex - 1;
+    stackWeights_.insert(stackWeights_.begin() + stackIndex, 1.0);
+  }
+
+  EnsureWeights();
+  DebugValidateMutation(L"Workspace::MovePendingAdmissionToIndex");
+  return true;
+}
+
+bool Workspace::ClearInsertionPlacement(HWND hwnd) {
+  AssertWmThread(L"Workspace::ClearInsertionPlacement");
+  WindowRecord* record = FindMutable(hwnd);
+  if (!record || !record->pendingInsertionPlacement) return false;
+  record->pendingInsertionPlacement = false;
+  DebugValidateMutation(L"Workspace::ClearInsertionPlacement");
+  return true;
+}
+
+bool Workspace::ClearDefaultFloatingCenter(HWND hwnd) {
+  AssertWmThread(L"Workspace::ClearDefaultFloatingCenter");
+  WindowRecord* record = FindMutable(hwnd);
+  if (!record || !record->pendingDefaultFloatingCenter) return false;
+  record->pendingDefaultFloatingCenter = false;
+  DebugValidateMutation(L"Workspace::ClearDefaultFloatingCenter");
+  return true;
+}
+
 void Workspace::RepairForArrangement(
     const std::vector<HWND>& invalidWindows,
     const std::vector<WindowRecord>& missingActiveRecords) {
@@ -705,7 +784,8 @@ static bool RectsSatisfyWindowConstraints(
 // active window has a compatible destination; no alternate divider model is
 // introduced for constrained windows.
 static bool PromoteBspWindowForConstraints(
-    Workspace& workspace, const RECT& workArea, LONG gap) {
+    Workspace& workspace, const RECT& workArea, LONG gap,
+    bool recordChanges = true) {
   if (workspace.Layout() != TileLayout::BSP || workspace.ActiveCount() < 2) {
     return false;
   }
@@ -818,12 +898,14 @@ static bool PromoteBspWindowForConstraints(
     }
 
     changed = true;
-    Wh_Log(
-        L"BSP constraint promotion hwnd=%p slot=%zu -> %zu",
-        orderedWindows[targetIndex], sourceIndex, targetIndex);
-    Diagnostics::RecordEvent(
-        L"BSP constraint promotion hwnd=%p slot=%zu -> %zu",
-        orderedWindows[targetIndex], sourceIndex, targetIndex);
+    if (recordChanges) {
+      Wh_Log(
+          L"BSP constraint promotion hwnd=%p slot=%zu -> %zu",
+          orderedWindows[targetIndex], sourceIndex, targetIndex);
+      Diagnostics::RecordEvent(
+          L"BSP constraint promotion hwnd=%p slot=%zu -> %zu",
+          orderedWindows[targetIndex], sourceIndex, targetIndex);
+    }
   }
   return changed;
 }
@@ -1137,8 +1219,9 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
 // Renders one workspace from authoritative model state. Arrangement itself is a
 // small pipeline: repair local invariants -> compute targets -> apply placement ->
 // fold placement outcomes back into the model. Reflow is iterative: a pass may
-// learn a new enforced constraint or permanently float one newest admission.
-static void ArrangeWorkspace(const DesktopMonitorKey& key) {
+// learn a new enforced constraint or select one constraint-removal candidate.
+static void ArrangeWorkspace(
+    const DesktopMonitorKey& key, HWND preferredTiledWindow) {
   ++Diagnostics::g_runtime.counters.arrangeCalls;
   if (!IsWorkspaceOnActiveDesktop(key)) return;
 
@@ -1209,10 +1292,11 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
       ++Diagnostics::g_runtime.counters.constraintUnsatisfiablePlans;
       HWND victim = nullptr;
       bool intrinsicallyImpossible = false;
+      bool singleRemovalProven = false;
 
       // Removing another member cannot help a window whose proven minimum is
       // larger than the entire usable workspace. Float that window directly;
-      // reserve the newest-admission policy for aggregate constraint conflicts.
+      // reserve candidate testing for aggregate constraint conflicts.
       const LONG workspaceWidth = RectWidth(workArea);
       const LONG workspaceHeight = RectHeight(workArea);
       const std::vector<WindowConstraints> activeConstraints =
@@ -1248,7 +1332,143 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
       if (victim) {
         intrinsicallyImpossible = true;
       } else {
-        victim = workspace.NewestTiledWindow();
+        struct ConstraintCandidate {
+          HWND hwnd;
+          uint64_t generation;
+        };
+
+        std::vector<ConstraintCandidate> candidates;
+        candidates.reserve(workspace.ActiveCount());
+        for (HWND candidate : workspace.TiledWindows()) {
+          const WindowRecord* candidateRecord = workspace.Find(candidate);
+          candidates.push_back({
+              candidate,
+              candidateRecord ? candidateRecord->tilingGeneration : 0});
+        }
+        std::stable_sort(
+            candidates.begin(), candidates.end(),
+            [&](const ConstraintCandidate& first,
+                const ConstraintCandidate& second) {
+              const bool firstPreferred = first.hwnd == preferredTiledWindow;
+              const bool secondPreferred = second.hwnd == preferredTiledWindow;
+              if (firstPreferred != secondPreferred) return !firstPreferred;
+              return first.generation > second.generation;
+            });
+
+        // A fresh admission's configured position is a preference, not a reason
+        // to discard it. Once placement has proven a conflict, try nearby active
+        // slots before changing membership. BSP already performs a complete
+        // compatible-slot matching pass above, and Monocle geometry is invariant
+        // under ordering, so only the ordered split layouts need this search.
+        const TileLayout layout = workspace.Layout();
+        const bool searchAlternateInsertion =
+            layout == TileLayout::MasterStack ||
+            layout == TileLayout::MasterStackH ||
+            layout == TileLayout::Columns || layout == TileLayout::Rows;
+        const size_t preferredTiledIndex =
+            workspace.TiledIndex(preferredTiledWindow);
+        Workspace viableInsertion;
+        HWND repositionedAdmission = nullptr;
+        size_t previousInsertionIndex = 0;
+        size_t viableInsertionIndex = 0;
+
+        if (searchAlternateInsertion) {
+          for (const ConstraintCandidate& candidate : candidates) {
+            const WindowRecord* candidateRecord = workspace.Find(candidate.hwnd);
+            if (!candidateRecord ||
+                !candidateRecord->pendingInsertionPlacement ||
+                candidate.hwnd == preferredTiledWindow) {
+              continue;
+            }
+
+            const size_t currentIndex = workspace.TiledIndex(candidate.hwnd);
+            if (currentIndex >= workspace.ActiveCount()) continue;
+
+            auto tryInsertionIndex = [&](size_t targetIndex) {
+              Workspace trial = workspace;
+              if (!trial.MovePendingAdmissionToIndex(
+                      candidate.hwnd, targetIndex)) {
+                return false;
+              }
+              if (preferredTiledIndex < workspace.ActiveCount() &&
+                  trial.TiledIndex(preferredTiledWindow) !=
+                      preferredTiledIndex) {
+                return false;
+              }
+
+              std::vector<RECT> trialRects;
+              ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+              if (BuildWorkspaceLayoutPlan(
+                      trial, workArea, gap, &trialRects) !=
+                  LayoutPlanStatus::Success) {
+                return false;
+              }
+
+              viableInsertion = std::move(trial);
+              repositionedAdmission = candidate.hwnd;
+              previousInsertionIndex = currentIndex;
+              viableInsertionIndex = targetIndex;
+              return true;
+            };
+
+            for (size_t distance = 1;
+                 distance < workspace.ActiveCount() && !repositionedAdmission;
+                 ++distance) {
+              if (currentIndex + distance < workspace.ActiveCount() &&
+                  tryInsertionIndex(currentIndex + distance)) {
+                break;
+              }
+              if (currentIndex >= distance &&
+                  tryInsertionIndex(currentIndex - distance)) {
+                break;
+              }
+            }
+            if (repositionedAdmission) break;
+          }
+        }
+
+        if (repositionedAdmission) {
+          workspace = std::move(viableInsertion);
+          Wh_Log(
+              L"Constraint-aware admission repositioned HWND %p from slot %zu to %zu",
+              static_cast<void*>(repositionedAdmission),
+              previousInsertionIndex, viableInsertionIndex);
+          Diagnostics::RecordEvent(
+              L"constraint-aware admission repositioned hwnd=%p from=%zu to=%zu",
+              repositionedAdmission, previousInsertionIndex,
+              viableInsertionIndex);
+          g_workspaces.Save(key, workspace);
+          continue;
+        }
+
+        // Test one removal at a time against the already-swapped model. This
+        // avoids permanently floating several newer windows before reaching the
+        // one member whose removal actually makes the layout viable. The window
+        // explicitly moved by the user is considered last so promotion,
+        // demotion, make-master, and drag swaps preserve their requested subject.
+        for (const ConstraintCandidate& candidate : candidates) {
+          Workspace trial = workspace;
+          if (!trial.Float(candidate.hwnd)) continue;
+
+          PromoteBspWindowForConstraints(trial, workArea, gap, false);
+          std::vector<RECT> trialRects;
+          ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+          if (BuildWorkspaceLayoutPlan(
+                  trial, workArea, gap, &trialRects) !=
+              LayoutPlanStatus::Success) {
+            continue;
+          }
+
+          victim = candidate.hwnd;
+          singleRemovalProven = true;
+          break;
+        }
+
+        // Some aggregate conflicts require more than one removal. Retain the
+        // bounded iterative fallback, but use the same ordering so the user's
+        // moved window remains the final candidate rather than the first newest
+        // admission discarded.
+        if (!victim && !candidates.empty()) victim = candidates.front().hwnd;
       }
       const WindowRecord* victimRecord = victim ? workspace.Find(victim) : nullptr;
       if (!victim || !victimRecord) {
@@ -1263,16 +1483,23 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
           L"Proven minimum exceeds workspace; floating HWND %p (generation=%llu)",
           static_cast<void*>(victim),
           static_cast<unsigned long long>(generation));
+      } else if (singleRemovalProven) {
+        Wh_Log(
+            L"Proven constraint layout unsatisfiable; floating viable single-removal HWND %p (generation=%llu)",
+            static_cast<void*>(victim),
+            static_cast<unsigned long long>(generation));
       } else {
         Wh_Log(
-          L"Proven constraint layout unsatisfiable; floating newest tiled HWND %p (generation=%llu)",
-          static_cast<void*>(victim),
-          static_cast<unsigned long long>(generation));
+            L"Proven constraint layout unsatisfiable; floating fallback HWND %p (generation=%llu)",
+            static_cast<void*>(victim),
+            static_cast<unsigned long long>(generation));
       }
       Diagnostics::RecordEvent(
-          L"proven constraints floated hwnd=%p generation=%llu intrinsic=%d enforcedMin=%d%d reportedMin=%ldx%ld",
+          L"proven constraints floated hwnd=%p generation=%llu intrinsic=%d singleRemoval=%d preferred=%d enforcedMin=%d%d reportedMin=%ldx%ld",
           victim, static_cast<unsigned long long>(generation),
           intrinsicallyImpossible ? 1 : 0,
+          singleRemovalProven ? 1 : 0,
+          victim == preferredTiledWindow ? 1 : 0,
           constraints.enforceMinWidth ? 1 : 0,
           constraints.enforceMinHeight ? 1 : 0,
           constraints.minWidth, constraints.minHeight);
@@ -1375,12 +1602,14 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
               switch (observation.result) {
                 case PlacementResult::Success:
                   if (observation.placementIssued) {
-                    BeginConformanceLease(hwnd, rects[i]);
+                    BeginConformanceLease(
+                        hwnd, rects[i], false, preferredTiledWindow);
                   }
                   break;
                 case PlacementResult::AdjustedByWindow:
                 case PlacementResult::Refused:
-                  BeginConformanceLease(hwnd, rects[i], true);
+                  BeginConformanceLease(
+                      hwnd, rects[i], true, preferredTiledWindow);
                   break;
                 case PlacementResult::AccessDenied:
                 case PlacementResult::Dead:
@@ -1427,6 +1656,9 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key) {
       participationChanged |= workspace.Float(hwnd);
     }
 
+    if (!participationChanged) {
+      ClearSettledInsertionPlacements(key, workspace);
+    }
     g_workspaces.Save(key, workspace);
     if (!participationChanged || workspace.Empty()) return;
   }
@@ -1484,6 +1716,39 @@ static bool GetCurrentAuthoritativeTiledRect(
   }
   *outRect = rects[tiledIndex];
   return true;
+}
+
+// An admission remains movable until every placement produced by its reflow has
+// survived conformance. This matters because an existing sibling, not only the
+// new HWND, can reveal the constraint that requires an alternate insertion slot.
+static bool ClearSettledInsertionPlacements(
+    const DesktopMonitorKey& key, Workspace& workspace) {
+  for (HWND hwnd : workspace.TiledWindows()) {
+    if (ReadConformanceLease(hwnd, nullptr) !=
+        ConformanceLeaseReadResult::Missing) {
+      return false;
+    }
+  }
+
+  bool changed = false;
+  for (HWND hwnd : workspace.TiledWindows()) {
+    const WindowRecord* record = workspace.Find(hwnd);
+    if (!record || !record->pendingInsertionPlacement ||
+        GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+        IsWindowCloaked(hwnd)) {
+      continue;
+    }
+
+    RECT authoritative{};
+    RECT current{};
+    if (GetCurrentAuthoritativeTiledRect(
+            key, workspace, hwnd, &authoritative) &&
+        GetWindowFrameRect(hwnd, &current) &&
+        RectsNear(current, authoritative)) {
+      changed |= workspace.ClearInsertionPlacement(hwnd);
+    }
+  }
+  return changed;
 }
 
 // HWND values can be reused. Conformance is allowed to act only on the same
@@ -1553,6 +1818,9 @@ static void FinalizeExpiredConformanceLease(
     Diagnostics::RecordEvent(
         L"conformance lease completed compliant hwnd=%p attempts=%u",
         hwnd, lease.attempts);
+    if (ClearSettledInsertionPlacements(owners.front(), workspace)) {
+      g_workspaces.Save(owners.front(), workspace);
+    }
     return;
   }
 
@@ -1591,7 +1859,7 @@ static void FinalizeExpiredConformanceLease(
         observed.enforceMinWidth ? 1 : 0,
         observed.enforceMinHeight ? 1 : 0);
     g_workspaces.Save(owners.front(), workspace);
-    ArrangeWorkspace(owners.front());
+    ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
     return;
   }
 
@@ -1608,7 +1876,7 @@ static void FinalizeExpiredConformanceLease(
       L"Window %p remained outside its assigned tile at conformance deadline; switching it to Floating",
       hwnd);
   g_workspaces.Save(owners.front(), workspace);
-  ArrangeWorkspace(owners.front());
+  ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
 }
 
 // A tracked tiled HWND either confirms its authoritative rectangle or opens/reuses
@@ -1740,7 +2008,7 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
         observedConstraints.enforceMinWidth ? 1 : 0,
         observedConstraints.enforceMinHeight ? 1 : 0);
     g_workspaces.Save(owners.front(), workspace);
-    ArrangeWorkspace(owners.front());
+    ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
     return true;
   }
 
@@ -1775,7 +2043,7 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
             observedConstraints.enforceMinWidth ? 1 : 0,
             observedConstraints.enforceMinHeight ? 1 : 0);
         g_workspaces.Save(owners.front(), workspace);
-        ArrangeWorkspace(owners.front());
+        ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
         return true;
       }
     }
@@ -1790,14 +2058,14 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
     CancelConformanceLease(hwnd, lease.generation);
     workspace.Forget(hwnd);
     g_workspaces.Save(owners.front(), workspace);
-    ArrangeWorkspace(owners.front());
+    ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
     return true;
   }
   if (action == Workspace::PlacementAction::Float) {
     CancelConformanceLease(hwnd, lease.generation);
     workspace.Float(hwnd);
     g_workspaces.Save(owners.front(), workspace);
-    ArrangeWorkspace(owners.front());
+    ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
     return true;
   }
 

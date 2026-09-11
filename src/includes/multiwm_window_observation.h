@@ -476,7 +476,13 @@ static bool WindowCanBeManaged(HWND hwnd) {
 
   // window could temporarily lose its WS_SizeBox.
   // (example: Office save/discard dialog)
-  if (!(style & WS_SIZEBOX) && !IsWindowTrackedInAnyState(hwnd)) return false;
+  // A Default-to-floating rule is also an explicit Automatic-mode admission
+  // policy for naturally fixed-size top-level windows; centering never resizes
+  // those HWNDs.
+  if (!(style & WS_SIZEBOX) && !IsWindowTrackedInAnyState(hwnd) &&
+      !(IsAutomaticMode() && ShouldWindowDefaultToFloating(hwnd))) {
+    return false;
+  }
 
   LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
   if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return false;
@@ -526,7 +532,8 @@ static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPla
 // Positions one observed HWND without mutating logical workspace state. The
 // resulting value object is folded into Workspace separately.
 static PlacementObservation PlaceWindowChecked(
-    HWND hwnd, bool canMove, const RECT& targetRect) {
+    HWND hwnd, bool canMove, const RECT& targetRect,
+    bool positionOnly = false) {
   ++Diagnostics::g_runtime.counters.placementChecks;
   PlacementObservation observation;
   observation.requested = targetRect;
@@ -599,9 +606,14 @@ static PlacementObservation PlaceWindowChecked(
       hwnd, nullptr,
       targetRect.left - offsetLeft,
       targetRect.top - offsetTop,
-      targetRect.right - targetRect.left + offsetLeft + offsetRight,
-      targetRect.bottom - targetRect.top + offsetTop + offsetBottom,
-      SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+      positionOnly
+          ? 0
+          : targetRect.right - targetRect.left + offsetLeft + offsetRight,
+      positionOnly
+          ? 0
+          : targetRect.bottom - targetRect.top + offsetTop + offsetBottom,
+      SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE |
+          SWP_NOSENDCHANGING | (positionOnly ? SWP_NOSIZE : 0));
   if (!placed) {
     const DWORD error = GetLastError();
     return finish(error == ERROR_ACCESS_DENIED
@@ -621,7 +633,10 @@ static PlacementObservation PlaceWindowChecked(
                     : PlacementResult::AdjustedByWindow);
 }
 
-static void ArrangeWorkspace(const DesktopMonitorKey& key);
+static void ArrangeWorkspace(
+    const DesktopMonitorKey& key, HWND preferredTiledWindow = nullptr);
+static bool ClearSettledInsertionPlacements(
+    const DesktopMonitorKey& key, Workspace& workspace);
 
 static void ClearMoveSizeSamples(HWND hwnd) {
   AssertWmThread(L"ClearMoveSizeSamples");

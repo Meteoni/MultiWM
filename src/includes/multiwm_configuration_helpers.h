@@ -331,20 +331,6 @@ bool Workspace::ResetEnforcedConstraints() {
   return changed;
 }
 
-HWND Workspace::NewestTiledWindow() const {
-  HWND newest = nullptr;
-  uint64_t newestGeneration = 0;
-  for (HWND hwnd : windows_) {
-    const WindowRecord* record = Find(hwnd);
-    if (!record) continue;
-    if (!newest || record->tilingGeneration >= newestGeneration) {
-      newest = hwnd;
-      newestGeneration = record->tilingGeneration;
-    }
-  }
-  return newest ? newest : (windows_.empty() ? nullptr : windows_.back());
-}
-
 bool Workspace::HasSuspended() const {
   return std::any_of(
       records_.begin(), records_.end(), [](const auto& kv) {
@@ -375,6 +361,9 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     const UINT floatingDpi = existing.floatingDpi;
     const bool hasFloatingRect = existing.hasFloatingRect;
     const uint64_t tilingGeneration = existing.tilingGeneration;
+    const bool pendingInsertionPlacement = existing.pendingInsertionPlacement;
+    const bool pendingDefaultFloatingCenter =
+        existing.pendingDefaultFloatingCenter;
     const WindowConstraints cachedConstraints = existing.constraints;
     const ManageState state = existing.state;
     const SuspensionReason suspension = existing.suspensionReason;
@@ -387,6 +376,8 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     existing.lastRequestedRect = lastRequested;
     existing.lastObservedRect = lastObserved;
     existing.tilingGeneration = tilingGeneration;
+    existing.pendingInsertionPlacement = pendingInsertionPlacement;
+    existing.pendingDefaultFloatingCenter = pendingDefaultFloatingCenter;
     if (!existing.constraints.valid && cachedConstraints.valid) {
       existing.constraints = cachedConstraints;
     }
@@ -411,6 +402,10 @@ bool Workspace::ActivateTiled(HWND hwnd) {
 
   const ManageState previousState = record->state;
   bool changed = false;
+  if (record->pendingDefaultFloatingCenter) {
+    record->pendingDefaultFloatingCenter = false;
+    changed = true;
+  }
   if (record->state != ManageState::Tiled || record->hasSavedSlot ||
       record->suspensionReason != SuspensionReason::None) {
     record->state = ManageState::Tiled;
@@ -420,6 +415,7 @@ bool Workspace::ActivateTiled(HWND hwnd) {
     if (previousState == ManageState::Floating ||
         previousState == ManageState::Ignored) {
       record->tilingGeneration = Model::NextTilingGeneration();
+      record->pendingInsertionPlacement = true;
       // Explicitly re-tiling a floating window is a real retry. Keep the last
       // report for diagnostics, but require fresh empirical proof before that
       // report constrains the solver again.
@@ -432,6 +428,7 @@ bool Workspace::ActivateTiled(HWND hwnd) {
   }
   if (!ContainsWindow(windows_, hwnd)) {
     AppendTiledWithDefaultWeight(hwnd);
+    record->pendingInsertionPlacement = true;
     changed = true;
   }
   if (changed) DebugValidateMutation(L"Workspace::ActivateTiled");
@@ -445,6 +442,7 @@ bool Workspace::AdmitFloating(WindowRecord record) {
 
   record.state = ManageState::Floating;
   record.tilingGeneration = 0;
+  record.pendingInsertionPlacement = false;
   record.suspensionReason = SuspensionReason::None;
   record.savedSlot = {};
   record.hasSavedSlot = false;
@@ -509,6 +507,7 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
   }
 
   record.state = ManageState::Tiled;
+  record.pendingInsertionPlacement = true;
   record.suspensionReason = SuspensionReason::None;
   record.savedSlot = {};
   record.hasSavedSlot = false;

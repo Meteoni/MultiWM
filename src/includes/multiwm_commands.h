@@ -31,7 +31,7 @@ void SwapMaster() {
   g_workspaces.Save(key, workspace);
   ClearMoveSizeSamples(oldMaster);
   ClearMoveSizeSamples(resolved);
-  ArrangeWorkspace(key);
+  ArrangeWorkspace(key, resolved);
   Diagnostics::RecordEvent(
       L"Swap Master old=%p new=%p", oldMaster, resolved);
 }
@@ -82,7 +82,7 @@ static void MoveFocusedWindowOneSlot(bool promote) {
   g_workspaces.Save(key, workspace);
   ClearMoveSizeSamples(resolved);
   ClearMoveSizeSamples(other);
-  ArrangeWorkspace(key);
+  ArrangeWorkspace(key, resolved);
 
   Diagnostics::RecordEvent(
       promote ? L"Promote Window hwnd=%p from=%zu to=%zu"
@@ -262,6 +262,7 @@ static void HandleUserMove(
   }
 
   HWND target = nullptr;
+  HWND preferredTiledWindow = nullptr;
   if (workspace.IsTiled(hwnd) && gesture.hasDropPoint) {
     for (HWND candidate : workspace.TiledWindows()) {
       if (candidate == hwnd) continue;
@@ -274,6 +275,7 @@ static void HandleUserMove(
   }
 
   if (target && workspace.SwapTiled(hwnd, target)) {
+    preferredTiledWindow = hwnd;
     g_workspaces.Save(key, workspace);
     ++Diagnostics::g_runtime.counters.tiledSwapActions;
     Wh_Log(L"User move swapped managed windows %p and %p", hwnd, target);
@@ -281,7 +283,7 @@ static void HandleUserMove(
   }
 
   // No target means the source remains tiled and simply snaps back to its slot.
-  ArrangeWorkspace(key);
+  ArrangeWorkspace(key, preferredTiledWindow);
 }
 
 static void HandleUserResize(

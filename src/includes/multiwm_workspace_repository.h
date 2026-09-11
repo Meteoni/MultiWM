@@ -83,6 +83,7 @@ enum class FloatingPlacementIntent {
   PassiveRestore,
   PreserveAnchor,
   NewWindowCenter,
+  NewWindowCenterMoveOnly,
 };
 
 struct FloatingPlacementHint {
@@ -178,11 +179,16 @@ static bool RepairFloatingGeometry(
                            current.right > current.left &&
                            current.bottom > current.top;
 
+  const bool centerWithoutResize =
+      hint.intent == FloatingPlacementIntent::NewWindowCenterMoveOnly;
   const bool centerNewWindow =
-      hint.intent == FloatingPlacementIntent::NewWindowCenter;
+      hint.intent == FloatingPlacementIntent::NewWindowCenter ||
+      centerWithoutResize;
+  if (centerWithoutResize && !haveCurrent) return false;
+
   const bool needsFallbackSize = centerNewWindow || !record->hasFloatingRect;
   const WindowRule* placementOverride =
-      IsAutomaticMode() && needsFallbackSize
+      IsAutomaticMode() && needsFallbackSize && !centerWithoutResize
           ? FindMatchingWindowRule(
                 hwnd, WindowRuleTreatment::FloatingPlacementOverride)
           : nullptr;
@@ -193,7 +199,7 @@ static bool RepairFloatingGeometry(
 
   LONG width = 0;
   LONG height = 0;
-  if (preserveCurrentSize && haveCurrent) {
+  if (centerWithoutResize || (preserveCurrentSize && haveCurrent)) {
     width = current.right - current.left;
     height = current.bottom - current.top;
   } else if (useCustomSize) {
@@ -232,13 +238,15 @@ static bool RepairFloatingGeometry(
     center = RectCenter(workArea);
   }
 
-  RECT target = ClampFloatingRectToWorkArea(
-      CenteredRect(center, width, height), workArea);
+  RECT target = CenteredRect(center, width, height);
+  if (!centerWithoutResize) {
+    target = ClampFloatingRectToWorkArea(target, workArea);
+  }
   // The window can enter a suspended physical state while the placement target
   // is being calculated. Never overwrite that newer application-owned state.
   if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) return false;
   PlacementObservation observation =
-      PlaceWindowChecked(hwnd, record->canMove, target);
+      PlaceWindowChecked(hwnd, record->canMove, target, centerWithoutResize);
   if (observation.result != PlacementResult::Success &&
       observation.result != PlacementResult::AdjustedByWindow) {
     return false;

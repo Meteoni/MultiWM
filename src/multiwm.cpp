@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.22
+// @version         1.13.27
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -71,7 +71,7 @@ A small tray indicator shows the active workspace layout and provides quick acce
       - automatic: Automatic
   - AutomaticNewWindowPosition: last_slot
     $name: Automatic Window Insertion Position
-    $description: 'Choose where Automatic mode inserts newly discovered windows and migrated windows from another workspace. Maximized / minimized windows are restored in-place.'
+    $description: 'Choose the preferred position for newly discovered windows and migrated windows from another workspace. If constraints prevent it, MultiWM tries the nearest viable slot. Maximized / minimized windows are restored in-place.'
     $options:
       - last_slot: Last slot
       - after_focused: After focused window

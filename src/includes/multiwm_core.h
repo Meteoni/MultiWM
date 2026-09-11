@@ -669,10 +669,15 @@ struct WindowRecord {
   bool canResize = true;
   bool topmost = false;
 
-  // Monotonic admission generation mirrors FancyWM's stable overflow policy:
-  // when proven constraints cannot coexist, the newest tiled admission floats.
-  // Reordering never changes this value.
+  // Monotonic admission generation provides stable ordering for constraint
+  // recovery candidates. Reordering never changes this value.
   uint64_t tilingGeneration = 0;
+  // Retained through constraint-learning replans so lazily proven constraints
+  // can try nearby insertion slots before this admission is floated.
+  bool pendingInsertionPlacement = false;
+  // Default-floating admission can precede a usable restored rectangle. Retain
+  // the centering request until discovery can place the restored HWND.
+  bool pendingDefaultFloatingCenter = false;
   WindowConstraints constraints{};
 
   PlacementResult lastPlacementResult = PlacementResult::Success;
@@ -738,7 +743,6 @@ class Workspace {
   bool RememberFocusedWindow(HWND hwnd);
   bool UpdateConstraints(HWND hwnd, const WindowConstraints& constraints);
   bool ResetEnforcedConstraints();
-  HWND NewestTiledWindow() const;
   bool HasSuspended() const;
   bool AllTiledVisible(const std::vector<HWND>& snapshot) const;
 
@@ -748,6 +752,9 @@ class Workspace {
   bool MakeMaster(HWND hwnd, HWND* oldMaster = nullptr);
   bool SwapTiled(HWND first, HWND second);
   bool PromoteTiledToIndex(HWND hwnd, size_t targetIndex);
+  bool MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex);
+  bool ClearInsertionPlacement(HWND hwnd);
+  bool ClearDefaultFloatingCenter(HWND hwnd);
   bool RememberFloatingGeometry(
       HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
 
@@ -893,6 +900,9 @@ static WinEventHooks g_hooks;
 
 struct ConformanceLease {
   RECT expectedRect{};
+  // Preserve the user action that produced this target through asynchronous
+  // constraint discovery and its subsequent arrangement.
+  HWND preferredTiledWindow = nullptr;
   ULONGLONG expiresAtTickMs = 0;
   // Diagnostic only. Attempt count never controls lease lifetime or policy.
   unsigned attempts = 0;
@@ -1035,7 +1045,8 @@ static uint64_t AllocateConformanceLeaseGeneration() {
 }
 
 static void BeginConformanceLease(
-    HWND hwnd, const RECT& expectedRect, bool scheduleRepair = false) {
+    HWND hwnd, const RECT& expectedRect, bool scheduleRepair = false,
+    HWND preferredTiledWindow = nullptr) {
   AssertWmThread(L"BeginConformanceLease");
   if (!hwnd || g_settings.conformanceLeaseMs == 0 ||
       expectedRect.right <= expectedRect.left ||
@@ -1052,6 +1063,9 @@ static void BeginConformanceLease(
   if (it != g_conformanceLeases.leases.end() &&
       now < it->second.expiresAtTickMs &&
       EqualRect(&it->second.expectedRect, &expectedRect)) {
+    if (preferredTiledWindow) {
+      it->second.preferredTiledWindow = preferredTiledWindow;
+    }
     if (scheduleRepair && !it->second.repairDueTickMs) {
       it->second.repairDueTickMs = std::min(
           it->second.expiresAtTickMs,
@@ -1063,6 +1077,7 @@ static void BeginConformanceLease(
 
   ConformanceLease lease;
   lease.expectedRect = expectedRect;
+  lease.preferredTiledWindow = preferredTiledWindow;
   lease.expiresAtTickMs = now + g_settings.conformanceLeaseMs;
   if (scheduleRepair) {
     lease.repairDueTickMs = std::min(
