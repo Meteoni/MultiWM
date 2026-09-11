@@ -222,9 +222,9 @@ struct FloatingDefaultSize {
 
 struct WindowRule {
   WindowRuleTreatment treatment = WindowRuleTreatment::Exclude;
-  std::wstring process;
-  std::wstring className;
-  std::wstring titleContains;
+  std::vector<std::wstring> processNames;
+  std::vector<std::wstring> classNames;
+  std::vector<std::wstring> titleFragments;
   bool preserveFloatingSize = true;
   bool useWorkspaceSize = false;
   FloatingDefaultSize floatingSizeDip{};

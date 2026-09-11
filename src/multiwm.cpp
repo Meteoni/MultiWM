@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.27
+// @version         1.13.28
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -199,13 +199,16 @@ A small tray indicator shows the active workspace layout and provides quick acce
   - Rules:
       - - Process: ""
           $name: Process name
-          $description: Case-insensitive exact match. Leave blank to match any process.
+          $description: "Case-insensitive exact match. Leave blank to match any process. \n
+            Separate multiple names with commas; escape a literal comma as \\,."
         - Class: ""
           $name: Window class
-          $description: Case-insensitive exact match. Leave blank to match any class.
+          $description: "Case-insensitive exact match. Leave blank to match any class. \n
+            Separate multiple names with commas; escape a literal comma as \\,."
         - TitleContains: ""
           $name: Window title contains
-          $description: Case-insensitive substring. Leave blank to match any title.
+          $description: "Case-insensitive substring match. Leave blank to match any title. \n
+            Separate multiple fragments with commas; escape a literal comma as \\,."
         - Treatment: exclude
           $name: Treatment
           $options:
@@ -219,7 +222,7 @@ A small tray indicator shows the active workspace layout and provides quick acce
           $description: 'Only effective when "Override size" is selected. Use Width, Height in DPI-scaled pixels, or "Workspace" to fill the current monitor''s usable workspace. Examples: 720, 480'
     $name: Rules
     $description: "There's no one-size-fits-all shoe. \n
-      Exclude prevents management. Default to floating admits a matching window as managed Floating during Automatic discovery. Trace to owner retargets move/size to its root owner."
+      Exclude prevents management. Default to floating admits a matching window as managed Floating during Automatic discovery. Trace to owner retargets move/size to its root owner. Every non-blank match field in a rule must match; comma-separated values within one field are alternatives."
   $name: Window Rules
 
 - advanced:

@@ -420,30 +420,48 @@ static const WindowRule* FindMatchingWindowRule(
   for (const auto& rule : g_settings.windowRules) {
     if (rule.treatment != treatment) continue;
 
-    if (!rule.className.empty()) {
+    if (!rule.classNames.empty()) {
       if (!haveClass) {
         wchar_t buffer[256]{};
         if (GetClassNameW(hwnd, buffer, ARRAYSIZE(buffer))) className = buffer;
         haveClass = true;
       }
-      if (!EqualsInsensitive(className, rule.className)) continue;
+      if (std::none_of(
+              rule.classNames.begin(), rule.classNames.end(),
+              [&](const std::wstring& candidate) {
+                return EqualsInsensitive(className, candidate);
+              })) {
+        continue;
+      }
     }
 
-    if (!rule.titleContains.empty()) {
+    if (!rule.titleFragments.empty()) {
       if (!haveTitle) {
         wchar_t buffer[512]{};
         if (GetWindowTextW(hwnd, buffer, ARRAYSIZE(buffer))) title = buffer;
         haveTitle = true;
       }
-      if (!ContainsInsensitive(title, rule.titleContains)) continue;
+      if (std::none_of(
+              rule.titleFragments.begin(), rule.titleFragments.end(),
+              [&](const std::wstring& candidate) {
+                return ContainsInsensitive(title, candidate);
+              })) {
+        continue;
+      }
     }
 
-    if (!rule.process.empty()) {
+    if (!rule.processNames.empty()) {
       if (!haveProcess) {
         processName = GetWindowProcessName(hwnd);
         haveProcess = true;
       }
-      if (!EqualsInsensitive(processName, rule.process)) continue;
+      if (std::none_of(
+              rule.processNames.begin(), rule.processNames.end(),
+              [&](const std::wstring& candidate) {
+                return EqualsInsensitive(processName, candidate);
+              })) {
+        continue;
+      }
     }
 
     return &rule;

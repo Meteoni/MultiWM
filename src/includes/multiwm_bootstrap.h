@@ -226,6 +226,34 @@ void LoadSettings() {
   g_settings.slowApplicationDelayMs =
       static_cast<UINT>(slowApplicationDelay);
 
+  auto parseWindowRuleList = [](const wchar_t* text) {
+    std::vector<std::wstring> values;
+    std::wstring value;
+    for (const wchar_t* cursor = text; ; ++cursor) {
+      if (*cursor == L'\\' && cursor[1] == L',') {
+        value.push_back(L',');
+        ++cursor;
+        continue;
+      }
+      if (*cursor != L',' && *cursor != L'\0') {
+        value.push_back(*cursor);
+        continue;
+      }
+
+      size_t first = 0;
+      while (first < value.size() && std::iswspace(value[first])) ++first;
+      size_t last = value.size();
+      while (last > first && std::iswspace(value[last - 1])) --last;
+      if (first < last) {
+        values.emplace_back(value.substr(first, last - first));
+      }
+
+      value.clear();
+      if (*cursor == L'\0') break;
+    }
+    return values;
+  };
+
   g_settings.windowRules.clear();
   for (int i = 0; i < 64; ++i) {
     auto process =
@@ -269,9 +297,14 @@ void LoadSettings() {
     } else {
       rule.treatment = WindowRuleTreatment::Exclude;
     }
-    rule.process = process.get();
-    rule.className = className.get();
-    rule.titleContains = titleContains.get();
+    rule.processNames = parseWindowRuleList(process.get());
+    rule.classNames = parseWindowRuleList(className.get());
+    rule.titleFragments = parseWindowRuleList(titleContains.get());
+    if (rule.processNames.empty() && rule.classNames.empty() &&
+        rule.titleFragments.empty()) {
+      Wh_Log(L"Ignoring window rule %d with no usable match values", i + 1);
+      continue;
+    }
     g_settings.windowRules.push_back(std::move(rule));
   }
 
