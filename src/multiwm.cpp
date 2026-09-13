@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.28
+// @version         1.13.41
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -39,7 +39,10 @@ continuous polling.
 ## Layouts
 - Floating
 - Master + Stack (vertical or horizontal)
-- Binary Space Partitioning (BSP)
+- Dwindle — recursive splits alternate side-by-side and top/bottom, starting
+  side-by-side. Resizing changes split ratios without rotating dividers.
+  Exchanging the first two windows can adjust their dividers to fit application
+  minimum sizes, using the same supported split-ratio range as manual resizing.
 - Columns / Rows
 - Monocle
 
@@ -86,10 +89,10 @@ A small tray indicator shows the active workspace layout and provides quick acce
       - master_stack_h: Master + Stack (Horizontal)
       - columns: Columns
       - rows: Rows
-      - bsp: BSP (Binary Space Partitioning)
+      - dwindle: Dwindle
       - monocle: Monocle (Fullscreen)
       - floating: Floating (No tiling)
-  - LayoutCycle: [master_stack, master_stack_h, bsp, columns, rows, monocle, floating]
+  - LayoutCycle: [master_stack, master_stack_h, dwindle, columns, rows, monocle, floating]
     $name: Layout Cycle
     $description: 'Layouts visited by the Cycle Layout hotkey, in order. Remove layouts you never want to cycle through, or re-order entries as you wish.'
     $options:
@@ -97,7 +100,7 @@ A small tray indicator shows the active workspace layout and provides quick acce
       - master_stack_h: Master + Stack (Horizontal)
       - columns: Columns
       - rows: Rows
-      - bsp: BSP (Binary Space Partitioning)
+      - dwindle: Dwindle
       - monocle: Monocle (Fullscreen)
       - floating: Floating (No tiling)
   - TileGap: 6
@@ -109,6 +112,9 @@ A small tray indicator shows the active workspace layout and provides quick acce
   - MasterPercent: 50
     $name: Master Size (%)
     $description: Default master share in Master + Stack layouts (1-99).
+  - ReverseDwindle: false
+    $name: Reverse Dwindle
+    $description: Reverse the recursive growth direction from bottom-right to top-left.
   $name: Workspace
 
 - appearance:
@@ -132,7 +138,7 @@ A small tray indicator shows the active workspace layout and provides quick acce
             - master_stack_h: Master + Stack (Horizontal)
             - columns: Columns
             - rows: Rows
-            - bsp: BSP
+            - dwindle: Dwindle
             - monocle: Monocle
             - floating: Floating
         - Path: ""

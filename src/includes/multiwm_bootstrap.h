@@ -156,6 +156,8 @@ void LoadSettings() {
   }
   g_settings.masterPercent = Wh_GetIntSetting(L"workspace.MasterPercent");
   if (g_settings.masterPercent < 1 || g_settings.masterPercent > 99) g_settings.masterPercent = 50;
+  g_settings.reverseDwindle =
+      Wh_GetIntSetting(L"workspace.ReverseDwindle") != 0;
 
   auto layout = StringSetting::make(L"workspace.DefaultLayout");
   g_settings.defaultLayout = ParseLayoutSetting(layout.get());

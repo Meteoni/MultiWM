@@ -73,6 +73,8 @@
 //    a saved logical slot/weight until restored or explicitly floated/forgotten.
 // 5. Columns/Rows keep one grid weight per active tiled window.
 //    MasterStack/MasterStackH keep one stack weight per non-master active window.
+//    Dwindle keeps one outgoing ratio per active slot. The final slot's ratio
+//    is dormant until another leaf follows it, and survives suspension.
 // 6. A managed HWND has exactly one desktop+monitor workspace owner.
 // 7. Visibility/cloak events are dirty signals; ownership comes from explicit
 //    desktop/monitor queries, not from cloak state.
@@ -186,7 +188,7 @@ enum class WmMessageDisposition {
 
 static WmMessageDisposition HandleWmThreadMessage(const MSG& msg);
 
-enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, BSP, Monocle, Floating, COUNT };
+enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, Dwindle, Monocle, Floating, COUNT };
 enum class MouseMoveBehavior { Float, Swap };
 enum class WindowRuleTreatment {
   Exclude,
@@ -201,7 +203,7 @@ static std::vector<TileLayout> MakeBuiltInLayoutCycle() {
   return {
       TileLayout::MasterStack,
       TileLayout::MasterStackH,
-      TileLayout::BSP,
+      TileLayout::Dwindle,
       TileLayout::Columns,
       TileLayout::Rows,
       TileLayout::Monocle,
@@ -254,6 +256,7 @@ struct SettingsState {
   LONG gapDip = 6;
   FloatingDefaultSize floatingDefaultSizeDip{};
   LONG masterPercent = 50;
+  bool reverseDwindle = false;
 
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
   AutomaticNewWindowPosition automaticNewWindowPosition =
@@ -355,6 +358,7 @@ struct Counters {
   uint64_t tiledSwapActions = 0;
   uint64_t tiledFloatActions = 0;
   uint64_t dividerUpdates = 0;
+  uint64_t rejectedResizeGestures = 0;
 
   uint64_t reconcileCalls = 0;
   uint64_t reconcileWindowsExamined = 0;
@@ -416,6 +420,8 @@ struct Counters {
   uint64_t swapMasterCommands = 0;
   uint64_t promoteWindowCommands = 0;
   uint64_t demoteWindowCommands = 0;
+  uint64_t rejectedOrderCommands = 0;
+  uint64_t rejectedLayoutChanges = 0;
 
   uint64_t reportsWritten = 0;
   uint64_t reportWriteFailures = 0;
@@ -727,6 +733,10 @@ class Workspace {
   const std::unordered_map<HWND, WindowRecord>& Records() const { return records_; }
   const std::vector<double>& StackWeights() const { return stackWeights_; }
   const std::vector<double>& GridWeights() const { return gridWeights_; }
+  std::vector<double> DwindleRatios() const {
+    if (dwindleRatios_.empty()) return {};
+    return {dwindleRatios_.begin(), dwindleRatios_.end() - 1};
+  }
   size_t ActiveCount() const { return windows_.size(); }
   size_t RecordCount() const { return records_.size(); }
   bool Empty() const { return windows_.empty(); }
@@ -751,10 +761,12 @@ class Workspace {
   void SetMasterRatio(double ratio);
   bool MakeMaster(HWND hwnd, HWND* oldMaster = nullptr);
   bool SwapTiled(HWND first, HWND second);
-  bool PromoteTiledToIndex(HWND hwnd, size_t targetIndex);
   bool MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex);
   bool ClearInsertionPlacement(HWND hwnd);
   bool ClearDefaultFloatingCenter(HWND hwnd);
+  bool SetDwindleRatio(size_t splitIndex, double ratio);
+  bool HasSameLayoutStateAs(const Workspace& other) const;
+  bool RestoreLayoutStateFrom(const Workspace& source);
   bool RememberFloatingGeometry(
       HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
 
@@ -783,6 +795,9 @@ class Workspace {
   bool LearnGridResize(
       const RECT& workArea, LONG gap, size_t resizedIndex,
       const ::MoveSizeGesture& gesture);
+  bool LearnDwindleResize(
+      const RECT& workArea, LONG gap, size_t resizedIndex,
+      const ::MoveSizeGesture& gesture);
   PlacementAction ApplyPlacementObservation(HWND hwnd, const PlacementObservation& observation);
 
   bool Validate(
@@ -807,6 +822,7 @@ class Workspace {
   SuspendedSlot MakeAppendedSuspendedSlot() const;
   void AppendTiledWithDefaultWeight(HWND hwnd);
   void ResetSuspendedLayoutHints();
+  bool HasSameWindowMembershipAs(const Workspace& other) const;
   void DebugValidateMutation(const wchar_t* operation) const;
 
   TileLayout layout_ = TileLayout::MasterStack;
@@ -815,6 +831,7 @@ class Workspace {
   double masterRatio_ = 0.5;
   std::vector<double> stackWeights_;
   std::vector<double> gridWeights_;
+  std::vector<double> dwindleRatios_;
   HWND lastFocusedWindow_ = nullptr;
 };
 
@@ -898,6 +915,25 @@ static WorkspaceRepository g_workspaces;
 static MoveSizeTracker g_moveSize;
 static WinEventHooks g_hooks;
 
+enum class UserLayoutMutationKind {
+  Resize,
+  Order,
+  LayoutChange,
+};
+
+struct PendingLayoutMutation {
+  Workspace previous;
+  Workspace candidate;
+  HWND subject = nullptr;
+  UserLayoutMutationKind kind = UserLayoutMutationKind::Resize;
+  const wchar_t* action = L"Layout mutation";
+};
+
+static std::unordered_map<
+    DesktopMonitorKey, PendingLayoutMutation,
+    Model::DesktopMonitorKeyHash, Model::DesktopMonitorKeyEqual>
+    g_pendingLayoutMutations;
+
 struct ConformanceLease {
   RECT expectedRect{};
   // Preserve the user action that produced this target through asynchronous
@@ -977,6 +1013,7 @@ static bool CancelConformanceLease(HWND hwnd, uint64_t generation = 0) {
 static void ClearAllConformanceLeases() {
   AssertWmThread(L"ClearAllConformanceLeases");
   g_conformanceLeases.leases.clear();
+  g_pendingLayoutMutations.clear();
 }
 
 static size_t CountActiveConformanceLeases() {

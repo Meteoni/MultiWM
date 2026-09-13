@@ -45,6 +45,7 @@ struct FlyoutInstance {
   HMONITOR monitor = nullptr;
   std::wstring text;
   DWORD shownTick = 0;
+  DWORD holdMs = kFlyoutHoldMs;
 };
 
 static std::vector<FlyoutInstance*> g_flyouts;
@@ -59,7 +60,7 @@ static const wchar_t* LayoutDisplayName(TileLayout layout) {
     case TileLayout::MasterStackH: return L"Master + Stack (Horizontal)";
     case TileLayout::Columns: return L"Columns";
     case TileLayout::Rows: return L"Rows";
-    case TileLayout::BSP: return L"BSP";
+    case TileLayout::Dwindle: return L"Dwindle";
     case TileLayout::Monocle: return L"Monocle";
     case TileLayout::Floating: return L"Floating";
     default: return L"Unknown";
@@ -72,7 +73,7 @@ static const wchar_t* LayoutTrayText(TileLayout layout) {
     case TileLayout::MasterStackH: return L"MH";
     case TileLayout::Columns: return L"CL";
     case TileLayout::Rows: return L"RW";
-    case TileLayout::BSP: return L"BS";
+    case TileLayout::Dwindle: return L"DW";
     case TileLayout::Monocle: return L"MN";
     case TileLayout::Floating: return L"FL";
     default: return L"??";
@@ -85,7 +86,7 @@ static const wchar_t* LayoutFlyoutText(TileLayout layout) {
     case TileLayout::MasterStackH: return L"Master + Stack H";
     case TileLayout::Columns: return L"Columns";
     case TileLayout::Rows: return L"Rows";
-    case TileLayout::BSP: return L"BSP";
+    case TileLayout::Dwindle: return L"Dwindle";
     case TileLayout::Monocle: return L"Monocle";
     case TileLayout::Floating: return L"Floating";
     default: return L"Unknown";
@@ -473,15 +474,15 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
     case WM_TIMER:
       if (wParam == kFlyoutTimerId && instance) {
         DWORD elapsed = GetTickCount() - instance->shownTick;
-        if (elapsed >= kFlyoutHoldMs + kFlyoutFadeMs) {
+        if (elapsed >= instance->holdMs + kFlyoutFadeMs) {
           KillTimer(hwnd, kFlyoutTimerId);
           ShowWindow(hwnd, SW_HIDE);
           return 0;
         }
         BYTE alpha = 255;
-        if (elapsed > kFlyoutHoldMs) {
+        if (elapsed > instance->holdMs) {
           alpha = static_cast<BYTE>(255 - std::min<DWORD>(
-              255, ((elapsed - kFlyoutHoldMs) * 255) / kFlyoutFadeMs));
+              255, ((elapsed - instance->holdMs) * 255) / kFlyoutFadeMs));
         }
         SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
         return 0;
@@ -562,6 +563,9 @@ static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
   if (region && !SetWindowRgn(instance->hwnd, region, TRUE)) DeleteObject(region);
 
   instance->shownTick = GetTickCount();
+  // Allow roughly 75 ms per character, retaining the minimum for short hints.
+  instance->holdMs = static_cast<DWORD>(std::max<size_t>(
+      kFlyoutHoldMs, std::min<size_t>(instance->text.size(), 1000000) * 75));
   SetLayeredWindowAttributes(instance->hwnd, 0, 255, LWA_ALPHA);
   SetWindowPos(instance->hwnd, HWND_TOPMOST, x, y, width, height,
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -576,6 +580,12 @@ static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
 static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor) {
   if (layout == TileLayout::COUNT) return;
   ShowStatusFlyout(LayoutFlyoutText(layout), monitor);
+}
+
+static void ShowCommandFailureFlyout(
+    const wchar_t* text, HMONITOR monitor) {
+  if (!text || !*text) return;
+  ShowStatusFlyout(text, monitor);
 }
 
 static void ShowManagementModeFlyout(bool automatic) {

@@ -17,7 +17,9 @@ static bool TryParseLayoutSetting(PCWSTR str, TileLayout* outLayout) {
       {L"master_stack_h", TileLayout::MasterStackH},
       {L"columns", TileLayout::Columns},
       {L"rows", TileLayout::Rows},
-      {L"bsp", TileLayout::BSP},
+      {L"dwindle", TileLayout::Dwindle},
+      // Compatibility alias for configurations saved before 1.13.29.
+      {L"bsp", TileLayout::Dwindle},
       {L"monocle", TileLayout::Monocle},
       {L"floating", TileLayout::Floating},
   };
@@ -504,6 +506,10 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
     const size_t stackIndex =
         std::min(insertionActiveIndex - 1, stackWeights_.size());
     stackWeights_.insert(stackWeights_.begin() + stackIndex, 1.0);
+  } else if (layout_ == TileLayout::Dwindle) {
+    const size_t ratioIndex =
+        std::min(insertionActiveIndex, dwindleRatios_.size());
+    dwindleRatios_.insert(dwindleRatios_.begin() + ratioIndex, 0.5);
   }
 
   record.state = ManageState::Tiled;

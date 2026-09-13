@@ -3,6 +3,42 @@
 //=============================================================================
 namespace Commands {
 
+// User-authored geometry changes are rejected before commit when existing
+// evidence already proves them impossible. A short-lived transaction handles a
+// minimum that an application reveals only during the resulting placement.
+static bool ValidateUserLayoutMutation(
+    const DesktopMonitorKey& key, HMONITOR monitor,
+    Workspace& candidate, HWND subject, UserLayoutMutationKind kind,
+    const wchar_t* action) {
+  WorkspaceMetrics metrics;
+  std::vector<RECT> rects;
+  LayoutPlanStatus status = LayoutPlanStatus::Unsatisfiable;
+  if (GetWorkspaceMetrics(monitor, &metrics)) {
+    ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+    status = BuildWorkspaceLayoutPlan(
+        candidate, metrics.workArea, metrics.gap, &rects);
+    if (status == LayoutPlanStatus::Unsatisfiable &&
+        kind == UserLayoutMutationKind::Order) {
+      Workspace previous;
+      if (g_workspaces.Load(key, &previous) &&
+          IsShallowDwindleExchange(previous, candidate) &&
+          FitShallowDwindleDividers(candidate, metrics.workArea, metrics.gap)) {
+        Diagnostics::RecordEvent(L"shallow dwindle exchange accommodated action=%ls", action);
+        return true;
+      }
+    }
+  }
+  if (status == LayoutPlanStatus::Success ||
+      status == LayoutPlanStatus::NotApplicable) {
+    return true;
+  }
+
+  ReportRejectedLayoutMutation(
+      key, monitor, kind, action ? action : L"Layout mutation", subject,
+      candidate, rects);
+  return false;
+}
+
 // Promotes the foreground window, or its tiled owner, to the master slot, then
 // clears stale gesture samples for both windows and reflows the workspace.
 void SwapMaster() {
@@ -25,10 +61,19 @@ void SwapMaster() {
   }
 
   HWND resolved = ResolveToTiledWindow(fg, workspace.TiledWindows());
+  Workspace candidate = workspace;
   HWND oldMaster = nullptr;
-  if (!resolved || !workspace.MakeMaster(resolved, &oldMaster)) return;
+  if (!resolved || !candidate.MakeMaster(resolved, &oldMaster)) return;
+  if (!ValidateUserLayoutMutation(
+          key, monitor, candidate, resolved, UserLayoutMutationKind::Order,
+          L"Set master")) {
+    return;
+  }
 
-  g_workspaces.Save(key, workspace);
+  RememberPendingLayoutMutation(
+      key, workspace, candidate, resolved, UserLayoutMutationKind::Order,
+      L"Set master");
+  g_workspaces.Save(key, candidate);
   ClearMoveSizeSamples(oldMaster);
   ClearMoveSizeSamples(resolved);
   ArrangeWorkspace(key, resolved);
@@ -77,9 +122,18 @@ static void MoveFocusedWindowOneSlot(bool promote) {
 
   const size_t otherIndex = promote ? index - 1 : index + 1;
   HWND other = workspace.TiledWindows()[otherIndex];
-  if (!workspace.SwapTiled(resolved, other)) return;
+  Workspace candidate = workspace;
+  if (!candidate.SwapTiled(resolved, other)) return;
+  if (!ValidateUserLayoutMutation(
+          key, monitor, candidate, resolved, UserLayoutMutationKind::Order,
+          promote ? L"Promote" : L"Demote")) {
+    return;
+  }
 
-  g_workspaces.Save(key, workspace);
+  RememberPendingLayoutMutation(
+      key, workspace, candidate, resolved, UserLayoutMutationKind::Order,
+      promote ? L"Promote" : L"Demote");
+  g_workspaces.Save(key, candidate);
   ClearMoveSizeSamples(resolved);
   ClearMoveSizeSamples(other);
   ArrangeWorkspace(key, resolved);
@@ -180,7 +234,17 @@ void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
   }
 
   const TileLayout previousLayout = state.Layout();
-  if (!state.CycleLayout(g_settings.layoutCycle)) return;
+  Workspace candidate = state;
+  if (!candidate.CycleLayout(g_settings.layoutCycle)) return;
+  if (!ValidateUserLayoutMutation(
+          key, monitor, candidate, nullptr,
+          UserLayoutMutationKind::LayoutChange, L"Change layout")) {
+    return;
+  }
+  RememberPendingLayoutMutation(
+      key, state, candidate, nullptr, UserLayoutMutationKind::LayoutChange,
+      L"Change layout");
+  state = std::move(candidate);
   if (previousLayout != TileLayout::Floating &&
       state.Layout() == TileLayout::Floating) {
     RestoreWorkspaceFloatingGeometry(key, state);
@@ -229,7 +293,17 @@ void SetCurrentWorkspaceLayout(TileLayout layout, HMONITOR monitor = nullptr) {
     return;
   }
 
-  state.SetLayout(layout);
+  Workspace candidate = state;
+  candidate.SetLayout(layout);
+  if (!ValidateUserLayoutMutation(
+          key, monitor, candidate, nullptr,
+          UserLayoutMutationKind::LayoutChange, L"Change layout")) {
+    return;
+  }
+  RememberPendingLayoutMutation(
+      key, state, candidate, nullptr, UserLayoutMutationKind::LayoutChange,
+      L"Change layout");
+  state = std::move(candidate);
   if (previousLayout != TileLayout::Floating && layout == TileLayout::Floating) {
     RestoreWorkspaceFloatingGeometry(key, state);
   }
@@ -274,12 +348,23 @@ static void HandleUserMove(
     }
   }
 
-  if (target && workspace.SwapTiled(hwnd, target)) {
-    preferredTiledWindow = hwnd;
-    g_workspaces.Save(key, workspace);
-    ++Diagnostics::g_runtime.counters.tiledSwapActions;
-    Wh_Log(L"User move swapped managed windows %p and %p", hwnd, target);
-    Diagnostics::RecordEvent(L"user drag swapped hwnd=%p target=%p", hwnd, target);
+  if (target) {
+    Workspace candidate = workspace;
+    if (candidate.SwapTiled(hwnd, target) &&
+        ValidateUserLayoutMutation(
+            key, key.ResolveMonitor(), candidate, hwnd,
+            UserLayoutMutationKind::Order, L"Swap")) {
+      RememberPendingLayoutMutation(
+          key, workspace, candidate, hwnd, UserLayoutMutationKind::Order,
+          L"Swap");
+      workspace = std::move(candidate);
+      preferredTiledWindow = hwnd;
+      g_workspaces.Save(key, workspace);
+      ++Diagnostics::g_runtime.counters.tiledSwapActions;
+      Wh_Log(L"User move swapped managed windows %p and %p", hwnd, target);
+      Diagnostics::RecordEvent(
+          L"user drag swapped hwnd=%p target=%p", hwnd, target);
+    }
   }
 
   // No target means the source remains tiled and simply snaps back to its slot.
@@ -300,36 +385,51 @@ static void HandleUserResize(
     return;
   }
 
+  Workspace candidate = workspace;
   bool changed = false;
-  switch (workspace.Layout()) {
+  switch (candidate.Layout()) {
     case TileLayout::MasterStack:
     case TileLayout::MasterStackH:
-      changed = workspace.LearnMasterStackResize(
+      changed = candidate.LearnMasterStackResize(
           workArea, gap, resizedIndex, gesture);
       break;
 
     case TileLayout::Columns:
     case TileLayout::Rows:
-      changed = workspace.LearnGridResize(
+      changed = candidate.LearnGridResize(
           workArea, gap, resizedIndex, gesture);
       break;
 
     case TileLayout::COUNT:
       return;
 
-    case TileLayout::BSP:
+    case TileLayout::Dwindle:
+      changed = candidate.LearnDwindleResize(
+          workArea, gap, resizedIndex, gesture);
+      break;
+
     case TileLayout::Monocle:
     case TileLayout::Floating:
       break;
   }
 
   if (changed) {
+    if (!ValidateUserLayoutMutation(
+            key, key.ResolveMonitor(), candidate, hwnd,
+            UserLayoutMutationKind::Resize, L"Resize")) {
+      ArrangeWorkspace(key, hwnd);
+      return;
+    }
+    RememberPendingLayoutMutation(
+        key, workspace, candidate, hwnd, UserLayoutMutationKind::Resize,
+        L"Resize");
+    workspace = std::move(candidate);
     g_workspaces.Save(key, workspace);
     ++Diagnostics::g_runtime.counters.dividerUpdates;
     Wh_Log(L"User resize updated local divider state for %p", hwnd);
     Diagnostics::RecordEvent(L"user resize updated divider hwnd=%p", hwnd);
   }
-  ArrangeWorkspace(key);
+  ArrangeWorkspace(key, changed ? hwnd : nullptr);
 }
 
 // Consumes one completed user gesture and routes it to the move or resize policy.

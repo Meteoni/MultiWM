@@ -135,9 +135,24 @@ void LayoutMasterStackWeighted(
   }
 }
 
-void LayoutBSP(
-    const RECT& area, LONG gap, size_t startIndex, size_t count, int depth,
-    std::vector<RECT>& outRects) {
+struct DwindleSplit {
+  bool vertical = false;
+  LONG usableSpan = 0;
+  LONG firstSpan = 0;
+  RECT first{};
+  RECT remaining{};
+};
+
+// Ordered-chain Dwindle: each node gives its first child to startIndex and
+// recursively gives its second child to all later windows. Ratios belong to
+// those split nodes, so swapping windows exchanges leaves without reshaping the
+// tree. Fibonacci-style axes alternate by depth, starting side-by-side;
+// resizing an ancestor never rotates a descendant's divider.
+void LayoutDwindle(
+    const RECT& area, LONG gap, size_t startIndex, size_t count,
+    const std::vector<double>& splitRatios, bool reverse,
+    std::vector<RECT>& outRects,
+    std::vector<DwindleSplit>* outSplits = nullptr) {
   if (count == 0) return;
   if (count == 1) {
     outRects[startIndex] = area;
@@ -146,8 +161,7 @@ void LayoutBSP(
 
   const LONG width = area.right - area.left;
   const LONG height = area.bottom - area.top;
-  bool splitVertical = depth % 2 == 0;
-  if ((splitVertical ? width : height) < 2) splitVertical = !splitVertical;
+  const bool splitVertical = (startIndex % 2) == 0;
 
   const LONG span = splitVertical ? width : height;
   if (span < 2) {
@@ -158,20 +172,48 @@ void LayoutBSP(
   }
 
   const LONG effectiveGap = std::clamp<LONG>(gap, 0, span - 2);
-  const LONG firstSpan = (span - effectiveGap) / 2;
+  const LONG usableSpan = span - effectiveGap;
+  const double ratio = startIndex < splitRatios.size()
+      ? ClampDouble(splitRatios[startIndex], 0.1, 0.9)
+      : 0.5;
+  const LONG firstSpan = std::clamp<LONG>(
+      static_cast<LONG>(std::llround(usableSpan * ratio)),
+      1, usableSpan - 1);
   RECT remaining = area;
   if (splitVertical) {
-    outRects[startIndex] = {
-        area.left, area.top, area.left + firstSpan, area.bottom};
-    remaining.left = outRects[startIndex].right + effectiveGap;
+    if (reverse) {
+      outRects[startIndex] = {
+          area.right - firstSpan, area.top, area.right, area.bottom};
+      remaining.right = outRects[startIndex].left - effectiveGap;
+    } else {
+      outRects[startIndex] = {
+          area.left, area.top, area.left + firstSpan, area.bottom};
+      remaining.left = outRects[startIndex].right + effectiveGap;
+    }
   } else {
-    outRects[startIndex] = {
-        area.left, area.top, area.right, area.top + firstSpan};
-    remaining.top = outRects[startIndex].bottom + effectiveGap;
+    if (reverse) {
+      outRects[startIndex] = {
+          area.left, area.bottom - firstSpan, area.right, area.bottom};
+      remaining.bottom = outRects[startIndex].top - effectiveGap;
+    } else {
+      outRects[startIndex] = {
+          area.left, area.top, area.right, area.top + firstSpan};
+      remaining.top = outRects[startIndex].bottom + effectiveGap;
+    }
   }
 
+  if (outSplits) {
+    if (outSplits->size() < startIndex + count - 1) {
+      outSplits->resize(startIndex + count - 1);
+    }
+    (*outSplits)[startIndex] = {
+        splitVertical, usableSpan, firstSpan,
+        outRects[startIndex], remaining};
+  }
 
-  LayoutBSP(remaining, gap, startIndex + 1, count - 1, depth + 1, outRects);
+  LayoutDwindle(
+      remaining, gap, startIndex + 1, count - 1,
+      splitRatios, reverse, outRects, outSplits);
 }
 
 struct ConstraintExtent {

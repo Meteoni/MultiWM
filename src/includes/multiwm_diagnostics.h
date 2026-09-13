@@ -12,7 +12,7 @@ static const wchar_t* DiagnosticLayoutName(TileLayout layout) {
     case TileLayout::Columns: return L"Columns";
     case TileLayout::Rows: return L"Rows";
     case TileLayout::MasterStackH: return L"MasterStackH";
-    case TileLayout::BSP: return L"BSP";
+    case TileLayout::Dwindle: return L"Dwindle";
     case TileLayout::Monocle: return L"Monocle";
     case TileLayout::Floating: return L"Floating";
     case TileLayout::COUNT: return L"COUNT";
@@ -648,6 +648,7 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Tiled drag -> Floating actions", c.tiledFloatActions, previous.tiledFloatActions, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Tiled drag swap actions", c.tiledSwapActions, previous.tiledSwapActions, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Divider weight updates", c.dividerUpdates, previous.dividerUpdates, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Rejected resize gestures", c.rejectedResizeGestures, previous.rejectedResizeGestures, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Reconcile calls", c.reconcileCalls, previous.reconcileCalls, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Known HWNDs examined", c.reconcileWindowsExamined, previous.reconcileWindowsExamined, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Workspace saves", c.workspaceSaves, previous.workspaceSaves, uptimeMs, intervalMs);
@@ -709,6 +710,8 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Swap master commands", c.swapMasterCommands, previous.swapMasterCommands, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Promote window commands", c.promoteWindowCommands, previous.promoteWindowCommands, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Demote window commands", c.demoteWindowCommands, previous.demoteWindowCommands, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Rejected order commands", c.rejectedOrderCommands, previous.rejectedOrderCommands, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Rejected layout changes", c.rejectedLayoutChanges, previous.rejectedLayoutChanges, uptimeMs, intervalMs);
 }
 
 static uint64_t DiagnosticFileTime100ns(const FILETIME& value) {
@@ -1092,9 +1095,9 @@ static void WriteDiagnosticReport() {
       g_wm.lifecycleDirtyWindows.size(), g_wm.pendingDesktopArranges.size(),
       duplicateOwners);
   report.Line(
-      L"Active conformance leases=%zu runtime-maintenance timer=%d attempt=%u",
-      CountActiveConformanceLeases(), g_wm.maintenanceTimer ? 1 : 0,
-      g_wm.maintenanceAttempts);
+      L"Active conformance leases=%zu pending layout mutations=%zu runtime-maintenance timer=%d attempt=%u",
+      CountActiveConformanceLeases(), g_pendingLayoutMutations.size(),
+      g_wm.maintenanceTimer ? 1 : 0, g_wm.maintenanceAttempts);
   report.Line(
       L"Reverse ownership index: entries=%zu mismatches=%zu",
       ownershipIndex.size(), ownershipIndexMismatches);
@@ -1255,6 +1258,9 @@ static void WriteDiagnosticReport() {
         state.LastFocusedWindow(), state.LastFocusedTiledWindow());
     report.Line(L"stackWeights: %ls", DiagnosticWeightsString(state.StackWeights()).c_str());
     report.Line(L"gridWeights:  %ls", DiagnosticWeightsString(state.GridWeights()).c_str());
+    report.Line(
+        L"dwindleRatios: %ls",
+        DiagnosticWeightsString(state.DwindleRatios()).c_str());
 
     struct LogicalRecordRef {
       size_t logicalIndex;

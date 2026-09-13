@@ -84,6 +84,7 @@ enum class FloatingPlacementIntent {
   PreserveAnchor,
   NewWindowCenter,
   NewWindowCenterMoveOnly,
+  FailureCenter,
 };
 
 struct FloatingPlacementHint {
@@ -183,7 +184,8 @@ static bool RepairFloatingGeometry(
       hint.intent == FloatingPlacementIntent::NewWindowCenterMoveOnly;
   const bool centerNewWindow =
       hint.intent == FloatingPlacementIntent::NewWindowCenter ||
-      centerWithoutResize;
+      centerWithoutResize ||
+      hint.intent == FloatingPlacementIntent::FailureCenter;
   if (centerWithoutResize && !haveCurrent) return false;
 
   const bool needsFallbackSize = centerNewWindow || !record->hasFloatingRect;
@@ -193,6 +195,7 @@ static bool RepairFloatingGeometry(
                 hwnd, WindowRuleTreatment::FloatingPlacementOverride)
           : nullptr;
   const bool preserveCurrentSize =
+      hint.intent != FloatingPlacementIntent::FailureCenter &&
       placementOverride && placementOverride->preserveFloatingSize;
   const bool useCustomSize =
       placementOverride && !placementOverride->preserveFloatingSize;
@@ -413,6 +416,7 @@ bool Workspace::Validate(
       fail(L"grid weight count does not match active tiled count");
     }
     if (!stackWeights_.empty()) fail(L"grid layout retains stack weights");
+    if (!dwindleRatios_.empty()) fail(L"grid layout retains Dwindle ratios");
   } else if (layout_ == TileLayout::MasterStack ||
              layout_ == TileLayout::MasterStackH) {
     const size_t expected = windows_.empty() ? 0 : windows_.size() - 1;
@@ -420,7 +424,23 @@ bool Workspace::Validate(
       fail(L"stack weight count does not match non-master tiled count");
     }
     if (!gridWeights_.empty()) fail(L"master/stack layout retains grid weights");
-  } else if (!stackWeights_.empty() || !gridWeights_.empty()) {
+    if (!dwindleRatios_.empty()) fail(L"master/stack layout retains Dwindle ratios");
+  } else if (layout_ == TileLayout::Dwindle) {
+    const size_t expected = windows_.size();
+    if (dwindleRatios_.size() != expected) {
+      fail(L"Dwindle outgoing ratio count does not match active slot count");
+    }
+    for (double ratio : dwindleRatios_) {
+      if (!std::isfinite(ratio) || ratio < 0.1 || ratio > 0.9) {
+        fail(L"Dwindle ratio is outside the supported range");
+        break;
+      }
+    }
+    if (!stackWeights_.empty() || !gridWeights_.empty()) {
+      fail(L"Dwindle layout retains unrelated layout weights");
+    }
+  } else if (!stackWeights_.empty() || !gridWeights_.empty() ||
+             !dwindleRatios_.empty()) {
     fail(L"weightless layout retains layout weights");
   }
 
@@ -625,6 +645,8 @@ static bool Initialize();
 static void Shutdown();
 static void UpdateIcon(TileLayout layout, HMONITOR monitor = nullptr);
 static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor = nullptr);
+static void ShowCommandFailureFlyout(
+    const wchar_t* text, HMONITOR monitor = nullptr);
 static void ShowManagementModeFlyout(bool automatic);
 static void ShowDesktopSwitchFlyouts(const GUID& desktopId);
 static void RefreshForMonitor(HMONITOR monitor);
