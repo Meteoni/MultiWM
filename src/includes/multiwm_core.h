@@ -766,6 +766,7 @@ class Workspace {
   bool ClearInsertionPlacement(HWND hwnd);
   bool ClearDefaultFloatingCenter(HWND hwnd);
   bool SetDwindleRatio(size_t splitIndex, double ratio);
+  bool HasSameWindowMembershipAs(const Workspace& other) const;
   bool HasSameLayoutStateAs(const Workspace& other) const;
   bool RestoreLayoutStateFrom(const Workspace& source);
   bool RememberFloatingGeometry(
@@ -823,7 +824,6 @@ class Workspace {
   SuspendedSlot MakeAppendedSuspendedSlot() const;
   void AppendTiledWithDefaultWeight(HWND hwnd);
   void ResetSuspendedLayoutHints();
-  bool HasSameWindowMembershipAs(const Workspace& other) const;
   void DebugValidateMutation(const wchar_t* operation) const;
 
   TileLayout layout_ = TileLayout::MasterStack;
