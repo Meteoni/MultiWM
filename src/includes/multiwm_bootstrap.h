@@ -158,6 +158,10 @@ void LoadSettings() {
   if (g_settings.masterPercent < 1 || g_settings.masterPercent > 99) g_settings.masterPercent = 50;
   g_settings.reverseDwindle =
       Wh_GetIntSetting(L"workspace.ReverseDwindle") != 0;
+  const int adaptiveDwindleSlots =
+      Wh_GetIntSetting(L"workspace.AdaptiveDwindleSlots");
+  g_settings.adaptiveDwindleSlots = static_cast<size_t>(
+      std::clamp(adaptiveDwindleSlots, 0, 64));
 
   auto layout = StringSetting::make(L"workspace.DefaultLayout");
   g_settings.defaultLayout = ParseLayoutSetting(layout.get());

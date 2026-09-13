@@ -21,9 +21,9 @@ static bool ValidateUserLayoutMutation(
         kind == UserLayoutMutationKind::Order) {
       Workspace previous;
       if (g_workspaces.Load(key, &previous) &&
-          IsShallowDwindleExchange(previous, candidate) &&
-          FitShallowDwindleDividers(candidate, metrics.workArea, metrics.gap)) {
-        Diagnostics::RecordEvent(L"shallow dwindle exchange accommodated action=%ls", action);
+          IsAdaptiveDwindleExchange(previous, candidate) &&
+          FitAdaptiveDwindleDividers(candidate, metrics.workArea, metrics.gap)) {
+        Diagnostics::RecordEvent(L"adaptive dwindle exchange accommodated action=%ls", action);
         return true;
       }
     }
