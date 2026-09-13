@@ -128,7 +128,7 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
   return constraints;
 }
 
-static bool SameConstraintReport(
+static bool SameConstraintGeometry(
     const WindowConstraints& a, const WindowConstraints& b) {
   return a.minWidth == b.minWidth &&
          a.minHeight == b.minHeight &&
@@ -136,38 +136,12 @@ static bool SameConstraintReport(
          a.valid == b.valid;
 }
 
-static bool SameEnforcedConstraintGeometry(
-    const WindowConstraints& a, const WindowConstraints& b) {
-  const bool aEnforced = a.enforceMinWidth || a.enforceMinHeight;
-  const bool bEnforced = b.enforceMinWidth || b.enforceMinHeight;
-  if ((aEnforced || bEnforced) && a.dpi != b.dpi) return false;
-  if (a.enforceMinWidth != b.enforceMinWidth ||
-      a.enforceMinHeight != b.enforceMinHeight) {
-    return false;
-  }
-  if (a.enforceMinWidth && a.minWidth != b.minWidth) return false;
-  if (a.enforceMinHeight && a.minHeight != b.minHeight) return false;
-  return true;
-}
-
 static WindowConstraints MergeConstraintProbeWithCache(
     const WindowConstraints& cached, WindowConstraints observed) {
-  if (!observed.valid) {
-    if (cached.valid) {
-      const DWORD error = observed.lastProbeError;
-      observed = cached;
-      observed.lastProbeError = error;
-    }
-    return observed;
-  }
-
-  // A proof belongs to the exact reported bound and DPI at which the HWND
-  // demonstrated it. Preserve it only while that native report remains stable.
-  if (cached.valid && cached.dpi == observed.dpi) {
-    observed.enforceMinWidth =
-        cached.enforceMinWidth && cached.minWidth == observed.minWidth;
-    observed.enforceMinHeight =
-        cached.enforceMinHeight && cached.minHeight == observed.minHeight;
+  if (!observed.valid && cached.valid) {
+    const DWORD error = observed.lastProbeError;
+    observed = cached;
+    observed.lastProbeError = error;
   }
   return observed;
 }
@@ -178,46 +152,6 @@ static LONG RectWidth(const RECT& rect) {
 
 static LONG RectHeight(const RECT& rect) {
   return rect.bottom - rect.top;
-}
-
-// A native minimum report becomes solver policy only after the HWND itself
-// corrects a placement that crosses that exact bound. Requiring the observed
-// frame to land near the reported bound avoids mistaking arbitrary app restores,
-// snap grids, or unrelated self-positioning for a hard tracking constraint.
-static bool PromoteEnforcedConstraintEvidence(
-    const PlacementObservation& placement, WindowConstraints* constraints) {
-  if (!constraints || !constraints->valid) return false;
-
-  const LONG requestedWidth = RectWidth(placement.requested);
-  const LONG requestedHeight = RectHeight(placement.requested);
-  const LONG observedWidth = RectWidth(placement.observed);
-  const LONG observedHeight = RectHeight(placement.observed);
-  if (requestedWidth <= 0 || requestedHeight <= 0 ||
-      observedWidth <= 0 || observedHeight <= 0) {
-    return false;
-  }
-
-  constexpr LONG kEvidenceTolerancePx = Model::kPlacementTolerancePx;
-  auto IsNearConstraintBound = [](LONG value, LONG bound) {
-    const long long delta =
-        static_cast<long long>(value) - static_cast<long long>(bound);
-    return std::llabs(delta) <= Model::kPlacementTolerancePx;
-  };
-
-  bool changed = false;
-  if (!constraints->enforceMinWidth &&
-      requestedWidth + kEvidenceTolerancePx < constraints->minWidth &&
-      IsNearConstraintBound(observedWidth, constraints->minWidth)) {
-    constraints->enforceMinWidth = true;
-    changed = true;
-  }
-  if (!constraints->enforceMinHeight &&
-      requestedHeight + kEvidenceTolerancePx < constraints->minHeight &&
-      IsNearConstraintBound(observedHeight, constraints->minHeight)) {
-    constraints->enforceMinHeight = true;
-    changed = true;
-  }
-  return changed;
 }
 
 static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState::Tiled) {

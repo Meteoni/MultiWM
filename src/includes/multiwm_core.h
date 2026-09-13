@@ -640,21 +640,15 @@ enum class PlacementResult {
   Dead,
 };
 
-// Native tracking constraints converted to the DWM extended-frame geometry used
-// by the layout engine. A failed probe is not a hard constraint; callers preserve
-// the last valid observation when one exists.
+// Native minimum tracking constraints converted to the DWM extended-frame
+// geometry used by the layout engine. A successful WM_GETMINMAXINFO report is
+// authoritative solver policy. If a later probe fails, callers retain the last
+// valid report rather than inventing a weaker constraint.
 struct WindowConstraints {
   LONG minWidth = 1;
   LONG minHeight = 1;
   UINT dpi = 96;
   bool valid = false;
-
-  // A WM_GETMINMAXINFO minimum is only a report until the HWND actually corrects
-  // a placement that crosses it. Only proven minimum axes participate in tiling;
-  // maximum tracking sizes intentionally don't constrain full-coverage layouts.
-  bool enforceMinWidth = false;
-  bool enforceMinHeight = false;
-
   DWORD lastProbeError = ERROR_SUCCESS;
 };
 
@@ -679,8 +673,8 @@ struct WindowRecord {
   // Monotonic admission generation provides stable ordering for constraint
   // recovery candidates. Reordering never changes this value.
   uint64_t tilingGeneration = 0;
-  // Retained through constraint-learning replans so lazily proven constraints
-  // can try nearby insertion slots before this admission is floated.
+  // Retained through constraint-refresh replans so a pending admission can try
+  // nearby insertion slots before it is floated.
   bool pendingInsertionPlacement = false;
   // Default-floating admission can precede a usable restored rectangle. Retain
   // the centering request until discovery can place the restored HWND.
@@ -753,7 +747,6 @@ class Workspace {
   }
   bool RememberFocusedWindow(HWND hwnd);
   bool UpdateConstraints(HWND hwnd, const WindowConstraints& constraints);
-  bool ResetEnforcedConstraints();
   bool HasSuspended() const;
   bool AllTiledVisible(const std::vector<HWND>& snapshot) const;
 

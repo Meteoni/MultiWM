@@ -236,16 +236,16 @@ static bool EnsureWorkspaceFromSnapshot(
         IsAutomaticMode() && !adoptCurrentGeometry);
   }
 
-  // Tile Workspace is the explicit escape hatch for stale empirical proof. It
-  // retries the whole visible set from ordinary geometry; any still-real minimum
-  // immediately proves itself again through checked placement.
-  if (adoptCurrentGeometry) workspace.ResetEnforcedConstraints();
+  // Tile Workspace may readopt current geometry, but it never bypasses native
+  // application minimums. Constraint overrides belong at the application layer,
+  // not in the tiling solver.
 
   RestoreSuspendedSnapshot(workspace, snapshot);
   if (adoptCurrentGeometry) ReadoptFloatingSnapshot(workspace, snapshot);
   AdmitUntrackedSnapshot(workspace, snapshot, true, false);
 
   if (adoptCurrentGeometry) {
+    RefreshWorkspaceNativeConstraints(workspace, true, L"Tile Workspace");
     AdoptSnapshotGeometryIfEligible(
         workspace, snapshot, metrics.workArea, metrics.gap, monitor);
   }

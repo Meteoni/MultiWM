@@ -3,13 +3,33 @@
 //=============================================================================
 namespace Commands {
 
-// User-authored geometry changes are rejected before commit when existing
-// evidence already proves them impossible. A short-lived transaction handles a
-// minimum that an application reveals only during the resulting placement.
+// User-authored geometry changes are rejected before commit when cached native
+// constraints already make them impossible. A short-lived transaction handles a
+// minimum that an application changes only during the resulting placement.
 static bool ValidateUserLayoutMutation(
     const DesktopMonitorKey& key, HMONITOR monitor,
     Workspace& candidate, HWND subject, UserLayoutMutationKind kind,
     const wchar_t* action) {
+  // A same-DPI native minimum can change while no placement is occurring.
+  // Refresh the committed workspace first, persist that application-owned state,
+  // then mirror it into the geometry-mutated candidate before deciding whether
+  // the user's operation is feasible.
+  Workspace current;
+  bool committedConstraintsChanged = false;
+  if (g_workspaces.Load(key, &current)) {
+    committedConstraintsChanged =
+        RefreshWorkspaceNativeConstraints(current, true, L"user mutation");
+    if (committedConstraintsChanged) {
+      g_workspaces.Save(key, current);
+    }
+    for (HWND hwnd : candidate.TiledWindows()) {
+      const WindowRecord* currentRecord = current.Find(hwnd);
+      if (currentRecord) {
+        candidate.UpdateConstraints(hwnd, currentRecord->constraints);
+      }
+    }
+  }
+
   WorkspaceMetrics metrics;
   std::vector<RECT> rects;
   LayoutPlanStatus status = LayoutPlanStatus::Unsatisfiable;
@@ -36,6 +56,21 @@ static bool ValidateUserLayoutMutation(
   ReportRejectedLayoutMutation(
       key, monitor, kind, action ? action : L"Layout mutation", subject,
       candidate, rects);
+  // If the rejection exposed a changed native contract, reconcile the committed
+  // layout only when that existing layout is itself no longer feasible. Avoid an
+  // unnecessary reflow merely because the rejected candidate needed fresh data.
+  if (committedConstraintsChanged) {
+    WorkspaceMetrics committedMetrics;
+    std::vector<RECT> committedRects;
+    if (GetWorkspaceMetrics(monitor, &committedMetrics)) {
+      ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+      if (BuildWorkspaceLayoutPlan(
+              current, committedMetrics.workArea, committedMetrics.gap,
+              &committedRects) == LayoutPlanStatus::Unsatisfiable) {
+        ArrangeWorkspace(key);
+      }
+    }
+  }
   return false;
 }
 

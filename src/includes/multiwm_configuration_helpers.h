@@ -312,24 +312,8 @@ bool Workspace::UpdateConstraints(
       old.minHeight != constraints.minHeight ||
       old.dpi != constraints.dpi ||
       old.valid != constraints.valid ||
-      old.enforceMinWidth != constraints.enforceMinWidth ||
-      old.enforceMinHeight != constraints.enforceMinHeight ||
       old.lastProbeError != constraints.lastProbeError;
   record->constraints = constraints;
-  return changed;
-}
-
-bool Workspace::ResetEnforcedConstraints() {
-  AssertWmThread(L"Workspace::ResetEnforcedConstraints");
-  bool changed = false;
-  for (auto& kv : records_) {
-    WindowConstraints& constraints = kv.second.constraints;
-    if (constraints.enforceMinWidth || constraints.enforceMinHeight) {
-      constraints.enforceMinWidth = false;
-      constraints.enforceMinHeight = false;
-      changed = true;
-    }
-  }
   return changed;
 }
 
@@ -418,11 +402,9 @@ bool Workspace::ActivateTiled(HWND hwnd) {
         previousState == ManageState::Ignored) {
       record->tilingGeneration = Model::NextTilingGeneration();
       record->pendingInsertionPlacement = true;
-      // Explicitly re-tiling a floating window is a real retry. Keep the last
-      // report for diagnostics, but require fresh empirical proof before that
-      // report constrains the solver again.
-      record->constraints.enforceMinWidth = false;
-      record->constraints.enforceMinHeight = false;
+      // Explicitly re-tiling a floating window is a new placement attempt, but
+      // the app's last valid native minimum remains authoritative. If it changed
+      // while floating, a corrected placement will trigger a bounded re-probe.
     } else if (!record->tilingGeneration) {
       record->tilingGeneration = Model::NextTilingGeneration();
     }

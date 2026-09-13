@@ -226,7 +226,7 @@ static bool ConstraintDimensionFits(LONG value, LONG minimum) {
 }
 
 // Weighted allocation with the same gap-degradation semantics as the ordinary
-// layout path. Relative weights remain preferences; members pin to their proven
+// layout path. Relative weights remain preferences; members pin to their native
 // minimum only when required to make the full span legal.
 static bool ComputeConstrainedWeightedSizes(
     LONG totalSize, LONG gap, const std::vector<double>& weights,
@@ -342,9 +342,9 @@ static bool ComputeConstrainedWeightedSizes(
 static ConstraintExtent ToConstraintExtent(
     const Model::WindowConstraints& c) {
   const LONG minWidth =
-      c.valid && c.enforceMinWidth ? std::max<LONG>(1, c.minWidth) : 1;
+      c.valid ? std::max<LONG>(1, c.minWidth) : 1;
   const LONG minHeight =
-      c.valid && c.enforceMinHeight ? std::max<LONG>(1, c.minHeight) : 1;
+      c.valid ? std::max<LONG>(1, c.minHeight) : 1;
   return {minWidth, minHeight};
 }
 

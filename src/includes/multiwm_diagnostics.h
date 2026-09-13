@@ -516,14 +516,12 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
       L"      capabilities: move=%d resize=%d topmost=%d",
       record.canMove ? 1 : 0, record.canResize ? 1 : 0, record.topmost ? 1 : 0);
   report.Line(
-      L"      constraints: generation=%llu pendingInsertion=%d pendingFloatCenter=%d valid=%d dpi=%u min=%ldx%ld enforcedMin=(%d,%d) timeout=%d error=%lu",
+      L"      constraints: generation=%llu pendingInsertion=%d pendingFloatCenter=%d valid=%d dpi=%u min=%ldx%ld timeout=%d error=%lu",
       static_cast<unsigned long long>(record.tilingGeneration),
       record.pendingInsertionPlacement ? 1 : 0,
       record.pendingDefaultFloatingCenter ? 1 : 0,
       record.constraints.valid ? 1 : 0, record.constraints.dpi,
       record.constraints.minWidth, record.constraints.minHeight,
-      record.constraints.enforceMinWidth ? 1 : 0,
-      record.constraints.enforceMinHeight ? 1 : 0,
       record.constraints.lastProbeError == ERROR_TIMEOUT ? 1 : 0,
       record.constraints.lastProbeError);
   report.Line(

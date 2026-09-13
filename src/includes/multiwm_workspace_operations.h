@@ -838,28 +838,57 @@ static void ObserveAndRepairWorkspaceForArrangement(Workspace& workspace) {
 // Workspace resize-learning operations
 //-----------------------------------------------------------------------------
 
+// Refreshes the application-owned native minimum contract without introducing a
+// second solver notion of "proof". Normal arrangement probes only records that
+// are missing, stale-DPI, or still resolving an admission/restore. User-authored
+// mutations and explicit Tile Workspace operations can force a refresh so a
+// relaxed same-DPI minimum cannot remain cached indefinitely.
+static bool RefreshWorkspaceNativeConstraints(
+    Workspace& workspace, bool forceAll, const wchar_t* reason) {
+  bool changed = false;
+  for (HWND hwnd : workspace.TiledWindows()) {
+    const WindowRecord* record = workspace.Find(hwnd);
+    if (!record ||
+        GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+        IsWindowCloaked(hwnd)) {
+      continue;
+    }
+
+    const HMONITOR windowMonitor = GetWindowPhysicalMonitor(hwnd);
+    const UINT currentDpi = windowMonitor
+        ? GetMonitorEffectiveDpi(windowMonitor)
+        : 0;
+    const bool needsProbe =
+        forceAll || record->pendingInsertionPlacement ||
+        !record->constraints.valid ||
+        (currentDpi && currentDpi != record->constraints.dpi);
+    if (!needsProbe) continue;
+
+    const WindowConstraints before = record->constraints;
+    const WindowConstraints fresh = ProbeWindowConstraints(hwnd);
+    const WindowConstraints refreshed =
+        MergeConstraintProbeWithCache(before, fresh);
+    const bool geometryChanged =
+        !SameConstraintGeometry(before, refreshed);
+    changed |= workspace.UpdateConstraints(hwnd, refreshed);
+
+    if (fresh.valid && geometryChanged) {
+      Diagnostics::RecordEvent(
+          L"native constraint report refreshed reason=%ls hwnd=%p min=%ldx%ld dpi=%u",
+          reason ? reason : L"arrange", hwnd, refreshed.minWidth,
+          refreshed.minHeight, refreshed.dpi);
+    }
+  }
+  return changed;
+}
+
 static std::vector<WindowConstraints> ActiveWindowConstraints(
     const Workspace& workspace) {
   std::vector<WindowConstraints> constraints;
   constraints.reserve(workspace.ActiveCount());
   for (HWND hwnd : workspace.TiledWindows()) {
     const WindowRecord* record = workspace.Find(hwnd);
-    WindowConstraints constraint =
-        record ? record->constraints : WindowConstraints{};
-
-    // Proven pixel bounds are DPI-specific observations. If a window crossed to
-    // another DPI before a new correction is observed, optimistically ignore the
-    // stale proof; a real bound will immediately prove itself again on placement.
-    if (constraint.valid &&
-        (constraint.enforceMinWidth || constraint.enforceMinHeight)) {
-      const HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
-      const UINT currentDpi = monitor ? GetMonitorEffectiveDpi(monitor) : 0;
-      if (currentDpi && currentDpi != constraint.dpi) {
-        constraint.enforceMinWidth = false;
-        constraint.enforceMinHeight = false;
-      }
-    }
-    constraints.push_back(constraint);
+    constraints.push_back(record ? record->constraints : WindowConstraints{});
   }
   return constraints;
 }
@@ -872,8 +901,9 @@ static bool RectsSatisfyWindowConstraints(
     const LONG width = rects[i].right - rects[i].left;
     const LONG height = rects[i].bottom - rects[i].top;
     const WindowConstraints& c = constraints[i];
-    if ((c.valid && c.enforceMinWidth && width < std::max<LONG>(1, c.minWidth)) ||
-        (c.valid && c.enforceMinHeight && height < std::max<LONG>(1, c.minHeight))) {
+    if (c.valid &&
+        (width < std::max<LONG>(1, c.minWidth) ||
+         height < std::max<LONG>(1, c.minHeight))) {
       return false;
     }
   }
@@ -1165,8 +1195,8 @@ static LayoutPlanStatus BuildWorkspaceLayoutPlan(
   if (!outRects) return LayoutPlanStatus::Unsatisfiable;
   outRects->assign(workspace.ActiveCount(), RECT{});
 
-  // Always begin from MultiWM's ordinary geometry. With no empirically proven
-  // constraints this is byte-for-byte the established layout path.
+  // Always begin from MultiWM's ordinary geometry. When the native constraints
+  // already fit, this stays byte-for-byte on the established layout path.
   switch (workspace.Layout()) {
     case TileLayout::MasterStack:
       Layout::LayoutMasterStackWeighted(
@@ -1321,10 +1351,8 @@ static bool FitAdaptiveDwindleDividers(
   std::vector<SIZE> windowMinimums(windows.size(), SIZE{1, 1});
   for (size_t i = 0; i < constraints.size(); ++i) {
     const auto& constraint = constraints[i];
-    if (constraint.valid && constraint.enforceMinWidth) {
+    if (constraint.valid) {
       windowMinimums[i].cx = std::max<LONG>(1, constraint.minWidth);
-    }
-    if (constraint.valid && constraint.enforceMinHeight) {
       windowMinimums[i].cy = std::max<LONG>(1, constraint.minHeight);
     }
   }
@@ -1461,10 +1489,8 @@ static HWND FindConstraintCulprit(
     if (index >= constraints.size() || index >= rects.size()) return false;
     const WindowConstraints& constraint = constraints[index];
     return constraint.valid &&
-        ((constraint.enforceMinWidth &&
-          RectWidth(rects[index]) < std::max<LONG>(1, constraint.minWidth)) ||
-         (constraint.enforceMinHeight &&
-          RectHeight(rects[index]) < std::max<LONG>(1, constraint.minHeight)));
+        (RectWidth(rects[index]) < std::max<LONG>(1, constraint.minWidth) ||
+         RectHeight(rects[index]) < std::max<LONG>(1, constraint.minHeight));
   };
 
   const size_t preferredIndex = workspace.TiledIndex(preferred);
@@ -1481,10 +1507,8 @@ static HWND FindConstraintCulprit(
 static bool WindowConstraintFitsSlot(
     const WindowConstraints& constraint, const RECT& slot) {
   return !constraint.valid ||
-      ((!constraint.enforceMinWidth ||
-        RectWidth(slot) >= std::max<LONG>(1, constraint.minWidth)) &&
-       (!constraint.enforceMinHeight ||
-        RectHeight(slot) >= std::max<LONG>(1, constraint.minHeight)));
+      (RectWidth(slot) >= std::max<LONG>(1, constraint.minWidth) &&
+       RectHeight(slot) >= std::max<LONG>(1, constraint.minHeight));
 }
 
 struct ConstraintSlotCompatibility {
@@ -1900,7 +1924,7 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
 // Renders one workspace from authoritative model state. Arrangement itself is a
 // small pipeline: repair local invariants -> compute targets -> apply placement ->
 // fold placement outcomes back into the model. Reflow is iterative: a pass may
-// learn a new enforced constraint or select one constraint-removal candidate.
+// refresh a native constraint or select one constraint-removal candidate.
 static void ArrangeWorkspace(
     const DesktopMonitorKey& key, HWND preferredTiledWindow) {
   ++Diagnostics::g_runtime.counters.arrangeCalls;
@@ -1927,8 +1951,8 @@ static void ArrangeWorkspace(
         pendingMutationIt->second.action, key.desktopId.Data1);
     g_pendingLayoutMutations.erase(pendingMutationIt);
   }
-  // Constraint reports are intentionally lazy. Until a window actually corrects
-  // one of our placements, ordinary MultiWM geometry remains authoritative.
+  // Native reports are cached between arrangements. The first pass below probes
+  // missing/stale reports and pending admissions/restores before geometry is solved.
   const size_t maxPasses = workspace.ActiveCount() * 5 + 8;
   bool constraintFailureReported = false;
   for (size_t pass = 0; pass < maxPasses; ++pass) {
@@ -1943,31 +1967,7 @@ static void ArrangeWorkspace(
     }
 
     if (pass == 0) {
-      // Proven native minimums are mutable window state, not permanent HWND
-      // identity. Refresh only the uncommon records that already constrain the
-      // solver. A failed query preserves the last proof; a changed successful
-      // report clears it until the HWND demonstrates the new bound.
-      for (HWND hwnd : workspace.TiledWindows()) {
-        const WindowRecord* record = workspace.Find(hwnd);
-        if (!record || !record->constraints.valid ||
-            (!record->constraints.enforceMinWidth &&
-             !record->constraints.enforceMinHeight) ||
-            GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-            IsWindowCloaked(hwnd)) {
-          continue;
-        }
-
-        const WindowConstraints before = record->constraints;
-        const WindowConstraints fresh = ProbeWindowConstraints(hwnd);
-        WindowConstraints refreshed =
-            MergeConstraintProbeWithCache(before, fresh);
-        if (workspace.UpdateConstraints(hwnd, refreshed) && fresh.valid &&
-            !SameEnforcedConstraintGeometry(before, refreshed)) {
-          Diagnostics::RecordEvent(
-              L"constraint report changed; proof cleared hwnd=%p min=%ldx%ld dpi=%u",
-              hwnd, refreshed.minWidth, refreshed.minHeight, refreshed.dpi);
-        }
-      }
+      RefreshWorkspaceNativeConstraints(workspace, false, L"arrange");
     }
 
     std::vector<RECT> rects;
@@ -1988,7 +1988,7 @@ static void ArrangeWorkspace(
           FitAdaptiveDwindleDividers(workspace, workArea, gap)) {
         mutation->second.candidate = workspace;
         g_workspaces.Save(key, workspace);
-        Diagnostics::RecordEvent(L"adaptive dwindle exchange accommodated newly proven constraints");
+        Diagnostics::RecordEvent(L"adaptive dwindle exchange accommodated native constraints");
         continue;
       }
       if (TryRollbackPendingLayoutMutation(
@@ -1999,9 +1999,9 @@ static void ArrangeWorkspace(
       bool intrinsicallyImpossible = false;
       bool singleRemovalMakesCurrentOrderViable = false;
 
-      // Removing another member cannot help a window whose proven minimum is
-      // larger than the entire usable workspace. Float that window directly;
-      // reserve candidate testing for aggregate constraint conflicts.
+      // Removing another member cannot help a window whose authoritative native
+      // minimum is larger than the entire usable workspace. Float that window
+      // directly; reserve candidate testing for aggregate constraint conflicts.
       const LONG workspaceWidth = RectWidth(workArea);
       const LONG workspaceHeight = RectHeight(workArea);
       const std::vector<WindowConstraints> activeConstraints =
@@ -2012,16 +2012,11 @@ static void ArrangeWorkspace(
            i < activeConstraints.size();
            ++i) {
         const WindowConstraints& constraint = activeConstraints[i];
-        if (!constraint.valid ||
-            (!constraint.enforceMinWidth && !constraint.enforceMinHeight)) {
-          continue;
-        }
+        if (!constraint.valid) continue;
 
         const bool impossible =
-            (constraint.enforceMinWidth &&
-             std::max<LONG>(1, constraint.minWidth) > workspaceWidth) ||
-            (constraint.enforceMinHeight &&
-             std::max<LONG>(1, constraint.minHeight) > workspaceHeight);
+            std::max<LONG>(1, constraint.minWidth) > workspaceWidth ||
+            std::max<LONG>(1, constraint.minHeight) > workspaceHeight;
         if (!impossible) continue;
 
         const HWND candidate = workspace.TiledWindows()[i];
@@ -2399,7 +2394,7 @@ static void ArrangeWorkspace(
       const WindowConstraints constraints = victimRecord->constraints;
       if (intrinsicallyImpossible) {
         Wh_Log(
-          L"Proven minimum exceeds workspace; floating HWND %p (generation=%llu)",
+          L"Native minimum exceeds workspace; floating HWND %p (generation=%llu)",
           static_cast<void*>(victim),
           static_cast<unsigned long long>(generation));
       } else if (singleRemovalMakesCurrentOrderViable) {
@@ -2414,13 +2409,11 @@ static void ArrangeWorkspace(
             static_cast<unsigned long long>(generation));
       }
       Diagnostics::RecordEvent(
-          L"proven constraints floated hwnd=%p generation=%llu intrinsic=%d singleRemovalCurrentOrder=%d preferred=%d enforcedMin=%d%d reportedMin=%ldx%ld",
+          L"native constraints floated hwnd=%p generation=%llu intrinsic=%d singleRemovalCurrentOrder=%d preferred=%d min=%ldx%ld",
           victim, static_cast<unsigned long long>(generation),
           intrinsicallyImpossible ? 1 : 0,
           singleRemovalMakesCurrentOrderViable ? 1 : 0,
           victim == preferredTiledWindow ? 1 : 0,
-          constraints.enforceMinWidth ? 1 : 0,
-          constraints.enforceMinHeight ? 1 : 0,
           constraints.minWidth, constraints.minHeight);
 
       for (size_t i = 0;
@@ -2428,28 +2421,17 @@ static void ArrangeWorkspace(
            i < workspace.TiledWindows().size();
            ++i) {
         const WindowConstraints& memberConstraint = activeConstraints[i];
-        if (!memberConstraint.valid ||
-            (!memberConstraint.enforceMinWidth &&
-             !memberConstraint.enforceMinHeight)) {
-          continue;
-        }
+        if (!memberConstraint.valid) continue;
         size_t compatibleSlotCount = 0;
         for (const RECT& slot : rects) {
-          if ((!memberConstraint.enforceMinWidth ||
-               RectWidth(slot) >=
-                   std::max<LONG>(1, memberConstraint.minWidth)) &&
-              (!memberConstraint.enforceMinHeight ||
-               RectHeight(slot) >=
-                   std::max<LONG>(1, memberConstraint.minHeight))) {
+          if (WindowConstraintFitsSlot(memberConstraint, slot)) {
             ++compatibleSlotCount;
           }
         }
         Diagnostics::RecordEvent(
-            L"constraint conflict member hwnd=%p slot=%zu min=%ldx%ld enforcedMin=%d%d compatibleSlots=%zu",
+            L"constraint conflict member hwnd=%p slot=%zu min=%ldx%ld compatibleSlots=%zu",
             workspace.TiledWindows()[i], i,
             memberConstraint.minWidth, memberConstraint.minHeight,
-            memberConstraint.enforceMinWidth ? 1 : 0,
-            memberConstraint.enforceMinHeight ? 1 : 0,
             compatibleSlotCount);
       }
 
@@ -2491,61 +2473,27 @@ static void ArrangeWorkspace(
               PlaceWindowChecked(hwnd, record->canMove, rects[i]);
           action = workspace.ApplyPlacementObservation(hwnd, observation);
 
-          // Treat WM_GETMINMAXINFO as evidence, not authority. Query only after
-          // the HWND has actually corrected our target; promote individual axes
-          // when the observed frame lands on the reported bound.
+          // A native minimum report is authoritative as soon as it is available.
+          // If an application still corrects a legal target, re-probe in case its
+          // own WM_GETMINMAXINFO contract changed dynamically. If the report is
+          // unchanged, leave the event to conformance handling rather than
+          // inventing a second empirical minimum-size policy.
           if (observation.result == PlacementResult::AdjustedByWindow) {
             const WindowConstraints before = record->constraints;
             const WindowConstraints fresh = ProbeWindowConstraints(hwnd);
-            WindowConstraints observed = MergeConstraintProbeWithCache(
-                before, fresh);
-            const bool reportChanged = !SameConstraintReport(before, observed);
-            if (fresh.valid && IsWindow(hwnd) &&
-                GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
-                !IsWindowCloaked(hwnd)) {
-              PromoteEnforcedConstraintEvidence(observation, &observed);
-            }
-            const bool enforcedChanged =
-                !SameEnforcedConstraintGeometry(before, observed);
+            const WindowConstraints observed =
+                MergeConstraintProbeWithCache(before, fresh);
+            const bool geometryChanged =
+                !SameConstraintGeometry(before, observed);
             workspace.UpdateConstraints(hwnd, observed);
 
-            if (enforcedChanged) {
+            if (fresh.valid && geometryChanged) {
               action = Workspace::PlacementAction::None;
               constraintReplanRequested = true;
               CancelConformanceLease(hwnd);
               Diagnostics::RecordEvent(
-                  L"placement updated constraints hwnd=%p min=%ldx%ld enforcedMin=%d%d",
-                  hwnd, observed.minWidth, observed.minHeight,
-                  observed.enforceMinWidth ? 1 : 0,
-                  observed.enforceMinHeight ? 1 : 0);
-            } else if (reportChanged) {
-              Diagnostics::RecordEvent(
-                  L"placement updated unproven constraint report hwnd=%p min=%ldx%ld",
-                  hwnd, observed.minWidth, observed.minHeight);
-            }
-          } else if (observation.result == PlacementResult::Success) {
-            // Empirical evidence works both ways. If a previously proven minimum
-            // is crossed successfully (for example after a framework/state change),
-            // stop constraining future plans on that stale proof.
-            WindowConstraints relaxed = record->constraints;
-            const LONG width = RectWidth(observation.requested);
-            const LONG height = RectHeight(observation.requested);
-            bool relaxedAny = false;
-            if (relaxed.enforceMinWidth &&
-                width + Model::kPlacementTolerancePx < relaxed.minWidth) {
-              relaxed.enforceMinWidth = false;
-              relaxedAny = true;
-            }
-            if (relaxed.enforceMinHeight &&
-                height + Model::kPlacementTolerancePx < relaxed.minHeight) {
-              relaxed.enforceMinHeight = false;
-              relaxedAny = true;
-            }
-            if (relaxedAny) {
-              workspace.UpdateConstraints(hwnd, relaxed);
-              Diagnostics::RecordEvent(
-                  L"successful placement cleared stale constraint proof hwnd=%p",
-                  hwnd);
+                  L"placement refreshed native constraints hwnd=%p min=%ldx%ld dpi=%u",
+                  hwnd, observed.minWidth, observed.minHeight, observed.dpi);
             }
           }
 
@@ -2793,15 +2741,12 @@ static void FinalizeExpiredConformanceLease(
     return;
   }
 
-  // The deadline is the last chance to distinguish a genuine native constraint
-  // from generic nonconformance. This also covers a missed LOCATIONCHANGE event.
-  PlacementObservation evidence;
-  evidence.result = PlacementResult::AdjustedByWindow;
-  evidence.requested = authoritative;
-  evidence.observed = current;
+  // The deadline is the last chance to catch a dynamic native minimum report
+  // that changed after planning. If the app's own report is unchanged, remaining
+  // nonconformance is not reinterpreted as a second empirical minimum policy.
   const WindowConstraints beforeConstraints = record->constraints;
   const WindowConstraints freshConstraints = ProbeWindowConstraints(hwnd);
-  WindowConstraints observed = MergeConstraintProbeWithCache(
+  const WindowConstraints observed = MergeConstraintProbeWithCache(
       beforeConstraints, freshConstraints);
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, *record) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
@@ -2809,16 +2754,13 @@ static void FinalizeExpiredConformanceLease(
     stale();
     return;
   }
-  if (freshConstraints.valid) {
-    PromoteEnforcedConstraintEvidence(evidence, &observed);
-  }
-  if (!SameEnforcedConstraintGeometry(beforeConstraints, observed)) {
-    workspace.UpdateConstraints(hwnd, observed);
+  const bool geometryChanged =
+      !SameConstraintGeometry(beforeConstraints, observed);
+  workspace.UpdateConstraints(hwnd, observed);
+  if (freshConstraints.valid && geometryChanged) {
     Diagnostics::RecordEvent(
-        L"conformance deadline updated constraints hwnd=%p min=%ldx%ld enforcedMin=%d%d",
-        hwnd, observed.minWidth, observed.minHeight,
-        observed.enforceMinWidth ? 1 : 0,
-        observed.enforceMinHeight ? 1 : 0);
+        L"conformance deadline refreshed native constraints hwnd=%p min=%ldx%ld dpi=%u",
+        hwnd, observed.minWidth, observed.minHeight, observed.dpi);
     g_workspaces.Save(owners.front(), workspace);
     ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
     return;
@@ -2945,16 +2887,12 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
     return false;
   }
 
-  // The incoming LOCATIONCHANGE describes where the application settled after
-  // our previous placement. Preserve that passive evidence before another
-  // SetWindowPos can temporarily move the HWND back onto its requested tile.
-  PlacementObservation settledEvidence;
-  settledEvidence.result = PlacementResult::AdjustedByWindow;
-  settledEvidence.requested = authoritative;
-  settledEvidence.observed = current;
+  // The incoming LOCATIONCHANGE says the application did not remain on its
+  // authoritative tile. Re-probe its own native minimum contract before another
+  // SetWindowPos, in case that contract changed dynamically.
   const WindowConstraints beforeConstraints = record->constraints;
   const WindowConstraints freshConstraints = ProbeWindowConstraints(hwnd);
-  WindowConstraints observedConstraints = MergeConstraintProbeWithCache(
+  const WindowConstraints observedConstraints = MergeConstraintProbeWithCache(
       beforeConstraints, freshConstraints);
   // WM_GETMINMAXINFO executes target window code. Revalidate physical state
   // after that bounded call before either learning policy or reinforcing a tile.
@@ -2964,18 +2902,15 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
-  if (freshConstraints.valid) {
-    PromoteEnforcedConstraintEvidence(settledEvidence, &observedConstraints);
-  }
-  if (!SameEnforcedConstraintGeometry(
-          beforeConstraints, observedConstraints)) {
-    workspace.UpdateConstraints(hwnd, observedConstraints);
+  const bool locationConstraintChanged =
+      !SameConstraintGeometry(beforeConstraints, observedConstraints);
+  workspace.UpdateConstraints(hwnd, observedConstraints);
+  if (freshConstraints.valid && locationConstraintChanged) {
     CancelConformanceLease(hwnd, lease.generation);
     Diagnostics::RecordEvent(
-        L"conformance location updated constraints hwnd=%p min=%ldx%ld enforcedMin=%d%d",
+        L"conformance location refreshed native constraints hwnd=%p min=%ldx%ld dpi=%u",
         hwnd, observedConstraints.minWidth, observedConstraints.minHeight,
-        observedConstraints.enforceMinWidth ? 1 : 0,
-        observedConstraints.enforceMinHeight ? 1 : 0);
+        observedConstraints.dpi);
     g_workspaces.Save(owners.front(), workspace);
     ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
     return true;
@@ -2994,29 +2929,6 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   Workspace::PlacementAction action =
       workspace.ApplyPlacementObservation(hwnd, observation);
 
-  if (observation.result == PlacementResult::AdjustedByWindow) {
-    const WindowRecord* updatedRecord = workspace.Find(hwnd);
-    if (updatedRecord) {
-      if (freshConstraints.valid) {
-        PromoteEnforcedConstraintEvidence(observation, &observedConstraints);
-      }
-      const bool enforcedChanged =
-          !SameEnforcedConstraintGeometry(
-              updatedRecord->constraints, observedConstraints);
-      workspace.UpdateConstraints(hwnd, observedConstraints);
-      if (enforcedChanged) {
-        CancelConformanceLease(hwnd, lease.generation);
-        Diagnostics::RecordEvent(
-            L"conformance repair updated constraints hwnd=%p min=%ldx%ld enforcedMin=%d%d",
-            hwnd, observedConstraints.minWidth, observedConstraints.minHeight,
-            observedConstraints.enforceMinWidth ? 1 : 0,
-            observedConstraints.enforceMinHeight ? 1 : 0);
-        g_workspaces.Save(owners.front(), workspace);
-        ArrangeWorkspace(owners.front(), lease.preferredTiledWindow);
-        return true;
-      }
-    }
-  }
 
   ++Diagnostics::g_runtime.counters.conformanceLeaseRepairs;
   Diagnostics::RecordEvent(
