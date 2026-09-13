@@ -2061,8 +2061,9 @@ static void ArrangeWorkspace(
             });
 
         // A fresh admission's configured position is a preference, not a reason
-        // to discard it. Once placement has proven a conflict, try compatible
-        // slot assignments without changing layout geometry.
+        // to discard it. Once placement has proven a conflict, preserve it when
+        // adaptive Dwindle ratios can make it viable, then try nearby slots before
+        // allowing broader sibling reassignment.
         const TileLayout layout = workspace.Layout();
         const bool searchAlternateInsertion =
             layout == TileLayout::MasterStack ||
@@ -2075,16 +2076,119 @@ static void ArrangeWorkspace(
         HWND repositionedAdmission = nullptr;
         size_t previousInsertionIndex = 0;
         size_t viableInsertionIndex = 0;
-        bool adjustedDwindleRatio = false;
-        size_t adjustedDwindleSplit = 0;
-        double adjustedDwindleValue = 0.5;
         bool matchedDwindleConstraints = false;
         size_t reassignedDwindleWindows = 0;
+        struct DwindleRatioAdjustment {
+          size_t splitIndex;
+          double before;
+          double after;
+        };
+        std::vector<DwindleRatioAdjustment> adjustedDwindleRatios;
 
-        if (searchAlternateInsertion) {
-          // Exhaust direct insertions before allowing other windows to move.
-          for (bool allowMatching : {false, true}) {
+        auto rememberDwindleRatioAdjustments = [&](const std::vector<double>& before,
+                                                   const Workspace& after) {
+          adjustedDwindleRatios.clear();
+          const auto& afterRatios = after.DwindleRatios();
+          const size_t count = std::min(before.size(), afterRatios.size());
+          for (size_t splitIndex = 0; splitIndex < count; ++splitIndex) {
+            if (std::abs(before[splitIndex] - afterRatios[splitIndex]) <= 1e-9) {
+              continue;
+            }
+            adjustedDwindleRatios.push_back(
+                {splitIndex, before[splitIndex], afterRatios[splitIndex]});
+          }
+        };
+
+        auto preservePreferredWindow = [&](const Workspace& trial) {
+          return preferredTiledIndex >= workspace.ActiveCount() ||
+              trial.TiledIndex(preferredTiledWindow) == preferredTiledIndex;
+        };
+
+        auto acceptInsertion = [&](Workspace&& trial, HWND hwnd,
+                                   size_t currentIndex, size_t targetIndex,
+                                   size_t movedWindowCount) {
+          viableInsertion = std::move(trial);
+          repositionedAdmission = hwnd;
+          previousInsertionIndex = currentIndex;
+          viableInsertionIndex = targetIndex;
+          matchedDwindleConstraints = movedWindowCount > 0;
+          reassignedDwindleWindows = movedWindowCount;
+        };
+
+        if (searchAlternateInsertion && layout == TileLayout::Dwindle) {
+          // Adaptive Dwindle Slots controls which leading split ratios may move,
+          // not where the pending window may be placed. Preserve its saved/current
+          // slot first; then walk every nearby slot before reassigning siblings.
+          for (const ConstraintCandidate& candidate : candidates) {
+            const WindowRecord* candidateRecord = workspace.Find(candidate.hwnd);
+            if (!candidateRecord ||
+                !candidateRecord->pendingInsertionPlacement ||
+                candidate.hwnd == preferredTiledWindow) {
+              continue;
+            }
+
+            const size_t currentIndex = workspace.TiledIndex(candidate.hwnd);
+            if (currentIndex >= workspace.ActiveCount()) continue;
+
+            auto tryAdaptiveIndex = [&](size_t targetIndex,
+                                        bool tryFixedGeometryFirst) {
+              Workspace trial = workspace;
+              if (targetIndex != currentIndex &&
+                  !trial.MovePendingAdmissionToIndex(
+                      candidate.hwnd, targetIndex)) {
+                return false;
+              }
+              if (!preservePreferredWindow(trial)) return false;
+
+              if (tryFixedGeometryFirst) {
+                std::vector<RECT> trialRects;
+                ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+                if (BuildWorkspaceLayoutPlan(
+                        trial, workArea, gap, &trialRects) ==
+                    LayoutPlanStatus::Success) {
+                  adjustedDwindleRatios.clear();
+                  acceptInsertion(
+                      std::move(trial), candidate.hwnd, currentIndex,
+                      targetIndex, 0);
+                  return true;
+                }
+              }
+
+              if (g_settings.adaptiveDwindleSlots == 0) return false;
+              const std::vector<double> beforeRatios = trial.DwindleRatios();
+              if (!FitAdaptiveDwindleDividers(trial, workArea, gap)) {
+                return false;
+              }
+              rememberDwindleRatioAdjustments(beforeRatios, trial);
+              acceptInsertion(
+                  std::move(trial), candidate.hwnd, currentIndex,
+                  targetIndex, 0);
+              return true;
+            };
+
+            // The current assignment is already known to fail at fixed geometry,
+            // so test whether changing only eligible ratios can preserve it.
+            if (tryAdaptiveIndex(currentIndex, false)) break;
+
+            for (size_t distance = 1;
+                 distance < workspace.ActiveCount() && !repositionedAdmission;
+                 ++distance) {
+              if (currentIndex + distance < workspace.ActiveCount() &&
+                  tryAdaptiveIndex(currentIndex + distance, true)) {
+                break;
+              }
+              if (currentIndex >= distance &&
+                  tryAdaptiveIndex(currentIndex - distance, true)) {
+                break;
+              }
+            }
             if (repositionedAdmission) break;
+          }
+
+          // Only after preserving/moving the pending member fails do we allow
+          // matching to move established siblings. Nearby target slots are tried
+          // before matching around the current slot to minimize disruption.
+          if (!repositionedAdmission) {
             for (const ConstraintCandidate& candidate : candidates) {
               const WindowRecord* candidateRecord = workspace.Find(candidate.hwnd);
               if (!candidateRecord ||
@@ -2096,18 +2200,14 @@ static void ArrangeWorkspace(
               const size_t currentIndex = workspace.TiledIndex(candidate.hwnd);
               if (currentIndex >= workspace.ActiveCount()) continue;
 
-              auto tryInsertionIndex = [&](size_t targetIndex) {
+              auto tryMatchedIndex = [&](size_t targetIndex) {
                 Workspace trial = workspace;
                 if (targetIndex != currentIndex &&
                     !trial.MovePendingAdmissionToIndex(
                         candidate.hwnd, targetIndex)) {
                   return false;
                 }
-                if (preferredTiledIndex < workspace.ActiveCount() &&
-                    trial.TiledIndex(preferredTiledWindow) !=
-                        preferredTiledIndex) {
-                  return false;
-                }
+                if (!preservePreferredWindow(trial)) return false;
 
                 std::vector<RECT> trialRects;
                 ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
@@ -2115,8 +2215,7 @@ static void ArrangeWorkspace(
                     trial, workArea, gap, &trialRects);
                 size_t movedWindowCount = 0;
                 if (trialStatus != LayoutPlanStatus::Success) {
-                  if (!allowMatching || layout != TileLayout::Dwindle ||
-                      !ReassignPendingDwindleAdmissionForConstraints(
+                  if (!ReassignPendingDwindleAdmissionForConstraints(
                           trial, trialRects, candidate.hwnd,
                           preferredTiledWindow, &movedWindowCount)) {
                     return false;
@@ -2124,51 +2223,48 @@ static void ArrangeWorkspace(
                   ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
                   trialStatus = BuildWorkspaceLayoutPlan(
                       trial, workArea, gap, &trialRects);
-                  if (trialStatus != LayoutPlanStatus::Success) return false;
+                  if (trialStatus != LayoutPlanStatus::Success) {
+                    if (g_settings.adaptiveDwindleSlots == 0) return false;
+                    const std::vector<double> beforeRatios =
+                        trial.DwindleRatios();
+                    if (!FitAdaptiveDwindleDividers(
+                            trial, workArea, gap)) {
+                      return false;
+                    }
+                    rememberDwindleRatioAdjustments(beforeRatios, trial);
+                  } else {
+                    adjustedDwindleRatios.clear();
+                  }
+                } else {
+                  adjustedDwindleRatios.clear();
                 }
 
-                viableInsertion = std::move(trial);
-                repositionedAdmission = candidate.hwnd;
-                previousInsertionIndex = currentIndex;
-                viableInsertionIndex = targetIndex;
-                matchedDwindleConstraints = movedWindowCount > 0;
-                reassignedDwindleWindows = movedWindowCount;
+                acceptInsertion(
+                    std::move(trial), candidate.hwnd, currentIndex,
+                    targetIndex, movedWindowCount);
                 return true;
               };
 
-              // On the direct pass, preserve the seeded/saved slot first. Once
-              // broader matching is required, do the opposite: move the incoming
-              // member through nearby insertion positions before allowing matching
-              // to reshuffle siblings around its existing position.
-              if (!allowMatching && layout == TileLayout::Dwindle &&
-                  tryInsertionIndex(currentIndex)) {
-                break;
-              }
               for (size_t distance = 1;
                    distance < workspace.ActiveCount() && !repositionedAdmission;
                    ++distance) {
                 if (currentIndex + distance < workspace.ActiveCount() &&
-                    tryInsertionIndex(currentIndex + distance)) {
+                    tryMatchedIndex(currentIndex + distance)) {
                   break;
                 }
                 if (currentIndex >= distance &&
-                    tryInsertionIndex(currentIndex - distance)) {
+                    tryMatchedIndex(currentIndex - distance)) {
                   break;
                 }
               }
-              if (!repositionedAdmission && allowMatching &&
-                  layout == TileLayout::Dwindle &&
-                  tryInsertionIndex(currentIndex)) {
+              if (!repositionedAdmission && tryMatchedIndex(currentIndex)) {
                 break;
               }
               if (repositionedAdmission) break;
             }
           }
-        }
-
-        // After fixed geometry is exhausted, try the configured adaptive Dwindle
-        // prefix. Window order stays fixed while only those leading ratios may move.
-        if (!repositionedAdmission && layout == TileLayout::Dwindle) {
+        } else if (searchAlternateInsertion) {
+          // Other layouts have no automatic divider adaptation or matching.
           for (const ConstraintCandidate& candidate : candidates) {
             const WindowRecord* candidateRecord = workspace.Find(candidate.hwnd);
             if (!candidateRecord ||
@@ -2179,37 +2275,39 @@ static void ArrangeWorkspace(
 
             const size_t currentIndex = workspace.TiledIndex(candidate.hwnd);
             if (currentIndex >= workspace.ActiveCount()) continue;
-            const size_t adaptiveSlotCount = std::min(
-                g_settings.adaptiveDwindleSlots, workspace.ActiveCount());
-            for (size_t targetIndex = 0;
-                 targetIndex < adaptiveSlotCount; ++targetIndex) {
+
+            auto tryInsertionIndex = [&](size_t targetIndex) {
               Workspace trial = workspace;
-              if (targetIndex != currentIndex &&
-                  !trial.MovePendingAdmissionToIndex(
-                      candidate.hwnd, targetIndex)) {
-                continue;
+              if (!trial.MovePendingAdmissionToIndex(
+                      candidate.hwnd, targetIndex) ||
+                  !preservePreferredWindow(trial)) {
+                return false;
               }
-              if (preferredTiledIndex < workspace.ActiveCount() &&
-                  trial.TiledIndex(preferredTiledWindow) !=
-                      preferredTiledIndex) {
-                continue;
+              std::vector<RECT> trialRects;
+              ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+              if (BuildWorkspaceLayoutPlan(
+                      trial, workArea, gap, &trialRects) !=
+                  LayoutPlanStatus::Success) {
+                return false;
               }
+              adjustedDwindleRatios.clear();
+              acceptInsertion(
+                  std::move(trial), candidate.hwnd, currentIndex,
+                  targetIndex, 0);
+              return true;
+            };
 
-              if (!FitAdaptiveDwindleDividers(trial, workArea, gap)) {
-                continue;
+            for (size_t distance = 1;
+                 distance < workspace.ActiveCount() && !repositionedAdmission;
+                 ++distance) {
+              if (currentIndex + distance < workspace.ActiveCount() &&
+                  tryInsertionIndex(currentIndex + distance)) {
+                break;
               }
-              const size_t splitIndex =
-                  std::min(targetIndex, trial.DwindleRatios().size() - 1);
-              const double ratio = trial.DwindleRatios()[splitIndex];
-
-              viableInsertion = std::move(trial);
-              repositionedAdmission = candidate.hwnd;
-              previousInsertionIndex = currentIndex;
-              viableInsertionIndex = targetIndex;
-              adjustedDwindleRatio = true;
-              adjustedDwindleSplit = splitIndex;
-              adjustedDwindleValue = ratio;
-              break;
+              if (currentIndex >= distance &&
+                  tryInsertionIndex(currentIndex - distance)) {
+                break;
+              }
             }
             if (repositionedAdmission) break;
           }
@@ -2227,18 +2325,29 @@ static void ArrangeWorkspace(
                 repositionedAdmission, viableInsertionIndex,
                 reassignedDwindleWindows);
           }
-          if (adjustedDwindleRatio) {
+          if (!adjustedDwindleRatios.empty()) {
             Wh_Log(
-                L"Dwindle admission accommodated HWND %p slot=%zu split=%zu ratio=%.6f",
+                L"Dwindle admission adapted %zu split ratio(s) for HWND %p at slot %zu",
+                adjustedDwindleRatios.size(),
                 static_cast<void*>(repositionedAdmission),
-                viableInsertionIndex, adjustedDwindleSplit,
-                adjustedDwindleValue);
+                viableInsertionIndex);
             Diagnostics::RecordEvent(
-                L"dwindle admission accommodated hwnd=%p from=%zu to=%zu split=%zu ratio=%.6f",
-                repositionedAdmission, previousInsertionIndex,
-                viableInsertionIndex, adjustedDwindleSplit,
-                adjustedDwindleValue);
-          } else {
+                L"dwindle admission adapted ratios hwnd=%p slot=%zu changes=%zu",
+                repositionedAdmission, viableInsertionIndex,
+                adjustedDwindleRatios.size());
+            for (const DwindleRatioAdjustment& adjustment :
+                 adjustedDwindleRatios) {
+              Wh_Log(
+                  L"Dwindle adaptive split %zu changed %.6f -> %.6f for HWND %p",
+                  adjustment.splitIndex, adjustment.before, adjustment.after,
+                  static_cast<void*>(repositionedAdmission));
+              Diagnostics::RecordEvent(
+                  L"dwindle adaptive ratio changed hwnd=%p split=%zu from=%.6f to=%.6f",
+                  repositionedAdmission, adjustment.splitIndex,
+                  adjustment.before, adjustment.after);
+            }
+          }
+          if (previousInsertionIndex != viableInsertionIndex) {
             Wh_Log(
                 L"Constraint-aware admission repositioned HWND %p from slot %zu to %zu",
                 static_cast<void*>(repositionedAdmission),
