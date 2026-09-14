@@ -38,18 +38,35 @@ static bool ValidateUserLayoutMutation(
     status = BuildWorkspaceLayoutPlan(
         candidate, metrics.workArea, metrics.gap, &rects);
     if (status == LayoutPlanStatus::Unsatisfiable &&
-        kind == UserLayoutMutationKind::Order &&
-        candidate.Layout() == TileLayout::Dwindle &&
-        FitAdaptiveDwindleDividers(candidate, metrics.workArea, metrics.gap)) {
-      // Order mutations may reshape only the configured adaptive Dwindle
-      // dividers. FitAdaptiveDwindleDividers never changes membership or window
-      // order, so the requested swap/promotion/demotion remains exact. If even
-      // that geometry is infeasible, reject the command below instead of
-      // invoking admission matching or floating an unrelated window.
-      Diagnostics::RecordEvent(
-          L"adaptive dwindle order preflight accommodated action=%ls",
-          action ? action : L"Order mutation");
-      return true;
+        candidate.Layout() == TileLayout::Dwindle) {
+      if ((kind == UserLayoutMutationKind::Order ||
+           kind == UserLayoutMutationKind::LayoutChange) &&
+          FitAdaptiveDwindleDividers(
+              candidate, metrics.workArea, metrics.gap)) {
+        // Preserve the requested/current order whenever adaptive geometry alone
+        // can make it feasible. Explicit order mutations stop here: they are
+        // never allowed to reshuffle unrelated windows.
+        Diagnostics::RecordEvent(
+            kind == UserLayoutMutationKind::Order
+                ? L"adaptive dwindle order preflight accommodated action=%ls"
+                : L"adaptive dwindle layout conversion preserved order action=%ls",
+            action ? action : L"Layout mutation");
+        return true;
+      }
+
+      if (kind == UserLayoutMutationKind::LayoutChange) {
+        Workspace reassigned = candidate;
+        size_t movedWindowCount = 0;
+        if (ReassignDwindleLayoutConversionForConstraints(
+                reassigned, metrics.workArea, metrics.gap,
+                &movedWindowCount)) {
+          candidate = std::move(reassigned);
+          Diagnostics::RecordEvent(
+              L"dwindle layout conversion reassigned windows action=%ls moved=%zu",
+              action ? action : L"Change layout", movedWindowCount);
+          return true;
+        }
+      }
     }
   }
   if (status == LayoutPlanStatus::Success ||

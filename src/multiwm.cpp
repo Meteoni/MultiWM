@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.46
+// @version         1.13.47
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -43,6 +43,8 @@ continuous polling.
   side-by-side. Resizing changes split ratios without rotating dividers.
   Constraint recovery can automatically reshape a configurable number of leading
   slots; set Adaptive Dwindle Slots to 0 to keep automatic recovery on fixed ratios.
+  Layout conversion preserves the current order when possible, then reassigns
+  windows to compatible Dwindle slots only when that is required to make it fit.
 - Columns / Rows
 - Monocle
 
