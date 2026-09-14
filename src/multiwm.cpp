@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.50
+// @version         1.13.51
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -119,7 +119,10 @@ A small tray indicator shows the active workspace layout and provides quick acce
     $description: Reverse the recursive growth direction from bottom-right to top-left.
   - AdaptiveDwindleSlots: 2
     $name: Adaptive Dwindle Slots
-    $description: 'Number of leading Dwindle slots whose split ratios may be adjusted automatically to satisfy native window minimum sizes during admission and eligible exchanges. Set to 0 for fixed-ratio Dwindle behavior. Manual divider resizing is unaffected. (0-64)'
+    $description: 'Number of leading Dwindle slots whose split ratios may be adjusted automatically to satisfy native window minimum sizes. Set to 0 for fixed-ratio Dwindle behavior. Manual divider resizing is unaffected. (0-64)'
+  - AdaptiveDwindlePercentage: 40
+    $name: Adaptive Dwindle Percentage
+    $description: 'Maximum automatic deviation from a 50/50 Dwindle split. 20 permits automatic ratios from 30% to 70%; 40 preserves the current 10%-90% range. Set to 0 to disable automatic ratio adjustment. Existing manual ratios are preserved when already feasible. (0-40)'
   $name: Workspace
 
 - appearance:

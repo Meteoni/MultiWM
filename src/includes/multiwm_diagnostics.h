@@ -1130,6 +1130,11 @@ static void WriteDiagnosticReport() {
   report.Line(L"Master percent: %ld", g_settings.masterPercent);
   report.Line(
       L"Adaptive Dwindle slots: %zu", g_settings.adaptiveDwindleSlots);
+  report.Line(
+      L"Adaptive Dwindle percentage: %ld (automatic envelope %.0f%%-%.0f%%)",
+      g_settings.adaptiveDwindlePercentage,
+      GetAdaptiveDwindleRatioEnvelope().minimum * 100.0,
+      GetAdaptiveDwindleRatioEnvelope().maximum * 100.0);
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
   report.Line(
       L"Automatic insertion position: %ls",

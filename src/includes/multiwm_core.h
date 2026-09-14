@@ -259,6 +259,7 @@ struct SettingsState {
   LONG masterPercent = 50;
   bool reverseDwindle = false;
   size_t adaptiveDwindleSlots = 2;
+  LONG adaptiveDwindlePercentage = 40;
 
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
   AutomaticNewWindowPosition automaticNewWindowPosition =

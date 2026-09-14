@@ -162,6 +162,10 @@ void LoadSettings() {
       Wh_GetIntSetting(L"workspace.AdaptiveDwindleSlots");
   g_settings.adaptiveDwindleSlots = static_cast<size_t>(
       std::clamp(adaptiveDwindleSlots, 0, 64));
+  const int adaptiveDwindlePercentage =
+      Wh_GetIntSetting(L"workspace.AdaptiveDwindlePercentage");
+  g_settings.adaptiveDwindlePercentage =
+      std::clamp(adaptiveDwindlePercentage, 0, 40);
 
   auto layout = StringSetting::make(L"workspace.DefaultLayout");
   g_settings.defaultLayout = ParseLayoutSetting(layout.get());
