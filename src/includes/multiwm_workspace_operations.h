@@ -568,6 +568,53 @@ void Workspace::MergeNonTiledRecordsFrom(const Workspace& source) {
   DebugValidateMutation(L"Workspace::MergeNonTiledRecordsFrom");
 }
 
+void Workspace::RememberCurrentLayoutGeometry() {
+  AssertWmThread(L"Workspace::RememberCurrentLayoutGeometry");
+
+  if (layout_ == TileLayout::MasterStack ||
+      layout_ == TileLayout::MasterStackH) {
+    rememberedMasterStackOrder_ = windows_;
+    rememberedMasterStackWeights_ = stackWeights_;
+  } else if (layout_ == TileLayout::Columns ||
+             layout_ == TileLayout::Rows) {
+    rememberedGridOrder_ = windows_;
+    rememberedGridWeights_ = gridWeights_;
+  } else if (layout_ == TileLayout::Dwindle) {
+    rememberedDwindleOrder_ = windows_;
+    rememberedDwindleRatios_ = dwindleRatios_;
+  }
+}
+
+void Workspace::RestoreRememberedLayoutGeometry() {
+  AssertWmThread(L"Workspace::RestoreRememberedLayoutGeometry");
+
+  if (layout_ == TileLayout::MasterStack ||
+      layout_ == TileLayout::MasterStackH) {
+    const size_t expected = windows_.empty() ? 0 : windows_.size() - 1;
+    if (rememberedMasterStackOrder_ == windows_ &&
+        rememberedMasterStackWeights_.size() == expected) {
+      stackWeights_ = rememberedMasterStackWeights_;
+    } else {
+      stackWeights_.clear();
+    }
+  } else if (layout_ == TileLayout::Columns ||
+             layout_ == TileLayout::Rows) {
+    if (rememberedGridOrder_ == windows_ &&
+        rememberedGridWeights_.size() == windows_.size()) {
+      gridWeights_ = rememberedGridWeights_;
+    } else {
+      gridWeights_.clear();
+    }
+  } else if (layout_ == TileLayout::Dwindle) {
+    if (rememberedDwindleOrder_ == windows_ &&
+        rememberedDwindleRatios_.size() == windows_.size()) {
+      dwindleRatios_ = rememberedDwindleRatios_;
+    } else {
+      dwindleRatios_.clear();
+    }
+  }
+}
+
 void Workspace::ResetSuspendedLayoutHints() {
   AssertWmThread(L"Workspace::ResetSuspendedLayoutHints");
   for (auto& kv : records_) {
@@ -583,8 +630,11 @@ void Workspace::ResetSuspendedLayoutHints() {
 void Workspace::SetLayout(TileLayout layout) {
   AssertWmThread(L"Workspace::SetLayout");
   if (layout_ == layout) return;
+
+  RememberCurrentLayoutGeometry();
   layout_ = layout;
   ResetSuspendedLayoutHints();
+  RestoreRememberedLayoutGeometry();
   EnsureWeights();
   DebugValidateMutation(L"Workspace::SetLayout");
 }
@@ -659,7 +709,13 @@ bool Workspace::HasSameLayoutStateAs(const Workspace& other) const {
       layout_ == other.layout_ && masterRatio_ == other.masterRatio_ &&
       stackWeights_ == other.stackWeights_ &&
       gridWeights_ == other.gridWeights_ &&
-      dwindleRatios_ == other.dwindleRatios_;
+      dwindleRatios_ == other.dwindleRatios_ &&
+      rememberedMasterStackOrder_ == other.rememberedMasterStackOrder_ &&
+      rememberedMasterStackWeights_ == other.rememberedMasterStackWeights_ &&
+      rememberedGridOrder_ == other.rememberedGridOrder_ &&
+      rememberedGridWeights_ == other.rememberedGridWeights_ &&
+      rememberedDwindleOrder_ == other.rememberedDwindleOrder_ &&
+      rememberedDwindleRatios_ == other.rememberedDwindleRatios_;
 }
 
 bool Workspace::RestoreLayoutStateFrom(const Workspace& source) {
@@ -672,6 +728,12 @@ bool Workspace::RestoreLayoutStateFrom(const Workspace& source) {
   stackWeights_ = source.stackWeights_;
   gridWeights_ = source.gridWeights_;
   dwindleRatios_ = source.dwindleRatios_;
+  rememberedMasterStackOrder_ = source.rememberedMasterStackOrder_;
+  rememberedMasterStackWeights_ = source.rememberedMasterStackWeights_;
+  rememberedGridOrder_ = source.rememberedGridOrder_;
+  rememberedGridWeights_ = source.rememberedGridWeights_;
+  rememberedDwindleOrder_ = source.rememberedDwindleOrder_;
+  rememberedDwindleRatios_ = source.rememberedDwindleRatios_;
   for (auto& [hwnd, record] : records_) {
     const WindowRecord& sourceRecord = source.records_.find(hwnd)->second;
     if (record.state == ManageState::Suspended) {
@@ -714,6 +776,12 @@ bool Workspace::RestoreCompatibleActiveLayoutStateFrom(
   stackWeights_ = source.stackWeights_;
   gridWeights_ = source.gridWeights_;
   dwindleRatios_ = source.dwindleRatios_;
+  rememberedMasterStackOrder_ = source.rememberedMasterStackOrder_;
+  rememberedMasterStackWeights_ = source.rememberedMasterStackWeights_;
+  rememberedGridOrder_ = source.rememberedGridOrder_;
+  rememberedGridWeights_ = source.rememberedGridWeights_;
+  rememberedDwindleOrder_ = source.rememberedDwindleOrder_;
+  rememberedDwindleRatios_ = source.rememberedDwindleRatios_;
 
   // Undo logical-index shifts caused by the provisional admission for suspended
   // members that existed in both snapshots. Current-only inactive records are
@@ -2288,6 +2356,7 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
 
   switch (observation.result) {
     case PlacementResult::Success:
+    case PlacementResult::SuppressedByPhysicalState:
     case PlacementResult::AdjustedByWindow:
     case PlacementResult::Refused:
       return PlacementAction::None;
@@ -2369,6 +2438,58 @@ static void ArrangeWorkspace(
       if (TryRollbackPendingLayoutMutation(
               key, monitor, &workspace, rects)) {
         continue;
+      }
+
+      // A settled Dwindle workspace should preserve membership and order when a
+      // DPI/work-area/native-minimum change makes its current ratios infeasible.
+      // Before considering any eviction, clamp only the configured adaptive
+      // divider prefix to the nearest feasible geometry. Pending admissions have
+      // their own transactional recovery below and must not use this settled path.
+      bool hasPendingAdmission = false;
+      for (HWND hwnd : workspace.TiledWindows()) {
+        const WindowRecord* record = workspace.Find(hwnd);
+        if (record && record->pendingInsertionPlacement) {
+          hasPendingAdmission = true;
+          break;
+        }
+      }
+      if (!hasPendingAdmission &&
+          workspace.Layout() == TileLayout::Dwindle &&
+          g_settings.adaptiveDwindleSlots > 0) {
+        Workspace adaptive = workspace;
+        const std::vector<double> beforeRatios = adaptive.DwindleRatios();
+        if (FitAdaptiveDwindleDividers(adaptive, workArea, gap)) {
+          const auto& afterRatios = adaptive.DwindleRatios();
+          const size_t ratioCount =
+              std::min(beforeRatios.size(), afterRatios.size());
+          size_t changedRatios = 0;
+          for (size_t splitIndex = 0; splitIndex < ratioCount; ++splitIndex) {
+            if (std::abs(beforeRatios[splitIndex] -
+                         afterRatios[splitIndex]) <= 1e-9) {
+              continue;
+            }
+            ++changedRatios;
+            Diagnostics::RecordEvent(
+                L"settled dwindle adaptive ratio changed split=%zu from=%.6f to=%.6f desktop=%08X",
+                splitIndex, beforeRatios[splitIndex], afterRatios[splitIndex],
+                key.desktopId.Data1);
+          }
+
+          // BuildWorkspaceLayoutPlan was unsatisfiable immediately above, so a
+          // successful fitter should necessarily alter geometry. Guard anyway to
+          // prevent a pathological no-op from spinning the arrangement loop.
+          if (changedRatios > 0) {
+            for (HWND hwnd : workspace.TiledWindows()) {
+              CancelConformanceLease(hwnd);
+            }
+            workspace = std::move(adaptive);
+            Diagnostics::RecordEvent(
+                L"settled dwindle constraints recovered adaptively changes=%zu desktop=%08X",
+                changedRatios, key.desktopId.Data1);
+            g_workspaces.Save(key, workspace);
+            continue;
+          }
+        }
       }
 
       // Keep the exact pre-recovery state. If a pending admission is moved or
@@ -2922,6 +3043,8 @@ static void ArrangeWorkspace(
                         hwnd, rects[i], false, preferredTiledWindow);
                   }
                   break;
+                case PlacementResult::SuppressedByPhysicalState:
+                  break;
                 case PlacementResult::AdjustedByWindow:
                 case PlacementResult::Refused:
                   BeginConformanceLease(
@@ -3056,12 +3179,33 @@ static bool ClearSettledInsertionPlacements(
   for (HWND hwnd : workspace.TiledWindows()) {
     const WindowRecord* record = workspace.Find(hwnd);
     if (!record || !record->pendingInsertionPlacement ||
-        record->presentationState != PresentationState::Normal ||
         GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-        GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
         IsWindowCloaked(hwnd)) {
       continue;
     }
+
+    const PresentationState physicalPresentation =
+        GetPhysicalPresentationState(hwnd);
+
+    // A maximized/fullscreen tiled member is already logically settled once the
+    // workspace reflow has survived every sibling conformance lease. Its physical
+    // frame is application-owned presentation geometry and must never be required
+    // to equal the authoritative tile. Clear the pending-admission role only when
+    // model and live presentation agree, so a transition race cannot settle stale
+    // state.
+    if (record->presentationState != PresentationState::Normal) {
+      if (physicalPresentation == record->presentationState &&
+          workspace.ClearInsertionPlacement(hwnd)) {
+        changed = true;
+        DiscardPendingAdmissionRecovery(hwnd);
+        Diagnostics::RecordEvent(
+            L"pending admission settled under presentation override hwnd=%p state=%d",
+            hwnd, static_cast<int>(record->presentationState));
+      }
+      continue;
+    }
+
+    if (physicalPresentation != PresentationState::Normal) continue;
 
     RECT authoritative{};
     RECT current{};

@@ -499,6 +499,9 @@ static PlacementObservation PlaceWindowChecked(
       case PlacementResult::Success:
         ++Diagnostics::g_runtime.counters.placementSuccess;
         break;
+      case PlacementResult::SuppressedByPhysicalState:
+        ++Diagnostics::g_runtime.counters.placementSuppressedByPhysicalState;
+        break;
       case PlacementResult::AdjustedByWindow:
         ++Diagnostics::g_runtime.counters.placementAdjusted;
         break;
@@ -512,7 +515,8 @@ static PlacementObservation PlaceWindowChecked(
         ++Diagnostics::g_runtime.counters.placementDead;
         break;
     }
-    if (result != PlacementResult::Success) {
+    if (result != PlacementResult::Success &&
+        result != PlacementResult::SuppressedByPhysicalState) {
       Diagnostics::RecordEvent(
           L"placement result=%d hwnd=%p target=[%ld,%ld,%ld,%ld]",
           static_cast<int>(result), hwnd, targetRect.left, targetRect.top,
@@ -552,6 +556,17 @@ static PlacementObservation PlaceWindowChecked(
     offsetTop = extendedFrame.top - windowRect.top;
     offsetRight = windowRect.right - extendedFrame.right;
     offsetBottom = windowRect.bottom - extendedFrame.bottom;
+  }
+
+  // Close the final presentation-state race at the actual mutation boundary.
+  // The application can maximize/fullscreen/minimize itself after arrangement's
+  // earlier eligibility check but before this SetWindowPos. Treat that transition
+  // as a benign suppressed placement, never as refusal/nonconformance.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
+      IsWindowCloaked(hwnd)) {
+    ++Diagnostics::g_runtime.counters.placementPreflightStops;
+    return finish(PlacementResult::SuppressedByPhysicalState);
   }
 
   SetLastError(ERROR_SUCCESS);

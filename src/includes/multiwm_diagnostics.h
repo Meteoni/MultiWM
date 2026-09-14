@@ -51,6 +51,7 @@ static const wchar_t* DiagnosticPresentationStateName(PresentationState state) {
 static const wchar_t* DiagnosticPlacementResultName(PlacementResult result) {
   switch (result) {
     case PlacementResult::Success: return L"Success";
+    case PlacementResult::SuppressedByPhysicalState: return L"SuppressedByPhysicalState";
     case PlacementResult::AdjustedByWindow: return L"AdjustedByWindow";
     case PlacementResult::AccessDenied: return L"AccessDenied";
     case PlacementResult::Refused: return L"Refused";
@@ -497,7 +498,8 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
   audit.deadHwnd = !identity.hwndAlive;
   audit.pidMismatch = identity.hwndAlive && record.pid != 0 && !identity.pidMatchesRecord;
   audit.hasPlacementFailure =
-      record.lastPlacementResult != PlacementResult::Success;
+      record.lastPlacementResult != PlacementResult::Success &&
+      record.lastPlacementResult != PlacementResult::SuppressedByPhysicalState;
 
   report.Line(
       L"      identity: hwndAlive=%d livePid=%lu pidMatchesRecord=%d process=%ls",
@@ -675,6 +677,7 @@ static void DumpCounters(
   DiagnosticCounterRow(report, L"Placement preflight stops", c.placementPreflightStops, previous.placementPreflightStops, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"SetWindowPos calls", c.setWindowPosCalls, previous.setWindowPosCalls, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement success", c.placementSuccess, previous.placementSuccess, uptimeMs, intervalMs);
+  DiagnosticCounterRow(report, L"Suppressed by physical state", c.placementSuppressedByPhysicalState, previous.placementSuppressedByPhysicalState, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Adjusted by window", c.placementAdjusted, previous.placementAdjusted, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement access denied", c.placementAccessDenied, previous.placementAccessDenied, uptimeMs, intervalMs);
   DiagnosticCounterRow(report, L"Placement refused", c.placementRefused, previous.placementRefused, uptimeMs, intervalMs);
@@ -1378,9 +1381,10 @@ static void WriteDiagnosticReport() {
       counters.lifecycleShow + counters.lifecycleCloaked +
       counters.lifecycleUncloaked;
   const uint64_t placementResultSum =
-      counters.placementSuccess + counters.placementAdjusted +
-      counters.placementAccessDenied + counters.placementRefused +
-      counters.placementDead;
+      counters.placementSuccess +
+      counters.placementSuppressedByPhysicalState +
+      counters.placementAdjusted + counters.placementAccessDenied +
+      counters.placementRefused + counters.placementDead;
   const uint64_t placementPathSum =
       counters.placementNoOps + counters.placementPreflightStops +
       counters.setWindowPosCalls;

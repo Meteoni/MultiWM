@@ -380,6 +380,7 @@ struct Counters {
   uint64_t placementPreflightStops = 0;
   uint64_t setWindowPosCalls = 0;
   uint64_t placementSuccess = 0;
+  uint64_t placementSuppressedByPhysicalState = 0;
   uint64_t placementAdjusted = 0;
   uint64_t placementAccessDenied = 0;
   uint64_t placementRefused = 0;
@@ -644,6 +645,7 @@ enum class PresentationState {
 
 enum class PlacementResult {
   Success,
+  SuppressedByPhysicalState,
   AdjustedByWindow,
   AccessDenied,
   Refused,
@@ -833,6 +835,8 @@ class Workspace {
   SuspendedSlot MakeAppendedSuspendedSlot() const;
   void AppendTiledWithDefaultWeight(HWND hwnd);
   void ResetSuspendedLayoutHints();
+  void RememberCurrentLayoutGeometry();
+  void RestoreRememberedLayoutGeometry();
   void DebugValidateMutation(const wchar_t* operation) const;
 
   TileLayout layout_ = TileLayout::MasterStack;
@@ -842,6 +846,19 @@ class Workspace {
   std::vector<double> stackWeights_;
   std::vector<double> gridWeights_;
   std::vector<double> dwindleRatios_;
+
+  // Active slot geometry is remembered per layout family. This makes Monocle
+  // and ordinary layout cycling presentation-like with respect to the previous
+  // tiling geometry: switching away and back restores the exact weights/ratios
+  // when the active window order is unchanged. Membership/order changes make the
+  // remembered snapshot ineligible rather than trying to reinterpret old slots.
+  std::vector<HWND> rememberedMasterStackOrder_;
+  std::vector<double> rememberedMasterStackWeights_;
+  std::vector<HWND> rememberedGridOrder_;
+  std::vector<double> rememberedGridWeights_;
+  std::vector<HWND> rememberedDwindleOrder_;
+  std::vector<double> rememberedDwindleRatios_;
+
   HWND lastFocusedWindow_ = nullptr;
 };
 
