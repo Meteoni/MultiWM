@@ -38,14 +38,18 @@ static bool ValidateUserLayoutMutation(
     status = BuildWorkspaceLayoutPlan(
         candidate, metrics.workArea, metrics.gap, &rects);
     if (status == LayoutPlanStatus::Unsatisfiable &&
-        kind == UserLayoutMutationKind::Order) {
-      Workspace previous;
-      if (g_workspaces.Load(key, &previous) &&
-          IsAdaptiveDwindleExchange(previous, candidate) &&
-          FitAdaptiveDwindleDividers(candidate, metrics.workArea, metrics.gap)) {
-        Diagnostics::RecordEvent(L"adaptive dwindle exchange accommodated action=%ls", action);
-        return true;
-      }
+        kind == UserLayoutMutationKind::Order &&
+        candidate.Layout() == TileLayout::Dwindle &&
+        FitAdaptiveDwindleDividers(candidate, metrics.workArea, metrics.gap)) {
+      // Order mutations may reshape only the configured adaptive Dwindle
+      // dividers. FitAdaptiveDwindleDividers never changes membership or window
+      // order, so the requested swap/promotion/demotion remains exact. If even
+      // that geometry is infeasible, reject the command below instead of
+      // invoking admission matching or floating an unrelated window.
+      Diagnostics::RecordEvent(
+          L"adaptive dwindle order preflight accommodated action=%ls",
+          action ? action : L"Order mutation");
+      return true;
     }
   }
   if (status == LayoutPlanStatus::Success ||

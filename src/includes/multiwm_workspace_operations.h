@@ -1294,46 +1294,10 @@ static LayoutPlanStatus BuildWorkspaceLayoutPlan(
   return LayoutPlanStatus::Unsatisfiable;
 }
 
-// Exchange eligibility remains separate from the ratio solver. An exchange may
-// use automatic Dwindle fitting only when it is exactly one two-window swap and
-// both changed slots lie inside the configured adaptive prefix.
-static bool IsAdaptiveDwindleExchange(
-    const Workspace& previous, const Workspace& candidate) {
-  const auto& before = previous.TiledWindows();
-  const auto& after = candidate.TiledWindows();
-  if (previous.Layout() != TileLayout::Dwindle ||
-      candidate.Layout() != TileLayout::Dwindle ||
-      before.size() < 2 || before.size() != after.size()) {
-    return false;
-  }
-
-  const size_t adaptiveSlotCount =
-      std::min(g_settings.adaptiveDwindleSlots, before.size());
-  if (adaptiveSlotCount < 2) return false;
-
-  size_t firstChanged = static_cast<size_t>(-1);
-  size_t secondChanged = static_cast<size_t>(-1);
-  for (size_t i = 0; i < before.size(); ++i) {
-    if (before[i] == after[i]) continue;
-    if (i >= adaptiveSlotCount) return false;
-    if (firstChanged == static_cast<size_t>(-1)) {
-      firstChanged = i;
-    } else if (secondChanged == static_cast<size_t>(-1)) {
-      secondChanged = i;
-    } else {
-      return false;
-    }
-  }
-
-  return firstChanged != static_cast<size_t>(-1) &&
-      secondChanged != static_cast<size_t>(-1) &&
-      before[firstChanged] == after[secondChanged] &&
-      before[secondChanged] == after[firstChanged];
-}
-
-// Admission and eligible exchanges share one feasibility calculation. Leading
-// split nodes may move according to Adaptive Dwindle Slots; every deeper ratio
-// remains fixed. A value of zero deliberately disables automatic ratio changes.
+// Admission recovery and explicit order-mutation preflight share one geometry
+// fitter. Leading split nodes may move according to Adaptive Dwindle Slots;
+// every deeper ratio and the complete window order stay fixed. A value of zero
+// deliberately disables automatic ratio changes.
 static bool FitAdaptiveDwindleDividers(
     Workspace& candidate, const RECT& workArea, LONG gap) {
   if (candidate.Layout() != TileLayout::Dwindle || candidate.ActiveCount() < 2 ||
@@ -1980,17 +1944,12 @@ static void ArrangeWorkspace(
     }
     if (planStatus == LayoutPlanStatus::Unsatisfiable) {
       ++Diagnostics::g_runtime.counters.constraintUnsatisfiablePlans;
-      auto mutation = g_pendingLayoutMutations.find(key);
-      if (mutation != g_pendingLayoutMutations.end() &&
-          mutation->second.kind == UserLayoutMutationKind::Order &&
-          workspace.HasSameLayoutStateAs(mutation->second.candidate) &&
-          IsAdaptiveDwindleExchange(mutation->second.previous, workspace) &&
-          FitAdaptiveDwindleDividers(workspace, workArea, gap)) {
-        mutation->second.candidate = workspace;
-        g_workspaces.Save(key, workspace);
-        Diagnostics::RecordEvent(L"adaptive dwindle exchange accommodated native constraints");
-        continue;
-      }
+      // An explicit order mutation has already passed a full native-constraint
+      // preflight before commit. If it later becomes unsatisfiable, do not
+      // reinterpret the command by reshaping/reassigning it again here. The
+      // delayed transaction gets first refusal: restore the previous order and
+      // report the same constraint toast. Only when that saved order is no
+      // longer feasible either may ordinary global constraint recovery proceed.
       if (TryRollbackPendingLayoutMutation(
               key, monitor, &workspace, rects)) {
         continue;
