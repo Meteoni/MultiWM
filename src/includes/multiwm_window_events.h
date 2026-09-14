@@ -95,13 +95,14 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // conformance lease instead of being silently discarded.
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
     if (!tracked) {
-      // A newly created window can already be minimized/maximized before the
-      // ordinary discovery snapshot ever sees it. Admit only those inactive
-      // physical states through this otherwise-noisy event; settled discovery
-      // re-checks eligibility, desktop, monitor and management mode.
+      // A newly created window can already be minimized, maximized or fullscreen
+      // before the ordinary discovery snapshot sees it. Minimized windows need the
+      // inactive-admission path; presentation overrides remain active tiled members.
       const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
+      const PresentationState presentation =
+          GetPhysicalPresentationState(hwnd);
       if ((reason != SuspensionReason::Minimized &&
-           reason != SuspensionReason::Maximized) ||
+           presentation == PresentationState::Normal) ||
           !WindowCanBeManaged(hwnd)) {
         return;
       }
@@ -110,7 +111,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     }
 
     const bool stateOrLeaseNeedsObservation =
-        IsWindowSuspendedMaximized(hwnd) ||
         HasActiveConformanceLease(hwnd) ||
         g_workspaces.IsTiled(hwnd);
     if (!stateOrLeaseNeedsObservation &&

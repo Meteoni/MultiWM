@@ -35,7 +35,15 @@ static const wchar_t* DiagnosticSuspensionReasonName(SuspensionReason reason) {
     case SuspensionReason::None: return L"None";
     case SuspensionReason::Hidden: return L"Hidden";
     case SuspensionReason::Minimized: return L"Minimized";
-    case SuspensionReason::Maximized: return L"Maximized";
+    default: return L"Unknown";
+  }
+}
+
+static const wchar_t* DiagnosticPresentationStateName(PresentationState state) {
+  switch (state) {
+    case PresentationState::Normal: return L"Normal";
+    case PresentationState::Maximized: return L"Maximized";
+    case PresentationState::Fullscreen: return L"Fullscreen";
     default: return L"Unknown";
   }
 }
@@ -479,10 +487,11 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
       hasActiveIndex ? std::to_wstring(activeIndex).c_str() : L"-",
       reinterpret_cast<void*>(mapHwnd));
   report.Line(
-      L"      recordHwnd=%p pid=%lu state=%ls suspension=%ls",
+      L"      recordHwnd=%p pid=%lu state=%ls suspension=%ls presentation=%ls",
       reinterpret_cast<void*>(record.hwnd), record.pid,
       DiagnosticManageStateName(record.state),
-      DiagnosticSuspensionReasonName(record.suspensionReason));
+      DiagnosticSuspensionReasonName(record.suspensionReason),
+      DiagnosticPresentationStateName(record.presentationState));
 
   DiagnosticWindowIdentity identity = DiagnosticReadWindowIdentity(mapHwnd, record.pid);
   audit.deadHwnd = !identity.hwndAlive;

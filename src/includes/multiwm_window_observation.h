@@ -160,6 +160,7 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
   record.state = state;
 
   if (hwnd) {
+    record.presentationState = GetPhysicalPresentationState(hwnd);
     GetWindowThreadProcessId(hwnd, &record.pid);
     LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
     LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
@@ -173,6 +174,7 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
     // geometry. Suspended admission should fall back to the configured size.
     if (monitor &&
         GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
+        GetPhysicalPresentationState(hwnd) == PresentationState::Normal &&
         GetWindowFrameRect(hwnd, &frame) &&
         frame.right > frame.left && frame.bottom > frame.top) {
       record.floatingRect = frame;
@@ -456,8 +458,9 @@ static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd) {
   // (example: VSCode unstaged commit dialog)
   if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return nullptr;
 
-  // FancyWM only tiles windows in the Restored state. Minimized, maximized and
-  // native-fullscreen windows remain managed logically until they are restored.
+  // Minimized/hidden windows are not active layout participants. Maximize and
+  // fullscreen are presentation overrides only, so they remain discoverable and
+  // keep their logical slot in the workspace.
   if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) return nullptr;
   if (!WindowCanBeManaged(hwnd)) return nullptr;
   if (IsWindowCloaked(hwnd)) return nullptr;

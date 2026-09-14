@@ -150,12 +150,16 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
   if (IsIconic(hwnd)) return SuspensionReason::Minimized;
   if (!IsWindowVisible(hwnd)) return SuspensionReason::Hidden;
-  if (IsZoomed(hwnd)) return SuspensionReason::Maximized;
+  return SuspensionReason::None;
+}
 
-  // Match FancyWM's native-fullscreen fallback: Chromium and similar apps can
-  // cover a complete display while Windows still reports the HWND as Restored.
-  // Maximized is the right model reason because both states have identical
-  // suspend/save-slot/restore semantics here.
+static PresentationState GetPhysicalPresentationState(HWND hwnd) {
+  if (!hwnd || !IsWindow(hwnd)) return PresentationState::Normal;
+  if (IsZoomed(hwnd)) return PresentationState::Maximized;
+
+  // Chromium and similar apps can cover the full monitor while Windows still
+  // reports the HWND as restored. Keep that as a presentation override instead
+  // of removing the logical leaf from the tiling tree.
   RECT windowRect{};
   if (GetWindowRect(hwnd, &windowRect)) {
     HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONULL);
@@ -170,16 +174,17 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
                  kFullscreenTolerancePx) &&
         !Differs(windowRect.bottom, monitorInfo.rcMonitor.bottom,
                  kFullscreenTolerancePx)) {
-      return SuspensionReason::Maximized;
+      return PresentationState::Fullscreen;
     }
   }
-  return SuspensionReason::None;
+  return PresentationState::Normal;
 }
 
 // Workspace initialization needs a broader physical snapshot than normal layout
 // participation. A visible top-level window can already belong to this workspace
-// while minimized or maximized, even though CollectTileWindows correctly excludes
-// it from placement. Enumerate that broader set only when creating a workspace.
+// while minimized. Maximized/fullscreen windows remain active logical members and
+// are collected normally; enumerate this broader set only for non-participating
+// physical states when creating a workspace.
 static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
     HMONITOR monitor, const GUID& desktopId) {
   std::vector<HWND> windows;
@@ -337,10 +342,6 @@ bool Workspace::AdmitInitialAfter(
   EnsureWeights();
   DebugValidateMutation(L"Workspace::AdmitInitialAfter");
   return true;
-}
-
-static bool IsWindowSuspendedMaximized(HWND hwnd) {
-  return g_workspaces.IsSuspendedMaximized(hwnd);
 }
 
 bool Workspace::Restore(HWND hwnd) {
@@ -1528,7 +1529,7 @@ static void RememberPendingAdmissionRecovery(
 // settled, derive the no-longer-active state from the pre-recovery snapshot and
 // restore that established order/geometry into the live workspace. This makes
 // adaptive ratios and sibling reassignment provisional instead of leaking into
-// the N-1 layout after a maximize/minimize/fullscreen race.
+// the N-1 layout after a minimize/hidden participation race.
 static bool RestorePendingAdmissionRecoveryAfterSuspension(
     const DesktopMonitorKey& key, HWND hwnd, Workspace* workspace) {
   if (!workspace || !hwnd) return false;
@@ -2873,12 +2874,15 @@ static void ArrangeWorkspace(
 
       if (!IsWindow(hwnd)) {
         action = Workspace::PlacementAction::Forget;
-      } else if (GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
-                 !IsWindowCloaked(hwnd)) {
+      } else {
         const WindowRecord* record = workspace.Find(hwnd);
         if (!record) {
           action = Workspace::PlacementAction::Forget;
-        } else {
+        } else if (
+            record->presentationState == PresentationState::Normal &&
+            GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
+            GetPhysicalPresentationState(hwnd) == PresentationState::Normal &&
+            !IsWindowCloaked(hwnd)) {
           PlacementObservation observation =
               PlaceWindowChecked(hwnd, record->canMove, rects[i]);
           action = workspace.ApplyPlacementObservation(hwnd, observation);
@@ -3052,7 +3056,9 @@ static bool ClearSettledInsertionPlacements(
   for (HWND hwnd : workspace.TiledWindows()) {
     const WindowRecord* record = workspace.Find(hwnd);
     if (!record || !record->pendingInsertionPlacement ||
+        record->presentationState != PresentationState::Normal ||
         GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+        GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
         IsWindowCloaked(hwnd)) {
       continue;
     }
@@ -3097,6 +3103,7 @@ static void FinalizeExpiredConformanceLease(
 
   if (!IsWindow(hwnd) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd) ||
       IsMoveSizeGestureInProgress(hwnd)) {
     stale();
@@ -3116,7 +3123,9 @@ static void FinalizeExpiredConformanceLease(
   }
 
   const WindowRecord* record = workspace.Find(hwnd);
-  if (!record || !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
+  if (!record ||
+      record->presentationState != PresentationState::Normal ||
+      !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
     stale();
     return;
   }
@@ -3147,9 +3156,10 @@ static void FinalizeExpiredConformanceLease(
   }
 
   // Expiry processing performs several live queries after its initial preflight.
-  // A window that entered fullscreen/maximized meanwhile must remain suspended,
-  // not be permanently converted to Floating by this stale lease verdict.
-  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+  // A window that entered maximize/fullscreen meanwhile owns its presentation
+  // geometry; a stale lease must not convert that tiled member to Floating.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal) {
     stale();
     return;
   }
@@ -3163,6 +3173,7 @@ static void FinalizeExpiredConformanceLease(
       beforeConstraints, freshConstraints);
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, *record) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd)) {
     stale();
     return;
@@ -3220,6 +3231,7 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
 
   if (!IsWindow(hwnd) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd)) {
     if (hasLease) CancelConformanceLease(hwnd, lease.generation);
     return false;
@@ -3238,6 +3250,7 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   }
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record || record->state != ManageState::Tiled ||
+      record->presentationState != PresentationState::Normal ||
       workspace.Layout() == TileLayout::Floating ||
       !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
     if (hasLease) CancelConformanceLease(hwnd, lease.generation);
@@ -3295,6 +3308,7 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   // while the ownership/layout queries above are in progress.
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, *record) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd)) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;
@@ -3311,6 +3325,7 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   // after that bounded call before either learning policy or reinforcing a tile.
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, *record) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd)) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;

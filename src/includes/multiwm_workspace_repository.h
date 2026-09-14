@@ -163,7 +163,8 @@ static bool RepairFloatingGeometry(
     const FloatingPlacementHint& hint) {
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record || !record->canMove || !IsWindow(hwnd) ||
-      GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+      GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal) {
     return false;
   }
 
@@ -245,9 +246,12 @@ static bool RepairFloatingGeometry(
   if (!centerWithoutResize) {
     target = ClampFloatingRectToWorkArea(target, workArea);
   }
-  // The window can enter a suspended physical state while the placement target
-  // is being calculated. Never overwrite that newer application-owned state.
-  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) return false;
+  // The window can enter a non-participating or presentation-owned physical
+  // state while the placement target is being calculated. Never overwrite it.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal) {
+    return false;
+  }
   PlacementObservation observation =
       PlaceWindowChecked(hwnd, record->canMove, target, centerWithoutResize);
   if (observation.result != PlacementResult::Success &&
@@ -537,29 +541,6 @@ bool WorkspaceRepository::IsTiled(HWND hwnd) const {
     for (const auto& key : ownersIt->second) {
       auto stateIt = states_.find(key);
       if (stateIt != states_.end() && stateIt->second.IsTiled(hwnd)) {
-        found = true;
-        break;
-      }
-    }
-  }
-
-  ReleaseSRWLockShared(&lock_);
-  return found;
-}
-
-bool WorkspaceRepository::IsSuspendedMaximized(HWND hwnd) const {
-  if (!hwnd) return false;
-  bool found = false;
-  AcquireSRWLockShared(&lock_);
-
-  auto ownersIt = ownersByWindow_.find(hwnd);
-  if (ownersIt != ownersByWindow_.end()) {
-    for (const auto& key : ownersIt->second) {
-      auto stateIt = states_.find(key);
-      if (stateIt == states_.end()) continue;
-      const WindowRecord* record = stateIt->second.Find(hwnd);
-      if (record && record->state == ManageState::Suspended &&
-          record->suspensionReason == SuspensionReason::Maximized) {
         found = true;
         break;
       }

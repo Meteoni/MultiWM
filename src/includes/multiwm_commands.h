@@ -495,7 +495,8 @@ static void HandleUserResize(
 void ApplyUserMoveSize(HWND hwnd) {
   if (!IsWindow(hwnd)) return;
 
-  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      GetPhysicalPresentationState(hwnd) != PresentationState::Normal) {
     ClearMoveSizeSamples(hwnd);
     return;
   }
