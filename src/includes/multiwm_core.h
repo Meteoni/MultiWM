@@ -762,6 +762,7 @@ class Workspace {
   bool HasSameWindowMembershipAs(const Workspace& other) const;
   bool HasSameLayoutStateAs(const Workspace& other) const;
   bool RestoreLayoutStateFrom(const Workspace& source);
+  bool RestoreCompatibleActiveLayoutStateFrom(const Workspace& source);
   bool RememberFloatingGeometry(
       HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
 
@@ -928,6 +929,20 @@ static std::unordered_map<
     Model::DesktopMonitorKeyHash, Model::DesktopMonitorKeyEqual>
     g_pendingLayoutMutations;
 
+// Admission recovery can temporarily move the pending member and/or adaptive
+// layout geometry before conformance has proved the resulting arrangement. Keep
+// the pre-recovery state until that member settles so a suspend/restore race
+// cannot strand the established members in geometry that existed only for the
+// pending admission.
+struct PendingAdmissionRecovery {
+  DesktopMonitorKey key;
+  Workspace baseline;
+  uint64_t generation = 0;
+};
+
+static std::unordered_map<HWND, PendingAdmissionRecovery>
+    g_pendingAdmissionRecoveries;
+
 struct ConformanceLease {
   RECT expectedRect{};
   // Preserve the user action that produced this target through asynchronous
@@ -1008,6 +1023,7 @@ static void ClearAllConformanceLeases() {
   AssertWmThread(L"ClearAllConformanceLeases");
   g_conformanceLeases.leases.clear();
   g_pendingLayoutMutations.clear();
+  g_pendingAdmissionRecoveries.clear();
 }
 
 static size_t CountActiveConformanceLeases() {

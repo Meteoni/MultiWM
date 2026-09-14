@@ -234,6 +234,7 @@ void FloatFocusedWindow() {
   }
 
   CancelConformanceLease(tiled);
+  DiscardPendingAdmissionRecovery(tiled);
   if (!workspace.Float(tiled)) return;
   RepairFloatingGeometry(key, workspace, tiled, hint);
   g_workspaces.Save(key, workspace);
@@ -379,6 +380,7 @@ static void HandleUserMove(
     const MoveSizeGesture& gesture) {
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
     CancelConformanceLease(hwnd);
+    DiscardPendingAdmissionRecovery(hwnd);
     if (workspace.Float(hwnd)) {
       RepairFloatingGeometry(
           key, workspace, hwnd, MakeFloatingPlacementHintFromGesture(gesture));
