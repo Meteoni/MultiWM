@@ -488,11 +488,12 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
       hasActiveIndex ? std::to_wstring(activeIndex).c_str() : L"-",
       reinterpret_cast<void*>(mapHwnd));
   report.Line(
-      L"      recordHwnd=%p pid=%lu state=%ls suspension=%ls presentation=%ls",
+      L"      recordHwnd=%p pid=%lu state=%ls suspension=%ls presentation=%ls alwaysFloating=%d",
       reinterpret_cast<void*>(record.hwnd), record.pid,
       DiagnosticManageStateName(record.state),
       DiagnosticSuspensionReasonName(record.suspensionReason),
-      DiagnosticPresentationStateName(record.presentationState));
+      DiagnosticPresentationStateName(record.presentationState),
+      record.alwaysFloating ? 1 : 0);
 
   DiagnosticWindowIdentity identity = DiagnosticReadWindowIdentity(mapHwnd, record.pid);
   audit.deadHwnd = !identity.hwndAlive;

@@ -232,9 +232,13 @@ static bool AdmitInitialObservedWindow(
   }
   const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
   if (reason == SuspensionReason::Hidden) return false;
-  if (useAutomaticAdmissionPolicy && ShouldWindowDefaultToFloating(hwnd)) {
+  bool alwaysFloating = false;
+  const bool startsFloating =
+      ShouldWindowStartFloating(hwnd, &alwaysFloating);
+  if (alwaysFloating || (useAutomaticAdmissionPolicy && startsFloating)) {
     WindowRecord record = MakeWindowRecord(hwnd, ManageState::Floating);
     record.pendingDefaultFloatingCenter = true;
+    record.alwaysFloating = alwaysFloating;
     return workspace.AdmitFloating(std::move(record));
   }
   return workspace.AdmitInitial(MakeWindowRecord(hwnd), reason);
@@ -687,6 +691,7 @@ bool Workspace::HasSameWindowMembershipAs(const Workspace& other) const {
         record.pid != otherIt->second.pid ||
         record.tilingGeneration != otherIt->second.tilingGeneration ||
         record.state != otherIt->second.state ||
+        record.alwaysFloating != otherIt->second.alwaysFloating ||
         record.suspensionReason != otherIt->second.suspensionReason ||
         record.hasSavedSlot != otherIt->second.hasSavedSlot) {
       return false;
@@ -894,6 +899,20 @@ bool Workspace::ClearDefaultFloatingCenter(HWND hwnd) {
   record->pendingDefaultFloatingCenter = false;
   DebugValidateMutation(L"Workspace::ClearDefaultFloatingCenter");
   return true;
+}
+
+bool Workspace::EnforceAlwaysFloating(HWND hwnd) {
+  AssertWmThread(L"Workspace::EnforceAlwaysFloating");
+  WindowRecord* record = FindMutable(hwnd);
+  if (!record) return false;
+
+  bool changed = !record->alwaysFloating;
+  record->alwaysFloating = true;
+  if (record->state != ManageState::Floating) {
+    changed |= Float(hwnd);
+  }
+  if (changed) DebugValidateMutation(L"Workspace::EnforceAlwaysFloating");
+  return changed;
 }
 
 void Workspace::RepairForArrangement(

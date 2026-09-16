@@ -285,6 +285,8 @@ void LoadSettings() {
     WindowRule rule;
     if (_wcsicmp(treatment.get(), L"default_to_floating") == 0) {
       rule.treatment = WindowRuleTreatment::DefaultToFloating;
+    } else if (_wcsicmp(treatment.get(), L"always_floating") == 0) {
+      rule.treatment = WindowRuleTreatment::AlwaysFloating;
     } else if (_wcsicmp(treatment.get(), L"trace_to_owner") == 0) {
       rule.treatment = WindowRuleTreatment::TraceToOwner;
     } else if (_wcsicmp(

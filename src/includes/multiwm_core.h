@@ -194,6 +194,7 @@ enum class MouseMoveBehavior { Float, Swap };
 enum class WindowRuleTreatment {
   Exclude,
   DefaultToFloating,
+  AlwaysFloating,
   TraceToOwner,
   FloatingPlacementOverride,
 };
@@ -692,6 +693,9 @@ struct WindowRecord {
   // Default-floating admission can precede a usable restored rectangle. Retain
   // the centering request until discovery can place the restored HWND.
   bool pendingDefaultFloatingCenter = false;
+  // Set by an Always-floating rule. The policy is retained on the record so a
+  // title change cannot make an explicitly protected window tileable by accident.
+  bool alwaysFloating = false;
   WindowConstraints constraints{};
 
   PlacementResult lastPlacementResult = PlacementResult::Success;
@@ -776,6 +780,7 @@ class Workspace {
   bool MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex);
   bool ClearInsertionPlacement(HWND hwnd);
   bool ClearDefaultFloatingCenter(HWND hwnd);
+  bool EnforceAlwaysFloating(HWND hwnd);
   bool SetDwindleRatio(size_t splitIndex, double ratio);
   bool HasSameWindowMembershipAs(const Workspace& other) const;
   bool HasSameLayoutStateAs(const Workspace& other) const;

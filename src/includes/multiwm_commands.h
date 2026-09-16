@@ -225,13 +225,8 @@ void FloatFocusedWindow() {
   HWND tiled = ResolveToTiledWindow(hwnd, workspace.TiledWindows());
   if (!tiled) return;
 
-  RECT before{};
   FloatingPlacementHint hint;
-  if (GetWindowFrameRect(tiled, &before) && before.right > before.left &&
-      before.bottom > before.top) {
-    hint.intent = FloatingPlacementIntent::PreserveAnchor;
-    hint.anchor = RectCenter(before);
-  }
+  hint.intent = FloatingPlacementIntent::CenterWithFloatingSize;
 
   CancelConformanceLease(tiled);
   DiscardPendingAdmissionRecovery(tiled);

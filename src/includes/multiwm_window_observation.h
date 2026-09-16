@@ -409,9 +409,16 @@ static bool IsWindowExcludedByRules(HWND hwnd) {
   return FindMatchingWindowRule(hwnd, WindowRuleTreatment::Exclude) != nullptr;
 }
 
-static bool ShouldWindowDefaultToFloating(HWND hwnd) {
+static bool ShouldWindowAlwaysFloat(HWND hwnd) {
   return FindMatchingWindowRule(
-             hwnd, WindowRuleTreatment::DefaultToFloating) != nullptr;
+             hwnd, WindowRuleTreatment::AlwaysFloating) != nullptr;
+}
+
+static bool ShouldWindowStartFloating(HWND hwnd, bool* alwaysFloating = nullptr) {
+  const bool always = ShouldWindowAlwaysFloat(hwnd);
+  if (alwaysFloating) *alwaysFloating = always;
+  return always || FindMatchingWindowRule(
+                       hwnd, WindowRuleTreatment::DefaultToFloating) != nullptr;
 }
 
 // Applies stable structural and exclusion policy only; visibility, show state,
@@ -431,11 +438,13 @@ static bool WindowCanBeManaged(HWND hwnd) {
   // window could temporarily lose its WS_SizeBox.
   // (example: Office save/discard dialog)
   // A Default-to-floating rule is also an explicit Automatic-mode admission
-  // policy for naturally fixed-size top-level windows; centering never resizes
-  // those HWNDs.
-  if (!(style & WS_SIZEBOX) && !IsWindowTrackedInAnyState(hwnd) &&
-      !(IsAutomaticMode() && ShouldWindowDefaultToFloating(hwnd))) {
-    return false;
+  // policy for naturally fixed-size top-level windows. Always-floating is also
+  // eligible during explicit Manual admission; centering never resizes either.
+  if (!(style & WS_SIZEBOX) && !IsWindowTrackedInAnyState(hwnd)) {
+    bool alwaysFloating = false;
+    const bool startsFloating =
+        ShouldWindowStartFloating(hwnd, &alwaysFloating);
+    if (!alwaysFloating && !(IsAutomaticMode() && startsFloating)) return false;
   }
 
   LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);

@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.51
+// @version         1.13.55
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -119,10 +119,10 @@ A small tray indicator shows the active workspace layout and provides quick acce
     $description: Reverse the recursive growth direction from bottom-right to top-left.
   - AdaptiveDwindleSlots: 2
     $name: Adaptive Dwindle Slots
-    $description: 'Number of leading Dwindle slots whose split ratios may be adjusted automatically to satisfy native window minimum sizes. Set to 0 for fixed-ratio Dwindle behavior. Manual divider resizing is unaffected. (0-64)'
-  - AdaptiveDwindlePercentage: 40
+    $description: 'Leading Dwindle splits allowed to adapt to window minimum sizes. Set to 0 to disable. (0-64)'
+  - AdaptiveDwindlePercentage: 15
     $name: Adaptive Dwindle Percentage
-    $description: 'Maximum automatic deviation from a 50/50 Dwindle split. 20 permits automatic ratios from 30% to 70%; 40 preserves the current 10%-90% range. Set to 0 to disable automatic ratio adjustment. Existing manual ratios are preserved when already feasible. (0-40)'
+    $description: 'Maximum automatic shift from 50/50. For example, 15 allows 35%-65%. Set to 0 to disable. (0-40)'
   $name: Workspace
 
 - appearance:
@@ -228,15 +228,16 @@ A small tray indicator shows the active workspace layout and provides quick acce
           $options:
             - exclude: Exclude
             - default_to_floating: Default to floating
+            - always_floating: Always floating
             - trace_to_owner: Trace to owner
             - preserve_size_when_centering: Preserve size when centering
             - override_size_when_centering: Override size when centering
         - Size: ""
           $name: Centering size override
-          $description: 'Only effective when "Override size" is selected. Use Width, Height in DPI-scaled pixels, or "Workspace" to fill the current monitor''s usable workspace. Examples: 720, 480'
+          $description: 'Only effective when "Override size" is selected. Default-to-floating and Always-floating discovery always preserve the application''s size. Use Width, Height in DPI-scaled pixels, or "Workspace" to fill the current monitor''s usable workspace. Examples: 720, 480'
     $name: Rules
     $description: "There's no one-size-fits-all shoe. \n
-      Exclude prevents management. Default to floating admits a matching window as managed Floating during Automatic discovery. Trace to owner retargets move/size to its root owner. Every non-blank match field in a rule must match; comma-separated values within one field are alternatives."
+      Exclude prevents management. Default to floating admits a matching window as managed Floating during Automatic discovery, while Always floating also prevents explicit re-tiling. Both floating treatments center without changing the application's size. Trace to owner retargets move/size to its root owner. Every non-blank match field in a rule must match; comma-separated values within one field are alternatives."
   $name: Window Rules
 
 - advanced:

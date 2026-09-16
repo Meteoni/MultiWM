@@ -82,8 +82,9 @@ static bool GetWorkspaceWorkArea(HMONITOR monitor, RECT* outWorkArea) {
 enum class FloatingPlacementIntent {
   PassiveRestore,
   PreserveAnchor,
+  CenterWithFloatingSize,
   NewWindowCenter,
-  NewWindowCenterMoveOnly,
+  CenterPreservingSize,
   FailureCenter,
 };
 
@@ -156,8 +157,8 @@ static HMONITOR ResolveRememberedFloatingMonitor(
 
 // Converts remembered floating geometry into a destination-monitor rectangle.
 // Passive migration restores the full rectangle on the same monitor and centers
-// remembered/default size on a different monitor. Explicit drag/hotkey intent
-// always preserves the user's anchor while repairing only the size.
+// remembered/default size on a different monitor. Drag intent preserves the
+// user's anchor; explicit centering can retain either floating or current size.
 static bool RepairFloatingGeometry(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const FloatingPlacementHint& hint) {
@@ -182,14 +183,17 @@ static bool RepairFloatingGeometry(
                            current.bottom > current.top;
 
   const bool centerWithoutResize =
-      hint.intent == FloatingPlacementIntent::NewWindowCenterMoveOnly;
-  const bool centerNewWindow =
+      hint.intent == FloatingPlacementIntent::CenterPreservingSize;
+  const bool useNewWindowSize =
       hint.intent == FloatingPlacementIntent::NewWindowCenter ||
-      centerWithoutResize ||
       hint.intent == FloatingPlacementIntent::FailureCenter;
+  const bool centerInWorkspace =
+      hint.intent == FloatingPlacementIntent::CenterWithFloatingSize ||
+      useNewWindowSize || centerWithoutResize;
   if (centerWithoutResize && !haveCurrent) return false;
 
-  const bool needsFallbackSize = centerNewWindow || !record->hasFloatingRect;
+  const bool needsFallbackSize =
+      useNewWindowSize || centerWithoutResize || !record->hasFloatingRect;
   const WindowRule* placementOverride =
       IsAutomaticMode() && needsFallbackSize && !centerWithoutResize
           ? FindMatchingWindowRule(
@@ -214,7 +218,7 @@ static bool RepairFloatingGeometry(
       width = ScaleDip(placementOverride->floatingSizeDip.width, targetDpi);
       height = ScaleDip(placementOverride->floatingSizeDip.height, targetDpi);
     }
-  } else if (!centerNewWindow && record->hasFloatingRect) {
+  } else if (!useNewWindowSize && record->hasFloatingRect) {
     const UINT sourceDpi = record->floatingDpi ? record->floatingDpi : 96;
     width = MulDiv(
         record->floatingRect.right - record->floatingRect.left,
@@ -235,7 +239,7 @@ static bool RepairFloatingGeometry(
   POINT center{};
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     center = hint.anchor;
-  } else if (!centerNewWindow && record->hasFloatingRect &&
+  } else if (!centerInWorkspace && record->hasFloatingRect &&
              ResolveRememberedFloatingMonitor(*record) == monitor) {
     center = RectCenter(record->floatingRect);
   } else {
@@ -376,6 +380,9 @@ bool Workspace::Validate(
          record.floatingRect.bottom <= record.floatingRect.top ||
          !record.floatingMonitor || !record.floatingDpi)) {
       fail(L"remembered floating geometry is invalid", hwnd);
+    }
+    if (record.alwaysFloating && record.state != ManageState::Floating) {
+      fail(L"Always-floating record is not Floating", hwnd);
     }
 
     switch (record.state) {

@@ -105,9 +105,13 @@ static bool AdmitUntrackedSnapshot(
   for (HWND hwnd : snapshot) {
     if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) continue;
 
-    if (useAutomaticAdmissionPolicy && ShouldWindowDefaultToFloating(hwnd)) {
+    bool alwaysFloating = false;
+    const bool startsFloating =
+        ShouldWindowStartFloating(hwnd, &alwaysFloating);
+    if (alwaysFloating || (useAutomaticAdmissionPolicy && startsFloating)) {
       WindowRecord record = MakeWindowRecord(hwnd, ManageState::Floating);
       record.pendingDefaultFloatingCenter = true;
+      record.alwaysFloating = alwaysFloating;
       if (workspace.AdmitFloating(std::move(record))) {
         changed = true;
         if (admittedWindows) admittedWindows->push_back(hwnd);
@@ -157,9 +161,13 @@ static bool AdmitUntrackedSuspendedSnapshot(
       return false;
     }
 
-    if (useAutomaticAdmissionPolicy && ShouldWindowDefaultToFloating(hwnd)) {
+    bool alwaysFloating = false;
+    const bool startsFloating =
+        ShouldWindowStartFloating(hwnd, &alwaysFloating);
+    if (alwaysFloating || (useAutomaticAdmissionPolicy && startsFloating)) {
       WindowRecord record = MakeWindowRecord(hwnd, ManageState::Floating);
       record.pendingDefaultFloatingCenter = true;
+      record.alwaysFloating = alwaysFloating;
       return workspace.AdmitFloating(std::move(record));
     }
 
@@ -613,6 +621,24 @@ static void ReconcileKnownWindow(
   ownerKeys = ReconcileWindowOwnership(hwnd, scope, std::move(ownerKeys), changedKeys);
   if (ownerKeys.empty()) return;
 
+  // Rules normally classify a window at admission. Also enforce Always floating
+  // for an already-managed window after a settings reload; once applied, retain
+  // it for that HWND's lifetime even if a title-based match later changes.
+  if (ShouldWindowAlwaysFloat(hwnd)) {
+    bool policyChanged = false;
+    for (const auto& ownerKey : ownerKeys) {
+      Workspace workspace;
+      if (!g_workspaces.Load(ownerKey, &workspace) ||
+          !workspace.EnforceAlwaysFloating(hwnd)) {
+        continue;
+      }
+      policyChanged = true;
+      g_workspaces.Save(ownerKey, workspace);
+      if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, ownerKey);
+    }
+    if (policyChanged) CancelConformanceLease(hwnd);
+  }
+
   if (HasReconcileScope(scope, ReconcileScope::Participation)) {
     ReconcileWindowParticipation(hwnd, ownerKeys, changedKeys);
   }
@@ -757,9 +783,9 @@ static bool DiscoverWorkspaceWindows(
   }
 
   // Automatic discovery owns the first floating geometry of a genuinely new
-  // restored window. A Floating workspace applies its configured sizing policy;
-  // a per-window Floating admission keeps its application-selected size and is
-  // moved only to the center of its workspace.
+  // restored window. A rule-floated admission always keeps its application-
+  // selected size, including when the whole workspace is already Floating.
+  // Other Floating-workspace admissions use the configured sizing policy.
   if (admitUntracked) {
     for (HWND hwnd : newlyAdmittedWindows) {
       const WindowRecord* record = workspace.Find(hwnd);
@@ -774,9 +800,8 @@ static bool DiscoverWorkspaceWindows(
 
       FloatingPlacementHint newWindowHint;
       newWindowHint.intent =
-          workspace.Layout() != TileLayout::Floating &&
-                  pendingDefaultCenter
-              ? FloatingPlacementIntent::NewWindowCenterMoveOnly
+          pendingDefaultCenter
+              ? FloatingPlacementIntent::CenterPreservingSize
               : FloatingPlacementIntent::NewWindowCenter;
       if (RepairFloatingGeometry(key, workspace, hwnd, newWindowHint)) {
         workspace.ClearDefaultFloatingCenter(hwnd);

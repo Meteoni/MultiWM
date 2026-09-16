@@ -359,6 +359,7 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     const bool pendingInsertionPlacement = existing.pendingInsertionPlacement;
     const bool pendingDefaultFloatingCenter =
         existing.pendingDefaultFloatingCenter;
+    const bool alwaysFloating = existing.alwaysFloating;
     const WindowConstraints cachedConstraints = existing.constraints;
     const ManageState state = existing.state;
     const PresentationState presentation = existing.presentationState;
@@ -374,6 +375,7 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     existing.tilingGeneration = tilingGeneration;
     existing.pendingInsertionPlacement = pendingInsertionPlacement;
     existing.pendingDefaultFloatingCenter = pendingDefaultFloatingCenter;
+    existing.alwaysFloating = alwaysFloating;
     if (!existing.constraints.valid && cachedConstraints.valid) {
       existing.constraints = cachedConstraints;
     }
@@ -395,7 +397,7 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
 bool Workspace::ActivateTiled(HWND hwnd) {
   AssertWmThread(L"Workspace::ActivateTiled");
   WindowRecord* record = FindMutable(hwnd);
-  if (!record) return false;
+  if (!record || record->alwaysFloating) return false;
 
   const ManageState previousState = record->state;
   bool changed = false;
