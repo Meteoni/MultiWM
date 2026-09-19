@@ -109,6 +109,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     }
 
     const bool stateOrLeaseNeedsObservation =
+        g_workspaces.IsSuspendedMaximized(hwnd) ||
         HasActiveConformanceLease(hwnd) ||
         g_workspaces.IsTiled(hwnd);
     if (!stateOrLeaseNeedsObservation &&

@@ -556,6 +556,29 @@ bool WorkspaceRepository::IsTiled(HWND hwnd) const {
   return found;
 }
 
+bool WorkspaceRepository::IsSuspendedMaximized(HWND hwnd) const {
+  if (!hwnd) return false;
+  bool found = false;
+  AcquireSRWLockShared(&lock_);
+
+  auto ownersIt = ownersByWindow_.find(hwnd);
+  if (ownersIt != ownersByWindow_.end()) {
+    for (const auto& key : ownersIt->second) {
+      auto stateIt = states_.find(key);
+      if (stateIt == states_.end()) continue;
+      const WindowRecord* record = stateIt->second.Find(hwnd);
+      if (record && record->state == ManageState::Suspended &&
+          record->suspensionReason == SuspensionReason::Maximized) {
+        found = true;
+        break;
+      }
+    }
+  }
+
+  ReleaseSRWLockShared(&lock_);
+  return found;
+}
+
 std::vector<DesktopMonitorKey> WorkspaceRepository::OwnersOf(HWND hwnd) const {
   std::vector<DesktopMonitorKey> keys;
   if (!hwnd) return keys;

@@ -868,6 +868,7 @@ class WorkspaceRepository {
   void Save(const DesktopMonitorKey& key, const Workspace& workspace);
   bool IsTracked(HWND hwnd) const;
   bool IsTiled(HWND hwnd) const;
+  bool IsSuspendedMaximized(HWND hwnd) const;
   std::vector<DesktopMonitorKey> OwnersOf(HWND hwnd) const;
   std::vector<HWND> KnownWindows() const;
   std::vector<HMONITOR> MonitorsOnDesktop(const GUID& desktopId) const;
