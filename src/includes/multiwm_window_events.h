@@ -95,14 +95,12 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // conformance lease instead of being silently discarded.
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
     if (!tracked) {
-      // A newly created window can already be minimized, maximized or fullscreen
-      // before the ordinary discovery snapshot sees it. Minimized windows need the
-      // inactive-admission path; presentation overrides remain active tiled members.
+      // A newly created window can already be minimized, maximized, or fullscreen
+      // before the ordinary discovery snapshot sees it. Queue those states for the
+      // inactive-admission path.
       const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
-      const PresentationState presentation =
-          GetPhysicalPresentationState(hwnd);
       if ((reason != SuspensionReason::Minimized &&
-           presentation == PresentationState::Normal) ||
+           reason != SuspensionReason::Maximized) ||
           !WindowCanBeManaged(hwnd)) {
         return;
       }

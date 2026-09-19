@@ -240,7 +240,6 @@ std::vector<double> DefaultWeights(size_t count) {
 
 static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd);
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd);
-static PresentationState GetPhysicalPresentationState(HWND hwnd);
 static bool WindowCanBeManaged(HWND hwnd);
 static bool IsWindowTrackedInAnyState(HWND hwnd);
 bool ContainsWindow(const std::vector<HWND>& windows, HWND hwnd) {
@@ -318,14 +317,6 @@ bool Workspace::UpdateConstraints(
   return changed;
 }
 
-bool Workspace::UpdatePresentationState(HWND hwnd, PresentationState state) {
-  AssertWmThread(L"Workspace::UpdatePresentationState");
-  WindowRecord* record = FindMutable(hwnd);
-  if (!record || record->presentationState == state) return false;
-  record->presentationState = state;
-  return true;
-}
-
 bool Workspace::HasSuspended() const {
   return std::any_of(
       records_.begin(), records_.end(), [](const auto& kv) {
@@ -362,7 +353,6 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
     const bool alwaysFloating = existing.alwaysFloating;
     const WindowConstraints cachedConstraints = existing.constraints;
     const ManageState state = existing.state;
-    const PresentationState presentation = existing.presentationState;
     const SuspensionReason suspension = existing.suspensionReason;
     const SuspendedSlot slot = existing.savedSlot;
     const bool hasSlot = existing.hasSavedSlot;
@@ -386,7 +376,6 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
       existing.hasFloatingRect = true;
     }
     existing.state = state;
-    existing.presentationState = presentation;
     existing.suspensionReason = suspension;
     existing.savedSlot = slot;
     existing.hasSavedSlot = hasSlot;

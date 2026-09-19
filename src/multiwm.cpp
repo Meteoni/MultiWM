@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.55
+// @version         1.13.56
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -70,13 +70,13 @@ A small tray indicator shows the active workspace layout and provides quick acce
 - general:
   - DefaultWindowManagementMode: automatic
     $name: Default Window Management Mode
-    $description: 'Choose membership policy after startup. Manual keeps Alt+T groups contained: new windows are not admitted, minimizing / moving to another desktop releases membership. Maximized and fullscreen tiled windows retain their assigned slot without reflowing the layout. Automatic continuously discovers and migrates managed windows.'
+    $description: 'Choose membership policy after startup. Manual keeps Alt+T groups contained: new windows are not admitted, minimizing / moving to another desktop releases membership. Maximized and fullscreen tiled windows are suspended and restore to their saved slot. Automatic continuously discovers and migrates managed windows.'
     $options:
       - manual: Manual
       - automatic: Automatic
   - AutomaticNewWindowPosition: last_slot
     $name: Automatic Window Insertion Position
-    $description: 'Choose the preferred position for newly discovered windows and migrated windows from another workspace. If constraints prevent it, MultiWM tries the nearest viable slot. Minimized windows restore to their saved logical slot; maximize/fullscreen never leave their tile.'
+    $description: 'Choose the preferred position for newly discovered windows and migrated windows from another workspace. If constraints prevent it, MultiWM tries the nearest viable slot. Minimized and maximized/fullscreen windows restore to their saved logical slot.'
     $options:
       - last_slot: Last slot
       - after_focused: After focused window

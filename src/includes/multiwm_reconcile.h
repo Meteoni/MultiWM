@@ -139,9 +139,8 @@ static bool AdmitUntrackedSnapshot(
 }
 
 // Automatic discovery can observe a new window while Windows still reports it as
-// minimized. Such HWNDs belong to the workspace logically but must not enter the
-// active tiling set until restored. Maximized/fullscreen windows are ordinary active
-// tiled members with a presentation override and are discovered by the normal path.
+// minimized, maximized, or fullscreen. Such HWNDs belong to the workspace
+// logically but must not enter the active tiling set until restored.
 static bool AdmitUntrackedSuspendedSnapshot(
     Workspace& workspace, const std::vector<HWND>& snapshot, bool allowAdmission,
     bool useAutomaticAdmissionPolicy = false) {
@@ -157,7 +156,8 @@ static bool AdmitUntrackedSuspendedSnapshot(
     if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) return false;
 
     const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
-    if (reason != SuspensionReason::Minimized) {
+    if (reason != SuspensionReason::Minimized &&
+        reason != SuspensionReason::Maximized) {
       return false;
     }
 
@@ -497,13 +497,11 @@ static void ReconcileWindowParticipation(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
   const SuspensionReason physicalReason = GetPhysicalSuspensionReason(hwnd);
-  const PresentationState physicalPresentation =
-      GetPhysicalPresentationState(hwnd);
 
   // In Manual mode, minimizing is an explicit departure from the managed group.
   // Forget the logical member entirely; restoring the HWND won't re-admit it
-  // because Manual discovery remains closed. Maximize/fullscreen are presentation
-  // overrides only and therefore never alter membership in either mode.
+  // because Manual discovery remains closed. Maximization is intentionally
+  // different: suspend it so restore returns to the exact saved slot/weight.
   if (IsManualMode() && physicalReason == SuspensionReason::Minimized) {
     ForgetWindowFromOwners(hwnd, ownerKeys, changedKeys);
     return;
@@ -516,54 +514,46 @@ static void ReconcileWindowParticipation(
     const WindowRecord* record = workspace.Find(hwnd);
     if (!record) continue;
 
-    PresentationState presentation = physicalPresentation;
-    if (presentation == PresentationState::Fullscreen &&
+    SuspensionReason reason = physicalReason;
+    if (reason == SuspensionReason::Maximized && !IsZoomed(hwnd) &&
         record->state == ManageState::Tiled) {
       // A borderless tile can legitimately cover the monitor when the configured
       // work area has no visible insets/gaps. If it already occupies its exact
-      // authoritative tile, don't mistake that geometry for application fullscreen.
+      // authoritative tile, don't mistake that geometry for fullscreen.
       RECT authoritative{};
       RECT current{};
       if (GetCurrentAuthoritativeTiledRect(
               ownerKey, workspace, hwnd, &authoritative) &&
           GetWindowFrameRect(hwnd, &current) &&
           RectsNear(current, authoritative)) {
-        presentation = PresentationState::Normal;
+        reason = SuspensionReason::None;
       }
     }
 
-    bool changed = workspace.UpdatePresentationState(hwnd, presentation);
-    if (presentation != PresentationState::Normal) {
-      // Presentation overrides are application-owned geometry. Keep the tile in
-      // the logical plan but stop any in-flight attempt to reinforce that HWND.
+    bool changed = false;
+    bool restoredIntoFloatingLayout = false;
+    const bool pendingInsertionBeforeSuspension =
+        record->state == ManageState::Tiled &&
+        record->pendingInsertionPlacement;
+
+    if (record->state == ManageState::Tiled &&
+        reason != SuspensionReason::None) {
       CancelConformanceLease(hwnd);
       ClearMoveSizeSamples(hwnd);
-    }
-
-    bool restoredIntoFloatingLayout = false;
-    const WindowRecord* refreshedRecord = workspace.Find(hwnd);
-    if (!refreshedRecord) continue;
-    const bool pendingInsertionBeforeSuspension =
-        refreshedRecord->state == ManageState::Tiled &&
-        refreshedRecord->pendingInsertionPlacement;
-
-    if (refreshedRecord->state == ManageState::Tiled &&
-        physicalReason != SuspensionReason::None) {
-      CancelConformanceLease(hwnd);
-      const bool suspended = workspace.Suspend(hwnd, physicalReason);
+      const bool suspended = workspace.Suspend(hwnd, reason);
       changed |= suspended;
       if (suspended && pendingInsertionBeforeSuspension) {
         changed |= RestorePendingAdmissionRecoveryAfterSuspension(
             ownerKey, hwnd, &workspace);
       }
-    } else if (refreshedRecord->state == ManageState::Suspended) {
-      if (physicalReason == SuspensionReason::None) {
+    } else if (record->state == ManageState::Suspended) {
+      if (reason == SuspensionReason::None) {
         const bool restored = workspace.Restore(hwnd);
         changed |= restored;
         restoredIntoFloatingLayout =
             restored && workspace.Layout() == TileLayout::Floating;
       } else {
-        changed |= workspace.Suspend(hwnd, physicalReason);
+        changed |= workspace.Suspend(hwnd, reason);
       }
     }
 
@@ -571,8 +561,7 @@ static void ReconcileWindowParticipation(
       // A member that was suspended while its workspace entered Floating missed
       // the layout-transition restore. Apply the same passive remembered-geometry
       // policy when it becomes active again.
-      if (restoredIntoFloatingLayout &&
-          presentation == PresentationState::Normal) {
+      if (restoredIntoFloatingLayout) {
         RepairFloatingGeometry(
             ownerKey, workspace, hwnd, FloatingPlacementHint{});
       }
@@ -680,10 +669,9 @@ static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) 
 static void ScheduleLifecycleReconcile(HWND hwnd);
 
 // Build only the extra inactive candidates implicated by this settled lifecycle
-// burst. This deliberately does not add another EnumWindows pass: normal active
-// discovery (including maximize/fullscreen presentation overrides) still comes from
-// the one-pass per-monitor snapshot, while newly observed minimized HWNDs are
-// classified from the already-dirty set.
+// burst. This deliberately does not add another EnumWindows pass: normal restored
+// discovery still comes from the one-pass per-monitor snapshot, while newly
+// observed minimized/maximized HWNDs are classified from the already-dirty set.
 static std::vector<std::vector<HWND>> CollectDirtySuspendedWindowsForMonitors(
     const std::vector<HWND>& dirtyWindows,
     const std::vector<HMONITOR>& monitors,
@@ -700,7 +688,8 @@ static std::vector<std::vector<HWND>> CollectDirtySuspendedWindowsForMonitors(
     }
 
     const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
-    if (reason != SuspensionReason::Minimized) {
+    if (reason != SuspensionReason::Minimized &&
+        reason != SuspensionReason::Maximized) {
       continue;
     }
 
@@ -770,9 +759,8 @@ static bool DiscoverWorkspaceWindows(
   }
 
   // A default-floating HWND can be admitted during initial seeding or while it
-  // is minimized. Once it appears in the active snapshot, route the retained
-  // centering request through the same placement pass. Maximize/fullscreen do not
-  // change its logical state and physical repair stays suppressed until Normal.
+  // is suspended. Once it appears in the active snapshot, route the retained
+  // centering request through the same placement pass.
   for (HWND hwnd : snapshot) {
     const WindowRecord* record = workspace.Find(hwnd);
     if (record && record->state == ManageState::Floating &&
@@ -1361,9 +1349,8 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
     case EVENT_SYSTEM_MINIMIZEEND:
     case EVENT_OBJECT_STATECHANGE:
       // These are prompts to query actual physical state. In Automatic mode,
-      // minimize/restore preserves membership through a saved slot. Maximize and
-      // fullscreen never leave the active layout; reconciliation only toggles
-      // their presentation override. Run immediately and after settle.
+      // minimize/maximize/fullscreen transitions preserve membership through a
+      // saved slot. Run immediately and after settle.
       ReconcileManagedWindowStateNow(hwnd);
       ScheduleLifecycleReconcile(hwnd);
       break;

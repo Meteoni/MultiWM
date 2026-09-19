@@ -150,16 +150,11 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
   if (IsIconic(hwnd)) return SuspensionReason::Minimized;
   if (!IsWindowVisible(hwnd)) return SuspensionReason::Hidden;
-  return SuspensionReason::None;
-}
-
-static PresentationState GetPhysicalPresentationState(HWND hwnd) {
-  if (!hwnd || !IsWindow(hwnd)) return PresentationState::Normal;
-  if (IsZoomed(hwnd)) return PresentationState::Maximized;
+  if (IsZoomed(hwnd)) return SuspensionReason::Maximized;
 
   // Chromium and similar apps can cover the full monitor while Windows still
-  // reports the HWND as restored. Keep that as a presentation override instead
-  // of removing the logical leaf from the tiling tree.
+  // reports the HWND as restored. Fullscreen and native maximize have identical
+  // suspend/save-slot/restore semantics here.
   RECT windowRect{};
   if (GetWindowRect(hwnd, &windowRect)) {
     HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONULL);
@@ -174,17 +169,16 @@ static PresentationState GetPhysicalPresentationState(HWND hwnd) {
                  kFullscreenTolerancePx) &&
         !Differs(windowRect.bottom, monitorInfo.rcMonitor.bottom,
                  kFullscreenTolerancePx)) {
-      return PresentationState::Fullscreen;
+      return SuspensionReason::Maximized;
     }
   }
-  return PresentationState::Normal;
+  return SuspensionReason::None;
 }
 
 // Workspace initialization needs a broader physical snapshot than normal layout
 // participation. A visible top-level window can already belong to this workspace
-// while minimized. Maximized/fullscreen windows remain active logical members and
-// are collected normally; enumerate this broader set only for non-participating
-// physical states when creating a workspace.
+// while minimized, maximized, or fullscreen, even though active collection
+// correctly excludes it from placement.
 static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
     HMONITOR monitor, const GUID& desktopId) {
   std::vector<HWND> windows;
@@ -3080,9 +3074,7 @@ static void ArrangeWorkspace(
         if (!record) {
           action = Workspace::PlacementAction::Forget;
         } else if (
-            record->presentationState == PresentationState::Normal &&
             GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
-            GetPhysicalPresentationState(hwnd) == PresentationState::Normal &&
             !IsWindowCloaked(hwnd)) {
           PlacementObservation observation =
               PlaceWindowChecked(hwnd, record->canMove, rects[i]);
@@ -3264,29 +3256,6 @@ static bool ClearSettledInsertionPlacements(
       continue;
     }
 
-    const PresentationState physicalPresentation =
-        GetPhysicalPresentationState(hwnd);
-
-    // A maximized/fullscreen tiled member is already logically settled once the
-    // workspace reflow has survived every sibling conformance lease. Its physical
-    // frame is application-owned presentation geometry and must never be required
-    // to equal the authoritative tile. Clear the pending-admission role only when
-    // model and live presentation agree, so a transition race cannot settle stale
-    // state.
-    if (record->presentationState != PresentationState::Normal) {
-      if (physicalPresentation == record->presentationState &&
-          workspace.ClearInsertionPlacement(hwnd)) {
-        changed = true;
-        DiscardPendingAdmissionRecovery(hwnd);
-        Diagnostics::RecordEvent(
-            L"pending admission settled under presentation override hwnd=%p state=%d",
-            hwnd, static_cast<int>(record->presentationState));
-      }
-      continue;
-    }
-
-    if (physicalPresentation != PresentationState::Normal) continue;
-
     RECT authoritative{};
     RECT current{};
     if (GetCurrentAuthoritativeTiledRect(
@@ -3327,7 +3296,6 @@ static void FinalizeExpiredConformanceLease(
 
   if (!IsWindow(hwnd) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd) ||
       IsMoveSizeGestureInProgress(hwnd)) {
     stale();
@@ -3347,9 +3315,7 @@ static void FinalizeExpiredConformanceLease(
   }
 
   const WindowRecord* record = workspace.Find(hwnd);
-  if (!record ||
-      record->presentationState != PresentationState::Normal ||
-      !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
+  if (!record || !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
     stale();
     return;
   }
@@ -3380,10 +3346,8 @@ static void FinalizeExpiredConformanceLease(
   }
 
   // Expiry processing performs several live queries after its initial preflight.
-  // A window that entered maximize/fullscreen meanwhile owns its presentation
-  // geometry; a stale lease must not convert that tiled member to Floating.
-  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      GetPhysicalPresentationState(hwnd) != PresentationState::Normal) {
+  // A window that became suspended meanwhile must not be converted to Floating.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     stale();
     return;
   }
@@ -3397,7 +3361,6 @@ static void FinalizeExpiredConformanceLease(
       beforeConstraints, freshConstraints);
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, *record) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd)) {
     stale();
     return;
@@ -3455,7 +3418,6 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
 
   if (!IsWindow(hwnd) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd)) {
     if (hasLease) CancelConformanceLease(hwnd, lease.generation);
     return false;
@@ -3474,7 +3436,6 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   }
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record || record->state != ManageState::Tiled ||
-      record->presentationState != PresentationState::Normal ||
       workspace.Layout() == TileLayout::Floating ||
       !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
     if (hasLease) CancelConformanceLease(hwnd, lease.generation);
@@ -3532,7 +3493,6 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   // while the ownership/layout queries above are in progress.
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, *record) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd)) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;
@@ -3549,7 +3509,6 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   // after that bounded call before either learning policy or reinforcing a tile.
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, *record) ||
       GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      GetPhysicalPresentationState(hwnd) != PresentationState::Normal ||
       IsWindowCloaked(hwnd)) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;

@@ -82,8 +82,8 @@
 //    Automatic admits unknown HWNDs and migrates managed HWNDs between workspaces;
 //    Manual admits only through explicit commands, forgets minimized members, and
 //    releases membership when a managed HWND moves to another virtual desktop.
-//    Maximized/fullscreen tiled members remain active logical leaves; only physical
-//    placement/conformance is suppressed until they return to Normal presentation.
+//    Maximized/fullscreen tiled members are suspended and restore to their saved
+//    logical slot when they return to a normal window state.
 // 9. Floating geometry is remembered independently of tiled geometry. Tiling and
 //    geometry adoption never overwrite the last meaningful floating rectangle.
 //
@@ -627,22 +627,13 @@ enum class ManageState {
 };
 
 // Why a logically managed tiled window is temporarily absent from the active
-// layout. Minimize/hidden states remove visible participation; maximize/fullscreen
-// are presentation overrides and therefore do not belong in this enum.
+// layout. Hidden is retained for close-to-tray behavior; maximize and fullscreen
+// share the same save-slot/restore semantics.
 enum class SuspensionReason {
   None,
   Hidden,
   Minimized,
-};
-
-// Presentation is orthogonal to layout membership. A tiled window remains in
-// windows_ with the same slot/order while maximized or fullscreen; arrangement
-// still computes its authoritative tile but suppresses SetWindowPos/conformance
-// until the application returns to Normal.
-enum class PresentationState {
-  Normal,
   Maximized,
-  Fullscreen,
 };
 
 enum class PlacementResult {
@@ -709,10 +700,6 @@ struct WindowRecord {
   UINT floatingDpi = 96;
   bool hasFloatingRect = false;
 
-  // Physical presentation never changes logical tile membership. Maximized and
-  // fullscreen tiled windows keep their slot while placement is suppressed.
-  PresentationState presentationState = PresentationState::Normal;
-
   // Only meaningful while state == Suspended. It preserves the tiled logical
   // position/weight across non-participating physical states.
   SuspensionReason suspensionReason = SuspensionReason::None;
@@ -768,7 +755,6 @@ class Workspace {
   }
   bool RememberFocusedWindow(HWND hwnd);
   bool UpdateConstraints(HWND hwnd, const WindowConstraints& constraints);
-  bool UpdatePresentationState(HWND hwnd, PresentationState state);
   bool HasSuspended() const;
   bool AllTiledVisible(const std::vector<HWND>& snapshot) const;
 
@@ -906,7 +892,6 @@ using Model::DesktopMonitorKey;
 using Model::ManageState;
 using Model::PlacementObservation;
 using Model::PlacementResult;
-using Model::PresentationState;
 using Model::SuspendedSlot;
 using Model::SuspensionReason;
 using Model::WindowConstraints;

@@ -164,8 +164,7 @@ static bool RepairFloatingGeometry(
     const FloatingPlacementHint& hint) {
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record || !record->canMove || !IsWindow(hwnd) ||
-      GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      GetPhysicalPresentationState(hwnd) != PresentationState::Normal) {
+      GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     return false;
   }
 
@@ -250,10 +249,9 @@ static bool RepairFloatingGeometry(
   if (!centerWithoutResize) {
     target = ClampFloatingRectToWorkArea(target, workArea);
   }
-  // The window can enter a non-participating or presentation-owned physical
-  // state while the placement target is being calculated. Never overwrite it.
-  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      GetPhysicalPresentationState(hwnd) != PresentationState::Normal) {
+  // The window can enter a non-participating physical state while the placement
+  // target is being calculated. Never overwrite it.
+  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     return false;
   }
   PlacementObservation observation =
