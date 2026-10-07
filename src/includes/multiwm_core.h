@@ -127,6 +127,13 @@ bool GetCurrentDesktopId(GUID* outGuid);
 bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid);
 bool IsWindowOnCurrentDesktopSafe(HWND hwnd, BOOL* onCurrent);
 bool RegisterVirtualDesktopNotifications();
+
+struct DesktopMetadata {
+  std::wstring name;
+  int number = 0;
+};
+
+DesktopMetadata ReadDesktopMetadata(const GUID& desktopId);
 }  // namespace Platform::VirtualDesktop
 
 namespace RuntimeLifecycle {
@@ -234,6 +241,17 @@ struct WindowRule {
   FloatingDefaultSize floatingSizeDip{};
 };
 
+enum class WorkspaceRuleMonitor { Any, Primary, NonPrimary };
+
+struct WorkspaceInitializationRule {
+  std::wstring desktopNameContains;
+  int desktopNumber = 0;
+  WorkspaceRuleMonitor monitor = WorkspaceRuleMonitor::Any;
+  std::wstring monitorId;
+  TileLayout layout = TileLayout::MasterStack;
+  int settingsIndex = 0;
+};
+
 // Windhawk settings and immutable-at-runtime policy values. Settings reloads
 // replace these fields; transient WM state lives in WmRuntime instead.
 struct SettingsState {
@@ -267,6 +285,7 @@ struct SettingsState {
       AutomaticNewWindowPosition::LastSlot;
   TileLayout defaultLayout = TileLayout::MasterStack;
   std::vector<TileLayout> layoutCycle = MakeBuiltInLayoutCycle();
+  std::vector<WorkspaceInitializationRule> workspaceInitializationRules;
   std::vector<WindowRule> windowRules;
   std::wstring diagnosticsOutputPath =
       L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";

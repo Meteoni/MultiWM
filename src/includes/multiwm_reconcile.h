@@ -34,10 +34,54 @@ static bool EnsureUniqueWindowOwnership(
     HWND hwnd, const DesktopMonitorKey& targetKey,
     std::vector<DesktopMonitorKey>* changedKeys = nullptr);
 
-static Workspace MakeDefaultWorkspace() {
+static TileLayout ResolveInitialWorkspaceLayout(
+    const DesktopMonitorKey& key, int* matchedRuleIndex = nullptr) {
+  if (matchedRuleIndex) *matchedRuleIndex = 0;
+  Platform::VirtualDesktop::DesktopMetadata desktop;
+  bool metadataRead = false;
+  MONITORINFO monitorInfo{sizeof(monitorInfo)};
+  const bool haveMonitorInfo =
+      !g_settings.workspaceInitializationRules.empty() &&
+      GetMonitorInfoW(key.ResolveMonitor(), &monitorInfo);
+
+  for (const auto& rule : g_settings.workspaceInitializationRules) {
+    if (!rule.monitorId.empty() && rule.monitorId != key.monitor.deviceId) continue;
+    if (rule.monitor != WorkspaceRuleMonitor::Any) {
+      if (!haveMonitorInfo) continue;
+      const bool primary = (monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
+      if (primary != (rule.monitor == WorkspaceRuleMonitor::Primary)) continue;
+    }
+    if (!rule.desktopNameContains.empty() || rule.desktopNumber != 0) {
+      if (!metadataRead) {
+        desktop = Platform::VirtualDesktop::ReadDesktopMetadata(key.desktopId);
+        std::transform(
+            desktop.name.begin(), desktop.name.end(), desktop.name.begin(),
+            [](wchar_t ch) { return std::towlower(ch); });
+        metadataRead = true;
+      }
+      if (rule.desktopNumber != 0 && rule.desktopNumber != desktop.number) continue;
+      if (!rule.desktopNameContains.empty() &&
+          desktop.name.find(rule.desktopNameContains) == std::wstring::npos) {
+        continue;
+      }
+    }
+    if (matchedRuleIndex) *matchedRuleIndex = rule.settingsIndex;
+    return rule.layout;
+  }
+  return g_settings.defaultLayout;
+}
+
+static Workspace MakeDefaultWorkspace(const DesktopMonitorKey& key) {
   Workspace workspace;
-  workspace.SetLayout(g_settings.defaultLayout);
+  int matchedRuleIndex = 0;
+  workspace.SetLayout(ResolveInitialWorkspaceLayout(key, &matchedRuleIndex));
   workspace.SetMasterRatio(g_settings.masterPercent / 100.0);
+  if (matchedRuleIndex != 0) {
+    Diagnostics::RecordEvent(
+        L"workspace initial layout desktop=%08X monitorId=%ls rule=%d layout=%d",
+        key.desktopId.Data1, key.monitor.deviceId.c_str(), matchedRuleIndex,
+        static_cast<int>(workspace.Layout()));
+  }
   return workspace;
 }
 
@@ -235,7 +279,7 @@ static bool EnsureWorkspaceFromSnapshot(
   ReconcileTrackedSnapshotOwnership(
       key, workspaceExisted ? snapshot : initialSnapshot, ownershipChangedKeys);
 
-  if (!g_workspaces.Load(key, &workspace)) workspace = MakeDefaultWorkspace();
+  if (!g_workspaces.Load(key, &workspace)) workspace = MakeDefaultWorkspace(key);
   if (!workspaceExisted) {
     SeedInitialSnapshot(
         workspace, initialSnapshot,
@@ -318,8 +362,7 @@ static bool MigrateManagedWindow(
 
   Workspace target;
   if (!g_workspaces.Load(targetKey, &target)) {
-    target.SetLayout(g_settings.defaultLayout);
-    target.SetMasterRatio(g_settings.masterPercent / 100.0);
+    target = MakeDefaultWorkspace(targetKey);
   }
 
   HWND insertionAnchor = nullptr;
@@ -735,7 +778,7 @@ static bool DiscoverWorkspaceWindows(
       key, initializing ? initialSnapshot : snapshot, ownershipChangedKeys);
 
   bool hasState = g_workspaces.Load(key, &workspace);
-  if (!hasState) workspace = MakeDefaultWorkspace();
+  if (!hasState) workspace = MakeDefaultWorkspace(key);
 
   if (initializing &&
       SeedInitialSnapshot(workspace, initialSnapshot, true)) {

@@ -191,6 +191,62 @@ void LoadSettings() {
     Wh_Log(L"LayoutCycle is empty or invalid; using the built-in layout sequence");
   }
 
+  g_settings.workspaceInitializationRules.clear();
+  for (int i = 0;; ++i) {
+    auto ruleLayout =
+        StringSetting::make(L"workspace.InitializationRules[%d].Layout", i);
+    auto desktopName = StringSetting::make(
+        L"workspace.InitializationRules[%d].DesktopNameContains", i);
+    auto monitor =
+        StringSetting::make(L"workspace.InitializationRules[%d].Monitor", i);
+    auto monitorId =
+        StringSetting::make(L"workspace.InitializationRules[%d].MonitorId", i);
+    const int desktopNumber = Wh_GetIntSetting(
+        L"workspace.InitializationRules[%d].DesktopNumber", i);
+    // Added rows can omit unchanged fields, including Monitor. Read the whole
+    // row before detecting the end, as blank Layout only disables that row.
+    if (!*ruleLayout.get() && !*desktopName.get() && !*monitor.get() &&
+        !*monitorId.get() && desktopNumber == 0) {
+      break;
+    }
+    if (!*ruleLayout.get()) continue;
+
+    WorkspaceInitializationRule rule;
+    rule.settingsIndex = i + 1;
+    rule.desktopNumber = desktopNumber;
+    if (rule.desktopNumber < 0 ||
+        !TryParseLayoutSetting(ruleLayout.get(), &rule.layout)) {
+      Wh_Log(L"Ignoring invalid workspace initialization rule %d", i + 1);
+      continue;
+    }
+    if (_wcsicmp(monitor.get(), L"primary") == 0) {
+      rule.monitor = WorkspaceRuleMonitor::Primary;
+    } else if (_wcsicmp(monitor.get(), L"non_primary") == 0) {
+      rule.monitor = WorkspaceRuleMonitor::NonPrimary;
+    } else if (*monitor.get() && _wcsicmp(monitor.get(), L"any") != 0) {
+      Wh_Log(L"Ignoring invalid monitor selector at workspace rule %d", i + 1);
+      continue;
+    }
+    auto trimmed = [](PCWSTR text) {
+      std::wstring value = text;
+      const size_t first = value.find_first_not_of(L" \t\r\n");
+      return first == std::wstring::npos ? std::wstring{}
+          : value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
+    };
+    rule.desktopNameContains = trimmed(desktopName.get());
+    std::transform(
+        rule.desktopNameContains.begin(), rule.desktopNameContains.end(),
+        rule.desktopNameContains.begin(),
+        [](wchar_t ch) { return std::towlower(ch); });
+    rule.monitorId = trimmed(monitorId.get());
+    NormalizeMonitorIdentityToken(&rule.monitorId);
+    if (rule.desktopNameContains.empty() && rule.desktopNumber == 0 &&
+        rule.monitor == WorkspaceRuleMonitor::Any && rule.monitorId.empty()) {
+      continue;
+    }
+    g_settings.workspaceInitializationRules.push_back(std::move(rule));
+  }
+
   auto mouseBehavior =
       StringSetting::make(L"windowBehavior.MouseMoveBehavior");
   g_settings.mouseMoveBehavior =

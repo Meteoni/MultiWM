@@ -33,6 +33,8 @@ static UINT g_taskbarCreatedMessage = 0;
 static bool g_iconAdded = false;
 static bool g_systemLightTheme = false;
 static bool g_flyoutTop = false;
+static bool g_showToasts = true;
+static bool g_trayClickOpensMenu = false;
 static int g_flyoutOffsetX = 0;
 static int g_flyoutOffsetY = 0;
 static TileLayout g_displayedLayout = TileLayout::COUNT;
@@ -95,6 +97,9 @@ static const wchar_t* LayoutFlyoutText(TileLayout layout) {
 
 static void LoadSettings() {
   using WindhawkUtils::StringSetting;
+  auto trayClickAction = StringSetting::make(L"general.TrayClickAction");
+  g_trayClickOpensMenu = _wcsicmp(trayClickAction.get(), L"context_menu") == 0;
+  g_showToasts = Wh_GetIntSetting(L"appearance.ShowToasts") != 0;
   auto position = StringSetting::make(L"appearance.FlyoutPosition");
   g_flyoutTop = _wcsicmp(position.get(), L"top") == 0;
   g_flyoutOffsetX = Wh_GetIntSetting(L"appearance.FlyoutOffsetX");
@@ -278,9 +283,9 @@ static void SetTooltip(TileLayout layout) {
         TileLayout monitorLayout = g_settings.defaultLayout;
         Workspace state;
         DesktopMonitorKey key{};
-        if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key) &&
-            g_workspaces.Load(key, &state)) {
-          monitorLayout = state.Layout();
+        if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) {
+          monitorLayout = g_workspaces.Load(key, &state)
+              ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
         }
 
         tooltip += L"\n";
@@ -527,7 +532,7 @@ static FlyoutInstance* GetOrCreateFlyoutForMonitor(HMONITOR monitor) {
 }
 
 static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
-  if (!text || !*text) return;
+  if (!g_showToasts || !text || !*text) return;
   if (!monitor) monitor = GetWorkspaceCommandMonitor();
   RECT workArea{};
   if (!monitor || !GetMonitorWorkArea(monitor, &workArea)) return;
@@ -595,15 +600,16 @@ static void ShowManagementModeFlyout(bool automatic) {
 }
 
 static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
+  if (!g_showToasts) return;
   std::vector<HMONITOR> monitors;
   Reconcile::EnumerateCurrentMonitors(monitors);
   for (HMONITOR monitor : monitors) {
     TileLayout layout = g_settings.defaultLayout;
     Workspace state;
     DesktopMonitorKey key{};
-    if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key) &&
-        g_workspaces.Load(key, &state)) {
-      layout = state.Layout();
+    if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) {
+      layout = g_workspaces.Load(key, &state)
+          ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
     }
     ShowLayoutFlyout(layout, monitor);
   }
@@ -628,9 +634,9 @@ static TileLayout GetMonitorLayoutOrDefault(HMONITOR monitor) {
   TileLayout layout = g_settings.defaultLayout;
   DesktopMonitorKey key{};
   Workspace state;
-  if (monitor && GetCurrentWorkspaceKey(monitor, &key) &&
-      g_workspaces.Load(key, &state)) {
-    layout = state.Layout();
+  if (monitor && GetCurrentWorkspaceKey(monitor, &key)) {
+    layout = g_workspaces.Load(key, &state)
+        ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
   }
   return layout;
 }
@@ -750,7 +756,10 @@ static void RefreshForMonitor(HMONITOR monitor) {
   DesktopMonitorKey key{};
   Workspace state;
   const bool haveKey = GetCurrentWorkspaceKey(monitor, &key);
-  if (haveKey && g_workspaces.Load(key, &state)) layout = state.Layout();
+  if (haveKey) {
+    layout = g_workspaces.Load(key, &state)
+        ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
+  }
 
   if (haveKey) {
     g_displayedDesktopId = key.desktopId;
@@ -812,6 +821,10 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
     }
     if (iconId == kIconId &&
         (event == NIN_SELECT || event == NIN_KEYSELECT)) {
+      if (g_trayClickOpensMenu) {
+        ShowContextMenu();
+        return 0;
+      }
       // Emit the exact same action as the layout hotkey; layout mutation stays
       // serialized on the WM thread and is implemented in one place only.
       const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);

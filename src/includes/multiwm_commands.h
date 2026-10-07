@@ -281,7 +281,7 @@ void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
         return;
       }
     } else {
-      state = Reconcile::MakeDefaultWorkspace();
+      state = Reconcile::MakeDefaultWorkspace(key);
     }
   }
 
@@ -332,7 +332,7 @@ void SetCurrentWorkspaceLayout(TileLayout layout, HMONITOR monitor = nullptr) {
         return;
       }
     } else {
-      state = Reconcile::MakeDefaultWorkspace();
+      state = Reconcile::MakeDefaultWorkspace(key);
       workspaceCreated = true;
     }
   }

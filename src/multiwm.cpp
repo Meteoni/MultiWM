@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.57
+// @version         1.13.58
 // @author          meteoni
 // @github          https://github.com/Meteony
 // @license         MIT
@@ -57,6 +57,12 @@ and Manual management (Alt+R).
 
 A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
 
+Workspace initialization rules select a starting layout by desktop name, Task View
+position, and monitor. The first matching rule wins; existing workspaces keep their
+layout. Rules use the built-in layouts independently of the layout cycle.
+
+Choose the tray icon's left-click action under General, and turn toasts on or off
+under Appearance.
 
 ## Also check out
 - [Virtual Desktop Helper by u2x1](https://windhawk.net/mods/virtual-desktop-helper)
@@ -80,12 +86,18 @@ A small tray indicator shows the active workspace layout and provides quick acce
     $options:
       - last_slot: Last slot
       - after_focused: After focused window
+  - TrayClickAction: cycle_layout
+    $name: Tray Icon Click
+    $description: Action when the tray icon is left-clicked.
+    $options:
+      - cycle_layout: Switch layout
+      - context_menu: Open context menu
   $name: General
 
 - workspace:
   - DefaultLayout: master_stack
-    $name: Default Layout
-    $description: Initial layout used when a new desktop + monitor workspace is created.
+    $name: Fallback Layout
+    $description: Initial layout used when no initialization rule matches.
     $options:
       - master_stack: Master + Stack (Vertical)
       - master_stack_h: Master + Stack (Horizontal)
@@ -105,6 +117,36 @@ A small tray indicator shows the active workspace layout and provides quick acce
       - dwindle: Dwindle
       - monocle: Monocle (Fullscreen)
       - floating: Floating (No tiling)
+  - InitializationRules:
+      - - DesktopNameContains: ""
+          $name: Desktop Name Contains
+          $description: 'Match a custom desktop name, ignoring case. Blank matches any desktop.'
+        - DesktopNumber: 0
+          $name: Desktop Number
+          $description: 'Position in Task View, starting at 1. Set to 0 for any desktop.'
+        - Monitor: any
+          $name: Monitor
+          $options:
+            - any: Any
+            - primary: Primary
+            - non_primary: Non-primary
+        - MonitorId: ""
+          $name: Monitor Device ID
+          $description: 'Optional exact ID from a diagnostic report. Blank matches any monitor.'
+        - Layout: ""
+          $name: Initial Layout
+          $description: Leave blank to ignore this rule.
+          $options:
+            - "": ""
+            - master_stack: Master + Stack (Vertical)
+            - master_stack_h: Master + Stack (Horizontal)
+            - columns: Columns
+            - rows: Rows
+            - dwindle: Dwindle
+            - monocle: Monocle (Fullscreen)
+            - floating: Floating (No tiling)
+    $name: Initialization Rules
+    $description: 'All conditions must match. First match wins; otherwise Fallback Layout applies. Fully empty rows end the list. Existing workspaces keep their layout.'
   - TileGap: 6
     $name: Window Gap (DPI-scaled pixels)
     $description: Gap between adjacent tiled windows, scaled per monitor.
@@ -126,6 +168,9 @@ A small tray indicator shows the active workspace layout and provides quick acce
   $name: Workspace
 
 - appearance:
+  - ShowToasts: true
+    $name: Show Toasts
+    $description: Show layout, mode, and error toasts.
   - FlyoutPosition: top
     $name: Status Flyout Position
     $description: Show layout and mode flyout at the top or bottom center of the active monitor.

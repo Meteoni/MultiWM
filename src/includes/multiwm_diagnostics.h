@@ -1111,8 +1111,13 @@ static void WriteDiagnosticReport() {
       static_cast<unsigned long long>(counters.reportWriteFailures));
 
   report.Section(L"Configuration snapshot");
-  report.Line(L"Default layout: %ls", DiagnosticLayoutName(g_settings.defaultLayout));
+  report.Line(L"Fallback layout: %ls", DiagnosticLayoutName(g_settings.defaultLayout));
   report.TextLine(L"Layout cycle: ", DiagnosticLayoutCycleString(g_settings.layoutCycle));
+  report.Line(L"Workspace initialization rules: %zu",
+              g_settings.workspaceInitializationRules.size());
+  report.Line(L"Tray click: %ls; toasts: %ls",
+              TrayUi::g_trayClickOpensMenu ? L"context menu" : L"switch layout",
+              TrayUi::g_showToasts ? L"enabled" : L"disabled");
   report.Line(
       L"Workspace geometry (96-DPI logical px): gap=%ld insets=[%ld,%ld,%ld,%ld] floatingDefault=%ldx%ld",
       g_settings.gapDip, g_settings.insetsDip.left, g_settings.insetsDip.top,

@@ -88,6 +88,67 @@ bool UsesHMonitorParameter() { return g_vd.abi.usesHMonitor; }
 // Virtual Desktop API + native change notifications
 //=============================================================================
 
+DesktopMetadata ReadDesktopMetadata(const GUID& desktopId) {
+  // Read only at the initial-layout boundary. Missing shell metadata leaves the
+  // corresponding condition unmatched; it never changes existing workspaces.
+  DesktopMetadata desktop;
+  DWORD sessionId = 0;
+  const bool haveSession = ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
+  const std::wstring registryPaths[] = {
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops",
+      haveSession
+          ? L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\" +
+                std::to_wstring(sessionId) + L"\\VirtualDesktops"
+          : std::wstring{}};
+
+  for (const auto& path : registryPaths) {
+    if (path.empty()) continue;
+    DWORD bytes = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, path.c_str(), L"VirtualDesktopIDs",
+                     RRF_RT_REG_BINARY, nullptr, nullptr, &bytes) != ERROR_SUCCESS ||
+        bytes == 0 || bytes > 65536 || bytes % sizeof(GUID) != 0) {
+      continue;
+    }
+    std::vector<GUID> ids(bytes / sizeof(GUID));
+    if (RegGetValueW(HKEY_CURRENT_USER, path.c_str(), L"VirtualDesktopIDs",
+                     RRF_RT_REG_BINARY, nullptr, ids.data(), &bytes) != ERROR_SUCCESS ||
+        bytes % sizeof(GUID) != 0) {
+      continue;
+    }
+    ids.resize(bytes / sizeof(GUID));
+    auto found = std::find_if(ids.begin(), ids.end(), [&](const GUID& id) {
+      return IsEqualGUID(id, desktopId);
+    });
+    if (found != ids.end()) {
+      desktop.number = static_cast<int>(found - ids.begin()) + 1;
+      break;
+    }
+  }
+
+  wchar_t desktopIdText[39]{};
+  if (!StringFromGUID2(desktopId, desktopIdText, ARRAYSIZE(desktopIdText))) {
+    return desktop;
+  }
+  for (const auto& path : registryPaths) {
+    if (path.empty()) continue;
+    const std::wstring namePath = path + L"\\Desktops\\" + desktopIdText;
+    DWORD bytes = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, namePath.c_str(), L"Name",
+                     RRF_RT_REG_SZ, nullptr, nullptr, &bytes) != ERROR_SUCCESS ||
+        bytes == 0 || bytes > 65536 || bytes % sizeof(wchar_t) != 0) {
+      continue;
+    }
+    std::vector<wchar_t> name(bytes / sizeof(wchar_t) + 1, L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, namePath.c_str(), L"Name",
+                     RRF_RT_REG_SZ, nullptr, name.data(), &bytes) == ERROR_SUCCESS &&
+        name.front() != L'\0') {
+      desktop.name = name.data();
+      break;
+    }
+  }
+  return desktop;
+}
+
 static const int VTABLE_GET_CURRENT_DESKTOP = 6;
 
 static const NotificationInterfaceConfig& GetNotificationInterfaceConfig() {
