@@ -222,6 +222,12 @@ void FloatFocusedWindow() {
   Workspace workspace;
   if (!g_workspaces.Load(key, &workspace)) return;
 
+  // Explicit floating also cancels a queued overflow of this focused HWND.
+  g_wm.overflowWindows.erase(hwnd);
+  g_wm.pendingWindowOverflow.erase(
+      std::remove_if(g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
+                     [hwnd](const PendingWindowOverflow& request) { return request.hwnd == hwnd; }),
+      g_wm.pendingWindowOverflow.end());
   HWND tiled = ResolveToTiledWindow(hwnd, workspace.TiledWindows());
   if (!tiled) return;
 

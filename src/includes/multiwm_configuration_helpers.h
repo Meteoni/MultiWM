@@ -240,8 +240,11 @@ std::vector<double> DefaultWeights(size_t count) {
 
 static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd);
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd);
-static bool WindowCanBeManaged(HWND hwnd);
+static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize = false);
 static bool IsWindowTrackedInAnyState(HWND hwnd);
+namespace Reconcile {
+static void ScheduleLifecycleReconcile(HWND hwnd);
+}
 bool ContainsWindow(const std::vector<HWND>& windows, HWND hwnd) {
   for (HWND w : windows) {
     if (w == hwnd) return true;
@@ -483,17 +486,19 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
   if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
     gridWeights_.insert(
         gridWeights_.begin() + std::min(insertionActiveIndex, gridWeights_.size()),
-        1.0);
+        insertionActiveIndex < inheritedSlotWeights_.size() ? inheritedSlotWeights_[insertionActiveIndex] : 1.0);
   } else if ((layout_ == TileLayout::MasterStack ||
               layout_ == TileLayout::MasterStackH) &&
              insertionActiveIndex > 0) {
     const size_t stackIndex =
         std::min(insertionActiveIndex - 1, stackWeights_.size());
-    stackWeights_.insert(stackWeights_.begin() + stackIndex, 1.0);
+    stackWeights_.insert(stackWeights_.begin() + stackIndex,
+        stackIndex < inheritedSlotWeights_.size() ? inheritedSlotWeights_[stackIndex] : 1.0);
   } else if (layout_ == TileLayout::Dwindle) {
     const size_t ratioIndex =
         std::min(insertionActiveIndex, dwindleRatios_.size());
-    dwindleRatios_.insert(dwindleRatios_.begin() + ratioIndex, 0.5);
+    dwindleRatios_.insert(dwindleRatios_.begin() + ratioIndex,
+        ratioIndex < inheritedSlotWeights_.size() ? inheritedSlotWeights_[ratioIndex] : 0.5);
   }
 
   record.state = ManageState::Tiled;

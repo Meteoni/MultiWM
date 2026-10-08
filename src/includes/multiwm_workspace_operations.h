@@ -122,6 +122,11 @@ bool Workspace::Suspend(HWND hwnd, SuspensionReason reason) {
   WindowRecord* existing = FindMutable(hwnd);
   if (existing && existing->state == ManageState::Suspended) {
     if (existing->suspensionReason == reason) return false;
+    if (reason == SuspensionReason::Maximized &&
+        (existing->suspensionReason == SuspensionReason::Minimized ||
+         existing->suspensionReason == SuspensionReason::Hidden)) {
+      existing->tilingGeneration = Model::NextTilingGeneration();
+    }
     existing->suspensionReason = reason;
     DebugValidateMutation(L"Workspace::Suspend(reason update)");
     return true;
@@ -149,7 +154,9 @@ bool Workspace::Suspend(HWND hwnd, SuspensionReason reason) {
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
   if (IsIconic(hwnd)) return SuspensionReason::Minimized;
-  if (!IsWindowVisible(hwnd)) return SuspensionReason::Hidden;
+  DWORD cloaked = 0;
+  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+  if (!IsWindowVisible(hwnd) || (cloaked & DWM_CLOAKED_APP)) return SuspensionReason::Hidden;
   if (IsZoomed(hwnd)) return SuspensionReason::Maximized;
 
   // Chromium and similar apps can cover the full monitor while Windows still
@@ -224,6 +231,9 @@ static bool AdmitInitialObservedWindow(
       IsWindowTrackedInAnyState(hwnd) || IsWindowCloaked(hwnd)) {
     return false;
   }
+  if (useAutomaticAdmissionPolicy && IsWindowAwaitingMonitorRouting(hwnd)) {
+    return false;
+  }
   const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
   if (reason == SuspensionReason::Hidden) return false;
   bool alwaysFloating = false;
@@ -235,7 +245,10 @@ static bool AdmitInitialObservedWindow(
     record.alwaysFloating = alwaysFloating;
     return workspace.AdmitFloating(std::move(record));
   }
-  return workspace.AdmitInitial(MakeWindowRecord(hwnd), reason);
+  WindowRecord record = MakeWindowRecord(hwnd);
+  record.automaticOverflowMonitorFixed =
+      FindMatchingWindowRule(hwnd, WindowRuleTreatment::OpenOnMonitor) != nullptr;
+  return workspace.AdmitInitial(std::move(record), reason);
 }
 
 size_t Workspace::LogicalWindowCount() const {
@@ -244,6 +257,35 @@ size_t Workspace::LogicalWindowCount() const {
     if (kv.second.state == ManageState::Suspended && kv.second.hasSavedSlot) ++count;
   }
   return count;
+}
+
+size_t Workspace::VisibleWindowCount() const {
+  if (layout_ == TileLayout::Floating) return 0;
+  size_t count = windows_.size();
+  for (const auto& member : records_) {
+    const WindowRecord& record = member.second;
+    if (record.state == ManageState::Suspended && record.hasSavedSlot &&
+        record.suspensionReason == SuspensionReason::Maximized) ++count;
+  }
+  return count;
+}
+
+Workspace Workspace::EmptyWithInheritedLayoutSettings() const {
+  Workspace empty;
+  empty.layout_ = layout_;
+  empty.masterRatio_ = masterRatio_;
+  if (layout_ == TileLayout::MasterStack || layout_ == TileLayout::MasterStackH) {
+    empty.inheritedSlotWeights_ = stackWeights_;
+  } else if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
+    empty.inheritedSlotWeights_ = gridWeights_;
+  } else if (layout_ == TileLayout::Dwindle) {
+    empty.inheritedSlotWeights_ = dwindleRatios_;
+  }
+  if (empty.inheritedSlotWeights_.size() < inheritedSlotWeights_.size()) {
+    empty.inheritedSlotWeights_.insert(empty.inheritedSlotWeights_.end(),
+        inheritedSlotWeights_.begin() + empty.inheritedSlotWeights_.size(), inheritedSlotWeights_.end());
+  }
+  return empty;
 }
 
 bool Workspace::AdmitInitial(
@@ -262,22 +304,8 @@ bool Workspace::AdmitInitial(
   if (reason == SuspensionReason::None) {
     AppendTiledWithDefaultWeight(hwnd);
   } else {
-    const size_t logicalIndex = LogicalWindowCount();
     record.suspensionReason = reason;
-    record.savedSlot.index = logicalIndex;
-    if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
-      record.savedSlot.weight = 1.0;
-      record.savedSlot.hasWeight = true;
-    } else if (layout_ == TileLayout::MasterStack || layout_ == TileLayout::MasterStackH) {
-      if (logicalIndex == 0) record.savedSlot.wasMaster = true;
-      else {
-        record.savedSlot.weight = 1.0;
-        record.savedSlot.hasWeight = true;
-      }
-    } else if (layout_ == TileLayout::Dwindle) {
-      record.savedSlot.weight = 0.5;
-      record.savedSlot.hasWeight = true;
-    }
+    record.savedSlot = MakeAppendedSuspendedSlot();
     record.hasSavedSlot = true;
   }
 
@@ -350,7 +378,9 @@ bool Workspace::Restore(HWND hwnd) {
   }
 
   const SuspendedSlot slot = record->savedSlot;
-  if (!record->tilingGeneration) {
+  const bool returnedToVisibleSet = record->suspensionReason == SuspensionReason::Minimized ||
+                                   record->suspensionReason == SuspensionReason::Hidden;
+  if (returnedToVisibleSet || !record->tilingGeneration) {
     record->tilingGeneration = Model::NextTilingGeneration();
   }
   const size_t index = std::min(
@@ -462,12 +492,12 @@ void Workspace::AppendTiledWithDefaultWeight(HWND hwnd) {
   const size_t oldCount = windows_.size();
   windows_.push_back(hwnd);
   if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
-    gridWeights_.push_back(1.0);
+    gridWeights_.push_back(oldCount < inheritedSlotWeights_.size() ? inheritedSlotWeights_[oldCount] : 1.0);
   } else if ((layout_ == TileLayout::MasterStack || layout_ == TileLayout::MasterStackH) &&
              oldCount > 0) {
-    stackWeights_.push_back(1.0);
+    stackWeights_.push_back(oldCount - 1 < inheritedSlotWeights_.size() ? inheritedSlotWeights_[oldCount - 1] : 1.0);
   } else if (layout_ == TileLayout::Dwindle) {
-    dwindleRatios_.push_back(0.5);
+    dwindleRatios_.push_back(oldCount < inheritedSlotWeights_.size() ? inheritedSlotWeights_[oldCount] : 0.5);
   }
 }
 
@@ -475,16 +505,16 @@ SuspendedSlot Workspace::MakeAppendedSuspendedSlot() const {
   SuspendedSlot slot{};
   slot.index = LogicalWindowCount();
   if (layout_ == TileLayout::Columns || layout_ == TileLayout::Rows) {
-    slot.weight = 1.0;
+    slot.weight = slot.index < inheritedSlotWeights_.size() ? inheritedSlotWeights_[slot.index] : 1.0;
     slot.hasWeight = true;
   } else if (layout_ == TileLayout::MasterStack || layout_ == TileLayout::MasterStackH) {
     if (slot.index == 0) slot.wasMaster = true;
     else {
-      slot.weight = 1.0;
+      slot.weight = slot.index - 1 < inheritedSlotWeights_.size() ? inheritedSlotWeights_[slot.index - 1] : 1.0;
       slot.hasWeight = true;
     }
   } else if (layout_ == TileLayout::Dwindle) {
-    slot.weight = 0.5;
+    slot.weight = slot.index < inheritedSlotWeights_.size() ? inheritedSlotWeights_[slot.index] : 0.5;
     slot.hasWeight = true;
   }
   return slot;
@@ -631,6 +661,7 @@ void Workspace::SetLayout(TileLayout layout) {
 
   RememberCurrentLayoutGeometry();
   layout_ = layout;
+  inheritedSlotWeights_.clear();
   ResetSuspendedLayoutHints();
   RestoreRememberedLayoutGeometry();
   EnsureWeights();
@@ -706,6 +737,7 @@ bool Workspace::HasSameLayoutStateAs(const Workspace& other) const {
   }
   return windows_ == other.windows_ &&
       layout_ == other.layout_ && masterRatio_ == other.masterRatio_ &&
+      inheritedSlotWeights_ == other.inheritedSlotWeights_ &&
       stackWeights_ == other.stackWeights_ &&
       gridWeights_ == other.gridWeights_ &&
       dwindleRatios_ == other.dwindleRatios_ &&
@@ -724,6 +756,7 @@ bool Workspace::RestoreLayoutStateFrom(const Workspace& source) {
   windows_ = source.windows_;
   layout_ = source.layout_;
   masterRatio_ = source.masterRatio_;
+  inheritedSlotWeights_ = source.inheritedSlotWeights_;
   stackWeights_ = source.stackWeights_;
   gridWeights_ = source.gridWeights_;
   dwindleRatios_ = source.dwindleRatios_;
@@ -772,6 +805,7 @@ bool Workspace::RestoreCompatibleActiveLayoutStateFrom(
 
   windows_ = source.windows_;
   masterRatio_ = source.masterRatio_;
+  inheritedSlotWeights_ = source.inheritedSlotWeights_;
   stackWeights_ = source.stackWeights_;
   gridWeights_ = source.gridWeights_;
   dwindleRatios_ = source.dwindleRatios_;
@@ -2444,6 +2478,39 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
   return PlacementAction::None;
 }
 
+static size_t AutomaticWindowLimitForMonitor(const Model::MonitorId& monitor) {
+  for (const auto& overrideLimit : g_settings.monitorWindowLimits) {
+    if (overrideLimit.first == monitor.deviceId) return overrideLimit.second;
+  }
+  return g_settings.automaticWindowLimit;
+}
+
+// Arrangement releases the slot first; physical routing runs after every source
+// workspace in the burst has been saved, so discovery snapshots cannot go stale
+// midway through admission. A failed route therefore already has a safe fallback.
+static bool FloatAutomaticOverflowWindow(
+    const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
+    const wchar_t* reason) {
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record) return false;
+  const DWORD processId = record->pid;
+  const bool monitorFixed = record->automaticOverflowMonitorFixed;
+  const uint64_t generation = record->tilingGeneration;
+  const bool route = IsAutomaticMode() && g_hooks.hideDestroy &&
+      (g_settings.overflowCreateDesktop || g_settings.overflowTryOtherMonitors);
+  CancelConformanceLease(hwnd);
+  DiscardPendingAdmissionRecovery(hwnd);
+  if (!(route ? workspace.Float(hwnd) : FloatWindowAfterFailure(key, workspace, hwnd))) return false;
+  if (route) {
+    g_wm.overflowWindows.insert(hwnd);
+    g_wm.pendingWindowOverflow.push_back(
+        {hwnd, processId, key.desktopId, key.monitor.deviceId, monitorFixed, generation});
+    Reconcile::ScheduleLifecycleReconcile(nullptr);
+  }
+  Diagnostics::RecordEvent(L"automatic overflow hwnd=%p reason=%ls route=%d", hwnd, reason, route ? 1 : 0);
+  return true;
+}
+
 // Renders one workspace from authoritative model state. Arrangement itself is a
 // small pipeline: repair local invariants -> compute targets -> apply placement ->
 // fold placement outcomes back into the model. Reflow is iterative: a pass may
@@ -2465,6 +2532,37 @@ static void ArrangeWorkspace(
   const LONG gap = metrics.gap;
 
   ObserveAndRepairWorkspaceForArrangement(workspace);
+  if (IsAutomaticMode() && workspace.Layout() != TileLayout::Floating) {
+    const size_t limit = AutomaticWindowLimitForMonitor(key.monitor);
+    if (limit) {
+      std::vector<WindowRecord> visibleMembers;
+      size_t retainedSlots = 0;
+      for (const auto& member : workspace.Records()) {
+        const WindowRecord& record = member.second;
+        if (record.state == ManageState::Tiled ||
+            (record.state == ManageState::Suspended && record.hasSavedSlot &&
+             record.suspensionReason == SuspensionReason::Maximized)) {
+          const SuspensionReason physicalReason = GetPhysicalSuspensionReason(record.hwnd);
+          if (physicalReason == SuspensionReason::Minimized ||
+              physicalReason == SuspensionReason::Hidden || IsWindowCloaked(record.hwnd)) continue;
+          visibleMembers.push_back(record);
+        }
+      }
+      std::sort(visibleMembers.begin(), visibleMembers.end(),
+                [](const WindowRecord& first, const WindowRecord& second) {
+                  return first.tilingGeneration < second.tilingGeneration;
+                });
+      for (const WindowRecord& record : visibleMembers) {
+        const bool exceedsLimit = retainedSlots >= limit;
+        ++retainedSlots;
+        // Visible maximized members count, but are not restored just to move them.
+        if (exceedsLimit && !IsMoveSizeGestureInProgress(record.hwnd) &&
+            FloatAutomaticOverflowWindow(key, workspace, record.hwnd, L"count limit")) {
+          --retainedSlots;
+        }
+      }
+    }
+  }
   auto pendingMutationIt = g_pendingLayoutMutations.find(key);
   if (pendingMutationIt != g_pendingLayoutMutations.end() &&
       !workspace.HasSameWindowMembershipAs(
@@ -2482,7 +2580,10 @@ static void ArrangeWorkspace(
     ++Diagnostics::g_runtime.counters.arrangePasses;
     if (workspace.Layout() == TileLayout::Floating || workspace.Empty()) {
       if (workspace.Layout() == TileLayout::Floating) {
-        for (HWND hwnd : workspace.TiledWindows()) CancelConformanceLease(hwnd);
+        for (HWND hwnd : workspace.TiledWindows()) {
+          CancelConformanceLease(hwnd);
+          workspace.ClearInsertionPlacement(hwnd);
+        }
       }
       g_workspaces.Save(key, workspace);
       ClearSettledLayoutMutation(key, workspace);
@@ -2597,6 +2698,7 @@ static void ArrangeWorkspace(
         if (!impossible) continue;
 
         const HWND candidate = workspace.TiledWindows()[i];
+        if (IsAutomaticMode() && IsMoveSizeGestureInProgress(candidate)) continue;
         const WindowRecord* candidateRecord = workspace.Find(candidate);
         const uint64_t generation =
             candidateRecord ? candidateRecord->tilingGeneration : 0;
@@ -2617,6 +2719,7 @@ static void ArrangeWorkspace(
         std::vector<ConstraintCandidate> candidates;
         candidates.reserve(workspace.ActiveCount());
         for (HWND candidate : workspace.TiledWindows()) {
+          if (IsAutomaticMode() && IsMoveSizeGestureInProgress(candidate)) continue;
           const WindowRecord* candidateRecord = workspace.Find(candidate);
           candidates.push_back({
               candidate,
@@ -2950,9 +3053,7 @@ static void ArrangeWorkspace(
         }
 
         if (!victim) {
-          // For a settled workspace, float a member only when that one removal is
-          // proven to make the current order viable. Do not progressively delete
-          // multiple settled windows from an aggregate conflict.
+          // Prefer a removal that makes the current order viable in one step.
           for (const ConstraintCandidate& candidate : candidates) {
             Workspace trial = workspace;
             if (!trial.Float(candidate.hwnd)) continue;
@@ -2969,6 +3070,11 @@ static void ArrangeWorkspace(
             singleRemovalMakesCurrentOrderViable = true;
             break;
           }
+        }
+        // Automatic mode also resolves conflicts requiring several removals.
+        // Each pass releases one member and replans the remaining group.
+        if (!victim && IsAutomaticMode() && !candidates.empty()) {
+          victim = candidates.front().hwnd;
         }
       }
       const WindowRecord* victimRecord = victim ? workspace.Find(victim) : nullptr;
@@ -3042,12 +3148,15 @@ static void ArrangeWorkspace(
 
       CancelConformanceLease(victim);
       const HWND culprit = FindConstraintCulprit(workspace, rects, victim);
-      if (!constraintFailureReported) {
+      const bool automaticOverflow = IsAutomaticMode();
+      if (!constraintFailureReported && !automaticOverflow) {
         ShowWindowConstraintConflict(workspace, rects, culprit ? culprit : victim, monitor);
         constraintFailureReported = true;
       }
       DiscardPendingAdmissionRecovery(victim);
-      if (!FloatWindowAfterFailure(key, workspace, victim)) {
+      if (!(automaticOverflow
+                ? FloatAutomaticOverflowWindow(key, workspace, victim, L"cannot fit")
+                : FloatWindowAfterFailure(key, workspace, victim))) {
         g_workspaces.Save(key, workspace);
         return;
       }

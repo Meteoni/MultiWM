@@ -403,6 +403,15 @@ static const WindowRule* FindMatchingWindowRule(
   return nullptr;
 }
 
+// Discovery waits for routing before assigning a monitor owner. Explicit
+// admission bypasses this policy and overrides pending initial placement.
+static bool IsWindowAwaitingMonitorRouting(HWND hwnd) {
+  return g_wm.monitorRoutingReady &&
+         (g_wm.pendingMonitorRoutes.count(hwnd) ||
+          (!g_wm.monitorRoutingEvaluated.count(hwnd) &&
+           FindMatchingWindowRule(hwnd, WindowRuleTreatment::OpenOnMonitor)));
+}
+
 static bool IsWindowExcludedByRules(HWND hwnd) {
   return FindMatchingWindowRule(hwnd, WindowRuleTreatment::Exclude) != nullptr;
 }
@@ -422,7 +431,7 @@ static bool ShouldWindowStartFloating(HWND hwnd, bool* alwaysFloating = nullptr)
 // Applies stable structural and exclusion policy only; visibility, show state,
 // desktop, and monitor participation are checked separately. Tracked windows
 // tolerate a temporarily missing resize style so transient app UI cannot evict them.
-static bool WindowCanBeManaged(HWND hwnd) {
+static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize) {
   if (!hwnd) return false;
 
   // Reject structurally ineligible HWNDs before evaluating configurable exclusion
@@ -438,7 +447,8 @@ static bool WindowCanBeManaged(HWND hwnd) {
   // A Default-to-floating rule is also an explicit Automatic-mode admission
   // policy for naturally fixed-size top-level windows. Always-floating is also
   // eligible during explicit Manual admission; centering never resizes either.
-  if (!(style & WS_SIZEBOX) && !IsWindowTrackedInAnyState(hwnd)) {
+  if (!allowFixedSize && !(style & WS_SIZEBOX) &&
+      !IsWindowTrackedInAnyState(hwnd)) {
     bool alwaysFloating = false;
     const bool startsFloating =
         ShouldWindowStartFloating(hwnd, &alwaysFloating);

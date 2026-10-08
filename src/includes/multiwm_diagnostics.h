@@ -876,6 +876,17 @@ static void DumpPlatformHealth(ReportBuilder& report) {
   Reconcile::EnumerateCurrentMonitors(connectedMonitors);
   report.Line(
       L"Connected physical monitors: %zu", connectedMonitors.size());
+  for (HMONITOR monitor : connectedMonitors) {
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    Model::MonitorId id;
+    if (GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&info)) &&
+        Model::MonitorId::FromHMonitor(monitor, &id)) {
+      report.Line(L"  %ls primary=%d monitorId: %ls", info.szDevice,
+                  (info.dwFlags & MONITORINFOF_PRIMARY) ? 1 : 0,
+                  id.deviceId.c_str());
+    }
+  }
   report.Line(
       L"Virtual desktop API: initialized=%d abiResolved=%d Explorer=%lu.%lu usesHMonitor=%d",
       g_vd.initialized ? 1 : 0, g_vd.abiResolved ? 1 : 0,
@@ -1147,6 +1158,8 @@ static void WriteDiagnosticReport() {
   report.Line(L"Slow application discovery delay: %u ms",
               g_settings.slowApplicationDelayMs);
   report.Line(L"Window rules: %zu", g_settings.windowRules.size());
+  report.Line(L"Initial monitor routing: ready=%d pending=%zu",
+              g_wm.monitorRoutingReady ? 1 : 0, g_wm.pendingMonitorRoutes.size());
   report.TextLine(L"Diagnostic output setting: ", g_settings.diagnosticsOutputPath);
   report.TextLine(L"Diagnostic output resolved: ", ExpandDiagnosticPath(g_settings.diagnosticsOutputPath));
 
@@ -1258,6 +1271,9 @@ static void WriteDiagnosticReport() {
         L"counts: active=%zu records=%zu tiled=%zu suspended=%zu floating=%zu ignored=%zu",
         state.ActiveCount(), state.Records().size(), workspaceTiled,
         workspaceSuspended, workspaceFloating, workspaceIgnored);
+    report.Line(L"overflow: visibleTiled=%zu limit=%zu",
+                state.VisibleWindowCount(),
+                AutomaticWindowLimitForMonitor(key.monitor));
     report.Line(L"pendingReinforcement=%d invariants=%ls",
                 pendingReinforcement ? 1 : 0,
                 invariantsValid ? L"PASS" : L"FAIL");
@@ -1342,6 +1358,10 @@ static void WriteDiagnosticReport() {
   }
 
   report.Section(L"Pending work");
+  report.Line(L"automaticOverflow: routingReady=%d limit=%zu createDesktop=%d otherMonitors=%d pending=%zu follow=%p",
+              g_hooks.hideDestroy ? 1 : 0, g_settings.automaticWindowLimit,
+              g_settings.overflowCreateDesktop ? 1 : 0, g_settings.overflowTryOtherMonitors ? 1 : 0,
+              g_wm.pendingWindowOverflow.size(), g_wm.pendingOverflowSwitch.hwnd);
   if (g_wm.lifecycleDirtyWindows.empty()) {
     report.Line(L"pendingLifecycleWindows: none");
   } else {

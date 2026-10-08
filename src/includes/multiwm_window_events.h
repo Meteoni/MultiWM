@@ -89,12 +89,30 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   }
 
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
+  if (event == EVENT_OBJECT_DESTROY) {
+    // Retire lifetime metadata when destruction is observed, before a delayed
+    // model message could mistake a reused HWND for the old routed window.
+    g_wm.overflowWindows.erase(hwnd);
+    g_wm.pendingWindowOverflow.erase(
+        std::remove_if(g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
+                       [hwnd](const PendingWindowOverflow& pending) { return pending.hwnd == hwnd; }),
+        g_wm.pendingWindowOverflow.end());
+    if (g_wm.pendingOverflowSwitch.hwnd == hwnd) g_wm.pendingOverflowSwitch = {};
+    const bool routingKnown = g_wm.monitorRoutingEvaluated.erase(hwnd) != 0;
+    const bool routingPending = g_wm.pendingMonitorRoutes.erase(hwnd) != 0;
+    if (tracked || routingKnown || routingPending) QueueWindowEvent(event, hwnd);
+    return;
+  }
 
   // A tiled LOCATIONCHANGE is classified later on the WM actor. Expected placement
   // echoes are cheap no-ops there; unexpected same-monitor drift opens a bounded
   // conformance lease instead of being silently discarded.
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
     if (!tracked) {
+      if (g_wm.pendingMonitorRoutes.count(hwnd)) {
+        QueueWindowEvent(event, hwnd);
+        return;
+      }
       // A newly created window can already be minimized, maximized, or fullscreen
       // before the ordinary discovery snapshot sees it. Queue those states for the
       // inactive-admission path.
@@ -108,8 +126,11 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
       return;
     }
 
+    const bool overflowPending = std::any_of(
+        g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
+        [hwnd](const PendingWindowOverflow& pending) { return pending.hwnd == hwnd; });
     const bool stateOrLeaseNeedsObservation =
-        g_workspaces.IsSuspendedMaximized(hwnd) ||
+        overflowPending || g_workspaces.IsSuspendedMaximized(hwnd) ||
         HasActiveConformanceLease(hwnd) ||
         g_workspaces.IsTiled(hwnd);
     if (!stateOrLeaseNeedsObservation &&
@@ -131,7 +152,10 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
         event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED ||
         event == EVENT_OBJECT_STATECHANGE ||
         event == EVENT_SYSTEM_MINIMIZESTART ||
-        event == EVENT_SYSTEM_MINIMIZEEND;
+        event == EVENT_SYSTEM_MINIMIZEEND ||
+        ((event == EVENT_SYSTEM_MOVESIZESTART ||
+          event == EVENT_SYSTEM_MOVESIZEEND) &&
+         (g_wm.monitorRoutingReady || IsAutomaticMode()));
     if (!discoveryEvent || GetAncestor(hwnd, GA_ROOT) != hwnd) {
       return;
     }
@@ -141,7 +165,25 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // Lease cancellation is actor-local; workspace mutation remains deferred until
   // normal message dispatch.
   if (event == EVENT_SYSTEM_MOVESIZESTART) {
+    g_wm.overflowWindows.erase(hwnd);
+    g_wm.pendingWindowOverflow.erase(
+        std::remove_if(g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
+                       [hwnd](const PendingWindowOverflow& pending) { return pending.hwnd == hwnd; }),
+        g_wm.pendingWindowOverflow.end());
+    if (g_wm.pendingOverflowSwitch.hwnd == hwnd) g_wm.pendingOverflowSwitch = {};
+    if (g_wm.monitorRoutingReady) {
+      g_wm.monitorRoutingEvaluated.insert(hwnd);
+      g_wm.pendingMonitorRoutes.erase(hwnd);
+    }
     CancelConformanceLease(hwnd);
+  }
+
+  // Untracked drags only cancel initial routing. They must not reach the
+  // managed-window gesture handler or leave samples for an unrelated workspace.
+  if (!tracked && (event == EVENT_SYSTEM_MOVESIZESTART ||
+                   event == EVENT_SYSTEM_MOVESIZEEND)) {
+    if (event == EVENT_SYSTEM_MOVESIZEEND) QueueWindowEvent(EVENT_OBJECT_SHOW, hwnd);
+    return;
   }
 
   // Cache user move/resize boundaries. The callback only records facts; model

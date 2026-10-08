@@ -61,6 +61,28 @@ Workspace initialization rules select a starting layout by desktop name, Task Vi
 position, and monitor. The first matching rule wins; existing workspaces keep their
 layout. Rules use the built-in layouts independently of the layout cycle.
 
+Window rules can open new windows on the primary monitor or a specific monitor
+using its ID from diagnostics. Set a diagnostic report hotkey under Hotkeys to
+get the IDs. Routing works in both management modes and can combine with floating
+rules. Minimized, maximized, and fullscreen windows move when restored; later
+user moves are respected.
+
+Under Workspace > Overflow, limit automatic tiling per desktop and monitor.
+0 means unlimited; Floating layouts and rule-floated windows do not use the limit.
+Minimized and hidden windows do not count; maximized windows do. In Automatic
+mode, the policy also applies to restored, migrated, and explicitly tiled windows.
+
+Overflow can float the window or create a desktop immediately after the current
+one. If the window cannot fit or creation fails, it floats here. Optional monitor
+fallback tries other monitors first; an Open on monitor rule keeps its chosen
+monitor. Foreground windows are followed with animation where supported; background
+windows move quietly.
+
+Overflow-created workspaces use the first matching initialization rule, otherwise
+they inherit the source workspace's layout and sizing. Window membership and focus
+are not copied. Ordinal rules use the new desktop's position; desktop name rules
+require a custom name. Existing workspaces keep their settings when positions shift.
+
 Choose the tray icon's left-click action under General, and turn toasts on or off
 under Appearance.
 
@@ -76,13 +98,13 @@ under Appearance.
 - general:
   - DefaultWindowManagementMode: automatic
     $name: Default Window Management Mode
-    $description: 'Choose membership policy after startup. Manual keeps Alt+T groups contained: new windows are not admitted, minimizing / moving to another desktop releases membership. Maximized and fullscreen tiled windows are suspended and restore to their saved slot. Automatic continuously discovers and migrates managed windows.'
+    $description: Automatic adds windows as they appear. Manual adds them when you choose Tile Workspace.
     $options:
       - manual: Manual
       - automatic: Automatic
   - AutomaticNewWindowPosition: last_slot
     $name: Automatic Window Insertion Position
-    $description: 'Choose the preferred position for newly discovered windows and migrated windows from another workspace. If constraints prevent it, MultiWM tries the nearest viable slot. Minimized and maximized/fullscreen windows restore to their saved logical slot.'
+    $description: Preferred position for new or moved windows in Automatic mode. Tries another position if needed.
     $options:
       - last_slot: Last slot
       - after_focused: After focused window
@@ -97,7 +119,7 @@ under Appearance.
 - workspace:
   - DefaultLayout: master_stack
     $name: Fallback Layout
-    $description: Initial layout used when no initialization rule matches.
+    $description: Starting layout when no rule matches.
     $options:
       - master_stack: Master + Stack (Vertical)
       - master_stack_h: Master + Stack (Horizontal)
@@ -108,7 +130,7 @@ under Appearance.
       - floating: Floating (No tiling)
   - LayoutCycle: [master_stack, master_stack_h, dwindle, columns, rows, monocle, floating]
     $name: Layout Cycle
-    $description: 'Layouts visited by the Cycle Layout hotkey, in order. Remove layouts you never want to cycle through, or re-order entries as you wish.'
+    $description: Layouts used by Cycle Layout, in this order.
     $options:
       - master_stack: Master + Stack (Vertical)
       - master_stack_h: Master + Stack (Horizontal)
@@ -120,10 +142,11 @@ under Appearance.
   - InitializationRules:
       - - DesktopNameContains: ""
           $name: Desktop Name Contains
-          $description: 'Match a custom desktop name, ignoring case. Blank matches any desktop.'
+          $description: Match part of a custom desktop name, ignoring case. Blank matches any desktop.
         - DesktopNumber: 0
           $name: Desktop Number
-          $description: 'Position in Task View, starting at 1. Set to 0 for any desktop.'
+          #! $min: 0
+          $description: Desktop position in Task View, starting at 1. 0 matches any desktop.
         - Monitor: any
           $name: Monitor
           $options:
@@ -132,7 +155,7 @@ under Appearance.
             - non_primary: Non-primary
         - MonitorId: ""
           $name: Monitor Device ID
-          $description: 'Optional exact ID from a diagnostic report. Blank matches any monitor.'
+          $description: Paste a monitor ID from a diagnostic report. Blank matches any monitor.
         - Layout: ""
           $name: Initial Layout
           $description: Leave blank to ignore this rule.
@@ -146,25 +169,63 @@ under Appearance.
             - monocle: Monocle (Fullscreen)
             - floating: Floating (No tiling)
     $name: Initialization Rules
-    $description: 'All conditions must match. First match wins; otherwise Fallback Layout applies. Fully empty rows end the list. Existing workspaces keep their layout.'
+    $description: All filled conditions must match. Uses the first matching rule. Empty rows end the list.
+  - Overflow:
+    - WindowLimit: 0
+      $name: Auto-tiling Limit
+      #! $min: 0
+      $description: Maximum tiled windows per monitor on each desktop. 0 means unlimited.
+    - Action: float
+      $name: Overflow Action
+      $description: Applies when tiled windows exceed the limit or cannot fit.
+      $options:
+        - float: Float window
+        - new_desktop: New desktop after current
+    - TryOtherMonitors: false
+      $name: Try Other Monitors First
+      $description: Try another monitor before floating or changing desktop.
+    - MonitorLimits:
+      - - MonitorId: ""
+          $name: Monitor ID
+          $description: Paste a monitor ID from a diagnostic report. Blank disables this row.
+        - Limit: 0
+          $name: Auto-tiling Limit
+          #! $min: 0
+          #! $hideIf: {MonitorId: ""}
+          $description: Maximum tiled windows on this monitor per desktop. 0 means unlimited.
+      $name: Monitor Limits
+      $description: First match wins. Other monitors use the main limit. Empty rows end the list.
+    $name: Overflow
+    $description: Automatic mode only. Minimized and hidden windows do not count. Maximized windows count.
   - TileGap: 6
     $name: Window Gap (DPI-scaled pixels)
-    $description: Gap between adjacent tiled windows, scaled per monitor.
+    #! $min: 0
+    #! $max: 100
+    $description: Space between tiled windows (0-100).
   - WorkspaceInsets: "6, 6, 6, 6"
     $name: Insets (DPI-scaled pixels)
-    $description: 'Left, Top, Right, Bottom (0-500), scaled per monitor. Positive values inset the workspace from that edge. Example: 4, 4, 4, 4'
+    $description: Space at the left, top, right, and bottom edges. Enter four values from 0 to 500.
   - MasterPercent: 50
     $name: Master Size (%)
-    $description: Default master share in Master + Stack layouts (1-99).
+    #! $min: 1
+    #! $max: 99
+    #! $format: slider
+    $description: Starting screen share for the main window in Master + Stack layouts (1-99%).
   - ReverseDwindle: false
     $name: Reverse Dwindle
-    $description: Reverse the recursive growth direction from bottom-right to top-left.
+    $description: Grow the Dwindle layout from the top-left instead of the bottom-right.
   - AdaptiveDwindleSlots: 2
     $name: Adaptive Dwindle Slots
-    $description: 'Leading Dwindle splits allowed to adapt to window minimum sizes. Set to 0 to disable. (0-64)'
+    #! $min: 0
+    #! $max: 64
+    $description: How many splits can adjust to fit windows (0-64). 0 keeps all splits fixed.
   - AdaptiveDwindlePercentage: 15
     $name: Adaptive Dwindle Percentage
-    $description: 'Maximum automatic shift from 50/50. For example, 15 allows 35%-65%. Set to 0 to disable. (0-40)'
+    #! $min: 0
+    #! $max: 40
+    #! $format: slider
+    #! $hideIf: {AdaptiveDwindleSlots: 0}
+    $description: How far splits may move from the middle (0-40). 15 allows 35%-65%. 0 disables adjustment.
   $name: Workspace
 
 - appearance:
@@ -172,17 +233,20 @@ under Appearance.
     $name: Show Toasts
     $description: Show layout, mode, and error toasts.
   - FlyoutPosition: top
-    $name: Status Flyout Position
-    $description: Show layout and mode flyout at the top or bottom center of the active monitor.
+    $name: Toast Position
+    #! $showIf: {ShowToasts: true}
+    $description: Show messages at the top or bottom of the active monitor.
     $options:
       - top: Top
       - bottom: Bottom
   - FlyoutOffsetX: 0
-    $name: Status Flyout X Offset
-    $description: Horizontal offset in DPI-scaled pixels (positive moves right).
+    $name: Toast Horizontal Offset (DPI-scaled pixels)
+    #! $showIf: {ShowToasts: true}
+    $description: Move messages left or right. Positive values move right.
   - FlyoutOffsetY: 0
-    $name: Status Flyout Y Offset
-    $description: Vertical offset in DPI-scaled pixels (positive moves down).
+    $name: Toast Vertical Offset (DPI-scaled pixels)
+    #! $showIf: {ShowToasts: true}
+    $description: Move messages up or down. Positive values move down.
   - CustomIcons:
       - - Layout: master_stack
           $name: Layout
@@ -195,15 +259,16 @@ under Appearance.
             - monocle: Monocle
             - floating: Floating
         - Path: ""
-          $name: Icon path (.ico)
+          $name: Icon File (.ico)
+          #! $format: filePath
     $name: Custom Tray Layout Icons
-    $description: Optional per-layout .ico overrides. Failed or empty paths use the generated text icon.
+    $description: Choose a .ico file for each layout. Blank or invalid files use the built-in icon.
   $name: Appearance
 
 - hotkeys:
   - TilingModifier: alt
     $name: Modifier
-    $description: "Modifier used by all window-manager hotkeys. \nNote: Alt+letter shortcuts can override application menu mnemonics. Choose Alt+Shift or Ctrl+Alt if this is disruptive. "
+    $description: Held with every shortcut below. Alt may conflict with app menus; choose another modifier if needed.
     $options:
       - alt: Alt
       - ctrl: Ctrl
@@ -212,92 +277,106 @@ under Appearance.
       - ctrl+shift: Ctrl + Shift
   - TileKey: "T"
     $name: Tile Workspace
-    $description: 'Reconcile and tile windows on the current monitor. Leave blank to disable. Examples: T, D, Space, `, -'
+    $description: Arrange windows on the current monitor. Blank disables this shortcut. Examples include T, Space, or F5.
   - LayoutKey: "L"
     $name: Cycle Layout
-    $description: 'Cycle the current workspace layout. Leave blank to disable. Examples: L, Tab, =, ], /'
+    $description: Switch to the next layout. Blank disables this shortcut.
   - SwapMasterKey: "M"
     $name: Set Master Window
-    $description: 'Set another tiled window as the master. Leave blank to disable.'
+    $description: Make the focused window the main window. Blank disables this shortcut.
   - PromoteWindowKey: ","
     $name: Promote Focused Window
-    $description: 'Move the focused tiled window one logical slot earlier. Does nothing in the first slot. Leave blank to disable.'
+    $description: Move the focused window one place earlier. Blank disables this shortcut.
   - DemoteWindowKey: "."
     $name: Demote Focused Window
-    $description: 'Move the focused tiled window one logical slot later. Does nothing in the last slot. Leave blank to disable.'
+    $description: Move the focused window one place later. Blank disables this shortcut.
   - ManagementModeToggleKey: "R"
     $name: Toggle Window Management Mode
-    $description: 'Switch between Automatic and Manual modes at runtime. Leave blank to disable.'
+    $description: Switch between Automatic and Manual mode. Blank disables this shortcut.
   - FloatFocusedKey: "F"
     $name: Float Focused Window
-    $description: 'Float the focused tiled window. Leave blank to disable.'
+    $description: Remove the focused window from tiling. Blank disables this shortcut.
   - DiagnosticDumpKey: ""
     $name: Write Diagnostic Report
-    $description: 'Write a formatted state, health, churn, and invariant report to the configured output directory. Uses the configured modifier. Leave blank to disable.'
+    $description: Save a diagnostic report to the Output Directory. Blank disables this shortcut.
   $name: Hotkeys
 
 - diagnostics:
   - DiagnosticsOutputPath: "%USERPROFILE%\\Documents\\MultiWMDiagnostics"
     $name: Output Directory
-    $description: 'Directory for timestamped UTF-8 .txt diagnostic reports. Environment variables such as %USERPROFILE% are supported and missing directories are created. Reports include window titles and executable paths, so review them before sharing.'
+    #! $format: folderPath
+    $description: Folder for diagnostic reports. Reports include window titles and app paths; review them before sharing.
   $name: Diagnostics
 
 - windowBehavior:
   - MouseMoveBehavior: float
     $name: Tiled Window Drag Action
-    $description: Action when a tiled window is dragged without resizing.
+    $description: What happens when you drag a tiled window.
     $options:
       - float: Float moved window
       - swap: Swap with tiled window under pointer
   - FloatingDefaultSize: "960, 640"
     $name: Floating Default Size (DPI-scaled pixels)
-    $description: 'Width, Height used for newly discovered windows in Floating workspaces (Automatic mode only). Values must be 100-4000. Scaled per monitor. Example: 960, 640'
+    $description: Starting size in Floating layouts. Enter width, height (100-4000). Automatic mode only.
   $name: Window Behavior
 
 - windowRules:
   - Rules:
       - - Process: ""
-          $name: Process name
-          $description: "Case-insensitive exact match. Leave blank to match any process. \n
-            Separate multiple names with commas; escape a literal comma as \\,."
+          $name: App File Name
+          $description: Match an app's .exe name, such as notepad.exe. Blank matches any app.
         - Class: ""
           $name: Window class
-          $description: "Case-insensitive exact match. Leave blank to match any class. \n
-            Separate multiple names with commas; escape a literal comma as \\,."
+          $description: Match a window class from diagnostics. Blank matches any class.
         - TitleContains: ""
           $name: Window title contains
-          $description: "Case-insensitive substring match. Leave blank to match any title. \n
-            Separate multiple fragments with commas; escape a literal comma as \\,."
+          $description: Match part of a window title. Blank matches any title; write \, to match a comma.
         - Treatment: exclude
           $name: Treatment
+          $description: Default to floating can be tiled later. Always floating cannot. Trace to owner drags or resizes the main window.
           $options:
             - exclude: Exclude
             - default_to_floating: Default to floating
             - always_floating: Always floating
             - trace_to_owner: Trace to owner
+            - open_on_monitor: Open on monitor
             - preserve_size_when_centering: Preserve size when centering
             - override_size_when_centering: Override size when centering
+        - TargetMonitor: ""
+          $name: Target monitor
+          #! $showIf: {Treatment: open_on_monitor}
+          $description: 'For Open on monitor: enter Primary or a monitor ID from diagnostics. Blank disables the rule.'
         - Size: ""
           $name: Centering size override
-          $description: 'Only effective when "Override size" is selected. Default-to-floating and Always-floating discovery always preserve the application''s size. Use Width, Height in DPI-scaled pixels, or "Workspace" to fill the current monitor''s usable workspace. Examples: 720, 480'
+          #! $showIf: {Treatment: override_size_when_centering}
+          $description: 'For custom centering size: enter width, height (100-4000), or Workspace to fill the usable screen area.'
     $name: Rules
-    $description: "There's no one-size-fits-all shoe. \n
-      Exclude prevents management. Default to floating admits a matching window as managed Floating during Automatic discovery, while Always floating also prevents explicit re-tiling. Both floating treatments center without changing the application's size. Trace to owner retargets move/size to its root owner. Every non-blank match field in a rule must match; comma-separated values within one field are alternatives."
+    $description: Fill at least one field. All filled fields must match. Capital letters do not matter. Use commas for choices. First match per treatment wins. Empty rows end the list.
   $name: Window Rules
+  $description: Monitor rules move new windows once, in either mode. Minimized, maximized, and fullscreen windows wait until restored. Existing windows stay put.
 
 - advanced:
   - ConformanceLeaseMs: 3000
-    $name: Tiled Window Conformance Lease (ms)
-    $description: 'Briefly reinforces the assigned rectangle after placement in case the application moves itself again. A still-tiled window that remains outside its tile is floated and the remaining layout reflows. Set to 0 to disable (0-10000 ms). [Default 3000]'
+    $name: Keep Windows in Place (ms)
+    #! $min: 0
+    #! $max: 10000
+    $description: Keep windows in their tiles for this long after placement (0-10000 ms). Windows that resist will float. 0 disables this.
   - ConformanceRepairIntervalMs: 75
-    $name: Conformance Repair Interval (ms)
-    $description: 'Minimum delay between attempts to return a tiled window to its assigned rectangle during the conformance lease (20-2000 ms). [Default 75]'
+    $name: Position Repair Interval (ms)
+    #! $min: 20
+    #! $max: 2000
+    #! $hideIf: {ConformanceLeaseMs: 0}
+    $description: Time between attempts to keep windows in their tiles (20-2000 ms).
   - ReconcileDelayMs: 50
-    $name: Lifecycle Settle Delay (ms)
-    $description: Delay before visibility/lifecycle bursts are reconciled. Increase only if shell transitions are unusually slow (20-2000 ms).
+    $name: Window Change Delay (ms)
+    #! $min: 20
+    #! $max: 2000
+    $description: Wait this long before handling window changes (20-2000 ms).
   - SlowApplicationDelayMs: 250
-    $name: Slow Application Discovery Delay (ms)
-    $description: 'One-time delay before rechecking an Automatic-mode window that was not ready for admission after lifecycle settling. Set to 0 to disable (0-2000 ms). [Default 250]'
+    $name: New Window Retry Delay (ms)
+    #! $min: 0
+    #! $max: 2000
+    $description: Wait this long before checking a new window again (0-2000 ms). 0 disables retries.
   $name: Advanced
 */
 // ==/WindhawkModSettings==

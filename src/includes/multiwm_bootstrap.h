@@ -191,6 +191,33 @@ void LoadSettings() {
     Wh_Log(L"LayoutCycle is empty or invalid; using the built-in layout sequence");
   }
 
+  g_settings.automaticWindowLimit = static_cast<size_t>(
+      std::max(0, Wh_GetIntSetting(L"workspace.Overflow.WindowLimit")));
+  auto overflowAction = StringSetting::make(L"workspace.Overflow.Action");
+  g_settings.overflowCreateDesktop =
+      _wcsicmp(overflowAction.get(), L"new_desktop") == 0 ||
+      _wcsicmp(overflowAction.get(), L"next_desktop") == 0; // Preserve earlier settings.
+  g_settings.overflowTryOtherMonitors =
+      Wh_GetIntSetting(L"workspace.Overflow.TryOtherMonitors") != 0;
+  g_settings.monitorWindowLimits.clear();
+  for (int i = 0;; ++i) {
+    auto monitorId = StringSetting::make(L"workspace.Overflow.MonitorLimits[%d].MonitorId", i);
+    const int limit = Wh_GetIntSetting(L"workspace.Overflow.MonitorLimits[%d].Limit", i);
+    if (!*monitorId.get() && limit == 0) {
+      // Windhawk's empty template is followed by missing rows with the same
+      // values. An empty row ends this list; populated IDs may explicitly use 0.
+      break;
+    }
+    std::wstring identity = monitorId.get();
+    const auto first = identity.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos || limit < 0) continue;
+    const auto last = identity.find_last_not_of(L" \t\r\n");
+    identity = identity.substr(first, last - first + 1);
+    NormalizeMonitorIdentityToken(&identity);
+    if (identity.rfind(L"IFACE:", 0) != 0 && identity.rfind(L"GDI:", 0) != 0) continue;
+    g_settings.monitorWindowLimits.emplace_back(std::move(identity), static_cast<size_t>(limit));
+  }
+
   g_settings.workspaceInitializationRules.clear();
   for (int i = 0;; ++i) {
     auto ruleLayout =
@@ -321,7 +348,7 @@ void LoadSettings() {
   };
 
   g_settings.windowRules.clear();
-  for (int i = 0; i < 64; ++i) {
+  for (int i = 0;; ++i) {
     auto process =
         StringSetting::make(L"windowRules.Rules[%d].Process", i);
     auto className =
@@ -331,6 +358,8 @@ void LoadSettings() {
     auto treatment =
         StringSetting::make(L"windowRules.Rules[%d].Treatment", i);
     auto size = StringSetting::make(L"windowRules.Rules[%d].Size", i);
+    auto targetMonitor =
+        StringSetting::make(L"windowRules.Rules[%d].TargetMonitor", i);
     if (!*process.get() && !*className.get() && !*titleContains.get()) {
       Wh_Log(
           L"Window rule %d is blank; later rules will not be loaded",
@@ -345,6 +374,20 @@ void LoadSettings() {
       rule.treatment = WindowRuleTreatment::AlwaysFloating;
     } else if (_wcsicmp(treatment.get(), L"trace_to_owner") == 0) {
       rule.treatment = WindowRuleTreatment::TraceToOwner;
+    } else if (_wcsicmp(treatment.get(), L"open_on_monitor") == 0) {
+      rule.treatment = WindowRuleTreatment::OpenOnMonitor;
+      rule.targetMonitor = targetMonitor.get();
+      const auto first = rule.targetMonitor.find_first_not_of(L" \t\r\n");
+      if (first == std::wstring::npos) continue;
+      const auto last = rule.targetMonitor.find_last_not_of(L" \t\r\n");
+      rule.targetMonitor = rule.targetMonitor.substr(first, last - first + 1);
+      NormalizeMonitorIdentityToken(&rule.targetMonitor);
+      if (rule.targetMonitor != L"PRIMARY" &&
+          rule.targetMonitor.rfind(L"IFACE:", 0) != 0 &&
+          rule.targetMonitor.rfind(L"GDI:", 0) != 0) {
+        Wh_Log(L"Ignoring invalid monitor target at window rule %d", i + 1);
+        continue;
+      }
     } else if (_wcsicmp(
                    treatment.get(), L"preserve_size_when_centering") == 0) {
       rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
@@ -477,6 +520,12 @@ static void SetWindowManagementMode(ManagementMode mode) {
   if (g_wm.managementMode == mode) return;
   g_wm.managementMode = mode;
   const bool automatic = IsAutomaticMode();
+  if (!automatic) {
+    g_wm.pendingWindowOverflow.clear();
+    g_wm.pendingOverflowSwitch = {};
+    if (g_wm.overflowTimer) KillTimer(nullptr, g_wm.overflowTimer);
+    g_wm.overflowTimer = 0;
+  }
   Wh_Log(L"Window management mode: %s", automatic ? L"Automatic" : L"Manual");
   Diagnostics::RecordEvent(
       L"management mode changed to %ls", automatic ? L"Automatic" : L"Manual");
@@ -516,6 +565,12 @@ static void HandleMoveSizeEndMessage(HWND hwnd) {
 // owned by the WM are explicitly returned to Windows so STA COM's hidden window
 // continues receiving cross-apartment calls.
 static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
+  if ((msg.message == WM_HOTKEY && msg.wParam != HK_DIAGNOSTIC_DUMP) ||
+      msg.message == WM_APP_LAYOUT_CYCLE ||
+      msg.message == WM_APP_LAYOUT_SET || msg.message == WM_APP_TILE_WORKSPACE ||
+      msg.message == WM_APP_MANAGEMENT_MODE_SET) {
+    g_wm.pendingOverflowSwitch = {};
+  }
   switch (msg.message) {
     case WM_APP_MOVE_SIZE_END:
       HandleMoveSizeEndMessage(reinterpret_cast<HWND>(msg.wParam));
@@ -542,7 +597,9 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
           // message is consumed. Preserve the discovery prompt with one settled
           // global snapshot, which can observe its live replacement.
           Reconcile::ScheduleLifecycleReconcile(nullptr);
-        } else if (!IsWindowTrackedInAnyState(hwnd)) {
+        } else if (!IsWindowTrackedInAnyState(hwnd) ||
+                   std::any_of(g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
+                               [hwnd](const PendingWindowOverflow& request) { return request.hwnd == hwnd; })) {
           Reconcile::ScheduleLifecycleReconcile(hwnd);
         }
       }
@@ -590,6 +647,11 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       if (g_wm.discoveryRetryTimer &&
           static_cast<UINT_PTR>(msg.wParam) == g_wm.discoveryRetryTimer) {
         Reconcile::ProcessDiscoveryRetryTimer();
+        return WmMessageDisposition::Handled;
+      }
+      if (g_wm.overflowTimer &&
+          static_cast<UINT_PTR>(msg.wParam) == g_wm.overflowTimer) {
+        Reconcile::ProcessWindowOverflow();
         return WmMessageDisposition::Handled;
       }
       if (g_wm.maintenanceTimer &&
@@ -662,6 +724,27 @@ static void RunWmMessageLoop() {
 }
 
 static void CleanupWmThread() {
+  // Deferred overflow is temporarily Floating while native routing waits. Return
+  // those members to tiling before discarding the actor queue so settings reload
+  // can enforce the new policy instead of retaining an accidental float forever.
+  std::vector<PendingWindowOverflow> deferredOverflow;
+  deferredOverflow.swap(g_wm.pendingWindowOverflow);
+  for (const PendingWindowOverflow& pending : deferredOverflow) {
+    DWORD livePid = 0;
+    GetWindowThreadProcessId(pending.hwnd, &livePid);
+    if (livePid != pending.processId || !g_wm.overflowWindows.count(pending.hwnd)) continue;
+    for (const auto& key : g_workspaces.OwnersOf(pending.hwnd)) {
+      Workspace workspace;
+      if (!g_workspaces.Load(key, &workspace) || workspace.Layout() == TileLayout::Floating) continue;
+      const WindowRecord* record = workspace.Find(pending.hwnd);
+      if (!record || record->pid != livePid || record->state != ManageState::Floating ||
+          record->alwaysFloating || record->tilingGeneration != pending.tilingGeneration) continue;
+      workspace.ActivateTiled(pending.hwnd);
+      const SuspensionReason reason = GetPhysicalSuspensionReason(pending.hwnd);
+      if (reason != SuspensionReason::None) workspace.Suspend(pending.hwnd, reason);
+      g_workspaces.Save(key, workspace);
+    }
+  }
   // Unhook WinEvent delivery before clearing transient callback observations so
   // no reentrant delivery can repopulate the next settings-reload session.
   UnregisterConfiguredHotkeys();
@@ -688,6 +771,14 @@ static void CleanupWmThread() {
   g_wm.lifecycleDirtyWindows.clear();
   g_wm.pendingDiscoveryRetries.clear();
   g_wm.pendingDesktopArranges.clear();
+  if (g_wm.overflowTimer) KillTimer(nullptr, g_wm.overflowTimer);
+  g_wm.overflowTimer = 0;
+  g_wm.overflowWindows.clear();
+  g_wm.pendingWindowOverflow.clear();
+  g_wm.pendingOverflowSwitch = {};
+  g_wm.monitorRoutingReady = false;
+  g_wm.monitorRoutingEvaluated.clear();
+  g_wm.pendingMonitorRoutes.clear();
   g_wm.maintenanceAttempts = 0;
   g_wm.maintenanceRunning = false;
   g_wm.lifecycleRetryAfterPlatformRecovery = false;
@@ -729,6 +820,22 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   } else {
     Platform::WindowEvents::InstallWinEventHooks();
     Wh_Log(L"COM initialization failed; virtual desktop integration unavailable for this WM session");
+  }
+
+  // Existing HWNDs, including hidden windows and windows on other desktops,
+  // form a baseline before discovery or hook-driven placement can route them.
+  if (std::any_of(g_settings.windowRules.begin(), g_settings.windowRules.end(),
+                  [](const WindowRule& rule) {
+                    return rule.treatment == WindowRuleTreatment::OpenOnMonitor;
+                  })) {
+    ++Diagnostics::g_runtime.counters.enumWindowsPasses;
+    g_wm.monitorRoutingReady = g_hooks.hideDestroy && EnumWindows(
+        [](HWND hwnd, LPARAM) WINAPI -> BOOL {
+          ++Diagnostics::g_runtime.counters.enumWindowsVisited;
+          g_wm.monitorRoutingEvaluated.insert(hwnd);
+          return TRUE;
+        }, 0) != FALSE;
+    if (!g_wm.monitorRoutingReady) Wh_Log(L"Initial monitor routing baseline failed");
   }
 
   Reconcile::ScheduleLifecycleReconcile(nullptr);

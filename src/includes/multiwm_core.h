@@ -116,7 +116,15 @@ struct NotificationInterfaceConfig {
 
 struct VirtualDesktopAbiProfile {
   IID managerInternal{};
+  IID virtualDesktop{};
   bool usesHMonitor = false;
+  int getDesktopsIndex = 7;
+  int switchDesktopIndex = 9;
+  int createDesktopIndex = 10;
+  int moveDesktopIndex = -1;
+  int removeDesktopIndex = 11;
+  int animatedSwitchIndex = -1;
+  int animationWaitIndex = -1;
   NotificationInterfaceConfig notification{};
 };
 
@@ -127,6 +135,12 @@ bool GetCurrentDesktopId(GUID* outGuid);
 bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid);
 bool IsWindowOnCurrentDesktopSafe(HWND hwnd, BOOL* onCurrent);
 bool RegisterVirtualDesktopNotifications();
+bool GetDesktopIdsInOrder(std::vector<GUID>* desktopIds);
+bool CreateDesktopAfter(const GUID& sourceDesktop, GUID* desktopId, int* desktopNumber);
+bool IsDesktopEmptyExcept(const GUID& desktopId, HWND allowedWindow = nullptr);
+bool RemoveEmptyOverflowDesktop(const GUID& desktopId, const GUID& fallbackDesktop);
+bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, const GUID& desktopId);
+bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GUID& sourceDesktop, DWORD inputTickMs);
 
 struct DesktopMetadata {
   std::wstring name;
@@ -154,6 +168,25 @@ using Platform::VirtualDesktop::IsWindowOnCurrentDesktopSafe;
 struct PendingWorkspaceArrange {
   GUID desktopId{};
   HMONITOR monitor = nullptr;
+};
+
+struct PendingWindowOverflow {
+  HWND hwnd = nullptr;
+  DWORD processId = 0;
+  GUID sourceDesktop{};
+  std::wstring sourceMonitorId;
+  bool monitorFixed = false;
+  uint64_t tilingGeneration = 0;
+};
+
+struct PendingOverflowSwitch {
+  HWND hwnd = nullptr;
+  DWORD processId = 0;
+  GUID sourceDesktop{};
+  GUID targetDesktop{};
+  RECT sourceFrame{};
+  ULONGLONG deadlineTickMs = 0;
+  DWORD inputTickMs = 0;
 };
 
 struct PendingDiscoveryRetry {
@@ -204,6 +237,7 @@ enum class WindowRuleTreatment {
   AlwaysFloating,
   TraceToOwner,
   FloatingPlacementOverride,
+  OpenOnMonitor,
 };
 enum class ManagementMode { Manual, Automatic };
 enum class AutomaticNewWindowPosition { LastSlot, AfterFocused };
@@ -239,6 +273,7 @@ struct WindowRule {
   bool preserveFloatingSize = true;
   bool useWorkspaceSize = false;
   FloatingDefaultSize floatingSizeDip{};
+  std::wstring targetMonitor;
 };
 
 enum class WorkspaceRuleMonitor { Any, Primary, NonPrimary };
@@ -287,6 +322,10 @@ struct SettingsState {
   std::vector<TileLayout> layoutCycle = MakeBuiltInLayoutCycle();
   std::vector<WorkspaceInitializationRule> workspaceInitializationRules;
   std::vector<WindowRule> windowRules;
+  size_t automaticWindowLimit = 0;
+  bool overflowCreateDesktop = false;
+  bool overflowTryOtherMonitors = false;
+  std::vector<std::pair<std::wstring, size_t>> monitorWindowLimits;
   std::wstring diagnosticsOutputPath =
       L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";
 };
@@ -331,6 +370,11 @@ struct WmRuntime {
 
   UINT_PTR lifecycleTimer = 0;
   UINT_PTR discoveryRetryTimer = 0;
+  UINT_PTR overflowTimer = 0; // Checks desktop arrival, without activating HWNDs.
+  // Destroy events retire queued HWND lifetimes before deferred work runs.
+  std::unordered_set<HWND> overflowWindows;
+  std::vector<PendingWindowOverflow> pendingWindowOverflow;
+  PendingOverflowSwitch pendingOverflowSwitch{};
   UINT_PTR maintenanceTimer = 0;
   UINT_PTR conformanceTimer = 0;
   UINT maintenanceAttempts = 0;
@@ -345,6 +389,10 @@ struct WmRuntime {
   std::vector<HWND> lifecycleDirtyWindows;
   std::vector<PendingDiscoveryRetry> pendingDiscoveryRetries;
   std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
+  // Routing is independent of management and also works in Manual mode.
+  bool monitorRoutingReady = false;
+  std::unordered_set<HWND> monitorRoutingEvaluated;
+  std::unordered_map<HWND, std::wstring> pendingMonitorRoutes;
   ManagementMode managementMode = ManagementMode::Automatic;
 };
 
@@ -700,6 +748,7 @@ struct WindowRecord {
   // Retained through constraint-refresh replans so a pending admission can try
   // nearby insertion slots before it is floated.
   bool pendingInsertionPlacement = false;
+  bool automaticOverflowMonitorFixed = false;
   // Default-floating admission can precede a usable restored rectangle. Retain
   // the centering request until discovery can place the restored HWND.
   bool pendingDefaultFloatingCenter = false;
@@ -760,6 +809,8 @@ class Workspace {
     return {dwindleRatios_.begin(), dwindleRatios_.end() - 1};
   }
   size_t ActiveCount() const { return windows_.size(); }
+  size_t VisibleWindowCount() const;
+  Workspace EmptyWithInheritedLayoutSettings() const;
   size_t RecordCount() const { return records_.size(); }
   bool Empty() const { return windows_.empty(); }
 
@@ -854,6 +905,8 @@ class Workspace {
   std::vector<HWND> windows_;
   std::unordered_map<HWND, WindowRecord> records_;
   double masterRatio_ = 0.5;
+  // Positional defaults inherited by an overflow-created workspace, without HWNDs.
+  std::vector<double> inheritedSlotWeights_;
   std::vector<double> stackWeights_;
   std::vector<double> gridWeights_;
   std::vector<double> dwindleRatios_;
