@@ -57,34 +57,6 @@ and Manual management (Alt+R).
 
 A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
 
-Workspace initialization rules select a starting layout by desktop name, Task View
-position, and monitor. The first matching rule wins; existing workspaces keep their
-layout. Rules use the built-in layouts independently of the layout cycle.
-
-Window rules can open new windows on the primary monitor or a specific monitor
-using its ID from diagnostics. Set a diagnostic report hotkey under Hotkeys to
-get the IDs. Routing works in both management modes and can combine with floating
-rules. Minimized, maximized, and fullscreen windows move when restored; later
-user moves are respected.
-
-Under Workspace > Overflow, limit automatic tiling per desktop and monitor.
-0 means unlimited; Floating layouts and rule-floated windows do not use the limit.
-Minimized and hidden windows do not count; maximized windows do. In Automatic
-mode, the policy also applies to restored, migrated, and explicitly tiled windows.
-
-Overflow can float the window or create a desktop immediately after the current
-one. If the window cannot fit or creation fails, it floats here. Optional monitor
-fallback tries other monitors first; an Open on monitor rule keeps its chosen
-monitor. Foreground windows are followed with animation where supported; background
-windows move quietly.
-
-Overflow-created workspaces use the first matching initialization rule, otherwise
-they inherit the source workspace's layout and sizing. Window membership and focus
-are not copied. Ordinal rules use the new desktop's position; desktop name rules
-require a custom name. Existing workspaces keep their settings when positions shift.
-
-Choose the tray icon's left-click action under General, and turn toasts on or off
-under Appearance.
 
 ## Also check out
 - [Virtual Desktop Helper by u2x1](https://windhawk.net/mods/virtual-desktop-helper)
@@ -140,27 +112,11 @@ under Appearance.
       - monocle: Monocle (Fullscreen)
       - floating: Floating (No tiling)
   - InitializationRules:
-      - - DesktopNameContains: ""
-          $name: Desktop Name Contains
-          $description: Match part of a custom desktop name, ignoring case. Blank matches any desktop.
-        - DesktopNumber: 0
-          $name: Desktop Number
-          #! $min: 0
-          $description: Desktop position in Task View, starting at 1. 0 matches any desktop.
-        - Monitor: any
-          $name: Monitor
-          $options:
-            - any: Any
-            - primary: Primary
-            - non_primary: Non-primary
-        - MonitorId: ""
-          $name: Monitor Device ID
-          $description: Paste a monitor ID from a diagnostic report. Blank matches any monitor.
-        - Layout: ""
+      - - Layout: ""
           $name: Initial Layout
-          $description: Leave blank to ignore this rule.
+          $description: Choose a layout and at least one desktop or monitor condition. Rule disabled ignores this row.
           $options:
-            - "": ""
+            - "": Rule disabled
             - master_stack: Master + Stack (Vertical)
             - master_stack_h: Master + Stack (Horizontal)
             - columns: Columns
@@ -168,8 +124,28 @@ under Appearance.
             - dwindle: Dwindle
             - monocle: Monocle (Fullscreen)
             - floating: Floating (No tiling)
+        - DesktopNameContains: ""
+          $name: Desktop Name Contains
+          #! $hideIf: {Layout: ""}
+          $description: Match part of a custom desktop name, ignoring case. Blank matches any desktop.
+        - DesktopNumber: 0
+          $name: Desktop Number
+          #! $hideIf: {Layout: ""}
+          #! $min: 0
+          $description: Desktop position in Task View, starting at 1. 0 matches any desktop.
+        - Monitor: any
+          $name: Monitor
+          #! $hideIf: {Layout: ""}
+          $options:
+            - any: Any
+            - primary: Primary
+            - non_primary: Non-primary
+        - MonitorId: ""
+          $name: Monitor Device ID
+          #! $hideIf: {Layout: ""}
+          $description: Paste a monitor ID from a diagnostic report. Blank matches any monitor.
     $name: Initialization Rules
-    $description: All filled conditions must match. Uses the first matching rule. Empty rows end the list.
+    $description: Special handling rules for specific virtual desktops / monitors.
   - Overflow:
     - WindowLimit: 0
       $name: Auto-tiling Limit
@@ -193,7 +169,7 @@ under Appearance.
           #! $min: 0
           #! $hideIf: {MonitorId: ""}
           $description: Maximum tiled windows on this monitor per desktop. 0 means unlimited.
-      $name: Monitor Limits
+      $name: Per-Monitor Limits
       $description: First match wins. Other monitors use the main limit. Empty rows end the list.
     $name: Overflow
     $description: Automatic mode only. Minimized and hidden windows do not count. Maximized windows count.
@@ -324,16 +300,18 @@ under Appearance.
   - Rules:
       - - Process: ""
           $name: App File Name
-          $description: Match an app's .exe name, such as notepad.exe. Blank matches any app.
+          $description: "Case-insensitive exact match. Leave blank to match any process. \n
+            Separate multiple names with commas; escape a literal comma as \\,."
         - Class: ""
           $name: Window class
-          $description: Match a window class from diagnostics. Blank matches any class.
+          $description: "Case-insensitive exact match. Leave blank to match any class. \n
+            Separate multiple names with commas; escape a literal comma as \\,."
         - TitleContains: ""
           $name: Window title contains
-          $description: Match part of a window title. Blank matches any title; write \, to match a comma.
+          $description: "Case-insensitive substring match. Leave blank to match any title. \n
+            Separate multiple fragments with commas; escape a literal comma as \\,."
         - Treatment: exclude
           $name: Treatment
-          $description: Default to floating can be tiled later. Always floating cannot. Trace to owner drags or resizes the main window.
           $options:
             - exclude: Exclude
             - default_to_floating: Default to floating
@@ -349,11 +327,14 @@ under Appearance.
         - Size: ""
           $name: Centering size override
           #! $showIf: {Treatment: override_size_when_centering}
-          $description: 'For custom centering size: enter width, height (100-4000), or Workspace to fill the usable screen area.'
+          $description: 'Only effective when "Override size" is selected. Default-to-floating and Always-floating discovery always preserve the application''s size. Use Width, Height in DPI-scaled pixels, or "Workspace" to fill the current monitor''s usable workspace. Examples: 720, 480'
     $name: Rules
-    $description: Fill at least one field. All filled fields must match. Capital letters do not matter. Use commas for choices. First match per treatment wins. Empty rows end the list.
+    $description: 
+        "Both floating treatments center without changing the application's size. \n
+        Trace to owner retargets move/size to its root owner. \n
+        Every non-blank match field in a rule must match; comma-separated values within one field are alternatives, e.g. Thunderbird.exe, Librewolf.exe."
   $name: Window Rules
-  $description: Monitor rules move new windows once, in either mode. Minimized, maximized, and fullscreen windows wait until restored. Existing windows stay put.
+  $description: One shoe does not fit everyone, apparently...
 
 - advanced:
   - ConformanceLeaseMs: 3000
