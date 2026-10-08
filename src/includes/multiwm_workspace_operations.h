@@ -221,7 +221,7 @@ static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
 static bool AdmitInitialObservedWindow(
     Workspace& workspace, HWND hwnd, bool useAutomaticAdmissionPolicy) {
   if (!hwnd || !IsWindow(hwnd) || workspace.HasRecord(hwnd) ||
-      IsWindowTrackedInAnyState(hwnd)) {
+      IsWindowTrackedInAnyState(hwnd) || IsWindowCloaked(hwnd)) {
     return false;
   }
   const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);

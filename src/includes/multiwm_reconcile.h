@@ -147,7 +147,10 @@ static bool AdmitUntrackedSnapshot(
 
   bool changed = false;
   for (HWND hwnd : snapshot) {
-    if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) continue;
+    if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd) ||
+        IsWindowCloaked(hwnd)) {
+      continue;
+    }
 
     bool alwaysFloating = false;
     const bool startsFloating =
@@ -197,7 +200,10 @@ static bool AdmitUntrackedSuspendedSnapshot(
   const HWND anchor = afterFocused ? workspace.LastFocusedTiledWindow() : nullptr;
 
   auto admitOne = [&](HWND hwnd) {
-    if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd)) return false;
+    if (workspace.HasRecord(hwnd) || IsWindowTrackedInAnyState(hwnd) ||
+        IsWindowCloaked(hwnd)) {
+      return false;
+    }
 
     const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
     if (reason != SuspensionReason::Minimized &&
@@ -895,7 +901,8 @@ static void EnumerateCurrentMonitors(std::vector<HMONITOR>& monitors) {
 
 // During a virtual-desktop switch, DWM cloaks and uncloaks windows one at a time.
 // Snapshot otherwise eligible windows by desktop GUID while deliberately ignoring
-// that transient cloak bit; settled reconciliation handles genuine cloaks later.
+// that transient cloak bit. Known membership therefore survives the transition;
+// the admission boundary defers unknown cloaked HWNDs to the settled pass.
 static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
     HMONITOR monitor, const GUID& desktopId) {
   std::vector<HWND> windows;
