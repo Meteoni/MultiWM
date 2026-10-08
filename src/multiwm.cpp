@@ -4,7 +4,7 @@
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
 // @version         1.13.58
 // @author          meteoni
-// @github          https://github.com/Meteony
+// @github          https://github.com/Meteoni
 // @license         MIT
 // @include         explorer.exe
 // @architecture    x86-64
@@ -20,10 +20,10 @@ MultiWM is a continuation of the original [Tiling Helper](https://windhawk.net/m
 A lightweight, low-cortisol window manager for Windows 11 with true per-virtual-desktop layouts - 
 including floating - and simple, predictable controls. 
 
-![GIF](https://raw.githubusercontent.com/Meteony/meteoni-assets/main/MultiWM/MultiWM.gif)
+![GIF](https://raw.githubusercontent.com/Meteoni/meteoni-assets/main/MultiWM/MultiWM.gif)
 
 ## Notes
-- *MultiWM launches a dedicated `explorer.exe -tool-mod` worker for compatibility with Windhawk 1.7.x. Restarting every Explorer process also restarts MultiWM and loses its in-memory workspace state; Windhawk 2.0 (or higher) users can change the target process (`explorer.exe` -> `windhawk.exe`) for better preservation across Explorer restarts.*
+- *Windhawk 2.0 (or higher) users can change the target process (`explorer.exe` -> `windhawk.exe, windhawk-mod.exe, windhawk-mod-uiaccess.exe`) for a better experience.*
 - *MultiWM's virtual-desktop notification integration is based on [Taskbar Desktop Indicator by Simon Benedict](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/taskbar-desktop-indicator.wh.cpp) (MIT).*
 
 ## Features
@@ -39,12 +39,7 @@ continuous polling.
 ## Layouts
 - Floating
 - Master + Stack (vertical or horizontal)
-- Dwindle — recursive splits alternate side-by-side and top/bottom, starting
-  side-by-side. Resizing changes split ratios without rotating dividers.
-  Constraint recovery can automatically reshape a configurable number of leading
-  slots; set Adaptive Dwindle Slots to 0 to keep automatic recovery on fixed ratios.
-  Layout conversion preserves the current order when possible, then reassigns
-  windows to compatible Dwindle slots only when that is required to make it fit.
+- Dwindle
 - Columns / Rows
 - Monocle
 
