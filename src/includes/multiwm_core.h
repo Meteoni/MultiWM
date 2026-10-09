@@ -411,6 +411,7 @@ struct WmRuntime {
     RuleMonitor monitor = RuleMonitor::Any;
     std::wstring monitorId;
     bool followWindow = false;
+    uint64_t visibleGeneration = 0; // Counts a maximized arrival without admitting it.
   };
   std::unordered_map<HWND, PendingWindowRoute> pendingWindowRoutes;
   PendingOverflowSwitch pendingInitialPlacementSwitch{};

@@ -737,6 +737,7 @@ static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) 
 static void RouteNewWindows(std::vector<HMONITOR>& monitors) {
   if (!g_wm.windowRoutingReady) return;
 
+  const HWND foregroundWindow = GetForegroundWindow();
   std::vector<HWND> candidates;
   ++Diagnostics::g_runtime.counters.enumWindowsPasses;
   EnumWindows(
@@ -869,7 +870,19 @@ static void RouteNewWindows(std::vector<HMONITOR>& monitors) {
       g_wm.pendingWindowRoutes.erase(hwnd);
       continue;
     }
-    if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) continue;
+    const SuspensionReason suspensionReason = GetPhysicalSuspensionReason(hwnd);
+    if (suspensionReason != SuspensionReason::None) {
+      const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
+      if (pending != g_wm.pendingWindowRoutes.end()) {
+        if (suspensionReason == SuspensionReason::Maximized) {
+          if (!pending->second.visibleGeneration) pending->second.visibleGeneration = Model::NextTilingGeneration();
+          AddPendingWorkspaceArrange(sourceDesktop, sourceMonitor);
+        } else {
+          pending->second.visibleGeneration = 0;
+        }
+      }
+      continue;
+    }
     // A frozen GUID must still exist; desktop reordering must not retarget it.
     if (changeDesktop) {
       std::vector<GUID> order;
@@ -946,7 +959,7 @@ static void RouteNewWindows(std::vector<HMONITOR>& monitors) {
       // Off-desktop windows stay unadmitted until the ordinary destination pass.
       // That pass enforces fit/limits, including when several windows arrive together.
       AddPendingWorkspaceArrange(request.targetDesktop, targetMonitor);
-      if (request.followWindow && (!g_wm.pendingInitialPlacementSwitch.hwnd || hwnd == GetForegroundWindow())) {
+      if (request.followWindow && (!g_wm.pendingInitialPlacementSwitch.hwnd || hwnd == foregroundWindow)) {
         g_wm.pendingInitialPlacementSwitch =
             {hwnd, processId, sourceDesktop, request.targetDesktop, {}, 0, input.dwTime};
       }

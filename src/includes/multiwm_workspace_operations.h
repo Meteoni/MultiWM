@@ -2547,7 +2547,13 @@ static void ArrangeWorkspace(
   if (IsAutomaticMode() && workspace.Layout() != TileLayout::Floating) {
     const size_t limit = AutomaticWindowLimitForMonitor(key.monitor);
     if (limit) {
-      std::vector<WindowRecord> visibleMembers;
+      struct VisibleMember {
+        HWND hwnd;
+        DWORD processId;
+        uint64_t generation;
+        bool awaitingInitialPlacement;
+      };
+      std::vector<VisibleMember> visibleMembers;
       size_t retainedSlots = 0;
       for (const auto& member : workspace.Records()) {
         const WindowRecord& record = member.second;
@@ -2557,19 +2563,42 @@ static void ArrangeWorkspace(
           const SuspensionReason physicalReason = GetPhysicalSuspensionReason(record.hwnd);
           if (physicalReason == SuspensionReason::Minimized ||
               physicalReason == SuspensionReason::Hidden || IsWindowCloaked(record.hwnd)) continue;
-          visibleMembers.push_back(record);
+          visibleMembers.push_back({record.hwnd, record.pid, record.tilingGeneration, false});
+        }
+      }
+      // Copy pending identities before desktop queries, which can deliver lifecycle events.
+      for (const auto& pending : g_wm.pendingWindowRoutes) {
+        const auto& request = pending.second;
+        if (request.visibleGeneration && IsEqualGUID(request.sourceDesktop, key.desktopId)) {
+          visibleMembers.push_back({pending.first, request.processId, request.visibleGeneration, true});
         }
       }
       std::sort(visibleMembers.begin(), visibleMembers.end(),
-                [](const WindowRecord& first, const WindowRecord& second) {
-                  return first.tilingGeneration < second.tilingGeneration;
+                [](const VisibleMember& first, const VisibleMember& second) {
+                  return first.generation < second.generation;
                 });
-      for (const WindowRecord& record : visibleMembers) {
+      for (const VisibleMember& member : visibleMembers) {
+        if (member.awaitingInitialPlacement) {
+          GUID owner{};
+          if (!GetWindowDesktopIdSafe(member.hwnd, &owner) || !IsEqualGUID(owner, key.desktopId)) continue;
+          DWORD liveProcessId = 0;
+          GetWindowThreadProcessId(member.hwnd, &liveProcessId);
+          if (!IsWindow(member.hwnd) || liveProcessId != member.processId ||
+              IsWindowTrackedInAnyState(member.hwnd) || IsWindowCloaked(member.hwnd) ||
+              GetPhysicalSuspensionReason(member.hwnd) != SuspensionReason::Maximized ||
+              GetWindowPhysicalMonitor(member.hwnd) != monitor || ShouldWindowStartFloating(member.hwnd)) continue;
+          const auto pending = g_wm.pendingWindowRoutes.find(member.hwnd);
+          if (pending == g_wm.pendingWindowRoutes.end() || pending->second.processId != member.processId ||
+              pending->second.visibleGeneration != member.generation) continue;
+          // Reserve its place in arrival order. Restoration still performs initial placement.
+          ++retainedSlots;
+          continue;
+        }
         const bool exceedsLimit = retainedSlots >= limit;
         ++retainedSlots;
         // Visible maximized members count, but are not restored just to move them.
-        if (exceedsLimit && !IsMoveSizeGestureInProgress(record.hwnd) &&
-            FloatAutomaticOverflowWindow(key, workspace, record.hwnd, L"count limit")) {
+        if (exceedsLimit && !IsMoveSizeGestureInProgress(member.hwnd) &&
+            FloatAutomaticOverflowWindow(key, workspace, member.hwnd, L"count limit")) {
           --retainedSlots;
         }
       }

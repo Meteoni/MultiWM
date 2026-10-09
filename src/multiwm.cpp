@@ -622,4 +622,4 @@ void Wh_ModUninit() {
   WhTool_ModUninit();
   ExitProcess(0);
 }
-  
+
