@@ -109,9 +109,9 @@ A small tray indicator shows the active workspace layout and provides quick acce
   - InitializationRules:
       - - Layout: ""
           $name: Initial Layout
-          $description: Choose a layout and at least one desktop or monitor condition. Rule disabled ignores this row.
+          $description: Choose a layout and at least one desktop or monitor condition. Disabled ignores this row.
           $options:
-            - "": Rule disabled
+            - "": Disabled
             - master_stack: Master + Stack (Vertical)
             - master_stack_h: Master + Stack (Horizontal)
             - columns: Columns
@@ -135,10 +135,12 @@ A small tray indicator shows the active workspace layout and provides quick acce
             - any: Any
             - primary: Primary
             - non_primary: Non-primary
+            - specific: Specific monitor
         - MonitorId: ""
-          $name: Monitor Device ID
+          $name: Monitor ID
           #! $hideIf: {Layout: ""}
-          $description: Paste a monitor ID from a diagnostic report. Blank matches any monitor.
+          #! $showIf: {Monitor: specific}
+          $description: Paste a monitor ID from diagnostics. Blank disables this rule.
     $name: Initialization Rules
     $description: Special handling rules for specific virtual desktops / monitors.
   - Overflow:
@@ -156,16 +158,24 @@ A small tray indicator shows the active workspace layout and provides quick acce
       $name: Try Other Monitors First
       $description: Try another monitor before floating or changing desktop.
     - MonitorLimits:
-      - - MonitorId: ""
+      - - Monitor: disabled
+          $name: Monitor
+          $options:
+            - disabled: Rule disabled
+            - primary: Primary
+            - non_primary: Non-primary
+            - specific: Specific monitor
+        - MonitorId: ""
           $name: Monitor ID
-          $description: Paste a monitor ID from a diagnostic report. Blank disables this row.
+          #! $showIf: {Monitor: specific}
+          $description: Paste a monitor ID from diagnostics. Blank disables this rule.
         - Limit: 0
           $name: Auto-tiling Limit
           #! $min: 0
-          #! $hideIf: {MonitorId: ""}
-          $description: Maximum tiled windows on this monitor per desktop. 0 means unlimited.
+          #! $hideIf: {Monitor: disabled}
+          $description: Limit for each matching monitor per desktop. 0 means unlimited.
       $name: Per-Monitor Limits
-      $description: First match wins. Other monitors use the main limit. Empty rows end the list.
+      $description: First matching rule wins. Other monitors use the main limit.
     $name: Overflow
     $description: Automatic mode only. Minimized and hidden windows do not count. Maximized windows count.
   - TileGap: 6
@@ -312,13 +322,35 @@ A small tray indicator shows the active workspace layout and provides quick acce
             - default_to_floating: Default to floating
             - always_floating: Always floating
             - trace_to_owner: Trace to owner
-            - open_on_monitor: Open on monitor
+            - open_on_monitor: Open on monitor / desktop
             - preserve_size_when_centering: Preserve size when centering
             - override_size_when_centering: Override size when centering
-        - TargetMonitor: ""
-          $name: Target monitor
+        - Monitor: any
+          $name: Monitor
           #! $showIf: {Treatment: open_on_monitor}
-          $description: 'For Open on monitor: enter Primary or a monitor ID from diagnostics. Blank disables the rule.'
+          $description: Any keeps the current monitor.
+          $options:
+            - any: Any
+            - primary: Primary
+            - non_primary: Non-primary
+            - specific: Specific monitor
+        - MonitorId: ""
+          $name: Monitor ID
+          #! $showIf: {Treatment: open_on_monitor, Monitor: specific}
+          $description: Paste a monitor ID from diagnostics. Blank disables this rule.
+        - DesktopNumber: 0
+          $name: Desktop Number
+          #! $showIf: {Treatment: open_on_monitor}
+          #! $min: 0
+          $description: Position in Task View, starting at 1. Both desktop fields must match. 0 matches any number.
+        - DesktopNameContains: ""
+          $name: Desktop Name Contains
+          #! $showIf: {Treatment: open_on_monitor}
+          $description: Match part of a name, ignoring case. First match wins. Leave both desktop fields empty to stay.
+        - FollowWindow: false
+          $name: Follow Window
+          #! $showIf: {Treatment: open_on_monitor}
+          $description: Switch to the window's desktop after moving it.
         - Size: ""
           $name: Centering size override
           #! $showIf: {Treatment: override_size_when_centering}
@@ -590,4 +622,4 @@ void Wh_ModUninit() {
   WhTool_ModUninit();
   ExitProcess(0);
 }
-
+  

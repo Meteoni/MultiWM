@@ -403,13 +403,18 @@ static const WindowRule* FindMatchingWindowRule(
   return nullptr;
 }
 
-// Discovery waits for routing before assigning a monitor owner. Explicit
+// Discovery waits for initial placement before assigning workspace ownership. Explicit
 // admission bypasses this policy and overrides pending initial placement.
-static bool IsWindowAwaitingMonitorRouting(HWND hwnd) {
-  return g_wm.monitorRoutingReady &&
-         (g_wm.pendingMonitorRoutes.count(hwnd) ||
-          (!g_wm.monitorRoutingEvaluated.count(hwnd) &&
-           FindMatchingWindowRule(hwnd, WindowRuleTreatment::OpenOnMonitor)));
+static bool IsWindowAwaitingInitialPlacement(HWND hwnd) {
+  return g_wm.windowRoutingReady &&
+         (g_wm.pendingWindowRoutes.count(hwnd) ||
+          (!g_wm.windowRoutingEvaluated.count(hwnd) &&
+           FindMatchingWindowRule(hwnd, WindowRuleTreatment::InitialPlacement)));
+}
+
+static bool HasMonitorPlacementRule(HWND hwnd) {
+  const WindowRule* rule = FindMatchingWindowRule(hwnd, WindowRuleTreatment::InitialPlacement);
+  return rule && (rule->monitor != RuleMonitor::Any || !rule->monitorId.empty());
 }
 
 static bool IsWindowExcludedByRules(HWND hwnd) {

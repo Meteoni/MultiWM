@@ -47,10 +47,10 @@ static TileLayout ResolveInitialWorkspaceLayout(
 
   for (const auto& rule : g_settings.workspaceInitializationRules) {
     if (!rule.monitorId.empty() && rule.monitorId != key.monitor.deviceId) continue;
-    if (rule.monitor != WorkspaceRuleMonitor::Any) {
+    if (rule.monitor == RuleMonitor::Primary || rule.monitor == RuleMonitor::NonPrimary) {
       if (!haveMonitorInfo) continue;
       const bool primary = (monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
-      if (primary != (rule.monitor == WorkspaceRuleMonitor::Primary)) continue;
+      if (primary != (rule.monitor == RuleMonitor::Primary)) continue;
     }
     if (!rule.desktopNameContains.empty() || rule.desktopNumber != 0) {
       if (!metadataRead) {
@@ -154,7 +154,7 @@ static bool AdmitUntrackedSnapshot(
         IsWindowCloaked(hwnd)) {
       continue;
     }
-    if (useAutomaticAdmissionPolicy && IsWindowAwaitingMonitorRouting(hwnd)) {
+    if (useAutomaticAdmissionPolicy && IsWindowAwaitingInitialPlacement(hwnd)) {
       continue;
     }
 
@@ -175,7 +175,7 @@ static bool AdmitUntrackedSnapshot(
     bool admitted = false;
     WindowRecord record = MakeWindowRecord(hwnd, ManageState::Tiled);
     record.automaticOverflowMonitorFixed =
-        FindMatchingWindowRule(hwnd, WindowRuleTreatment::OpenOnMonitor) != nullptr;
+        HasMonitorPlacementRule(hwnd);
     if (anchor) {
       admitted = workspace.AdmitTiledAfter(std::move(record), anchor);
     } else {
@@ -213,7 +213,7 @@ static bool AdmitUntrackedSuspendedSnapshot(
       return false;
     }
 
-    if (useAutomaticAdmissionPolicy && IsWindowAwaitingMonitorRouting(hwnd)) {
+    if (useAutomaticAdmissionPolicy && IsWindowAwaitingInitialPlacement(hwnd)) {
       return false;
     }
 
@@ -235,7 +235,7 @@ static bool AdmitUntrackedSuspendedSnapshot(
 
     WindowRecord record = MakeWindowRecord(hwnd);
     record.automaticOverflowMonitorFixed =
-        FindMatchingWindowRule(hwnd, WindowRuleTreatment::OpenOnMonitor) != nullptr;
+        HasMonitorPlacementRule(hwnd);
     if (anchor) {
       return workspace.AdmitInitialAfter(std::move(record), reason, anchor);
     }
@@ -732,102 +732,242 @@ static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) 
   }
 }
 
-// Run before monitor snapshots are built. Suspended candidates retain their
-// selected rule but remain untouched until restored.
-static void RouteNewWindowsToMonitors(std::vector<HMONITOR>& monitors) {
-  if (!g_wm.monitorRoutingReady) return;
+// Run before snapshots are built. A rule chooses the initial destination once;
+// admission and overflow remain owned by the destination's ordinary active pass.
+static void RouteNewWindows(std::vector<HMONITOR>& monitors) {
+  if (!g_wm.windowRoutingReady) return;
 
   std::vector<HWND> candidates;
   ++Diagnostics::g_runtime.counters.enumWindowsPasses;
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
         ++Diagnostics::g_runtime.counters.enumWindowsVisited;
-        if (!g_wm.monitorRoutingEvaluated.count(hwnd) ||
-            g_wm.pendingMonitorRoutes.count(hwnd)) {
+        if (!g_wm.windowRoutingEvaluated.count(hwnd) || g_wm.pendingWindowRoutes.count(hwnd)) {
           reinterpret_cast<std::vector<HWND>*>(lParam)->push_back(hwnd);
         }
         return TRUE;
       }, reinterpret_cast<LPARAM>(&candidates));
 
   for (HWND hwnd : candidates) {
-    // Explicit admission or a user gesture overrides pending initial placement.
+    // Explicit admission and user gestures override pending initial placement.
     if (IsWindowTrackedInAnyState(hwnd) || IsMoveSizeGestureInProgress(hwnd)) {
-      g_wm.monitorRoutingEvaluated.insert(hwnd);
-      g_wm.pendingMonitorRoutes.erase(hwnd);
+      g_wm.windowRoutingEvaluated.insert(hwnd);
+      g_wm.pendingWindowRoutes.erase(hwnd);
       continue;
     }
-    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || !IsWindowEnabled(hwnd) ||
-        IsWindowCloaked(hwnd) || IsHungAppWindow(hwnd)) {
-      continue;
-    }
+    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || !IsWindowEnabled(hwnd) || IsHungAppWindow(hwnd)) continue;
     if (!WindowCanBeManaged(hwnd, true)) {
-      // In particular, an Exclude rule always wins over monitor routing.
-      g_wm.pendingMonitorRoutes.erase(hwnd);
+      // Exclusion wins. Ineligible framework HWNDs may become eligible later.
+      g_wm.pendingWindowRoutes.erase(hwnd);
       continue;
     }
-    BOOL onCurrent = FALSE;
-    if (!IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) continue;
+    DWORD processId = 0;
+    GUID sourceDesktop{};
+    GetWindowThreadProcessId(hwnd, &processId);
+    if (!processId || !GetWindowDesktopIdSafe(hwnd, &sourceDesktop) ||
+        IsEqualGUID(sourceDesktop, GUID_NULL)) continue;
 
-    auto pending = g_wm.pendingMonitorRoutes.find(hwnd);
-    if (pending == g_wm.pendingMonitorRoutes.end()) {
-      // Platform queries above can deliver a user-move or destroy event.
-      if (g_wm.monitorRoutingEvaluated.count(hwnd) || !IsWindow(hwnd)) continue;
-      const WindowRule* rule =
-          FindMatchingWindowRule(hwnd, WindowRuleTreatment::OpenOnMonitor);
-      if (g_wm.monitorRoutingEvaluated.count(hwnd) || !IsWindow(hwnd)) continue;
-      g_wm.monitorRoutingEvaluated.insert(hwnd);
-      if (!rule) continue;
-      pending = g_wm.pendingMonitorRoutes.emplace(hwnd, rule->targetMonitor).first;
-    }
-
-    // Keep a value copy: native placement can reenter WinEvent delivery, which
-    // may cancel the pending route or report destruction of this HWND.
-    const std::wstring targetMonitorId = pending->second;
-    HMONITOR targetMonitor = nullptr;
-    if (targetMonitorId == L"PRIMARY") {
-      targetMonitor = MonitorFromPoint(POINT{}, MONITOR_DEFAULTTOPRIMARY);
-    } else {
-      Model::MonitorId targetId;
-      targetId.deviceId = targetMonitorId;
-      targetMonitor = targetId.Resolve();
-    }
-    const HMONITOR sourceMonitor = GetWindowPhysicalMonitor(hwnd);
-    AddUniqueMonitor(monitors, sourceMonitor);
-    if (!targetMonitor || sourceMonitor == targetMonitor) {
-      if (!targetMonitor) {
-        Wh_Log(L"Monitor rule target unavailable for HWND %p: %ls",
-               hwnd, targetMonitorId.c_str());
+    if (!g_wm.pendingWindowRoutes.count(hwnd)) {
+      if (g_wm.windowRoutingEvaluated.count(hwnd) || !IsWindow(hwnd)) continue;
+      const WindowRule* rule = FindMatchingWindowRule(hwnd, WindowRuleTreatment::InitialPlacement);
+      if (g_wm.windowRoutingEvaluated.count(hwnd) || !IsWindow(hwnd)) continue;
+      if (!rule) {
+        g_wm.windowRoutingEvaluated.insert(hwnd);
+        continue;
       }
-      g_wm.pendingMonitorRoutes.erase(hwnd);
+      // Copy the rule before COM calls, which may deliver lifecycle events.
+      WmRuntime::PendingWindowRoute request;
+      request.processId = processId;
+      request.sourceDesktop = sourceDesktop;
+      request.targetDesktop = sourceDesktop;
+      request.monitor = rule->monitor;
+      request.monitorId = rule->monitorId;
+      request.followWindow = rule->followWindow;
+      const int desktopNumber = rule->desktopNumber;
+      const std::wstring desktopName = rule->desktopNameContains;
+      if (desktopNumber || !desktopName.empty()) {
+        std::vector<GUID> order;
+        if (!Platform::VirtualDesktop::GetDesktopIdsInOrder(&order)) continue;
+        request.targetDesktop = GUID_NULL;
+        for (size_t i = 0; i < order.size(); ++i) {
+          if (desktopNumber && desktopNumber != static_cast<int>(i + 1)) continue;
+          if (!desktopName.empty()) {
+            const auto metadata = Platform::VirtualDesktop::ReadDesktopMetadata(order[i]);
+            if (!ContainsInsensitive(metadata.name, desktopName)) continue;
+          }
+          request.targetDesktop = order[i];
+          break;
+        }
+      }
+      DWORD livePid = 0;
+      GUID liveOwner{};
+      GetWindowThreadProcessId(hwnd, &livePid);
+      if (g_wm.windowRoutingEvaluated.count(hwnd) || !IsWindow(hwnd) || livePid != processId ||
+          !GetWindowDesktopIdSafe(hwnd, &liveOwner) || !IsEqualGUID(liveOwner, sourceDesktop)) continue;
+      g_wm.windowRoutingEvaluated.insert(hwnd);
+      if (IsEqualGUID(request.targetDesktop, GUID_NULL)) {
+        Wh_Log(L"Initial placement desktop unavailable for HWND %p", hwnd);
+        continue;
+      }
+      g_wm.pendingWindowRoutes.emplace(hwnd, std::move(request));
+    }
+    // Never retain map iterators or references across native calls.
+    const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
+    if (pending == g_wm.pendingWindowRoutes.end()) continue;
+    const auto request = pending->second;
+    if (request.processId != processId || !IsEqualGUID(request.sourceDesktop, sourceDesktop)) {
+      g_wm.pendingWindowRoutes.erase(hwnd); // The app or user relocated it.
+      continue;
+    }
+    GUID currentDesktop{};
+    if (!GetCurrentDesktopId(&currentDesktop) || !IsEqualGUID(currentDesktop, sourceDesktop) ||
+        IsWindowCloaked(hwnd)) continue;
+
+    const HMONITOR sourceMonitor = GetWindowPhysicalMonitor(hwnd);
+    HMONITOR targetMonitor = sourceMonitor;
+    AddUniqueMonitor(monitors, sourceMonitor);
+    if (request.monitor == RuleMonitor::Specific) {
+      Model::MonitorId identity;
+      identity.deviceId = request.monitorId;
+      targetMonitor = identity.Resolve();
+    } else if (request.monitor == RuleMonitor::Primary || request.monitor == RuleMonitor::NonPrimary) {
+      auto matchesMonitor = [&](HMONITOR monitor) {
+        MONITORINFO info{sizeof(info)};
+        return GetMonitorInfoW(monitor, &info) &&
+            ((info.dwFlags & MONITORINFOF_PRIMARY) != 0) == (request.monitor == RuleMonitor::Primary);
+      };
+      if (!matchesMonitor(sourceMonitor)) {
+        std::vector<std::pair<std::wstring, HMONITOR>> connected;
+        EnumDisplayMonitors(nullptr, nullptr,
+            [](HMONITOR monitor, HDC, LPRECT, LPARAM parameter) WINAPI -> BOOL {
+              Model::MonitorId identity;
+              if (Model::MonitorId::FromHMonitor(monitor, &identity)) {
+                reinterpret_cast<std::vector<std::pair<std::wstring, HMONITOR>>*>(parameter)
+                    ->emplace_back(identity.deviceId, monitor);
+              }
+              return TRUE;
+            }, reinterpret_cast<LPARAM>(&connected));
+        // Stable IDs give a repeatable choice among several secondary monitors.
+        std::sort(connected.begin(), connected.end(), [](const auto& first, const auto& second) {
+          return first.first < second.first;
+        });
+        targetMonitor = nullptr;
+        for (const auto& candidate : connected) {
+          if (matchesMonitor(candidate.second)) { targetMonitor = candidate.second; break; }
+        }
+      }
+    }
+    if (!targetMonitor) {
+      Wh_Log(L"Initial placement monitor unavailable for HWND %p", hwnd);
+      g_wm.pendingWindowRoutes.erase(hwnd);
+      continue;
+    }
+    const bool changeDesktop = !IsEqualGUID(request.targetDesktop, sourceDesktop);
+    if (!changeDesktop && targetMonitor == sourceMonitor) {
+      // Already at its destination: normal suspended admission must still count
+      // maximized windows, without waiting for an unnecessary physical move.
+      g_wm.pendingWindowRoutes.erase(hwnd);
       continue;
     }
     if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) continue;
-
-    RECT frame{}, workArea{};
-    if (!GetWindowFrameRect(hwnd, &frame) || RectWidth(frame) <= 0 ||
-        RectHeight(frame) <= 0 || !GetWorkspaceWorkArea(targetMonitor, &workArea)) {
-      g_wm.pendingMonitorRoutes.erase(hwnd);
+    // A frozen GUID must still exist; desktop reordering must not retarget it.
+    if (changeDesktop) {
+      std::vector<GUID> order;
+      if (!Platform::VirtualDesktop::GetDesktopIdsInOrder(&order)) continue;
+      if (std::none_of(order.begin(), order.end(), [&](const GUID& id) {
+            return IsEqualGUID(id, request.targetDesktop);
+          })) {
+        g_wm.pendingWindowRoutes.erase(hwnd);
+        continue;
+      }
+    }
+    auto canRoute = [&] {
+      const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
+      if (pending == g_wm.pendingWindowRoutes.end() || pending->second.processId != processId) return false;
+      DWORD livePid = 0;
+      GUID owner{}, current{};
+      GetWindowThreadProcessId(hwnd, &livePid);
+      return IsWindow(hwnd) && livePid == processId && !IsWindowTrackedInAnyState(hwnd) &&
+          !IsMoveSizeGestureInProgress(hwnd) && !IsWindowCloaked(hwnd) &&
+          GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
+          GetWindowDesktopIdSafe(hwnd, &owner) && IsEqualGUID(owner, sourceDesktop) &&
+          GetCurrentDesktopId(&current) && IsEqualGUID(current, sourceDesktop) &&
+          g_wm.pendingWindowRoutes.count(hwnd);
+    };
+    LASTINPUTINFO input{sizeof(input)};
+    if (!GetLastInputInfo(&input) || !canRoute()) continue;
+    RECT sourceFrame{};
+    if (targetMonitor != sourceMonitor) {
+      RECT workArea{};
+      if (!GetWindowFrameRect(hwnd, &sourceFrame) || RectWidth(sourceFrame) <= 0 ||
+          RectHeight(sourceFrame) <= 0 || !GetWorkspaceWorkArea(targetMonitor, &workArea)) {
+        g_wm.pendingWindowRoutes.erase(hwnd);
+        continue;
+      }
+      const RECT target = CenteredRect(RectCenter(workArea), RectWidth(sourceFrame), RectHeight(sourceFrame));
+      const auto placed = PlaceWindowChecked(hwnd, true, target, true);
+      if (placed.result == PlacementResult::SuppressedByPhysicalState) continue;
+      AddUniqueMonitor(monitors, GetWindowPhysicalMonitor(hwnd));
+      if (placed.result != PlacementResult::Success || GetWindowPhysicalMonitor(hwnd) != targetMonitor) {
+        Diagnostics::RecordEvent(L"initial placement monitor refused hwnd=%p target=%p result=%d",
+                                 hwnd, targetMonitor, static_cast<int>(placed.result));
+        g_wm.pendingWindowRoutes.erase(hwnd);
+        continue;
+      }
+    }
+    if (!canRoute()) continue;
+    if (changeDesktop && !Platform::VirtualDesktop::MoveWindowToDesktop(
+            hwnd, processId, sourceDesktop, request.targetDesktop,
+            Platform::VirtualDesktop::WindowMovePurpose::InitialPlacement)) {
+      // Undo only our monitor move, and only while the original request is live.
+      LASTINPUTINFO latestInput{sizeof(latestInput)};
+      if (targetMonitor != sourceMonitor && GetLastInputInfo(&latestInput) &&
+          latestInput.dwTime == input.dwTime && canRoute()) {
+        PlaceWindowChecked(hwnd, true, sourceFrame, true);
+      }
+      g_wm.pendingWindowRoutes.erase(hwnd);
       continue;
     }
-    const RECT target = CenteredRect(
-        RectCenter(workArea), RectWidth(frame), RectHeight(frame));
-    if (!g_wm.pendingMonitorRoutes.count(hwnd) || IsMoveSizeGestureInProgress(hwnd)) {
-      continue;
+    DWORD livePid = 0;
+    GUID owner{};
+    GetWindowThreadProcessId(hwnd, &livePid);
+    if (!GetWindowDesktopIdSafe(hwnd, &owner) || !IsEqualGUID(owner, request.targetDesktop)) continue;
+    GetWindowThreadProcessId(hwnd, &livePid);
+    if (!IsWindow(hwnd) || !g_wm.pendingWindowRoutes.count(hwnd) || livePid != processId) continue;
+    g_wm.pendingWindowRoutes.erase(hwnd); // Overflow must never reapply this rule.
+    AddUniqueMonitor(monitors, targetMonitor);
+    if (changeDesktop) {
+      DesktopMonitorKey targetKey{};
+      Workspace workspace;
+      if (DesktopMonitorKey::FromHMonitor(request.targetDesktop, targetMonitor, &targetKey) &&
+          !g_workspaces.Load(targetKey, &workspace)) {
+        g_workspaces.Save(targetKey, MakeDefaultWorkspace(targetKey));
+      }
+      // Off-desktop windows stay unadmitted until the ordinary destination pass.
+      // That pass enforces fit/limits, including when several windows arrive together.
+      AddPendingWorkspaceArrange(request.targetDesktop, targetMonitor);
+      if (request.followWindow && (!g_wm.pendingInitialPlacementSwitch.hwnd || hwnd == GetForegroundWindow())) {
+        g_wm.pendingInitialPlacementSwitch =
+            {hwnd, processId, sourceDesktop, request.targetDesktop, {}, 0, input.dwTime};
+      }
+      ScheduleLifecycleReconcile(nullptr);
     }
-    const PlacementObservation placement =
-        PlaceWindowChecked(hwnd, true, target, true);
-    if (placement.result == PlacementResult::SuppressedByPhysicalState) continue;
-
-    // Consume even a refused move. Placement echoes must not fight an app or the
-    // user. Logical ownership will follow the actual physical monitor.
-    const HMONITOR actualMonitor = GetWindowPhysicalMonitor(hwnd);
-    AddUniqueMonitor(monitors, actualMonitor);
-    Diagnostics::RecordEvent(
-        L"initial monitor routing hwnd=%p target=%ls reached=%d result=%d",
-        hwnd, targetMonitorId.c_str(), actualMonitor == targetMonitor,
-        static_cast<int>(placement.result));
-    g_wm.pendingMonitorRoutes.erase(hwnd);
+    Diagnostics::RecordEvent(L"initial placement hwnd=%p targetDesktop=%08X monitor=%p follow=%d",
+                             hwnd, request.targetDesktop.Data1, targetMonitor, request.followWindow ? 1 : 0);
   }
+}
+
+// Switch only after snapshots have finished. No forced HWND activation is needed.
+static void FollowInitiallyPlacedWindow() {
+  const PendingOverflowSwitch pending = g_wm.pendingInitialPlacementSwitch;
+  if (!pending.hwnd) return;
+  if (Platform::VirtualDesktop::SwitchToDesktop(
+          pending.hwnd, pending.processId, pending.targetDesktop, pending.sourceDesktop, pending.inputTickMs,
+          Platform::VirtualDesktop::WindowMovePurpose::InitialPlacement)) {
+    g_wm.reconciledDesktopState = ReconciledDesktopState::TransitionPending;
+    ScheduleLifecycleReconcile(nullptr);
+  }
+  g_wm.pendingInitialPlacementSwitch = {};
 }
 
 // Build only the extra inactive candidates implicated by this settled lifecycle
@@ -984,7 +1124,7 @@ static bool DiscoverCurrentWorkspaceOnMonitor(HMONITOR monitor) {
   }
 
   std::vector<HMONITOR> monitors{monitor};
-  RouteNewWindowsToMonitors(monitors);
+  RouteNewWindows(monitors);
   const auto snapshots = CollectTileWindowsForMonitors(monitors);
   bool arranged = false;
   for (size_t i = 0; i < monitors.size(); ++i) {
@@ -1197,7 +1337,7 @@ static void ProcessDiscoveryRetryTimer() {
     KillTimer(nullptr, g_wm.discoveryRetryTimer);
     g_wm.discoveryRetryTimer = 0;
   }
-  if (!IsAutomaticMode() && !g_wm.monitorRoutingReady) {
+  if (!IsAutomaticMode() && !g_wm.windowRoutingReady) {
     g_wm.pendingDiscoveryRetries.clear();
     return;
   }
@@ -1228,7 +1368,7 @@ static void ProcessDiscoveryRetryTimer() {
     AddUniqueMonitor(monitors,
                      GetCurrentManagedWindowMonitor(pending.hwnd));
   }
-  RouteNewWindowsToMonitors(monitors);
+  RouteNewWindows(monitors);
   for (HMONITOR monitor : monitors) DiscoverCurrentWorkspaceOnMonitor(monitor);
   if (!g_wm.pendingWindowOverflow.empty()) ScheduleLifecycleReconcile(nullptr);
 }
@@ -1504,7 +1644,7 @@ static void ProcessWindowOverflow() {
         if (context.trial->HasRecord(candidate)) return TRUE;
         // A stale owner must be reconciled before importing this destination;
         // copying it here would duplicate ownership or lose its floating policy.
-        if (IsWindowTrackedInAnyState(candidate) || IsWindowAwaitingMonitorRouting(candidate)) {
+        if (IsWindowTrackedInAnyState(candidate) || IsWindowAwaitingInitialPlacement(candidate)) {
           context.complete = false;
           return TRUE;
         }
@@ -1895,7 +2035,7 @@ static void ReconcileDeferredLifecycle() {
     AddUniqueMonitor(monitors, GetWindowPhysicalMonitor(hwnd));
   }
 
-  RouteNewWindowsToMonitors(monitors);
+  RouteNewWindows(monitors);
 
   // One top-level enumeration is enough for every monitor involved in this burst.
   std::vector<std::vector<HWND>> snapshots = CollectTileWindowsForMonitors(monitors);
@@ -1927,14 +2067,14 @@ static void ReconcileDeferredLifecycle() {
   // plausible Automatic-mode candidate is still unknown, its first observation
   // may have raced application initialization or shell desktop registration.
   // Give it one independent re-observation without turning discovery into polling.
-  if ((IsAutomaticMode() || g_wm.monitorRoutingReady) &&
+  if ((IsAutomaticMode() || g_wm.windowRoutingReady) &&
       g_settings.slowApplicationDelayMs) {
     bool addedRetry = false;
     const ULONGLONG dueTickMs =
         GetTickCount64() + g_settings.slowApplicationDelayMs;
     for (HWND hwnd : dirtyWindows) {
       if (hwnd && IsWindow(hwnd) && !IsWindowTrackedInAnyState(hwnd) &&
-          (IsAutomaticMode() || !g_wm.monitorRoutingEvaluated.count(hwnd)) &&
+          (IsAutomaticMode() || !g_wm.windowRoutingEvaluated.count(hwnd)) &&
           GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
           GetAncestor(hwnd, GA_ROOT) == hwnd) {
         DWORD processId = 0;
@@ -1986,6 +2126,7 @@ static void ReconcileDeferredLifecycle() {
     TrayUi::ShowDesktopSwitchFlyouts(currentDesktop);
   }
   ProcessWindowOverflow();
+  FollowInitiallyPlacedWindow();
   // Ordinary lifecycle work updates the icon/tooltip for the monitor the tray is
   // already representing. Only a foreground event or explicit workspace command
   // retargets that single shell icon to another monitor.

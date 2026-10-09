@@ -98,8 +98,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
                        [hwnd](const PendingWindowOverflow& pending) { return pending.hwnd == hwnd; }),
         g_wm.pendingWindowOverflow.end());
     if (g_wm.pendingOverflowSwitch.hwnd == hwnd) g_wm.pendingOverflowSwitch = {};
-    const bool routingKnown = g_wm.monitorRoutingEvaluated.erase(hwnd) != 0;
-    const bool routingPending = g_wm.pendingMonitorRoutes.erase(hwnd) != 0;
+    if (g_wm.pendingInitialPlacementSwitch.hwnd == hwnd) g_wm.pendingInitialPlacementSwitch = {};
+    const bool routingKnown = g_wm.windowRoutingEvaluated.erase(hwnd) != 0;
+    const bool routingPending = g_wm.pendingWindowRoutes.erase(hwnd) != 0;
     if (tracked || routingKnown || routingPending) QueueWindowEvent(event, hwnd);
     return;
   }
@@ -109,7 +110,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // conformance lease instead of being silently discarded.
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
     if (!tracked) {
-      if (g_wm.pendingMonitorRoutes.count(hwnd)) {
+      if (g_wm.pendingWindowRoutes.count(hwnd)) {
         QueueWindowEvent(event, hwnd);
         return;
       }
@@ -155,7 +156,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
         event == EVENT_SYSTEM_MINIMIZEEND ||
         ((event == EVENT_SYSTEM_MOVESIZESTART ||
           event == EVENT_SYSTEM_MOVESIZEEND) &&
-         (g_wm.monitorRoutingReady || IsAutomaticMode()));
+         (g_wm.windowRoutingReady || IsAutomaticMode()));
     if (!discoveryEvent || GetAncestor(hwnd, GA_ROOT) != hwnd) {
       return;
     }
@@ -171,9 +172,10 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
                        [hwnd](const PendingWindowOverflow& pending) { return pending.hwnd == hwnd; }),
         g_wm.pendingWindowOverflow.end());
     if (g_wm.pendingOverflowSwitch.hwnd == hwnd) g_wm.pendingOverflowSwitch = {};
-    if (g_wm.monitorRoutingReady) {
-      g_wm.monitorRoutingEvaluated.insert(hwnd);
-      g_wm.pendingMonitorRoutes.erase(hwnd);
+    if (g_wm.pendingInitialPlacementSwitch.hwnd == hwnd) g_wm.pendingInitialPlacementSwitch = {};
+    if (g_wm.windowRoutingReady) {
+      g_wm.windowRoutingEvaluated.insert(hwnd);
+      g_wm.pendingWindowRoutes.erase(hwnd);
     }
     CancelConformanceLease(hwnd);
   }

@@ -139,8 +139,11 @@ bool GetDesktopIdsInOrder(std::vector<GUID>* desktopIds);
 bool CreateDesktopAfter(const GUID& sourceDesktop, GUID* desktopId, int* desktopNumber);
 bool IsDesktopEmptyExcept(const GUID& desktopId, HWND allowedWindow = nullptr);
 bool RemoveEmptyOverflowDesktop(const GUID& desktopId, const GUID& fallbackDesktop);
-bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, const GUID& desktopId);
-bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GUID& sourceDesktop, DWORD inputTickMs);
+enum class WindowMovePurpose { Overflow, InitialPlacement };
+bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, const GUID& desktopId,
+                         WindowMovePurpose purpose = WindowMovePurpose::Overflow);
+bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GUID& sourceDesktop, DWORD inputTickMs,
+                     WindowMovePurpose purpose = WindowMovePurpose::Overflow);
 
 struct DesktopMetadata {
   std::wstring name;
@@ -237,7 +240,7 @@ enum class WindowRuleTreatment {
   AlwaysFloating,
   TraceToOwner,
   FloatingPlacementOverride,
-  OpenOnMonitor,
+  InitialPlacement,
 };
 enum class ManagementMode { Manual, Automatic };
 enum class AutomaticNewWindowPosition { LastSlot, AfterFocused };
@@ -265,6 +268,8 @@ struct FloatingDefaultSize {
   LONG height = 640;
 };
 
+enum class RuleMonitor { Any, Primary, NonPrimary, Specific };
+
 struct WindowRule {
   WindowRuleTreatment treatment = WindowRuleTreatment::Exclude;
   std::vector<std::wstring> processNames;
@@ -273,15 +278,17 @@ struct WindowRule {
   bool preserveFloatingSize = true;
   bool useWorkspaceSize = false;
   FloatingDefaultSize floatingSizeDip{};
-  std::wstring targetMonitor;
+  RuleMonitor monitor = RuleMonitor::Any;
+  std::wstring monitorId;
+  int desktopNumber = 0;
+  std::wstring desktopNameContains;
+  bool followWindow = false;
 };
-
-enum class WorkspaceRuleMonitor { Any, Primary, NonPrimary };
 
 struct WorkspaceInitializationRule {
   std::wstring desktopNameContains;
   int desktopNumber = 0;
-  WorkspaceRuleMonitor monitor = WorkspaceRuleMonitor::Any;
+  RuleMonitor monitor = RuleMonitor::Any;
   std::wstring monitorId;
   TileLayout layout = TileLayout::MasterStack;
   int settingsIndex = 0;
@@ -325,7 +332,12 @@ struct SettingsState {
   size_t automaticWindowLimit = 0;
   bool overflowCreateDesktop = false;
   bool overflowTryOtherMonitors = false;
-  std::vector<std::pair<std::wstring, size_t>> monitorWindowLimits;
+  struct MonitorWindowLimit {
+    RuleMonitor monitor = RuleMonitor::Specific;
+    std::wstring monitorId;
+    size_t limit = 0;
+  };
+  std::vector<MonitorWindowLimit> monitorWindowLimits;
   std::wstring diagnosticsOutputPath =
       L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";
 };
@@ -390,9 +402,18 @@ struct WmRuntime {
   std::vector<PendingDiscoveryRetry> pendingDiscoveryRetries;
   std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
   // Routing is independent of management and also works in Manual mode.
-  bool monitorRoutingReady = false;
-  std::unordered_set<HWND> monitorRoutingEvaluated;
-  std::unordered_map<HWND, std::wstring> pendingMonitorRoutes;
+  bool windowRoutingReady = false;
+  std::unordered_set<HWND> windowRoutingEvaluated;
+  struct PendingWindowRoute {
+    DWORD processId = 0;
+    GUID sourceDesktop{};
+    GUID targetDesktop{};
+    RuleMonitor monitor = RuleMonitor::Any;
+    std::wstring monitorId;
+    bool followWindow = false;
+  };
+  std::unordered_map<HWND, PendingWindowRoute> pendingWindowRoutes;
+  PendingOverflowSwitch pendingInitialPlacementSwitch{};
   ManagementMode managementMode = ManagementMode::Automatic;
 };
 

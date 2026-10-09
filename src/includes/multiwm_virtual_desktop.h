@@ -896,10 +896,23 @@ bool RemoveEmptyOverflowDesktop(const GUID& desktopId, const GUID& fallbackDeskt
   return removed;
 }
 
-bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, const GUID& desktopId) {
+bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, const GUID& desktopId,
+                         WindowMovePurpose purpose) {
+  auto requestPending = [&] {
+    if (purpose == WindowMovePurpose::Overflow) return g_wm.overflowWindows.count(hwnd) != 0;
+    const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
+    return pending != g_wm.pendingWindowRoutes.end() && pending->second.processId == processId &&
+        IsEqualGUID(pending->second.sourceDesktop, sourceDesktop) &&
+        IsEqualGUID(pending->second.targetDesktop, desktopId) && !IsMoveSizeGestureInProgress(hwnd);
+  };
+  if (!requestPending() || !g_vd.serviceProvider) return false;
   IVirtualDesktop* desktop = FindLiveDesktop(desktopId);
   if (!desktop) return false;
   IUnknown* const manager = g_vd.managerInternal;
+  if (!manager || !g_vd.serviceProvider || !requestPending()) {
+    desktop->Release();
+    return false;
+  }
   const IID viewCollectionIid =
       {0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
   IUnknown* collection = nullptr;
@@ -935,12 +948,16 @@ bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, 
     hr = canMoveView(g_vd.managerInternal, view, &canMove);
   }
   DWORD livePid = 0;
-  GUID owner{};
+  GUID owner{}, current{};
+  const bool sourceObserved = SUCCEEDED(hr) && view && canMove &&
+      GetWindowDesktopIdSafe(hwnd, &owner) && IsEqualGUID(owner, sourceDesktop);
+  const bool sourceActive = purpose == WindowMovePurpose::Overflow ||
+      (GetCurrentDesktopId(&current) && IsEqualGUID(current, sourceDesktop) &&
+       !IsWindowTrackedInAnyState(hwnd) && !IsWindowCloaked(hwnd) &&
+       GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None);
   GetWindowThreadProcessId(hwnd, &livePid);
-  if (SUCCEEDED(hr) && view && canMove && IsWindow(hwnd) && livePid == processId &&
-      g_wm.overflowWindows.count(hwnd) &&
-      GetWindowDesktopIdSafe(hwnd, &owner) && IsEqualGUID(owner, sourceDesktop) &&
-      g_vd.managerInternal == manager) {
+  if (sourceObserved && sourceActive && IsWindow(hwnd) && livePid == processId &&
+      requestPending() && manager && g_vd.managerInternal == manager) {
     const auto moveView = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, IVirtualDesktop*)>(g_vd.managerInternal, 4);
     hr = moveView(g_vd.managerInternal, view, desktop);
   } else if (SUCCEEDED(hr)) {
@@ -951,30 +968,38 @@ bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, 
   desktop->Release();
   GUID observed{};
   // A mutation can complete despite a lost COM response. Never blindly repeat it.
+  const bool ownerObserved = GetWindowDesktopIdSafe(hwnd, &observed);
   GetWindowThreadProcessId(hwnd, &livePid);
-  const bool moved = livePid == processId && g_wm.overflowWindows.count(hwnd) &&
-                     GetWindowDesktopIdSafe(hwnd, &observed) &&
-                     IsEqualGUID(observed, desktopId);
-  Diagnostics::RecordEvent(L"overflow desktop move hwnd=%p target=%08X hr=%08X observedSuccess=%d",
+  const bool moved = IsWindow(hwnd) && livePid == processId && ownerObserved &&
+                     IsEqualGUID(observed, desktopId) && requestPending();
+  Diagnostics::RecordEvent(L"window desktop move hwnd=%p target=%08X hr=%08X observedSuccess=%d",
                            hwnd, desktopId.Data1, hr, moved ? 1 : 0);
   if (IsDeadVirtualDesktopProxy(hr)) RuntimeLifecycle::RequestMaintenance(true);
   return moved;
 }
 
-bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GUID& sourceDesktop, DWORD inputTickMs) {
+bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GUID& sourceDesktop, DWORD inputTickMs,
+                     WindowMovePurpose purpose) {
   IVirtualDesktop* desktop = FindLiveDesktop(desktopId);
   if (!desktop) return false;
   IUnknown* const manager = g_vd.managerInternal;
   auto canFollow = [&] {
     LASTINPUTINFO input{sizeof(input)};
     GUID current{}, owner{};
+    if (!GetWindowDesktopIdSafe(hwnd, &owner) || !IsEqualGUID(owner, desktopId) ||
+        !GetCurrentDesktopId(&current) || !IsEqualGUID(current, sourceDesktop) ||
+        !manager || g_vd.managerInternal != manager) return false;
+    // Owner queries can pump destroy/user-gesture events. Check intent last.
     DWORD livePid = 0;
     GetWindowThreadProcessId(hwnd, &livePid);
-    return IsWindow(hwnd) && livePid == processId && g_wm.overflowWindows.count(hwnd) &&
-           GetLastInputInfo(&input) && input.dwTime == inputTickMs &&
-           GetWindowDesktopIdSafe(hwnd, &owner) && IsEqualGUID(owner, desktopId) &&
-           GetCurrentDesktopId(&current) && IsEqualGUID(current, sourceDesktop) &&
-           g_vd.managerInternal == manager;
+    const auto& initial = g_wm.pendingInitialPlacementSwitch;
+    const bool requestPending = purpose == WindowMovePurpose::Overflow
+        ? g_wm.overflowWindows.count(hwnd) != 0
+        : initial.hwnd == hwnd && initial.processId == processId &&
+          initial.inputTickMs == inputTickMs && IsEqualGUID(initial.sourceDesktop, sourceDesktop) &&
+          IsEqualGUID(initial.targetDesktop, desktopId) && !IsMoveSizeGestureInProgress(hwnd);
+    return IsWindow(hwnd) && livePid == processId && requestPending &&
+           GetLastInputInfo(&input) && input.dwTime == inputTickMs;
   };
   if (!canFollow()) {
     desktop->Release();
@@ -1020,7 +1045,7 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
   desktop->Release();
   GUID current{};
   const bool accepted = SUCCEEDED(hr) || (GetCurrentDesktopId(&current) && IsEqualGUID(current, desktopId));
-  Diagnostics::RecordEvent(L"overflow desktop switch target=%08X hr=%08X accepted=%d animated=%d", desktopId.Data1, hr, accepted ? 1 : 0, animated ? 1 : 0);
+  Diagnostics::RecordEvent(L"window desktop switch target=%08X hr=%08X accepted=%d animated=%d", desktopId.Data1, hr, accepted ? 1 : 0, animated ? 1 : 0);
   if (IsDeadVirtualDesktopProxy(hr)) RuntimeLifecycle::RequestMaintenance(true);
   return accepted;
 }

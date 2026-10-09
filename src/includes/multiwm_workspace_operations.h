@@ -231,7 +231,7 @@ static bool AdmitInitialObservedWindow(
       IsWindowTrackedInAnyState(hwnd) || IsWindowCloaked(hwnd)) {
     return false;
   }
-  if (useAutomaticAdmissionPolicy && IsWindowAwaitingMonitorRouting(hwnd)) {
+  if (useAutomaticAdmissionPolicy && IsWindowAwaitingInitialPlacement(hwnd)) {
     return false;
   }
   const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
@@ -247,7 +247,7 @@ static bool AdmitInitialObservedWindow(
   }
   WindowRecord record = MakeWindowRecord(hwnd);
   record.automaticOverflowMonitorFixed =
-      FindMatchingWindowRule(hwnd, WindowRuleTreatment::OpenOnMonitor) != nullptr;
+      HasMonitorPlacementRule(hwnd);
   return workspace.AdmitInitial(std::move(record), reason);
 }
 
@@ -2479,8 +2479,20 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
 }
 
 static size_t AutomaticWindowLimitForMonitor(const Model::MonitorId& monitor) {
-  for (const auto& overrideLimit : g_settings.monitorWindowLimits) {
-    if (overrideLimit.first == monitor.deviceId) return overrideLimit.second;
+  MONITORINFO monitorInfo{sizeof(monitorInfo)};
+  bool monitorInfoRead = false;
+  bool haveMonitorInfo = false;
+  for (const auto& rule : g_settings.monitorWindowLimits) {
+    if (rule.monitor == RuleMonitor::Specific) {
+      if (rule.monitorId == monitor.deviceId) return rule.limit;
+      continue;
+    }
+    if (!monitorInfoRead) {
+      haveMonitorInfo = GetMonitorInfoW(monitor.Resolve(), &monitorInfo);
+      monitorInfoRead = true;
+    }
+    if (haveMonitorInfo && ((monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0) ==
+                              (rule.monitor == RuleMonitor::Primary)) return rule.limit;
   }
   return g_settings.automaticWindowLimit;
 }

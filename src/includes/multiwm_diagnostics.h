@@ -1158,8 +1158,8 @@ static void WriteDiagnosticReport() {
   report.Line(L"Slow application discovery delay: %u ms",
               g_settings.slowApplicationDelayMs);
   report.Line(L"Window rules: %zu", g_settings.windowRules.size());
-  report.Line(L"Initial monitor routing: ready=%d pending=%zu",
-              g_wm.monitorRoutingReady ? 1 : 0, g_wm.pendingMonitorRoutes.size());
+  report.Line(L"Initial window placement: ready=%d pending=%zu",
+              g_wm.windowRoutingReady ? 1 : 0, g_wm.pendingWindowRoutes.size());
   report.TextLine(L"Diagnostic output setting: ", g_settings.diagnosticsOutputPath);
   report.TextLine(L"Diagnostic output resolved: ", ExpandDiagnosticPath(g_settings.diagnosticsOutputPath));
 

@@ -195,27 +195,41 @@ void LoadSettings() {
       std::max(0, Wh_GetIntSetting(L"workspace.Overflow.WindowLimit")));
   auto overflowAction = StringSetting::make(L"workspace.Overflow.Action");
   g_settings.overflowCreateDesktop =
-      _wcsicmp(overflowAction.get(), L"new_desktop") == 0 ||
-      _wcsicmp(overflowAction.get(), L"next_desktop") == 0; // Preserve earlier settings.
+      _wcsicmp(overflowAction.get(), L"new_desktop") == 0;
   g_settings.overflowTryOtherMonitors =
       Wh_GetIntSetting(L"workspace.Overflow.TryOtherMonitors") != 0;
   g_settings.monitorWindowLimits.clear();
   for (int i = 0;; ++i) {
+    auto monitor = StringSetting::make(L"workspace.Overflow.MonitorLimits[%d].Monitor", i);
     auto monitorId = StringSetting::make(L"workspace.Overflow.MonitorLimits[%d].MonitorId", i);
     const int limit = Wh_GetIntSetting(L"workspace.Overflow.MonitorLimits[%d].Limit", i);
-    if (!*monitorId.get() && limit == 0) {
-      // Windhawk's empty template is followed by missing rows with the same
-      // values. An empty row ends this list; populated IDs may explicitly use 0.
-      break;
+    if (!*monitor.get() && !*monitorId.get() && limit == 0) break;
+    // Disabled rows do not terminate the list or inspect their hidden fields.
+    if (!*monitor.get() || _wcsicmp(monitor.get(), L"disabled") == 0) continue;
+    if (limit < 0) {
+      Wh_Log(L"Ignoring negative per-monitor limit at rule %d", i + 1);
+      continue;
     }
-    std::wstring identity = monitorId.get();
-    const auto first = identity.find_first_not_of(L" \t\r\n");
-    if (first == std::wstring::npos || limit < 0) continue;
-    const auto last = identity.find_last_not_of(L" \t\r\n");
-    identity = identity.substr(first, last - first + 1);
-    NormalizeMonitorIdentityToken(&identity);
-    if (identity.rfind(L"IFACE:", 0) != 0 && identity.rfind(L"GDI:", 0) != 0) continue;
-    g_settings.monitorWindowLimits.emplace_back(std::move(identity), static_cast<size_t>(limit));
+    SettingsState::MonitorWindowLimit rule;
+    if (_wcsicmp(monitor.get(), L"primary") == 0) rule.monitor = RuleMonitor::Primary;
+    else if (_wcsicmp(monitor.get(), L"non_primary") == 0) rule.monitor = RuleMonitor::NonPrimary;
+    else if (_wcsicmp(monitor.get(), L"specific") != 0) {
+      Wh_Log(L"Ignoring invalid monitor selector at limit rule %d", i + 1);
+      continue;
+    }
+    if (rule.monitor == RuleMonitor::Specific) {
+      rule.monitorId = monitorId.get();
+      const size_t first = rule.monitorId.find_first_not_of(L" \t\r\n");
+      if (first == std::wstring::npos) continue;
+      rule.monitorId = rule.monitorId.substr(first, rule.monitorId.find_last_not_of(L" \t\r\n") - first + 1);
+      NormalizeMonitorIdentityToken(&rule.monitorId);
+      if (rule.monitorId.rfind(L"IFACE:", 0) != 0 && rule.monitorId.rfind(L"GDI:", 0) != 0) {
+        Wh_Log(L"Ignoring invalid monitor ID at limit rule %d", i + 1);
+        continue;
+      }
+    }
+    rule.limit = static_cast<size_t>(limit);
+    g_settings.monitorWindowLimits.push_back(std::move(rule));
   }
 
   g_settings.workspaceInitializationRules.clear();
@@ -247,9 +261,11 @@ void LoadSettings() {
       continue;
     }
     if (_wcsicmp(monitor.get(), L"primary") == 0) {
-      rule.monitor = WorkspaceRuleMonitor::Primary;
+      rule.monitor = RuleMonitor::Primary;
     } else if (_wcsicmp(monitor.get(), L"non_primary") == 0) {
-      rule.monitor = WorkspaceRuleMonitor::NonPrimary;
+      rule.monitor = RuleMonitor::NonPrimary;
+    } else if (_wcsicmp(monitor.get(), L"specific") == 0) {
+      rule.monitor = RuleMonitor::Specific;
     } else if (*monitor.get() && _wcsicmp(monitor.get(), L"any") != 0) {
       Wh_Log(L"Ignoring invalid monitor selector at workspace rule %d", i + 1);
       continue;
@@ -265,10 +281,17 @@ void LoadSettings() {
         rule.desktopNameContains.begin(), rule.desktopNameContains.end(),
         rule.desktopNameContains.begin(),
         [](wchar_t ch) { return std::towlower(ch); });
-    rule.monitorId = trimmed(monitorId.get());
-    NormalizeMonitorIdentityToken(&rule.monitorId);
+    if (rule.monitor == RuleMonitor::Specific) {
+      rule.monitorId = trimmed(monitorId.get());
+      NormalizeMonitorIdentityToken(&rule.monitorId);
+      if (rule.monitorId.empty() || (rule.monitorId.rfind(L"IFACE:", 0) != 0 &&
+                                   rule.monitorId.rfind(L"GDI:", 0) != 0)) {
+        Wh_Log(L"Ignoring invalid monitor ID at workspace rule %d", i + 1);
+        continue;
+      }
+    }
     if (rule.desktopNameContains.empty() && rule.desktopNumber == 0 &&
-        rule.monitor == WorkspaceRuleMonitor::Any && rule.monitorId.empty()) {
+        rule.monitor == RuleMonitor::Any && rule.monitorId.empty()) {
       continue;
     }
     g_settings.workspaceInitializationRules.push_back(std::move(rule));
@@ -358,8 +381,10 @@ void LoadSettings() {
     auto treatment =
         StringSetting::make(L"windowRules.Rules[%d].Treatment", i);
     auto size = StringSetting::make(L"windowRules.Rules[%d].Size", i);
-    auto targetMonitor =
-        StringSetting::make(L"windowRules.Rules[%d].TargetMonitor", i);
+    auto monitor = StringSetting::make(L"windowRules.Rules[%d].Monitor", i);
+    auto monitorId = StringSetting::make(L"windowRules.Rules[%d].MonitorId", i);
+    auto desktopName = StringSetting::make(L"windowRules.Rules[%d].DesktopNameContains", i);
+    const int desktopNumber = Wh_GetIntSetting(L"windowRules.Rules[%d].DesktopNumber", i);
     if (!*process.get() && !*className.get() && !*titleContains.get()) {
       Wh_Log(
           L"Window rule %d is blank; later rules will not be loaded",
@@ -375,19 +400,37 @@ void LoadSettings() {
     } else if (_wcsicmp(treatment.get(), L"trace_to_owner") == 0) {
       rule.treatment = WindowRuleTreatment::TraceToOwner;
     } else if (_wcsicmp(treatment.get(), L"open_on_monitor") == 0) {
-      rule.treatment = WindowRuleTreatment::OpenOnMonitor;
-      rule.targetMonitor = targetMonitor.get();
-      const auto first = rule.targetMonitor.find_first_not_of(L" \t\r\n");
-      if (first == std::wstring::npos) continue;
-      const auto last = rule.targetMonitor.find_last_not_of(L" \t\r\n");
-      rule.targetMonitor = rule.targetMonitor.substr(first, last - first + 1);
-      NormalizeMonitorIdentityToken(&rule.targetMonitor);
-      if (rule.targetMonitor != L"PRIMARY" &&
-          rule.targetMonitor.rfind(L"IFACE:", 0) != 0 &&
-          rule.targetMonitor.rfind(L"GDI:", 0) != 0) {
-        Wh_Log(L"Ignoring invalid monitor target at window rule %d", i + 1);
+      rule.treatment = WindowRuleTreatment::InitialPlacement;
+      auto trimmed = [](PCWSTR text) {
+        std::wstring value = text;
+        const size_t first = value.find_first_not_of(L" \t\r\n");
+        return first == std::wstring::npos ? std::wstring{}
+            : value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
+      };
+      if (_wcsicmp(monitor.get(), L"primary") == 0) rule.monitor = RuleMonitor::Primary;
+      else if (_wcsicmp(monitor.get(), L"non_primary") == 0) rule.monitor = RuleMonitor::NonPrimary;
+      else if (_wcsicmp(monitor.get(), L"specific") == 0) rule.monitor = RuleMonitor::Specific;
+      else if (*monitor.get() && _wcsicmp(monitor.get(), L"any") != 0) {
+        Wh_Log(L"Ignoring invalid monitor selector at window rule %d", i + 1);
         continue;
       }
+      if (rule.monitor == RuleMonitor::Specific) {
+        rule.monitorId = trimmed(monitorId.get());
+        NormalizeMonitorIdentityToken(&rule.monitorId);
+        if (rule.monitorId.empty() || (rule.monitorId.rfind(L"IFACE:", 0) != 0 &&
+                                     rule.monitorId.rfind(L"GDI:", 0) != 0)) {
+          Wh_Log(L"Ignoring invalid monitor target at window rule %d", i + 1);
+          continue;
+        }
+      }
+      rule.desktopNumber = desktopNumber;
+      rule.desktopNameContains = trimmed(desktopName.get());
+      if (desktopNumber < 0) {
+        Wh_Log(L"Ignoring invalid desktop number at window rule %d", i + 1);
+        continue;
+      }
+      rule.followWindow = Wh_GetIntSetting(L"windowRules.Rules[%d].FollowWindow", i) != 0;
+      if (rule.monitor == RuleMonitor::Any && !desktopNumber && rule.desktopNameContains.empty()) continue;
     } else if (_wcsicmp(
                    treatment.get(), L"preserve_size_when_centering") == 0) {
       rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
@@ -776,9 +819,10 @@ static void CleanupWmThread() {
   g_wm.overflowWindows.clear();
   g_wm.pendingWindowOverflow.clear();
   g_wm.pendingOverflowSwitch = {};
-  g_wm.monitorRoutingReady = false;
-  g_wm.monitorRoutingEvaluated.clear();
-  g_wm.pendingMonitorRoutes.clear();
+  g_wm.windowRoutingReady = false;
+  g_wm.windowRoutingEvaluated.clear();
+  g_wm.pendingWindowRoutes.clear();
+  g_wm.pendingInitialPlacementSwitch = {};
   g_wm.maintenanceAttempts = 0;
   g_wm.maintenanceRunning = false;
   g_wm.lifecycleRetryAfterPlatformRecovery = false;
@@ -826,16 +870,16 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   // form a baseline before discovery or hook-driven placement can route them.
   if (std::any_of(g_settings.windowRules.begin(), g_settings.windowRules.end(),
                   [](const WindowRule& rule) {
-                    return rule.treatment == WindowRuleTreatment::OpenOnMonitor;
+                    return rule.treatment == WindowRuleTreatment::InitialPlacement;
                   })) {
     ++Diagnostics::g_runtime.counters.enumWindowsPasses;
-    g_wm.monitorRoutingReady = g_hooks.hideDestroy && EnumWindows(
+    g_wm.windowRoutingReady = g_hooks.hideDestroy && EnumWindows(
         [](HWND hwnd, LPARAM) WINAPI -> BOOL {
           ++Diagnostics::g_runtime.counters.enumWindowsVisited;
-          g_wm.monitorRoutingEvaluated.insert(hwnd);
+          g_wm.windowRoutingEvaluated.insert(hwnd);
           return TRUE;
         }, 0) != FALSE;
-    if (!g_wm.monitorRoutingReady) Wh_Log(L"Initial monitor routing baseline failed");
+    if (!g_wm.windowRoutingReady) Wh_Log(L"Initial placement baseline failed");
   }
 
   Reconcile::ScheduleLifecycleReconcile(nullptr);
