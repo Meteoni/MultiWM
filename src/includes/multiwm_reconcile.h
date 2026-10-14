@@ -2247,32 +2247,3 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
 
 }  // namespace Reconcile
 
-// Consumes and clears the WinEvent samples for one completed gesture.
-// The WM core never reads these caches piecemeal after this boundary.
-static MoveSizeGesture ConsumeMoveSizeGesture(HWND hwnd) {
-  AssertWmThread(L"ConsumeMoveSizeGesture");
-  MoveSizeGesture gesture;
-
-  auto startIt = g_moveSize.startRects.find(hwnd);
-  auto endIt = g_moveSize.endRects.find(hwnd);
-  auto pointIt = g_moveSize.endPoints.find(hwnd);
-
-  if (startIt != g_moveSize.startRects.end() && endIt != g_moveSize.endRects.end()) {
-    gesture.start = startIt->second;
-    gesture.end = endIt->second;
-    gesture.hasRects = true;
-  }
-  if (pointIt != g_moveSize.endPoints.end()) {
-    gesture.dropPoint = pointIt->second;
-    gesture.hasDropPoint = true;
-  }
-
-  g_moveSize.startRects.erase(hwnd);
-  g_moveSize.endRects.erase(hwnd);
-  g_moveSize.endPoints.erase(hwnd);
-  if (gesture.hasRects) {
-    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
-  }
-  return gesture;
-}
-

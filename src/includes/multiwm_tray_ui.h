@@ -934,6 +934,3 @@ static void Shutdown() {
 
 }  // namespace TrayUi
 
-
-namespace Diagnostics {
-

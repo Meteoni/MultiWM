@@ -390,6 +390,8 @@ A small tray indicator shows the active workspace layout and provides quick acce
 */
 // ==/WindhawkModSettings==
 
+// Implementation headers share one translation unit and must remain in this order.
+// Amalgamate this entry file to produce the distributable Windhawk source.
 #include "includes/multiwm_core.h"
 #include "includes/multiwm_gestures.h"
 #include "includes/multiwm_configuration_helpers.h"
@@ -612,6 +614,7 @@ void Wh_ModSettingsChanged() {
     return;
   }
 
+  
   WhTool_ModSettingsChanged();
 }
 
@@ -623,4 +626,3 @@ void Wh_ModUninit() {
   WhTool_ModUninit();
   ExitProcess(0);
 }
-
