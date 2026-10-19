@@ -52,6 +52,9 @@ and Manual management (Alt+R).
 
 A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
 
+## Contributing
+MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)! Pull requests are welcome!
+
 
 ## Also check out
 - [Virtual Desktop Helper by u2x1](https://windhawk.net/mods/virtual-desktop-helper)
