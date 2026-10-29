@@ -1070,13 +1070,15 @@ static bool IsMeaningfulResizeDelta(LONG delta) {
   return std::abs(delta) > kResizeEdgeDeltaTolerance;
 }
 
-// Transfers one divider delta between adjacent logical weights while preserving
-// their combined weight. Expected layout rectangles provide the pre-drag spans;
-// live sibling geometry is intentionally never learned into durable state.
+// Transfer a drag between the adjacent spans from the rendered layout. When
+// minimums displaced the divider, use the constrained allocation's weight scale
+// to remember the new visible spans without changing unrelated preferences.
 static bool TransferPairResizeDelta(
     std::vector<double>& weights, size_t firstWeight,
     const RECT& firstRect, const RECT& secondRect,
-    bool verticalAxis, LONG delta) {
+    const WindowConstraints& firstConstraints,
+    const WindowConstraints& secondConstraints,
+    bool verticalAxis, LONG delta, double constrainedWeightPerPixel) {
   if (!IsMeaningfulResizeDelta(delta) || firstWeight + 1 >= weights.size()) {
     return false;
   }
@@ -1090,10 +1092,27 @@ static bool TransferPairResizeDelta(
 
   const LONG minSpan = std::min<LONG>(
       kMinLearnedResizeSpan, std::max<LONG>(1, (pairSpan - 1) / 2));
-  const LONG maxFirstSpan = pairSpan - minSpan;
+  const LONG firstMinimum = firstConstraints.valid
+      ? std::max<LONG>(minSpan, verticalAxis ? firstConstraints.minHeight
+                                           : firstConstraints.minWidth)
+      : minSpan;
+  const LONG secondMinimum = secondConstraints.valid
+      ? std::max<LONG>(minSpan, verticalAxis ? secondConstraints.minHeight
+                                           : secondConstraints.minWidth)
+      : minSpan;
+  const LONG maxFirstSpan = pairSpan - secondMinimum;
+  if (firstMinimum > maxFirstSpan) return false;
   const LONG newFirstSpan =
-      std::clamp<LONG>(firstSpan + delta, minSpan, maxFirstSpan);
+      std::clamp<LONG>(firstSpan + delta, firstMinimum, maxFirstSpan);
   if (newFirstSpan == firstSpan) return false;
+
+  if (constrainedWeightPerPixel > 0.0 &&
+      std::isfinite(constrainedWeightPerPixel)) {
+    weights[firstWeight] = newFirstSpan * constrainedWeightPerPixel;
+    weights[firstWeight + 1] =
+        (pairSpan - newFirstSpan) * constrainedWeightPerPixel;
+    return true;
+  }
 
   double pairWeight = weights[firstWeight] + weights[firstWeight + 1];
   if (!(pairWeight > 0.0) || !std::isfinite(pairWeight)) pairWeight = 2.0;
@@ -1114,6 +1133,7 @@ bool Workspace::LearnMasterStackResize(
   const std::vector<WindowConstraints> constraints =
       ActiveWindowConstraints(*this);
 
+  double constrainedWeightPerPixel = 0.0;
   std::vector<RECT> expectedRects;
   Layout::LayoutMasterStackWeighted(
       workArea, gap, windows_.size(), expectedRects, horizontal,
@@ -1123,7 +1143,7 @@ bool Workspace::LearnMasterStackResize(
     if (Layout::LayoutMasterStackConstrained(
             workArea, gap, horizontal,
             ClampDouble(masterRatio_, 0.1, 0.9), stackWeights_,
-            constraints, &constrainedRects)) {
+            constraints, &constrainedRects, &constrainedWeightPerPixel)) {
       expectedRects = std::move(constrainedRects);
     }
   }
@@ -1172,13 +1192,15 @@ bool Workspace::LearnMasterStackResize(
       changed |= TransferPairResizeDelta(
           stackWeights_, stackIndex - 1,
           expectedRects[resizedIndex - 1], expectedRects[resizedIndex],
-          !horizontal, leadingDelta);
+          constraints[resizedIndex - 1], constraints[resizedIndex],
+          !horizontal, leadingDelta, constrainedWeightPerPixel);
     }
     if (stackIndex + 1 < stackWeights_.size()) {
       changed |= TransferPairResizeDelta(
           stackWeights_, stackIndex,
           expectedRects[resizedIndex], expectedRects[resizedIndex + 1],
-          !horizontal, trailingDelta);
+          constraints[resizedIndex], constraints[resizedIndex + 1],
+          !horizontal, trailingDelta, constrainedWeightPerPixel);
     }
   }
 
@@ -1195,6 +1217,7 @@ bool Workspace::LearnGridResize(
   const std::vector<WindowConstraints> constraints =
       ActiveWindowConstraints(*this);
 
+  double constrainedWeightPerPixel = 0.0;
   std::vector<RECT> expectedRects;
   Layout::LayoutGridWeighted(
       workArea, gap, windows_.size(), expectedRects,
@@ -1203,7 +1226,7 @@ bool Workspace::LearnGridResize(
     std::vector<RECT> constrainedRects;
     if (Layout::LayoutGridConstrained(
             workArea, gap, gridWeights_, constraints,
-            horizontal, &constrainedRects)) {
+            horizontal, &constrainedRects, &constrainedWeightPerPixel)) {
       expectedRects = std::move(constrainedRects);
     }
   }
@@ -1221,13 +1244,15 @@ bool Workspace::LearnGridResize(
     changed |= TransferPairResizeDelta(
         gridWeights_, resizedIndex - 1,
         expectedRects[resizedIndex - 1], expectedRects[resizedIndex],
-        horizontal, leadingDelta);
+        constraints[resizedIndex - 1], constraints[resizedIndex],
+        horizontal, leadingDelta, constrainedWeightPerPixel);
   }
   if (resizedIndex + 1 < windows_.size()) {
     changed |= TransferPairResizeDelta(
         gridWeights_, resizedIndex,
         expectedRects[resizedIndex], expectedRects[resizedIndex + 1],
-        horizontal, trailingDelta);
+        constraints[resizedIndex], constraints[resizedIndex + 1],
+        horizontal, trailingDelta, constrainedWeightPerPixel);
   }
   if (changed) DebugValidateMutation(L"Workspace::LearnGridResize");
   return changed;

@@ -231,7 +231,9 @@ static bool ConstraintDimensionFits(LONG value, LONG minimum) {
 static bool ComputeConstrainedWeightedSizes(
     LONG totalSize, LONG gap, const std::vector<double>& weights,
     const std::vector<LONG>& minimums,
-    std::vector<LONG>* outSizes, LONG* outEffectiveGap = nullptr) {
+    std::vector<LONG>* outSizes, LONG* outEffectiveGap = nullptr,
+    double* outWeightPerPixel = nullptr) {
+  if (outWeightPerPixel) *outWeightPerPixel = 0.0;
   if (!outSizes) return false;
   const size_t count = minimums.size();
   outSizes->assign(count, 0);
@@ -292,6 +294,8 @@ static bool ComputeConstrainedWeightedSizes(
       high = mid;
     }
   }
+
+  if (outWeightPerPixel) *outWeightPerPixel = 1.0 / high;
 
   std::vector<double> raw(count);
   long long roundedSum = 0;
@@ -379,7 +383,9 @@ static bool ChooseConstrainedSplit(
 bool LayoutGridConstrained(
     const RECT& area, LONG gap, const std::vector<double>& weights,
     const std::vector<Model::WindowConstraints>& constraints,
-    bool horizontal, std::vector<RECT>* outRects) {
+    bool horizontal, std::vector<RECT>* outRects,
+    double* outWeightPerPixel = nullptr) {
+  if (outWeightPerPixel) *outWeightPerPixel = 0.0;
   if (!outRects) return false;
   const size_t count = constraints.size();
   outRects->assign(count, RECT{});
@@ -408,7 +414,8 @@ bool LayoutGridConstrained(
   LONG effectiveGap = 0;
   std::vector<LONG> sizes;
   if (!ComputeConstrainedWeightedSizes(
-          total, gap, weights, mins, &sizes, &effectiveGap)) {
+          total, gap, weights, mins, &sizes, &effectiveGap,
+          outWeightPerPixel)) {
     return false;
   }
 
@@ -430,7 +437,9 @@ bool LayoutMasterStackConstrained(
     const RECT& area, LONG gap, bool horizontal, double masterRatio,
     const std::vector<double>& stackWeights,
     const std::vector<Model::WindowConstraints>& constraints,
-    std::vector<RECT>* outRects) {
+    std::vector<RECT>* outRects,
+    double* outStackWeightPerPixel = nullptr) {
+  if (outStackWeightPerPixel) *outStackWeightPerPixel = 0.0;
   if (!outRects) return false;
   const size_t count = constraints.size();
   outRects->assign(count, RECT{});
@@ -485,7 +494,7 @@ bool LayoutMasterStackConstrained(
   std::vector<LONG> innerSizes;
   if (!ComputeConstrainedWeightedSizes(
           innerSpan, gap, stackWeights, innerMins,
-          &innerSizes, &stackGap)) {
+          &innerSizes, &stackGap, outStackWeightPerPixel)) {
     return false;
   }
 
