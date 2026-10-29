@@ -859,7 +859,6 @@ class Workspace {
   bool ClearInsertionPlacement(HWND hwnd);
   bool ClearDefaultFloatingCenter(HWND hwnd);
   bool EnforceAlwaysFloating(HWND hwnd);
-  bool SetDwindleRatio(size_t splitIndex, double ratio);
   bool HasSameWindowMembershipAs(const Workspace& other) const;
   bool HasSameLayoutStateAs(const Workspace& other) const;
   bool RestoreLayoutStateFrom(const Workspace& source);
@@ -931,6 +930,7 @@ class Workspace {
   std::vector<double> inheritedSlotWeights_;
   std::vector<double> stackWeights_;
   std::vector<double> gridWeights_;
+  // User preferences; native minimums adjust rendered geometry only.
   std::vector<double> dwindleRatios_;
 
   // Active slot geometry is remembered per layout family. This makes Monocle
@@ -1047,11 +1047,10 @@ static std::unordered_map<
     Model::DesktopMonitorKeyHash, Model::DesktopMonitorKeyEqual>
     g_pendingLayoutMutations;
 
-// Admission recovery can temporarily move the pending member and/or adaptive
-// layout geometry before conformance has proved the resulting arrangement. Keep
-// the pre-recovery state until that member settles so a suspend/restore race
-// cannot strand the established members in geometry that existed only for the
-// pending admission.
+// Admission recovery can move the pending member and reassign siblings before
+// conformance has proved the resulting arrangement. Keep the pre-recovery order
+// until that member settles so a suspend/restore race cannot strand established
+// members in slots chosen only for the pending admission.
 struct PendingAdmissionRecovery {
   DesktopMonitorKey key;
   Workspace baseline;

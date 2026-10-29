@@ -68,21 +68,6 @@ static bool ValidateUserLayoutMutation(
         candidate, metrics.workArea, metrics.gap, &rects);
     if (status == LayoutPlanStatus::Unsatisfiable &&
         candidate.Layout() == TileLayout::Dwindle) {
-      if ((kind == UserLayoutMutationKind::Order ||
-           kind == UserLayoutMutationKind::LayoutChange) &&
-          FitAdaptiveDwindleDividers(
-              candidate, metrics.workArea, metrics.gap)) {
-        // Preserve the requested/current order whenever adaptive geometry alone
-        // can make it feasible. Explicit order mutations stop here: they are
-        // never allowed to reshuffle unrelated windows.
-        Diagnostics::RecordEvent(
-            kind == UserLayoutMutationKind::Order
-                ? L"adaptive dwindle order preflight accommodated action=%ls"
-                : L"adaptive dwindle layout conversion preserved order action=%ls",
-            action ? action : L"Layout mutation");
-        return true;
-      }
-
       if (kind == UserLayoutMutationKind::LayoutChange) {
         Workspace reassigned = candidate;
         size_t movedWindowCount = 0;

@@ -1694,9 +1694,6 @@ static void ProcessWindowOverflow() {
       }
       auto fits = [&](Workspace& candidate) {
         std::vector<RECT> rects;
-        if (BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, &rects) != LayoutPlanStatus::Success &&
-            !(candidate.Layout() == TileLayout::Dwindle && AutomaticDwindleAdaptationEnabled() &&
-              FitAdaptiveDwindleDividers(candidate, metrics.workArea, metrics.gap))) return false;
         if (BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, &rects) != LayoutPlanStatus::Success) return false;
         const size_t index = candidate.TiledIndex(hwnd);
         if (index >= rects.size()) return false;

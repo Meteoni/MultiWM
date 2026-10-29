@@ -1291,7 +1291,7 @@ static void WriteDiagnosticReport() {
     report.Line(L"stackWeights: %ls", DiagnosticWeightsString(state.StackWeights()).c_str());
     report.Line(L"gridWeights:  %ls", DiagnosticWeightsString(state.GridWeights()).c_str());
     report.Line(
-        L"dwindleRatios: %ls",
+        L"dwindlePreferredRatios: %ls",
         DiagnosticWeightsString(state.DwindleRatios()).c_str());
 
     struct LogicalRecordRef {

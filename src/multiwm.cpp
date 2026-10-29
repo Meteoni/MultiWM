@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.58
+// @version         1.13.59
 // @author          meteoni
 // @github          https://github.com/Meteoni
 // @license         MIT
@@ -203,7 +203,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     $name: Adaptive Dwindle Slots
     #! $min: 0
     #! $max: 64
-    $description: How many splits can adjust to fit windows (0-64). 0 keeps all splits fixed.
+    $description: How many splits can temporarily adjust to fit windows (0-64). Splits return when the extra space is no longer needed. Manually resizing a divider saves its new position. 0 keeps all splits fixed.
   - AdaptiveDwindlePercentage: 15
     $name: Adaptive Dwindle Percentage
     #! $min: 0
@@ -287,10 +287,10 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
   $name: Hotkeys
 
 - diagnostics:
-  - DiagnosticsOutputPath: "%USERPROFILE%\\Documents\\MultiWMDiagnostics"
+  - DiagnosticsOutputPath: ""
     $name: Output Directory
     #! $format: folderPath
-    $description: Folder for diagnostic reports. Reports include window titles and app paths; review them before sharing.
+    $description: Folder for diagnostic reports. Leave blank to use %USERPROFILE%\Documents\MultiWMDiagnostics. Reports include window titles and app paths; review them before sharing.
   $name: Diagnostics
 
 - windowBehavior:
@@ -393,8 +393,6 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 */
 // ==/WindhawkModSettings==
 
-// Implementation headers share one translation unit and must remain in this order.
-// Amalgamate this entry file to produce the distributable Windhawk source.
 #include "includes/multiwm_core.h"
 #include "includes/multiwm_gestures.h"
 #include "includes/multiwm_configuration_helpers.h"

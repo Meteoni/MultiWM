@@ -690,21 +690,6 @@ void Workspace::SetMasterRatio(double ratio) {
   DebugValidateMutation(L"Workspace::SetMasterRatio");
 }
 
-bool Workspace::SetDwindleRatio(size_t splitIndex, double ratio) {
-  AssertWmThread(L"Workspace::SetDwindleRatio");
-  EnsureWeights();
-  if (layout_ != TileLayout::Dwindle ||
-      dwindleRatios_.size() < 2 || splitIndex >= dwindleRatios_.size() - 1) {
-    return false;
-  }
-
-  const double clamped = ClampDouble(ratio, 0.1, 0.9);
-  if (std::abs(dwindleRatios_[splitIndex] - clamped) <= 1e-9) return false;
-  dwindleRatios_[splitIndex] = clamped;
-  DebugValidateMutation(L"Workspace::SetDwindleRatio");
-  return true;
-}
-
 bool Workspace::HasSameWindowMembershipAs(const Workspace& other) const {
   if (windows_.size() != other.windows_.size() ||
       records_.size() != other.records_.size()) {
@@ -1248,6 +1233,178 @@ bool Workspace::LearnGridResize(
   return changed;
 }
 
+struct AdaptiveDwindleRatioEnvelope {
+  double minimum = 0.1;
+  double maximum = 0.9;
+};
+
+static bool AutomaticDwindleAdaptationEnabled() {
+  return g_settings.adaptiveDwindleSlots > 0 &&
+      g_settings.adaptiveDwindlePercentage > 0;
+}
+
+static AdaptiveDwindleRatioEnvelope GetAdaptiveDwindleRatioEnvelope() {
+  const double deviation =
+      static_cast<double>(std::clamp<LONG>(
+          g_settings.adaptiveDwindlePercentage, 0, 40)) /
+      100.0;
+  return {0.5 - deviation, 0.5 + deviation};
+}
+
+// Calculate temporary geometry from the saved divider preferences. Only the
+// configured leading splits may adapt; deeper ratios and window order stay fixed.
+// A feasible manual ratio outside the automatic envelope remains unchanged.
+// Never write fitted ratios back to the workspace: removing a constraint should
+// let the divider return to its preferred position.
+static bool BuildAdaptiveDwindleLayout(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    std::vector<RECT>* outRects,
+    std::vector<Layout::DwindleSplit>* outSplits = nullptr) {
+  if (workspace.Layout() != TileLayout::Dwindle || workspace.ActiveCount() < 2 ||
+      !AutomaticDwindleAdaptationEnabled()) {
+    return false;
+  }
+
+  const auto& windows = workspace.TiledWindows();
+  const auto constraints = ActiveWindowConstraints(workspace);
+  std::vector<double> ratios = workspace.DwindleRatios();
+  const size_t adaptiveSplitCount =
+      std::min(g_settings.adaptiveDwindleSlots, ratios.size());
+  if (adaptiveSplitCount == 0) return false;
+  const AdaptiveDwindleRatioEnvelope adaptiveEnvelope =
+      GetAdaptiveDwindleRatioEnvelope();
+
+  std::vector<SIZE> windowMinimums(windows.size(), SIZE{1, 1});
+  for (size_t i = 0; i < constraints.size(); ++i) {
+    const auto& constraint = constraints[i];
+    if (constraint.valid) {
+      windowMinimums[i].cx = std::max<LONG>(1, constraint.minWidth);
+      windowMinimums[i].cy = std::max<LONG>(1, constraint.minHeight);
+    }
+  }
+
+  const LONG maximumSpan = std::max(RectWidth(workArea), RectHeight(workArea));
+  auto requiredSpan = [&](LONG first, LONG tail, size_t splitIndex,
+                          bool adaptive) {
+    const double fixedRatio = ClampDouble(ratios[splitIndex], 0.1, 0.9);
+    auto fits = [&](LONG span) {
+      if (span < 2) return false;
+      const LONG usable = span - std::clamp<LONG>(gap, 0, span - 2);
+      if (usable < 2) return false;
+
+      if (!adaptive) {
+        const LONG allocated = std::clamp<LONG>(
+            static_cast<LONG>(std::llround(usable * fixedRatio)),
+            1, usable - 1);
+        return allocated >= first && usable - allocated >= tail;
+      }
+
+      // A manually chosen ratio outside the adaptive envelope remains a legal
+      // no-op if it already satisfies both sides. Only a ratio we actually need
+      // to change must land inside the configured symmetric envelope.
+      const LONG currentAllocated = std::clamp<LONG>(
+          static_cast<LONG>(std::llround(usable * fixedRatio)),
+          1, usable - 1);
+      if (currentAllocated >= first && usable - currentAllocated >= tail) {
+        return true;
+      }
+
+      const LONG minimumAdaptive = std::clamp<LONG>(
+          static_cast<LONG>(std::llround(
+              usable * adaptiveEnvelope.minimum)), 1, usable - 1);
+      const LONG maximumAdaptive = std::clamp<LONG>(
+          static_cast<LONG>(std::llround(
+              usable * adaptiveEnvelope.maximum)), 1, usable - 1);
+      const LONG lower = std::max(first, minimumAdaptive);
+      const LONG upper = std::min(usable - tail, maximumAdaptive);
+      return lower <= upper;
+    };
+
+    if (!fits(maximumSpan)) return maximumSpan + 1;
+    LONG low = 2;
+    LONG high = maximumSpan;
+    while (low < high) {
+      const LONG middle = low + (high - low) / 2;
+      if (fits(middle)) {
+        high = middle;
+      } else {
+        low = middle + 1;
+      }
+    }
+    return low;
+  };
+
+  // Minimum extent of each recursive tail. Fixed descendants preserve their
+  // current ratios; adaptive descendants contribute only the space they need
+  // somewhere inside the configured adaptive ratio envelope.
+  std::vector<SIZE> subtreeMinimums = windowMinimums;
+  for (size_t splitIndex = windows.size() - 1; splitIndex-- > 0;) {
+    const SIZE first = windowMinimums[splitIndex];
+    const SIZE tail = subtreeMinimums[splitIndex + 1];
+    SIZE combined{
+        std::max(first.cx, tail.cx),
+        std::max(first.cy, tail.cy)};
+    const bool adaptive = splitIndex < adaptiveSplitCount;
+    if ((splitIndex % 2) == 0) {
+      combined.cx = requiredSpan(first.cx, tail.cx, splitIndex, adaptive);
+    } else {
+      combined.cy = requiredSpan(first.cy, tail.cy, splitIndex, adaptive);
+    }
+    subtreeMinimums[splitIndex] = combined;
+  }
+
+  if (RectWidth(workArea) < subtreeMinimums[0].cx ||
+      RectHeight(workArea) < subtreeMinimums[0].cy) {
+    return false;
+  }
+
+  std::vector<RECT> rects(windows.size());
+  std::vector<Layout::DwindleSplit> splits;
+  RECT remaining = workArea;
+  for (size_t splitIndex = 0; splitIndex < adaptiveSplitCount; ++splitIndex) {
+    const bool vertical = (splitIndex % 2) == 0;
+    const LONG span = vertical ? RectWidth(remaining) : RectHeight(remaining);
+    if (span < 2) return false;
+    const LONG usable = span - std::clamp<LONG>(gap, 0, span - 2);
+    if (usable < 2) return false;
+
+    const LONG firstMinimum = vertical
+        ? windowMinimums[splitIndex].cx
+        : windowMinimums[splitIndex].cy;
+    const LONG tailMinimum = vertical
+        ? subtreeMinimums[splitIndex + 1].cx
+        : subtreeMinimums[splitIndex + 1].cy;
+    const double preferred = ClampDouble(ratios[splitIndex], 0.1, 0.9);
+    const LONG desired = std::clamp<LONG>(
+        static_cast<LONG>(std::llround(usable * preferred)),
+        1, usable - 1);
+    LONG firstSpan = desired;
+    if (desired < firstMinimum || usable - desired < tailMinimum) {
+      const LONG minimumAdaptive = std::clamp<LONG>(
+          static_cast<LONG>(std::llround(
+              usable * adaptiveEnvelope.minimum)), 1, usable - 1);
+      const LONG maximumAdaptive = std::clamp<LONG>(
+          static_cast<LONG>(std::llround(
+              usable * adaptiveEnvelope.maximum)), 1, usable - 1);
+      const LONG lower = std::max(firstMinimum, minimumAdaptive);
+      const LONG upper = std::min(usable - tailMinimum, maximumAdaptive);
+      if (lower > upper) return false;
+      firstSpan = std::clamp<LONG>(desired, lower, upper);
+    }
+    ratios[splitIndex] = static_cast<double>(firstSpan) / usable;
+    Layout::LayoutDwindle(
+        workArea, gap, 0, windows.size(), ratios,
+        g_settings.reverseDwindle, rects, &splits);
+    if (splitIndex >= splits.size()) return false;
+    remaining = splits[splitIndex].remaining;
+  }
+
+  if (!RectsSatisfyWindowConstraints(rects, constraints)) return false;
+  *outRects = std::move(rects);
+  if (outSplits) *outSplits = std::move(splits);
+  return true;
+}
+
 bool Workspace::LearnDwindleResize(
     const RECT& workArea, LONG gap, size_t resizedIndex,
     const MoveSizeGesture& gesture) {
@@ -1263,6 +1420,12 @@ bool Workspace::LearnDwindleResize(
   Layout::LayoutDwindle(
       workArea, gap, 0, windows_.size(), dwindleRatios_,
       g_settings.reverseDwindle, expectedRects, &splits);
+  if (!RectsSatisfyWindowConstraints(
+          expectedRects, ActiveWindowConstraints(*this)) &&
+      !BuildAdaptiveDwindleLayout(
+          *this, workArea, gap, &expectedRects, &splits)) {
+    return false;
+  }
   if (splits.size() + 1 != dwindleRatios_.size()) return false;
 
   const RECT& resizedRect = expectedRects[resizedIndex];
@@ -1443,10 +1606,11 @@ static LayoutPlanStatus BuildWorkspaceLayoutPlan(
       break;
 
     case TileLayout::Dwindle:
-      // Dwindle ratios are tree state. Constraint handling may reassign a fresh
-      // admission or fit the shared shallow-divider policy, but ordinary planning
-      // never reshapes the tree around its current occupants.
-      return LayoutPlanStatus::Unsatisfiable;
+      // Saved ratios express user preferences. Fit only the rendered geometry
+      // so dividers return when native minimums no longer require extra room.
+      constrainedSuccess = BuildAdaptiveDwindleLayout(
+          workspace, workArea, gap, outRects);
+      break;
 
     case TileLayout::Monocle:
       constrainedSuccess = Layout::LayoutMonocleConstrained(
@@ -1460,183 +1624,6 @@ static LayoutPlanStatus BuildWorkspaceLayoutPlan(
 
   if (constrainedSuccess) return LayoutPlanStatus::Success;
   return LayoutPlanStatus::Unsatisfiable;
-}
-
-struct AdaptiveDwindleRatioEnvelope {
-  double minimum = 0.1;
-  double maximum = 0.9;
-};
-
-static bool AutomaticDwindleAdaptationEnabled() {
-  return g_settings.adaptiveDwindleSlots > 0 &&
-      g_settings.adaptiveDwindlePercentage > 0;
-}
-
-static AdaptiveDwindleRatioEnvelope GetAdaptiveDwindleRatioEnvelope() {
-  const double deviation =
-      static_cast<double>(std::clamp<LONG>(
-          g_settings.adaptiveDwindlePercentage, 0, 40)) /
-      100.0;
-  return {0.5 - deviation, 0.5 + deviation};
-}
-
-// Admission recovery and explicit order-mutation preflight share one geometry
-// fitter. Leading split nodes may move according to Adaptive Dwindle Slots and
-// Adaptive Dwindle Percentage; every deeper ratio and the complete window order
-// stay fixed. A percentage of zero deliberately disables automatic ratio
-// changes. A manual ratio outside the adaptive envelope is retained whenever it
-// is already feasible; the envelope constrains only an automatic replacement.
-static bool FitAdaptiveDwindleDividers(
-    Workspace& candidate, const RECT& workArea, LONG gap) {
-  if (candidate.Layout() != TileLayout::Dwindle || candidate.ActiveCount() < 2 ||
-      !AutomaticDwindleAdaptationEnabled()) {
-    return false;
-  }
-
-  const auto& windows = candidate.TiledWindows();
-  const auto constraints = ActiveWindowConstraints(candidate);
-  const auto& ratios = candidate.DwindleRatios();
-  const size_t adaptiveSplitCount =
-      std::min(g_settings.adaptiveDwindleSlots, ratios.size());
-  if (adaptiveSplitCount == 0) return false;
-  const AdaptiveDwindleRatioEnvelope adaptiveEnvelope =
-      GetAdaptiveDwindleRatioEnvelope();
-
-  std::vector<SIZE> windowMinimums(windows.size(), SIZE{1, 1});
-  for (size_t i = 0; i < constraints.size(); ++i) {
-    const auto& constraint = constraints[i];
-    if (constraint.valid) {
-      windowMinimums[i].cx = std::max<LONG>(1, constraint.minWidth);
-      windowMinimums[i].cy = std::max<LONG>(1, constraint.minHeight);
-    }
-  }
-
-  const LONG maximumSpan = std::max(RectWidth(workArea), RectHeight(workArea));
-  auto requiredSpan = [&](LONG first, LONG tail, size_t splitIndex,
-                          bool adaptive) {
-    const double fixedRatio = ClampDouble(ratios[splitIndex], 0.1, 0.9);
-    auto fits = [&](LONG span) {
-      if (span < 2) return false;
-      const LONG usable = span - std::clamp<LONG>(gap, 0, span - 2);
-      if (usable < 2) return false;
-
-      if (!adaptive) {
-        const LONG allocated = std::clamp<LONG>(
-            static_cast<LONG>(std::llround(usable * fixedRatio)),
-            1, usable - 1);
-        return allocated >= first && usable - allocated >= tail;
-      }
-
-      // A manually chosen ratio outside the adaptive envelope remains a legal
-      // no-op if it already satisfies both sides. Only a ratio we actually need
-      // to change must land inside the configured symmetric envelope.
-      const LONG currentAllocated = std::clamp<LONG>(
-          static_cast<LONG>(std::llround(usable * fixedRatio)),
-          1, usable - 1);
-      if (currentAllocated >= first && usable - currentAllocated >= tail) {
-        return true;
-      }
-
-      const LONG minimumAdaptive = std::clamp<LONG>(
-          static_cast<LONG>(std::llround(
-              usable * adaptiveEnvelope.minimum)), 1, usable - 1);
-      const LONG maximumAdaptive = std::clamp<LONG>(
-          static_cast<LONG>(std::llround(
-              usable * adaptiveEnvelope.maximum)), 1, usable - 1);
-      const LONG lower = std::max(first, minimumAdaptive);
-      const LONG upper = std::min(usable - tail, maximumAdaptive);
-      return lower <= upper;
-    };
-
-    if (!fits(maximumSpan)) return maximumSpan + 1;
-    LONG low = 2;
-    LONG high = maximumSpan;
-    while (low < high) {
-      const LONG middle = low + (high - low) / 2;
-      if (fits(middle)) {
-        high = middle;
-      } else {
-        low = middle + 1;
-      }
-    }
-    return low;
-  };
-
-  // Minimum extent of each recursive tail. Fixed descendants preserve their
-  // current ratios; adaptive descendants contribute only the space they need
-  // somewhere inside the configured adaptive ratio envelope.
-  std::vector<SIZE> subtreeMinimums = windowMinimums;
-  for (size_t splitIndex = windows.size() - 1; splitIndex-- > 0;) {
-    const SIZE first = windowMinimums[splitIndex];
-    const SIZE tail = subtreeMinimums[splitIndex + 1];
-    SIZE combined{
-        std::max(first.cx, tail.cx),
-        std::max(first.cy, tail.cy)};
-    const bool adaptive = splitIndex < adaptiveSplitCount;
-    if ((splitIndex % 2) == 0) {
-      combined.cx = requiredSpan(first.cx, tail.cx, splitIndex, adaptive);
-    } else {
-      combined.cy = requiredSpan(first.cy, tail.cy, splitIndex, adaptive);
-    }
-    subtreeMinimums[splitIndex] = combined;
-  }
-
-  if (RectWidth(workArea) < subtreeMinimums[0].cx ||
-      RectHeight(workArea) < subtreeMinimums[0].cy) {
-    return false;
-  }
-
-  Workspace trial = candidate;
-  RECT remaining = workArea;
-  for (size_t splitIndex = 0; splitIndex < adaptiveSplitCount; ++splitIndex) {
-    const bool vertical = (splitIndex % 2) == 0;
-    const LONG span = vertical ? RectWidth(remaining) : RectHeight(remaining);
-    if (span < 2) return false;
-    const LONG usable = span - std::clamp<LONG>(gap, 0, span - 2);
-    if (usable < 2) return false;
-
-    const LONG firstMinimum = vertical
-        ? windowMinimums[splitIndex].cx
-        : windowMinimums[splitIndex].cy;
-    const LONG tailMinimum = vertical
-        ? subtreeMinimums[splitIndex + 1].cx
-        : subtreeMinimums[splitIndex + 1].cy;
-    const double preferred = ClampDouble(ratios[splitIndex], 0.1, 0.9);
-    const LONG desired = std::clamp<LONG>(
-        static_cast<LONG>(std::llround(usable * preferred)),
-        1, usable - 1);
-    LONG firstSpan = desired;
-    if (desired < firstMinimum || usable - desired < tailMinimum) {
-      const LONG minimumAdaptive = std::clamp<LONG>(
-          static_cast<LONG>(std::llround(
-              usable * adaptiveEnvelope.minimum)), 1, usable - 1);
-      const LONG maximumAdaptive = std::clamp<LONG>(
-          static_cast<LONG>(std::llround(
-              usable * adaptiveEnvelope.maximum)), 1, usable - 1);
-      const LONG lower = std::max(firstMinimum, minimumAdaptive);
-      const LONG upper = std::min(usable - tailMinimum, maximumAdaptive);
-      if (lower > upper) return false;
-      firstSpan = std::clamp<LONG>(desired, lower, upper);
-    }
-    trial.SetDwindleRatio(
-        splitIndex, static_cast<double>(firstSpan) / usable);
-
-    std::vector<RECT> rects(windows.size());
-    std::vector<Layout::DwindleSplit> splits;
-    Layout::LayoutDwindle(
-        workArea, gap, 0, windows.size(), trial.DwindleRatios(),
-        g_settings.reverseDwindle, rects, &splits);
-    if (splitIndex >= splits.size()) return false;
-    remaining = splits[splitIndex].remaining;
-  }
-
-  std::vector<RECT> rects;
-  if (BuildWorkspaceLayoutPlan(
-          trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
-    return false;
-  }
-  candidate = std::move(trial);
-  return true;
 }
 
 static void RememberPendingLayoutMutation(
@@ -1682,9 +1669,9 @@ static void RememberPendingAdmissionRecovery(
 
 // If an admission/restore leaves active participation before its recovery has
 // settled, derive the no-longer-active state from the pre-recovery snapshot and
-// restore that established order/geometry into the live workspace. This makes
-// adaptive ratios and sibling reassignment provisional instead of leaking into
-// the N-1 layout after a minimize/hidden participation race.
+// restore that established order/geometry into the live workspace. This keeps
+// sibling reassignment provisional instead of leaking into the N-1 layout after
+// a minimize/hidden participation race.
 static bool RestorePendingAdmissionRecoveryAfterSuspension(
     const DesktopMonitorKey& key, HWND hwnd, Workspace* workspace) {
   if (!workspace || !hwnd) return false;
@@ -2129,15 +2116,11 @@ static bool ReassignDwindleLayoutConversionForConstraints(
 
   Workspace trial = workspace;
   if (!ApplyTiledWindowOrder(trial, desiredOrder)) return false;
-  if (adaptiveSplitCount > 0) {
-    if (!FitAdaptiveDwindleDividers(trial, workArea, gap)) return false;
-  } else {
-    std::vector<RECT> rects;
-    ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
-    if (BuildWorkspaceLayoutPlan(
-            trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
-      return false;
-    }
+  std::vector<RECT> rects;
+  ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+  if (BuildWorkspaceLayoutPlan(
+          trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
+    return false;
   }
 
   size_t movedWindowCount = 0;
@@ -2656,61 +2639,7 @@ static void ArrangeWorkspace(
         continue;
       }
 
-      // A settled Dwindle workspace should preserve membership and order when a
-      // DPI/work-area/native-minimum change makes its current ratios infeasible.
-      // Before considering any eviction, clamp only the configured adaptive
-      // divider prefix to the nearest feasible geometry. Pending admissions have
-      // their own transactional recovery below and must not use this settled path.
-      bool hasPendingAdmission = false;
-      for (HWND hwnd : workspace.TiledWindows()) {
-        const WindowRecord* record = workspace.Find(hwnd);
-        if (record && record->pendingInsertionPlacement) {
-          hasPendingAdmission = true;
-          break;
-        }
-      }
-      if (!hasPendingAdmission &&
-          workspace.Layout() == TileLayout::Dwindle &&
-          AutomaticDwindleAdaptationEnabled()) {
-        Workspace adaptive = workspace;
-        const std::vector<double> beforeRatios = adaptive.DwindleRatios();
-        if (FitAdaptiveDwindleDividers(adaptive, workArea, gap)) {
-          const auto& afterRatios = adaptive.DwindleRatios();
-          const size_t ratioCount =
-              std::min(beforeRatios.size(), afterRatios.size());
-          size_t changedRatios = 0;
-          for (size_t splitIndex = 0; splitIndex < ratioCount; ++splitIndex) {
-            if (std::abs(beforeRatios[splitIndex] -
-                         afterRatios[splitIndex]) <= 1e-9) {
-              continue;
-            }
-            ++changedRatios;
-            Diagnostics::RecordEvent(
-                L"settled dwindle adaptive ratio changed split=%zu from=%.6f to=%.6f desktop=%08X",
-                splitIndex, beforeRatios[splitIndex], afterRatios[splitIndex],
-                key.desktopId.Data1);
-          }
-
-          // BuildWorkspaceLayoutPlan was unsatisfiable immediately above, so a
-          // successful fitter should necessarily alter geometry. Guard anyway to
-          // prevent a pathological no-op from spinning the arrangement loop.
-          if (changedRatios > 0) {
-            for (HWND hwnd : workspace.TiledWindows()) {
-              CancelConformanceLease(hwnd);
-            }
-            workspace = std::move(adaptive);
-            Diagnostics::RecordEvent(
-                L"settled dwindle constraints recovered adaptively changes=%zu desktop=%08X",
-                changedRatios, key.desktopId.Data1);
-            g_workspaces.Save(key, workspace);
-            continue;
-          }
-        }
-      }
-
-      // Keep the exact pre-recovery state. If a pending admission is moved or
-      // adaptive geometry is changed below, that state remains provisional until
-      // conformance settles.
+      // Keep order changes provisional until admission conformance settles.
       const Workspace pendingAdmissionRecoveryBaseline = workspace;
 
       HWND victim = nullptr;
@@ -2776,10 +2705,8 @@ static void ArrangeWorkspace(
               return first.generation > second.generation;
             });
 
-        // A fresh admission's configured position is a preference, not a reason
-        // to discard it. Once placement has proven a conflict, preserve it when
-        // adaptive Dwindle ratios can make it viable, then try nearby slots before
-        // allowing broader sibling reassignment.
+        // Planning already tried temporary divider fitting at the configured
+        // position. Try nearby slots before allowing broader sibling reassignment.
         const TileLayout layout = workspace.Layout();
         const bool searchAlternateInsertion =
             layout == TileLayout::MasterStack ||
@@ -2794,26 +2721,6 @@ static void ArrangeWorkspace(
         size_t viableInsertionIndex = 0;
         bool matchedDwindleConstraints = false;
         size_t reassignedDwindleWindows = 0;
-        struct DwindleRatioAdjustment {
-          size_t splitIndex;
-          double before;
-          double after;
-        };
-        std::vector<DwindleRatioAdjustment> adjustedDwindleRatios;
-
-        auto rememberDwindleRatioAdjustments = [&](const std::vector<double>& before,
-                                                   const Workspace& after) {
-          adjustedDwindleRatios.clear();
-          const auto& afterRatios = after.DwindleRatios();
-          const size_t count = std::min(before.size(), afterRatios.size());
-          for (size_t splitIndex = 0; splitIndex < count; ++splitIndex) {
-            if (std::abs(before[splitIndex] - afterRatios[splitIndex]) <= 1e-9) {
-              continue;
-            }
-            adjustedDwindleRatios.push_back(
-                {splitIndex, before[splitIndex], afterRatios[splitIndex]});
-          }
-        };
 
         auto preservePreferredWindow = [&](const Workspace& trial) {
           return preferredTiledIndex >= workspace.ActiveCount() ||
@@ -2833,8 +2740,8 @@ static void ArrangeWorkspace(
 
         if (searchAlternateInsertion && layout == TileLayout::Dwindle) {
           // Adaptive Dwindle Slots controls which leading split ratios may move,
-          // not where the pending window may be placed. Preserve its saved/current
-          // slot first; then walk every nearby slot before reassigning siblings.
+          // not where the pending window may be placed. Planning already tried
+          // its current slot; walk nearby slots before reassigning siblings.
           for (const ConstraintCandidate& candidate : candidates) {
             const WindowRecord* candidateRecord = workspace.Find(candidate.hwnd);
             if (!candidateRecord ||
@@ -2846,55 +2753,38 @@ static void ArrangeWorkspace(
             const size_t currentIndex = workspace.TiledIndex(candidate.hwnd);
             if (currentIndex >= workspace.ActiveCount()) continue;
 
-            auto tryAdaptiveIndex = [&](size_t targetIndex,
-                                        bool tryFixedGeometryFirst) {
+            auto tryAdaptiveIndex = [&](size_t targetIndex) {
               Workspace trial = workspace;
-              if (targetIndex != currentIndex &&
-                  !trial.MovePendingAdmissionToIndex(
-                      candidate.hwnd, targetIndex)) {
+              if (!trial.MovePendingAdmissionToIndex(
+                      candidate.hwnd, targetIndex) ||
+                  !preservePreferredWindow(trial)) {
                 return false;
               }
-              if (!preservePreferredWindow(trial)) return false;
 
-              if (tryFixedGeometryFirst) {
-                std::vector<RECT> trialRects;
-                ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
-                if (BuildWorkspaceLayoutPlan(
-                        trial, workArea, gap, &trialRects) ==
-                    LayoutPlanStatus::Success) {
-                  adjustedDwindleRatios.clear();
-                  acceptInsertion(
-                      std::move(trial), candidate.hwnd, currentIndex,
-                      targetIndex, 0);
-                  return true;
-                }
-              }
-
-              if (!AutomaticDwindleAdaptationEnabled()) return false;
-              const std::vector<double> beforeRatios = trial.DwindleRatios();
-              if (!FitAdaptiveDwindleDividers(trial, workArea, gap)) {
+              std::vector<RECT> trialRects;
+              ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+              if (BuildWorkspaceLayoutPlan(
+                      trial, workArea, gap, &trialRects) !=
+                  LayoutPlanStatus::Success) {
                 return false;
               }
-              rememberDwindleRatioAdjustments(beforeRatios, trial);
               acceptInsertion(
                   std::move(trial), candidate.hwnd, currentIndex,
                   targetIndex, 0);
               return true;
             };
 
-            // The current assignment is already known to fail at fixed geometry,
-            // so test whether changing only eligible ratios can preserve it.
-            if (tryAdaptiveIndex(currentIndex, false)) break;
-
+            // Planning already tried the current order with temporary fitting.
+            // Try nearby slots before disturbing established siblings.
             for (size_t distance = 1;
                  distance < workspace.ActiveCount() && !repositionedAdmission;
                  ++distance) {
               if (currentIndex + distance < workspace.ActiveCount() &&
-                  tryAdaptiveIndex(currentIndex + distance, true)) {
+                  tryAdaptiveIndex(currentIndex + distance)) {
                 break;
               }
               if (currentIndex >= distance &&
-                  tryAdaptiveIndex(currentIndex - distance, true)) {
+                  tryAdaptiveIndex(currentIndex - distance)) {
                 break;
               }
             }
@@ -2939,20 +2829,7 @@ static void ArrangeWorkspace(
                   ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
                   trialStatus = BuildWorkspaceLayoutPlan(
                       trial, workArea, gap, &trialRects);
-                  if (trialStatus != LayoutPlanStatus::Success) {
-                    if (!AutomaticDwindleAdaptationEnabled()) return false;
-                    const std::vector<double> beforeRatios =
-                        trial.DwindleRatios();
-                    if (!FitAdaptiveDwindleDividers(
-                            trial, workArea, gap)) {
-                      return false;
-                    }
-                    rememberDwindleRatioAdjustments(beforeRatios, trial);
-                  } else {
-                    adjustedDwindleRatios.clear();
-                  }
-                } else {
-                  adjustedDwindleRatios.clear();
+                  if (trialStatus != LayoutPlanStatus::Success) return false;
                 }
 
                 acceptInsertion(
@@ -3006,7 +2883,6 @@ static void ArrangeWorkspace(
                   LayoutPlanStatus::Success) {
                 return false;
               }
-              adjustedDwindleRatios.clear();
               acceptInsertion(
                   std::move(trial), candidate.hwnd, currentIndex,
                   targetIndex, 0);
@@ -3042,28 +2918,6 @@ static void ArrangeWorkspace(
                 L"dwindle admission matched all constraints hwnd=%p slot=%zu reassigned=%zu",
                 repositionedAdmission, viableInsertionIndex,
                 reassignedDwindleWindows);
-          }
-          if (!adjustedDwindleRatios.empty()) {
-            Wh_Log(
-                L"Dwindle admission adapted %zu split ratio(s) for HWND %p at slot %zu",
-                adjustedDwindleRatios.size(),
-                static_cast<void*>(repositionedAdmission),
-                viableInsertionIndex);
-            Diagnostics::RecordEvent(
-                L"dwindle admission adapted ratios hwnd=%p slot=%zu changes=%zu",
-                repositionedAdmission, viableInsertionIndex,
-                adjustedDwindleRatios.size());
-            for (const DwindleRatioAdjustment& adjustment :
-                 adjustedDwindleRatios) {
-              Wh_Log(
-                  L"Dwindle adaptive split %zu changed %.6f -> %.6f for HWND %p",
-                  adjustment.splitIndex, adjustment.before, adjustment.after,
-                  static_cast<void*>(repositionedAdmission));
-              Diagnostics::RecordEvent(
-                  L"dwindle adaptive ratio changed hwnd=%p split=%zu from=%.6f to=%.6f",
-                  repositionedAdmission, adjustment.splitIndex,
-                  adjustment.before, adjustment.after);
-            }
           }
           if (previousInsertionIndex != viableInsertionIndex) {
             Wh_Log(
