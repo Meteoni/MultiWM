@@ -238,7 +238,8 @@ std::vector<double> DefaultWeights(size_t count) {
   return std::vector<double>(count, 1.0);
 }
 
-static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd);
+static HMONITOR GetCurrentManagedWindowMonitor(
+    HWND hwnd, const GUID* expectedDesktop = nullptr);
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd);
 static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize = false);
 static bool IsWindowTrackedInAnyState(HWND hwnd);

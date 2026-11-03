@@ -210,21 +210,23 @@ HWND ResolveToTiledWindow(HWND hwnd, const std::vector<HWND>& candidates) {
   return nullptr;
 }
 
-std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
+std::vector<HWND> CollectTileWindows(HMONITOR monitor, const GUID& desktopId) {
   std::vector<HWND> windows;
   if (!monitor) return windows;
 
   struct EnumContext {
     HMONITOR targetMonitor;
+    GUID desktopId;
     std::vector<HWND>* windowList;
-  } context = {monitor, &windows};
+  } context = {monitor, desktopId, &windows};
 
   ++Diagnostics::g_runtime.counters.enumWindowsPasses;
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
         ++Diagnostics::g_runtime.counters.enumWindowsVisited;
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
-        if (GetCurrentManagedWindowMonitor(hwnd) == ctx->targetMonitor) {
+        if (GetCurrentManagedWindowMonitor(hwnd, &ctx->desktopId) ==
+            ctx->targetMonitor) {
           ctx->windowList->push_back(hwnd);
           ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
         }
@@ -239,21 +241,23 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
 // Enumerate top-level HWNDs once and bucket each eligible window by monitor instead
 // of repeating EnumWindows (and its DWM/VD checks) once per monitor.
 static std::vector<std::vector<HWND>> CollectTileWindowsForMonitors(
-    const std::vector<HMONITOR>& monitors) {
+    const std::vector<HMONITOR>& monitors, const GUID& desktopId) {
   std::vector<std::vector<HWND>> snapshots(monitors.size());
   if (monitors.empty()) return snapshots;
 
   struct EnumContext {
     const std::vector<HMONITOR>* monitors;
+    GUID desktopId;
     std::vector<std::vector<HWND>>* snapshots;
-  } context = {&monitors, &snapshots};
+  } context = {&monitors, desktopId, &snapshots};
 
   ++Diagnostics::g_runtime.counters.enumWindowsPasses;
   EnumWindows(
       [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
         ++Diagnostics::g_runtime.counters.enumWindowsVisited;
         auto* ctx = reinterpret_cast<EnumContext*>(lParam);
-        const HMONITOR monitor = GetCurrentManagedWindowMonitor(hwnd);
+        const HMONITOR monitor =
+            GetCurrentManagedWindowMonitor(hwnd, &ctx->desktopId);
         if (!monitor) return TRUE;
 
         auto it = std::find(ctx->monitors->begin(), ctx->monitors->end(), monitor);
@@ -475,7 +479,8 @@ static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize) {
 
 // Returns the monitor on which an HWND can actively participate right now.
 // A null result means the window is not currently tile-eligible.
-static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd) {
+static HMONITOR GetCurrentManagedWindowMonitor(
+    HWND hwnd, const GUID* expectedDesktop) {
   // window might become temporarily disabled
   // (example: VSCode unstaged commit dialog)
   if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return nullptr;
@@ -490,9 +495,18 @@ static HMONITOR GetCurrentManagedWindowMonitor(HWND hwnd) {
   // at the moment we enumerate (race between uncloak/cloak during switch).
   // Fail closed when the desktop predicate is temporarily unavailable; the
   // centralized runtime-maintenance path will recover the COM service and retry.
-  BOOL onCurrent = FALSE;
-  if (!IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) {
-    return nullptr;
+  if (expectedDesktop) {
+    // Bind enumeration to one desktop, rather than a moving "current" predicate.
+    GUID windowDesktop{};
+    if (!GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+        !IsEqualGUID(windowDesktop, *expectedDesktop)) {
+      return nullptr;
+    }
+  } else {
+    BOOL onCurrent = FALSE;
+    if (!IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) {
+      return nullptr;
+    }
   }
 
   return GetWindowPhysicalMonitor(hwnd);

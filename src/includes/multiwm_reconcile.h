@@ -33,6 +33,27 @@ static void ReconcileKnownWindows(
 static bool EnsureUniqueWindowOwnership(
     HWND hwnd, const DesktopMonitorKey& targetKey,
     std::vector<DesktopMonitorKey>* changedKeys = nullptr);
+static void ForgetWindowFromOwners(
+    HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
+    std::vector<DesktopMonitorKey>* changedKeys);
+
+// Enumeration and COM calls can span a desktop switch even on the WM thread.
+// Keep the old workspace intact and let ordinary settled discovery retry.
+static bool IsSnapshotDesktopCurrent(const GUID& expectedDesktop) {
+  GUID currentDesktop{};
+  if (GetCurrentDesktopId(&currentDesktop) &&
+      IsEqualGUID(currentDesktop, expectedDesktop)) {
+    return true;
+  }
+  if (g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown) {
+    g_wm.reconciledDesktopState = ReconciledDesktopState::TransitionPending;
+  }
+  Diagnostics::RecordEvent(
+      L"desktop snapshot deferred expected=%08X observed=%08X",
+      expectedDesktop.Data1, currentDesktop.Data1);
+  ScheduleLifecycleReconcile(nullptr);
+  return false;
+}
 
 static TileLayout ResolveInitialWorkspaceLayout(
     const DesktopMonitorKey& key, int* matchedRuleIndex = nullptr,
@@ -91,10 +112,26 @@ static bool ReconcileTrackedSnapshotOwnership(
     std::vector<DesktopMonitorKey>* changedKeys) {
   bool changed = false;
   for (HWND hwnd : snapshot) {
-    if (IsWindowTrackedInAnyState(hwnd) &&
-        EnsureUniqueWindowOwnership(hwnd, key, changedKeys)) {
-      changed = true;
+    if (!IsWindowTrackedInAnyState(hwnd)) continue;
+
+    // A snapshot can outlive a desktop transition. Visibility on the current
+    // desktop is never evidence that a tracked window moved to this saved key.
+    // An unavailable ownership query must preserve the existing slot and weights.
+    GUID windowDesktop{};
+    if (!GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+        !IsEqualGUID(windowDesktop, key.desktopId)) {
+      continue;
     }
+    const auto owners = g_workspaces.OwnersOf(hwnd);
+    if (IsManualMode() && std::any_of(
+            owners.begin(), owners.end(), [&](const DesktopMonitorKey& owner) {
+              return !IsEqualGUID(owner.desktopId, windowDesktop);
+            })) {
+      ForgetWindowFromOwners(hwnd, owners, changedKeys);
+      changed = true;
+      continue;
+    }
+    if (EnsureUniqueWindowOwnership(hwnd, key, changedKeys)) changed = true;
   }
   return changed;
 }
@@ -290,13 +327,14 @@ static bool EnsureWorkspaceFromSnapshot(
   WorkspaceMetrics metrics;
   if (!GetWorkspaceMetrics(monitor, &metrics)) return false;
 
-  const std::vector<HWND> snapshot = CollectTileWindows(monitor);
+  const std::vector<HWND> snapshot = CollectTileWindows(monitor, key.desktopId);
   Workspace workspace;
   const bool workspaceExisted = g_workspaces.Load(key, &workspace);
   const std::vector<HWND> initialSnapshot = workspaceExisted
       ? std::vector<HWND>{}
       : CollectWorkspaceWindowsForInitialization(monitor, key.desktopId);
 
+  if (!IsSnapshotDesktopCurrent(key.desktopId)) return false;
   ReconcileTrackedSnapshotOwnership(
       key, workspaceExisted ? snapshot : initialSnapshot, ownershipChangedKeys);
 
@@ -1046,6 +1084,7 @@ static bool DiscoverWorkspaceWindows(
       ? CollectWorkspaceWindowsForInitialization(monitor, desktopId)
       : std::vector<HWND>{};
 
+  if (!IsSnapshotDesktopCurrent(desktopId)) return false;
   bool changed = ReconcileTrackedSnapshotOwnership(
       key, initializing ? initialSnapshot : snapshot, ownershipChangedKeys);
 
@@ -1138,7 +1177,7 @@ static bool DiscoverCurrentWorkspaceOnMonitor(HMONITOR monitor) {
 
   std::vector<HMONITOR> monitors{monitor};
   RouteNewWindows(monitors);
-  const auto snapshots = CollectTileWindowsForMonitors(monitors);
+  const auto snapshots = CollectTileWindowsForMonitors(monitors, currentDesktop);
   bool arranged = false;
   for (size_t i = 0; i < monitors.size(); ++i) {
     DesktopMonitorKey key{};
@@ -2048,9 +2087,26 @@ static void ReconcileDeferredLifecycle() {
   RouteNewWindows(monitors);
 
   // One top-level enumeration is enough for every monitor involved in this burst.
-  std::vector<std::vector<HWND>> snapshots = CollectTileWindowsForMonitors(monitors);
+  std::vector<std::vector<HWND>> snapshots =
+      CollectTileWindowsForMonitors(monitors, currentDesktop);
   std::vector<std::vector<HWND>> suspendedSnapshots =
       CollectDirtySuspendedWindowsForMonitors(dirtyWindows, monitors, currentDesktop);
+
+  auto snapshotStillCurrent = [&] {
+    if (IsSnapshotDesktopCurrent(currentDesktop)) return true;
+    // A retry must retain dirty suspended admissions and any already-committed
+    // participation/ownership changes, not just rediscover visible windows.
+    for (HWND hwnd : dirtyWindows) {
+      if (hwnd && !ContainsWindow(g_wm.lifecycleDirtyWindows, hwnd)) {
+        g_wm.lifecycleDirtyWindows.push_back(hwnd);
+      }
+    }
+    for (const auto& key : globallyChanged) {
+      AddPendingWorkspaceArrange(key.desktopId, key.ResolveMonitor());
+    }
+    return false;
+  };
+  if (!snapshotStillCurrent()) return;
 
   std::vector<DesktopMonitorKey> arrangedKeys;
   for (size_t monitorIndex = 0; monitorIndex < monitors.size(); ++monitorIndex) {
@@ -2122,6 +2178,9 @@ static void ReconcileDeferredLifecycle() {
     }
   }
 
+  // Discovery/placement can itself take time. Do not consume pending work for
+  // a pass overtaken by another switch.
+  if (!snapshotStillCurrent()) return;
   g_wm.pendingDesktopArranges.erase(
       std::remove_if(
           g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
