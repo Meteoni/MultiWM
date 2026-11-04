@@ -154,17 +154,17 @@ static void RunDesktopReconciliationTests() {
   manager.nextDesktop = target.desktopId;
   manager.currentQueries = 0;
   manager.switchAfter = 1;
-  g_wm.reconciledDesktop = source.desktopId;
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
-  g_wm.lifecycleDirtyWindows = hiddenWindows;
+  g_wm.desktop.reconciled = source.desktopId;
+  g_wm.desktop.state = ReconciledDesktopState::Settled;
+  g_wm.lifecycle.dirtyWindows = hiddenWindows;
   Reconcile::ReconcileDeferredLifecycle();
-  check(g_wm.reconciledDesktopState == ReconciledDesktopState::TransitionPending,
+  check(g_wm.desktop.state == ReconciledDesktopState::TransitionPending,
         "whole pass detects desktop change during enumeration");
   for (HWND hwnd : hiddenWindows) {
-    check(Model::ContainsWindow(g_wm.lifecycleDirtyWindows, hwnd), "retry retains dirty window");
+    check(Model::ContainsWindow(g_wm.lifecycle.dirtyWindows, hwnd), "retry retains dirty window");
   }
-  check(g_wm.lifecycleTimer != 0, "whole pass schedules retry");
-  check(std::any_of(g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
+  check(g_wm.timers.lifecycle != 0, "whole pass schedules retry");
+  check(std::any_of(g_wm.lifecycle.pendingArranges.begin(), g_wm.lifecycle.pendingArranges.end(),
         [&](const PendingWorkspaceArrange& pending) { return IsEqualGUID(pending.desktopId, source.desktopId) && pending.monitor == monitor; }),
         "retry retains arrangement for participation changes");
   Workspace retried;
@@ -189,27 +189,27 @@ static void RunDesktopReconciliationTests() {
     Reconcile::ForgetManagedWindow(hwnd);
     DestroyWindow(hwnd);
   }
-  KillTimer(nullptr, g_wm.lifecycleTimer);
-  g_wm.lifecycleTimer = 0;
-  g_wm.lifecycleDirtyWindows.clear();
-  g_wm.pendingDesktopArranges.clear();
+  KillTimer(nullptr, g_wm.timers.lifecycle);
+  g_wm.timers.lifecycle = 0;
+  g_wm.lifecycle.dirtyWindows.clear();
+  g_wm.lifecycle.pendingArranges.clear();
   manager.switchAfter = UINT_MAX;
 
   manager.desktop.id = source.desktopId;
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  g_wm.desktop.state = ReconciledDesktopState::Settled;
   check(Reconcile::ValidateSnapshotDesktop(source.desktopId), "stable snapshot accepted");
-  check(g_wm.lifecycleTimer == 0, "stable snapshot does not poll");
+  check(g_wm.timers.lifecycle == 0, "stable snapshot does not poll");
   manager.desktop.id = target.desktopId;
   check(!Reconcile::ValidateSnapshotDesktop(source.desktopId), "desktop switch invalidates snapshot");
-  check(g_wm.reconciledDesktopState == ReconciledDesktopState::TransitionPending && g_wm.lifecycleTimer != 0, "switch schedules settled retry");
-  KillTimer(nullptr, g_wm.lifecycleTimer);
-  g_wm.lifecycleTimer = 0;
+  check(g_wm.desktop.state == ReconciledDesktopState::TransitionPending && g_wm.timers.lifecycle != 0, "switch schedules settled retry");
+  KillTimer(nullptr, g_wm.timers.lifecycle);
+  g_wm.timers.lifecycle = 0;
   g_vd.managerInternal = nullptr;
   check(!Reconcile::ValidateSnapshotDesktop(source.desktopId), "missing current desktop invalidates snapshot");
-  check(g_wm.lifecycleTimer != 0 && g_wm.lifecycleRetryAfterPlatformRecovery, "unavailable desktop retains recovery path");
-  KillTimer(nullptr, g_wm.lifecycleTimer);
-  KillTimer(nullptr, g_wm.maintenanceTimer);
-  g_wm.lifecycleTimer = g_wm.maintenanceTimer = 0;
+  check(g_wm.timers.lifecycle != 0 && g_wm.lifecycle.retryAfterPlatformRecovery, "unavailable desktop retains recovery path");
+  KillTimer(nullptr, g_wm.timers.lifecycle);
+  KillTimer(nullptr, g_wm.timers.maintenance);
+  g_wm.timers.lifecycle = g_wm.timers.maintenance = 0;
   g_vd.desktopManager = nullptr;
   g_vd.initialized = false;
   std::printf("Passed %d desktop reconciliation checks.\n", checks);
@@ -280,7 +280,7 @@ static void RunWinEventRoutingTests() {
 
   // Untracked windows: only discovery prompts on top-level windows get through.
   g_wm.managementMode = ManagementMode::Manual;
-  g_wm.windowRoutingReady = false;
+  g_wm.routing.ready = false;
   send(EVENT_OBJECT_SHOW, untracked);
   check(windowEvent(EVENT_OBJECT_SHOW, untracked), "untracked show prompts discovery");
   send(EVENT_OBJECT_SHOW, child);
@@ -295,17 +295,17 @@ static void RunWinEventRoutingTests() {
   check(drain().empty(), "untracked restored-window location change is ignored");
 
   // Initial-placement routing state for untracked windows.
-  g_wm.windowRoutingReady = true;
-  g_wm.pendingWindowRoutes[untracked] = {};
+  g_wm.routing.ready = true;
+  g_wm.routing.pending[untracked] = {};
   send(EVENT_OBJECT_LOCATIONCHANGE, untracked);
   check(windowEvent(EVENT_OBJECT_LOCATIONCHANGE, untracked), "location change of a routed window is forwarded");
   send(EVENT_SYSTEM_MOVESIZESTART, untracked);
   check(drain().empty(), "untracked drag start posts nothing");
-  check(!g_wm.pendingWindowRoutes.count(untracked) && g_wm.windowRoutingEvaluated.count(untracked),
+  check(!g_wm.routing.pending.count(untracked) && g_wm.routing.evaluated.count(untracked),
         "user drag cancels initial routing");
   send(EVENT_OBJECT_DESTROY, untracked);
   check(windowEvent(EVENT_OBJECT_DESTROY, untracked), "destroy of a routing-known window is forwarded");
-  check(!g_wm.windowRoutingEvaluated.count(untracked), "destroy retires routing bookkeeping");
+  check(!g_wm.routing.evaluated.count(untracked), "destroy retires routing bookkeeping");
   send(EVENT_OBJECT_DESTROY, untracked);
   check(drain().empty(), "destroy of an unknown window is ignored");
 
@@ -313,36 +313,36 @@ static void RunWinEventRoutingTests() {
   send(EVENT_OBJECT_LOCATIONCHANGE, tracked);
   check(windowEvent(EVENT_OBJECT_LOCATIONCHANGE, tracked), "tiled window location change is forwarded");
   Placement::g_conformanceLeases.leases[tracked] = Placement::ConformanceLease{};
-  g_wm.overflowWindows.insert(tracked);
-  g_wm.pendingWindowOverflow.push_back({tracked});
+  g_wm.overflow.windows.insert(tracked);
+  g_wm.overflow.queue.push_back({tracked});
   send(EVENT_SYSTEM_MOVESIZESTART, tracked);
   check(drain().empty(), "tracked drag start posts nothing");
   check(!Placement::g_conformanceLeases.leases.count(tracked), "drag start cancels the conformance lease");
-  check(!g_wm.HasPendingOverflow(tracked) && !g_wm.overflowWindows.count(tracked), "drag start cancels queued overflow");
+  check(!g_wm.HasPendingOverflow(tracked) && !g_wm.overflow.windows.count(tracked), "drag start cancels queued overflow");
   check(Gestures::g_moveSize.startRects.count(tracked) == 1, "drag start records the start frame");
   send(EVENT_SYSTEM_MOVESIZEEND, tracked);
   check(postedOnly(WM_APP_MOVE_SIZE_END, reinterpret_cast<WPARAM>(tracked), 0), "drag end posts MOVE_SIZE_END");
   check(Gestures::g_moveSize.endRects.count(tracked) == 1, "drag end records the end frame");
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  g_wm.desktop.state = ReconciledDesktopState::Settled;
   send(EVENT_OBJECT_CLOAKED, tracked);
   check(windowEvent(EVENT_OBJECT_CLOAKED, tracked), "cloak is forwarded");
-  check(g_wm.reconciledDesktopState == ReconciledDesktopState::TransitionPending, "cloak marks a possible desktop switch");
+  check(g_wm.desktop.state == ReconciledDesktopState::TransitionPending, "cloak marks a possible desktop switch");
   send(EVENT_OBJECT_HIDE, tracked);
   check(windowEvent(EVENT_OBJECT_HIDE, tracked), "tracked hide is forwarded");
-  g_wm.pendingOverflowSwitch.hwnd = tracked;
+  g_wm.overflow.follow.hwnd = tracked;
   send(EVENT_OBJECT_DESTROY, tracked);
   check(windowEvent(EVENT_OBJECT_DESTROY, tracked), "tracked destroy is forwarded");
-  check(!g_wm.pendingOverflowSwitch.hwnd, "destroy cancels a pending desktop follow");
+  check(!g_wm.overflow.follow.hwnd, "destroy cancels a pending desktop follow");
 
   Reconcile::ForgetManagedWindow(tracked);
   DestroyWindow(child);
   DestroyWindow(untracked);
   DestroyWindow(tracked);
   drain();
-  g_wm.windowRoutingEvaluated.clear();
-  g_wm.pendingWindowRoutes.clear();
-  g_wm.windowRoutingReady = false;
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
+  g_wm.routing.evaluated.clear();
+  g_wm.routing.pending.clear();
+  g_wm.routing.ready = false;
+  g_wm.desktop.state = ReconciledDesktopState::Unknown;
   g_wm.threadId.store(0, std::memory_order_release);
   std::printf("Passed %u WinEvent routing checks.\n", checks);
 }
@@ -380,8 +380,8 @@ static void RunConformanceLocationTests() {
   g_vd.initialized = true;
   g_vd.desktopManager = &windows;
   g_vd.managerInternal = &manager;
-  g_wm.reconciledDesktop = desktop;
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  g_wm.desktop.reconciled = desktop;
+  g_wm.desktop.state = ReconciledDesktopState::Settled;
   g_wm.managementMode = ManagementMode::Manual;
 
   const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
@@ -452,8 +452,8 @@ static void RunConformanceLocationTests() {
   };
   auto resetLease = [&] {
     Placement::g_conformanceLeases.leases.clear();
-    if (g_wm.conformanceTimer) KillTimer(nullptr, g_wm.conformanceTimer);
-    g_wm.conformanceTimer = 0;
+    if (g_wm.timers.conformance) KillTimer(nullptr, g_wm.timers.conformance);
+    g_wm.timers.conformance = 0;
   };
 
   const DWORD pid = GetCurrentProcessId();
@@ -519,7 +519,7 @@ static void RunConformanceLocationTests() {
   Reconcile::ForgetManagedWindow(hwnd);
   Reconcile::ForgetManagedWindow(neighbour);
   DestroyWindow(hwnd);
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
+  g_wm.desktop.state = ReconciledDesktopState::Unknown;
   g_vd.desktopManager = nullptr;
   g_vd.managerInternal = nullptr;
   g_vd.initialized = false;
@@ -528,6 +528,194 @@ static void RunConformanceLocationTests() {
   check(digest == 0x19b1f6837e1683fcull, "conformance location trace matches recorded behavior");
   std::printf("Passed %u conformance location checks (trace digest %016llx).\n",
               checks, static_cast<unsigned long long>(digest));
+}
+
+// Characterizes Placement::RecoverUnsatisfiableLayout: given a workspace whose
+// windows cannot all fit, which window is floated, or how is it reordered?
+// Fake HWNDs only; toasts disabled; no native window is moved.
+static void RunConstraintRecoveryDigest() {
+  uint64_t digest = 1469598103934665603ull;
+  auto mix = [&](uint64_t value) { digest ^= value; digest *= 1099511628211ull; };
+  uint32_t seed = 4111;
+  auto random = [&](uint32_t bound) { seed = seed * 1664525u + 1013904223u; return (seed >> 8) % bound; };
+
+  const bool savedToasts = TrayUi::g_showToasts;
+  const ManagementMode savedMode = g_wm.managementMode;
+  TrayUi::g_showToasts = false;
+  const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  // Fixed geometry so the digest does not depend on this machine's displays.
+  Platform::Monitors::WorkspaceMetrics metrics;
+  metrics.workArea = {0, 0, 1920, 1040};
+  metrics.gap = 12;
+  metrics.dpi = 96;
+  DesktopMonitorKey key;
+  GUID desktop{};
+  desktop.Data1 = 0xC0457;
+  if (!DesktopMonitorKey::FromHMonitor(desktop, monitor, &key)) std::exit(1);
+  const LONG width = Layout::RectWidth(metrics.workArea);
+  const LONG height = Layout::RectHeight(metrics.workArea);
+  const TileLayout layouts[] = {TileLayout::MasterStack, TileLayout::MasterStackH, TileLayout::Columns,
+                                TileLayout::Rows, TileLayout::Dwindle, TileLayout::Monocle};
+
+  size_t exercised = 0, replans = 0;
+  for (int iteration = 0; iteration < 3000; ++iteration) {
+    g_wm.managementMode = random(2) ? ManagementMode::Automatic : ManagementMode::Manual;
+    Workspace workspace;
+    workspace.SetLayout(layouts[random(std::size(layouts))]);
+    const size_t count = 2 + random(5);
+    const size_t pending = random(count + 2);  // >= count: no pending admission.
+    std::vector<HWND> hwnds;
+    for (size_t i = 0; i < count; ++i) {
+      const HWND hwnd = reinterpret_cast<HWND>(0x7300000 + i * 4);
+      hwnds.push_back(hwnd);
+      WindowRecord record;
+      record.hwnd = hwnd;
+      record.pid = 900;
+      record.canMove = false;
+      workspace.AdmitTiled(record);
+      if (random(4) != 0) {
+        WindowConstraints constraints;
+        constraints.valid = true;
+        constraints.dpi = metrics.dpi;
+        // Mostly plausible minimums, occasionally larger than the whole monitor.
+        constraints.minWidth = 1 + static_cast<LONG>(random(static_cast<uint32_t>(width + width / 4)));
+        constraints.minHeight = 1 + static_cast<LONG>(random(static_cast<uint32_t>(height + height / 4)));
+        workspace.UpdateConstraints(hwnd, constraints);
+      }
+      if (i != pending) workspace.ClearInsertionPlacement(hwnd);
+    }
+    std::vector<RECT> rects;
+    if (Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects) !=
+        Layout::LayoutPlanStatus::Unsatisfiable) {
+      continue;
+    }
+    ++exercised;
+    g_workspaces.Save(key, workspace);
+    const HWND preferred = random(3) == 0 ? hwnds[random(static_cast<uint32_t>(count))] : nullptr;
+    Placement::ArrangementContext context{key, monitor, metrics, preferred};
+    const auto step = Placement::RecoverUnsatisfiableLayout(workspace, context, rects);
+    replans += step == Placement::ArrangementStep::Replan;
+
+    auto mixWorkspace = [&](const Workspace& state) {
+      mix(static_cast<uint64_t>(state.Layout()));
+      for (HWND hwnd : state.TiledWindows()) mix(reinterpret_cast<uintptr_t>(hwnd));
+      for (HWND hwnd : hwnds) {
+        const WindowRecord* record = state.Find(hwnd);
+        mix(record ? 1 + static_cast<uint64_t>(record->state) : 0);
+        mix(record && record->pendingInsertionPlacement);
+      }
+    };
+    mix(iteration);
+    mix(static_cast<uint64_t>(step));
+    mix(context.constraintFailureReported);
+    mixWorkspace(workspace);
+    Workspace saved;
+    mix(g_workspaces.Load(key, &saved));
+    mixWorkspace(saved);
+    mix(g_wm.overflow.queue.size());
+    mix(Placement::g_pendingAdmissionRecoveries.size());
+
+    g_workspaces.Save(key, Workspace{});
+    Placement::g_pendingAdmissionRecoveries.clear();
+    Placement::g_conformanceLeases.leases.clear();
+    g_wm.overflow.queue.clear();
+    g_wm.overflow.windows.clear();
+  }
+  if (g_wm.timers.overflow) KillTimer(nullptr, g_wm.timers.overflow);
+  if (g_wm.timers.conformance) KillTimer(nullptr, g_wm.timers.conformance);
+  g_wm.timers.overflow = g_wm.timers.conformance = 0;
+  TrayUi::g_showToasts = savedToasts;
+  g_wm.managementMode = savedMode;
+  if (exercised < 500 || replans == 0 || replans == exercised) {
+    std::fprintf(stderr, "FAILED: recovery digest inputs do not exercise all outcomes (%zu/%zu)\n", replans, exercised);
+    std::exit(1);
+  }
+  // Recorded from the implementation as of 2026-11-04.
+  if (digest != 0xba09f692dab18be1ull) {
+    std::fprintf(stderr, "FAILED: constraint recovery digest %016llx changed\n", static_cast<unsigned long long>(digest));
+    std::exit(1);
+  }
+  std::printf("Constraint recovery digest %016llx over %zu unsatisfiable layouts (%zu replans).\n",
+              static_cast<unsigned long long>(digest), exercised, replans);
+}
+
+// Writes a real diagnostic report and fingerprints its shape: every line with
+// digits and hex runs masked and spacing collapsed, so timings, PIDs and HWND
+// values do not matter but
+// section order, labels and PASS/FAIL verdicts do.
+static void RunDiagnosticReportShapeTest() {
+  wchar_t tempPath[MAX_PATH]{};
+  GetTempPathW(MAX_PATH, tempPath);
+  const std::wstring directory = std::wstring(tempPath) + L"multiwm_report_test";
+  CreateDirectoryW(directory.c_str(), nullptr);
+  WIN32_FIND_DATAW found{};
+  HANDLE search = FindFirstFileW((directory + L"\\*.txt").c_str(), &found);
+  if (search != INVALID_HANDLE_VALUE) {
+    do { DeleteFileW((directory + L"\\" + found.cFileName).c_str()); } while (FindNextFileW(search, &found));
+    FindClose(search);
+  }
+
+  DesktopMonitorKey key;
+  key.desktopId.Data1 = 0xD1A6;
+  key.monitor.deviceId = L"IFACE:TEST_REPORT_MONITOR";
+  Workspace workspace;
+  workspace.SetLayout(TileLayout::Columns);
+  for (int i = 0; i < 3; ++i) {
+    WindowRecord record;
+    record.hwnd = reinterpret_cast<HWND>(0x7200000 + i * 4);
+    record.pid = 777;
+    record.canMove = false;
+    if (i == 2) workspace.AdmitFloating(record); else workspace.AdmitTiled(record);
+  }
+  g_workspaces.Save(key, workspace);
+  g_wm.lifecycle.dirtyWindows = {reinterpret_cast<HWND>(0x7200000)};
+
+  const std::wstring savedPath = g_settings.diagnosticsOutputPath;
+  g_settings.diagnosticsOutputPath = directory;
+  Diagnostics::WriteDiagnosticReport();
+  g_settings.diagnosticsOutputPath = savedPath;
+  g_wm.lifecycle.dirtyWindows.clear();
+  for (const auto& entry : workspace.Records()) Reconcile::ForgetManagedWindow(entry.first);
+
+  search = FindFirstFileW((directory + L"\\*.txt").c_str(), &found);
+  if (search == INVALID_HANDLE_VALUE) { std::fprintf(stderr, "FAILED: diagnostic report not written\n"); std::exit(1); }
+  FindClose(search);
+  const std::wstring file = directory + L"\\" + found.cFileName;
+  HANDLE handle = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  std::string bytes(GetFileSize(handle, nullptr), '\0');
+  DWORD read = 0;
+  ReadFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
+  CloseHandle(handle);
+  DeleteFileW(file.c_str());
+
+  uint64_t digest = 1469598103934665603ull;
+  size_t lines = 0;
+  bool inRun = false;
+  char previous = 0;
+  for (char ch : bytes) {
+    // Column padding depends on number widths; treat any run of spaces as one.
+    if (ch == ' ' && previous == ' ') continue;
+    previous = ch;
+    const bool maskable = std::isxdigit(static_cast<unsigned char>(ch)) != 0;
+    if (ch == '\n') ++lines;
+    // Mask runs containing a digit: words like "Dead" survive, numbers/hex do not.
+    if (maskable && (std::isdigit(static_cast<unsigned char>(ch)) || inRun)) {
+      if (!inRun) { digest ^= '#'; digest *= 1099511628211ull; }
+      inRun = true;
+      continue;
+    }
+    inRun = false;
+    digest ^= static_cast<unsigned char>(ch);
+    digest *= 1099511628211ull;
+  }
+  // Recorded from the implementation as of 2026-11-04. Intentional report format
+  // changes must update this value.
+  if (digest != 0x1ab140825e70107full) {
+    std::fprintf(stderr, "FAILED: diagnostic report shape changed (%016llx)\n", static_cast<unsigned long long>(digest));
+    std::exit(1);
+  }
+  std::printf("Diagnostic report shape digest %016llx over %zu lines.\n",
+              static_cast<unsigned long long>(digest), lines);
 }
 
 static void RunDiscoveryResultTests() {
@@ -544,8 +732,8 @@ static void RunDiscoveryResultTests() {
   g_vd.initialized = true;
   g_vd.desktopManager = &windows; g_vd.managerInternal = &manager;
   g_wm.managementMode = ManagementMode::Manual;
-  g_wm.reconciledDesktop = current;
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  g_wm.desktop.reconciled = current;
+  g_wm.desktop.state = ReconciledDesktopState::Settled;
   const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
   DesktopMonitorKey key;
   check(DesktopMonitorKey::FromHMonitor(current, monitor, &key), "resolve live monitor");
@@ -575,9 +763,9 @@ static void RunDiscoveryResultTests() {
   check(result.status == WorkspaceDiscoveryStatus::DesktopChanged, "stale snapshot is DesktopChanged");
   check(Model::DesktopMonitorKeyEqual{}(result.key, key), "DesktopChanged retains requested key");
   check(result.ownershipChanges.empty(), "stale snapshot makes no ownership repairs");
-  check(g_wm.lifecycleTimer != 0 && g_wm.reconciledDesktopState == ReconciledDesktopState::TransitionPending,
+  check(g_wm.timers.lifecycle != 0 && g_wm.desktop.state == ReconciledDesktopState::TransitionPending,
         "DesktopChanged retains deferred retry effects");
-  KillTimer(nullptr, g_wm.lifecycleTimer); g_wm.lifecycleTimer = 0;
+  KillTimer(nullptr, g_wm.timers.lifecycle); g_wm.timers.lifecycle = 0;
   g_vd.desktopManager = nullptr; g_vd.managerInternal = nullptr; g_vd.initialized = false;
   std::printf("Passed %u discovery result contract checks.\n", checks);
 }
@@ -587,4 +775,6 @@ int main() {
   RunDiscoveryResultTests();
   RunWinEventRoutingTests();
   RunConformanceLocationTests();
+  RunDiagnosticReportShapeTest();
+  RunConstraintRecoveryDigest();
 }

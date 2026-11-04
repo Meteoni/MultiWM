@@ -18,8 +18,8 @@ static bool IsWorkspaceOnActiveDesktop(const DesktopMonitorKey& key) {
   // signals. Avoid re-querying Explorer from high-frequency placement and
   // LOCATIONCHANGE paths; a dirty transition deliberately retains the old GUID
   // for comparison while falling through to the existing live query.
-  if (g_wm.reconciledDesktopState == ReconciledDesktopState::Settled) {
-    return IsEqualGUID(g_wm.reconciledDesktop, key.desktopId);
+  if (g_wm.desktop.state == ReconciledDesktopState::Settled) {
+    return IsEqualGUID(g_wm.desktop.reconciled, key.desktopId);
   }
 
   GUID currentDesktop{};
@@ -393,8 +393,8 @@ static bool FloatAutomaticOverflowWindow(
   DiscardPendingAdmissionRecovery(hwnd);
   if (!(route ? workspace.Float(hwnd) : FloatWindowAfterFailure(key, workspace, hwnd))) return false;
   if (route) {
-    g_wm.overflowWindows.insert(hwnd);
-    g_wm.pendingWindowOverflow.push_back(
+    g_wm.overflow.windows.insert(hwnd);
+    g_wm.overflow.queue.push_back(
         {hwnd, processId, key.desktopId, key.monitor.deviceId, monitorFixed, generation});
     Reconcile::ScheduleLifecycleReconcile(nullptr);
   }
@@ -430,7 +430,7 @@ static void EnforceAutomaticWindowLimit(
     }
   }
   // Copy pending identities before desktop queries, which can deliver lifecycle events.
-  for (const auto& pending : g_wm.pendingWindowRoutes) {
+  for (const auto& pending : g_wm.routing.pending) {
     const auto& request = pending.second;
     if (request.visibleGeneration && IsEqualGUID(request.sourceDesktop, key.desktopId)) {
       visibleMembers.push_back({pending.first, request.processId, request.visibleGeneration, true});
@@ -447,8 +447,8 @@ static void EnforceAutomaticWindowLimit(
           Platform::Windows::IsWindowTrackedInAnyState(member.hwnd) || Platform::Windows::IsWindowCloaked(member.hwnd) ||
           Platform::Windows::GetPhysicalSuspensionReason(member.hwnd) != SuspensionReason::Maximized ||
           Platform::Windows::GetWindowPhysicalMonitor(member.hwnd) != monitor || Platform::Windows::ShouldWindowStartFloating(member.hwnd)) continue;
-      const auto pending = g_wm.pendingWindowRoutes.find(member.hwnd);
-      if (pending == g_wm.pendingWindowRoutes.end() || pending->second.processId != member.processId ||
+      const auto pending = g_wm.routing.pending.find(member.hwnd);
+      if (pending == g_wm.routing.pending.end() || pending->second.processId != member.processId ||
           pending->second.visibleGeneration != member.generation) continue;
       // Reserve its place in arrival order. Restoration still performs initial placement.
       ++retainedSlots;
@@ -538,167 +538,195 @@ static void RecordConstraintRemoval(
   }
 }
 
-// Handles one failed plan: rollback a provisional mutation, recover admission,
-// or release one conflicting member. Saves are explicit; Replan means the next
-// arrangement pass must calculate new rectangles from the resulting workspace.
+// --- Recovering from a layout that cannot fit --------------------------------
+
+// The window to float so the rest can fit, and why it was chosen.
+struct ConstraintVictim {
+  HWND hwnd = nullptr;
+  ConstraintRemovalReason reason = ConstraintRemovalReason::AggregateConflict;
+};
+
+// Windows being dragged are never removed in Automatic mode.
+static bool IsExemptFromRemoval(HWND hwnd) {
+  return RuntimeLifecycle::IsAutomaticMode() && Gestures::IsMoveSizeGestureInProgress(hwnd);
+}
+
+// A tiled window whose minimum size is larger than the whole work area can never
+// fit, so removing other windows cannot help. Returns the newest such window.
+static HWND FindWindowLargerThanWorkArea(
+    const Workspace& workspace, const std::vector<WindowConstraints>& activeConstraints, const RECT& workArea) {
+  const LONG workspaceWidth = Layout::RectWidth(workArea);
+  const LONG workspaceHeight = Layout::RectHeight(workArea);
+  HWND victim = nullptr;
+  uint64_t newestImpossibleGeneration = 0;
+  for (size_t i = 0; i < workspace.TiledWindows().size() && i < activeConstraints.size(); ++i) {
+    const WindowConstraints& constraint = activeConstraints[i];
+    if (!constraint.valid) continue;
+    const bool impossible = std::max<LONG>(1, constraint.minWidth) > workspaceWidth ||
+                            std::max<LONG>(1, constraint.minHeight) > workspaceHeight;
+    if (!impossible) continue;
+    const HWND candidate = workspace.TiledWindows()[i];
+    if (IsExemptFromRemoval(candidate)) continue;
+    const WindowRecord* candidateRecord = workspace.Find(candidate);
+    const uint64_t generation = candidateRecord ? candidateRecord->tilingGeneration : 0;
+    if (!victim || generation >= newestImpossibleGeneration) {
+      victim = candidate;
+      newestImpossibleGeneration = generation;
+    }
+  }
+  return victim;
+}
+
+// Tiled windows that may be removed, newest admission first, with the window
+// the user just acted on (`preferredTiledWindow`) last.
+static std::vector<Layout::ConstraintCandidate> OrderRemovalCandidates(
+    const Workspace& workspace, HWND preferredTiledWindow) {
+  std::vector<Layout::ConstraintCandidate> candidates;
+  candidates.reserve(workspace.ActiveCount());
+  for (HWND candidate : workspace.TiledWindows()) {
+    if (IsExemptFromRemoval(candidate)) continue;
+    const WindowRecord* candidateRecord = workspace.Find(candidate);
+    candidates.push_back({candidate, candidateRecord ? candidateRecord->tilingGeneration : 0});
+  }
+  std::stable_sort(candidates.begin(), candidates.end(),
+                   [&](const Layout::ConstraintCandidate& first, const Layout::ConstraintCandidate& second) {
+                     const bool firstPreferred = first.hwnd == preferredTiledWindow;
+                     const bool secondPreferred = second.hwnd == preferredTiledWindow;
+                     if (firstPreferred != secondPreferred) return !firstPreferred;
+                     return first.generation > second.generation;
+                   });
+  return candidates;
+}
+
+// Picks the window to float after admission recovery failed, in this order:
+//  1. A still-settling (pending) window: it introduced the failure, so it goes,
+//     never an already-settled sibling.
+//  2. The first candidate whose removal alone makes the current order fit.
+//  3. Automatic mode only: the first candidate, even if more removals will be
+//     needed (each pass removes one and replans).
+// No value of `hwnd` means: leave membership unchanged.
+static ConstraintVictim ChooseConstraintVictim(
+    const Workspace& workspace, const std::vector<Layout::ConstraintCandidate>& candidates,
+    const RECT& workArea, LONG gap) {
+  for (const Layout::ConstraintCandidate& candidate : candidates) {
+    const WindowRecord* candidateRecord = workspace.Find(candidate.hwnd);
+    if (candidateRecord && candidateRecord->pendingInsertionPlacement) {
+      return {candidate.hwnd, ConstraintRemovalReason::PendingAdmission};
+    }
+  }
+  for (const Layout::ConstraintCandidate& candidate : candidates) {
+    Workspace trial = workspace;
+    if (!trial.Float(candidate.hwnd)) continue;
+    std::vector<RECT> trialRects;
+    ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+    if (Layout::BuildWorkspaceLayoutPlan(trial, workArea, gap, &trialRects) == Layout::LayoutPlanStatus::Success) {
+      return {candidate.hwnd, ConstraintRemovalReason::SingleRemoval};
+    }
+  }
+  if (RuntimeLifecycle::IsAutomaticMode() && !candidates.empty()) {
+    return {candidates.front().hwnd, ConstraintRemovalReason::AggregateConflict};
+  }
+  return {};
+}
+
+// Commits a successful admission recovery (a pending window moved to a slot it
+// fits, possibly reassigning siblings). The pre-recovery order is kept until the
+// window settles, so it can be restored if a race strands its siblings.
+static void ApplyAdmissionRecovery(
+    const DesktopMonitorKey& key, Workspace& workspace, const Workspace& baseline,
+    Layout::AdmissionRecoveryPlan& recovery) {
+  RememberPendingAdmissionRecovery(key, recovery.window, baseline);
+  workspace = std::move(recovery.workspace);
+  if (recovery.reassignedWindows > 0) {
+    Wh_Log(L"Dwindle admission reassigned %zu windows across compatible slots for HWND %p",
+           recovery.reassignedWindows, static_cast<void*>(recovery.window));
+    Diagnostics::RecordEvent(L"dwindle admission matched all constraints hwnd=%p slot=%zu reassigned=%zu",
+                             recovery.window, recovery.toIndex, recovery.reassignedWindows);
+  }
+  if (recovery.fromIndex != recovery.toIndex) {
+    Wh_Log(L"Constraint-aware admission repositioned HWND %p from slot %zu to %zu",
+           static_cast<void*>(recovery.window), recovery.fromIndex, recovery.toIndex);
+    Diagnostics::RecordEvent(L"constraint-aware admission repositioned hwnd=%p from=%zu to=%zu",
+                             recovery.window, recovery.fromIndex, recovery.toIndex);
+  }
+  g_workspaces.Save(key, workspace);
+}
+
+// Floats the chosen window (Automatic mode routes it through overflow), tells
+// the user once per arrangement in Manual mode, and saves.
+static ArrangementStep ReleaseConstraintVictim(
+    Workspace& workspace, ArrangementContext& context, const std::vector<RECT>& rects,
+    const std::vector<WindowConstraints>& activeConstraints, const ConstraintVictim& victim,
+    const WindowRecord& victimRecord) {
+  const auto& key = context.key;
+  RecordConstraintRemoval(workspace, rects, activeConstraints, victimRecord, victim.hwnd,
+                          victim.reason, context.preferredTiledWindow);
+  CancelConformanceLease(victim.hwnd);
+  const HWND culprit = Layout::FindConstraintCulprit(workspace, rects, victim.hwnd);
+  const bool automaticOverflow = RuntimeLifecycle::IsAutomaticMode();
+  if (!context.constraintFailureReported && !automaticOverflow) {
+    ShowWindowConstraintConflict(workspace, rects, culprit ? culprit : victim.hwnd, context.monitor);
+    context.constraintFailureReported = true;
+  }
+  DiscardPendingAdmissionRecovery(victim.hwnd);
+  const bool floated = automaticOverflow
+      ? FloatAutomaticOverflowWindow(key, workspace, victim.hwnd, L"cannot fit")
+      : FloatWindowAfterFailure(key, workspace, victim.hwnd);
+  if (!floated) {
+    g_workspaces.Save(key, workspace);
+    return ArrangementStep::Finished;
+  }
+  ++Diagnostics::g_runtime.counters.constraintFloats;
+  g_workspaces.Save(key, workspace);
+  return workspace.Empty() ? ArrangementStep::Finished : ArrangementStep::Replan;
+}
+
+// Handles one failed plan, trying in order: roll back a provisional user change;
+// float a window that can never fit; move a pending admission to a slot it fits;
+// float one window chosen by ChooseConstraintVictim. Saves are explicit; Replan
+// means the next arrangement pass must plan again from the resulting workspace.
 // WM thread only; rects are physical screen pixels from the rejected plan.
 static ArrangementStep RecoverUnsatisfiableLayout(
     Workspace& workspace, ArrangementContext& context, const std::vector<RECT>& rects) {
   const auto& key = context.key;
-  const HMONITOR monitor = context.monitor;
   const RECT& workArea = context.metrics.workArea;
   const LONG gap = context.metrics.gap;
-  const HWND preferredTiledWindow = context.preferredTiledWindow;
-  bool& constraintFailureReported = context.constraintFailureReported;
   ++Diagnostics::g_runtime.counters.constraintUnsatisfiablePlans;
+
   // An explicit order mutation has already passed a full native-constraint
   // preflight before commit. If it later becomes unsatisfiable, do not
   // reinterpret the command by reshaping/reassigning it again here. The
   // delayed transaction gets first refusal: restore the previous order and
   // report the same constraint toast. Only when that saved order is no
   // longer feasible either may ordinary global constraint recovery proceed.
-  if (TryRollbackPendingLayoutMutation(
-          key, monitor, &workspace, rects)) {
+  if (TryRollbackPendingLayoutMutation(key, context.monitor, &workspace, rects)) {
     return ArrangementStep::Replan;
   }
 
   // Keep order changes provisional until admission conformance settles.
   const Workspace pendingAdmissionRecoveryBaseline = workspace;
+  const std::vector<WindowConstraints> activeConstraints = Layout::ActiveWindowConstraints(workspace);
 
-  HWND victim = nullptr;
-  ConstraintRemovalReason removalReason = ConstraintRemovalReason::AggregateConflict;
-
-  // Removing another member cannot help a window whose authoritative native
-  // minimum is larger than the entire usable workspace. Float that window
-  // directly; reserve candidate testing for aggregate constraint conflicts.
-  const LONG workspaceWidth = Layout::RectWidth(workArea);
-  const LONG workspaceHeight = Layout::RectHeight(workArea);
-  const std::vector<WindowConstraints> activeConstraints =
-      Layout::ActiveWindowConstraints(workspace);
-  uint64_t newestImpossibleGeneration = 0;
-  for (size_t i = 0;
-       i < workspace.TiledWindows().size() &&
-       i < activeConstraints.size();
-       ++i) {
-    const WindowConstraints& constraint = activeConstraints[i];
-    if (!constraint.valid) continue;
-
-    const bool impossible =
-        std::max<LONG>(1, constraint.minWidth) > workspaceWidth ||
-        std::max<LONG>(1, constraint.minHeight) > workspaceHeight;
-    if (!impossible) continue;
-
-    const HWND candidate = workspace.TiledWindows()[i];
-    if (RuntimeLifecycle::IsAutomaticMode() && Gestures::IsMoveSizeGestureInProgress(candidate)) continue;
-    const WindowRecord* candidateRecord = workspace.Find(candidate);
-    const uint64_t generation =
-        candidateRecord ? candidateRecord->tilingGeneration : 0;
-    if (!victim || generation >= newestImpossibleGeneration) {
-      victim = candidate;
-      newestImpossibleGeneration = generation;
-    }
-  }
-
-  if (victim) {
-    removalReason = ConstraintRemovalReason::IntrinsicMinimum;
-  } else {
-    std::vector<Layout::ConstraintCandidate> candidates;
-    candidates.reserve(workspace.ActiveCount());
-    for (HWND candidate : workspace.TiledWindows()) {
-      if (RuntimeLifecycle::IsAutomaticMode() && Gestures::IsMoveSizeGestureInProgress(candidate)) continue;
-      const WindowRecord* candidateRecord = workspace.Find(candidate);
-      candidates.push_back({
-          candidate,
-          candidateRecord ? candidateRecord->tilingGeneration : 0});
-    }
-    std::stable_sort(
-        candidates.begin(), candidates.end(),
-        [&](const Layout::ConstraintCandidate& first,
-            const Layout::ConstraintCandidate& second) {
-          const bool firstPreferred = first.hwnd == preferredTiledWindow;
-          const bool secondPreferred = second.hwnd == preferredTiledWindow;
-          if (firstPreferred != secondPreferred) return !firstPreferred;
-          return first.generation > second.generation;
-        });
-
+  ConstraintVictim victim{FindWindowLargerThanWorkArea(workspace, activeConstraints, workArea),
+                          ConstraintRemovalReason::IntrinsicMinimum};
+  if (!victim.hwnd) {
+    const auto candidates = OrderRemovalCandidates(workspace, context.preferredTiledWindow);
     Layout::AdmissionRecoveryPlan recovery;
     if (Layout::TryRecoverPendingAdmission(
-            workspace, workArea, gap, candidates, preferredTiledWindow,
-            &recovery)) {
-      RememberPendingAdmissionRecovery(
-          key, recovery.window, pendingAdmissionRecoveryBaseline);
-      workspace = std::move(recovery.workspace);
-      if (recovery.reassignedWindows > 0) {
-        Wh_Log(
-            L"Dwindle admission reassigned %zu windows across compatible slots for HWND %p",
-            recovery.reassignedWindows,
-            static_cast<void*>(recovery.window));
-        Diagnostics::RecordEvent(
-            L"dwindle admission matched all constraints hwnd=%p slot=%zu reassigned=%zu",
-            recovery.window, recovery.toIndex,
-            recovery.reassignedWindows);
-      }
-      if (recovery.fromIndex != recovery.toIndex) {
-        Wh_Log(
-            L"Constraint-aware admission repositioned HWND %p from slot %zu to %zu",
-            static_cast<void*>(recovery.window),
-            recovery.fromIndex, recovery.toIndex);
-        Diagnostics::RecordEvent(
-            L"constraint-aware admission repositioned hwnd=%p from=%zu to=%zu",
-            recovery.window, recovery.fromIndex,
-            recovery.toIndex);
-      }
-      g_workspaces.Save(key, workspace);
+            workspace, workArea, gap, candidates, context.preferredTiledWindow, &recovery)) {
+      ApplyAdmissionRecovery(key, workspace, pendingAdmissionRecoveryBaseline, recovery);
       return ArrangementStep::Replan;
     }
-
-    // A still-pending admission/restore owns the failure it introduced.
-    // Once every placement/adaptive/matching recovery above has failed, reject
-    // that pending member itself; never evict an already-settled sibling to
-    // make room for it.
-    for (const Layout::ConstraintCandidate& candidate : candidates) {
-      const WindowRecord* candidateRecord = workspace.Find(candidate.hwnd);
-      if (!candidateRecord || !candidateRecord->pendingInsertionPlacement) {
-        continue;
-      }
-      victim = candidate.hwnd;
-      removalReason = ConstraintRemovalReason::PendingAdmission;
-      break;
-    }
-
-    if (!victim) {
-      // Prefer a removal that makes the current order viable in one step.
-      for (const Layout::ConstraintCandidate& candidate : candidates) {
-        Workspace trial = workspace;
-        if (!trial.Float(candidate.hwnd)) continue;
-
-        std::vector<RECT> trialRects;
-        ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
-        if (Layout::BuildWorkspaceLayoutPlan(
-                trial, workArea, gap, &trialRects) !=
-            Layout::LayoutPlanStatus::Success) {
-          continue;
-        }
-
-        victim = candidate.hwnd;
-        removalReason = ConstraintRemovalReason::SingleRemoval;
-        break;
-      }
-    }
-    // Automatic mode also resolves conflicts requiring several removals.
-    // Each pass releases one member and replans the remaining group.
-    if (!victim && RuntimeLifecycle::IsAutomaticMode() && !candidates.empty()) {
-      victim = candidates.front().hwnd;
-    }
+    victim = ChooseConstraintVictim(workspace, candidates, workArea, gap);
   }
-  const WindowRecord* victimRecord = victim ? workspace.Find(victim) : nullptr;
-  if (!victim || !victimRecord) {
-    const HWND culprit = Layout::FindConstraintCulprit(
-        workspace, rects, preferredTiledWindow);
-    if (!constraintFailureReported) {
-      ShowWindowConstraintConflict(
-          workspace, rects, culprit, monitor);
-      constraintFailureReported = true;
+
+  const WindowRecord* victimRecord = victim.hwnd ? workspace.Find(victim.hwnd) : nullptr;
+  if (!victimRecord) {
+    // No removal can make this layout fit: keep everyone, tell the user once.
+    const HWND culprit = Layout::FindConstraintCulprit(workspace, rects, context.preferredTiledWindow);
+    if (!context.constraintFailureReported) {
+      ShowWindowConstraintConflict(workspace, rects, culprit, context.monitor);
+      context.constraintFailureReported = true;
     }
     Diagnostics::RecordEvent(
         L"constraint conflict left membership unchanged; no single settled removal is sufficient desktop=%08X",
@@ -706,31 +734,8 @@ static ArrangementStep RecoverUnsatisfiableLayout(
     g_workspaces.Save(key, workspace);
     return ArrangementStep::Finished;
   }
-
-  RecordConstraintRemoval(
-      workspace, rects, activeConstraints, *victimRecord, victim,
-      removalReason, preferredTiledWindow);
-
-  CancelConformanceLease(victim);
-  const HWND culprit = Layout::FindConstraintCulprit(workspace, rects, victim);
-  const bool automaticOverflow = RuntimeLifecycle::IsAutomaticMode();
-  if (!constraintFailureReported && !automaticOverflow) {
-    ShowWindowConstraintConflict(workspace, rects, culprit ? culprit : victim, monitor);
-    constraintFailureReported = true;
-  }
-  DiscardPendingAdmissionRecovery(victim);
-  if (!(automaticOverflow
-            ? FloatAutomaticOverflowWindow(key, workspace, victim, L"cannot fit")
-            : FloatWindowAfterFailure(key, workspace, victim))) {
-    g_workspaces.Save(key, workspace);
-    return ArrangementStep::Finished;
-  }
-  ++Diagnostics::g_runtime.counters.constraintFloats;
-  g_workspaces.Save(key, workspace);
-  if (workspace.Empty()) return ArrangementStep::Finished;
-  return ArrangementStep::Replan;
+  return ReleaseConstraintVictim(workspace, context, rects, activeConstraints, victim, *victimRecord);
 }
-
 // Places current targets, observes the application's response, then commits
 // membership changes. A native constraint refresh or rollback requests another
 // pass. Replan after rollback deliberately does not save the rejected candidate.

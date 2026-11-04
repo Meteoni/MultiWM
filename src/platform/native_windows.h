@@ -504,9 +504,9 @@ static const WindowRule* FindMatchingWindowRule(
 // Discovery waits for initial placement before assigning workspace ownership. Explicit
 // admission bypasses this policy and overrides pending initial placement.
 static bool IsWindowAwaitingInitialPlacement(HWND hwnd) {
-  return g_wm.windowRoutingReady &&
-         (g_wm.pendingWindowRoutes.count(hwnd) ||
-          (!g_wm.windowRoutingEvaluated.count(hwnd) &&
+  return g_wm.routing.ready &&
+         (g_wm.routing.pending.count(hwnd) ||
+          (!g_wm.routing.evaluated.count(hwnd) &&
            FindMatchingWindowRule(hwnd, WindowRuleTreatment::InitialPlacement)));
 }
 

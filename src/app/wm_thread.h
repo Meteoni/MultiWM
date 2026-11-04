@@ -76,10 +76,10 @@ static void SetWindowManagementMode(ManagementMode mode) {
   g_wm.managementMode = mode;
   const bool automatic = IsAutomaticMode();
   if (!automatic) {
-    g_wm.pendingWindowOverflow.clear();
-    g_wm.pendingOverflowSwitch = {};
-    if (g_wm.overflowTimer) KillTimer(nullptr, g_wm.overflowTimer);
-    g_wm.overflowTimer = 0;
+    g_wm.overflow.queue.clear();
+    g_wm.overflow.follow = {};
+    if (g_wm.timers.overflow) KillTimer(nullptr, g_wm.timers.overflow);
+    g_wm.timers.overflow = 0;
   }
   Wh_Log(L"Window management mode: %s", automatic ? L"Automatic" : L"Manual");
   Diagnostics::RecordEvent(
@@ -139,11 +139,11 @@ static bool DispatchActorTimer(UINT_PTR timerId) {
     UINT_PTR id;
     void (*handler)();
   } actorTimers[] = {
-      {g_wm.lifecycleTimer, Reconcile::ReconcileDeferredLifecycle},
-      {g_wm.discoveryRetryTimer, Reconcile::ProcessDiscoveryRetryTimer},
-      {g_wm.overflowTimer, Reconcile::ProcessWindowOverflow},
-      {g_wm.maintenanceTimer, RunMaintenanceNow},
-      {g_wm.conformanceTimer, Placement::ProcessConformanceTimer},
+      {g_wm.timers.lifecycle, Reconcile::ReconcileDeferredLifecycle},
+      {g_wm.timers.discoveryRetry, Reconcile::ProcessDiscoveryRetryTimer},
+      {g_wm.timers.overflow, Reconcile::ProcessWindowOverflow},
+      {g_wm.timers.maintenance, RunMaintenanceNow},
+      {g_wm.timers.conformance, Placement::ProcessConformanceTimer},
   };
   for (const auto& timer : actorTimers) {
     if (timer.id && timer.id == timerId) {
@@ -160,7 +160,7 @@ static bool DispatchActorTimer(UINT_PTR timerId) {
 static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
   // A new user command supersedes a pending "follow the overflowed window to its
   // new desktop" switch; never yank the user away after they have acted.
-  if (IsUserCommandMessage(msg)) g_wm.pendingOverflowSwitch = {};
+  if (IsUserCommandMessage(msg)) g_wm.overflow.follow = {};
   switch (msg.message) {
     case WM_APP_MOVE_SIZE_END:
       HandleMoveSizeEndMessage(reinterpret_cast<HWND>(msg.wParam));
@@ -293,10 +293,10 @@ static void CleanupWmThread() {
   // those members to tiling before discarding the actor queue so settings reload
   // can enforce the new policy instead of retaining an accidental float forever.
   std::vector<PendingWindowOverflow> deferredOverflow;
-  deferredOverflow.swap(g_wm.pendingWindowOverflow);
+  deferredOverflow.swap(g_wm.overflow.queue);
   for (const PendingWindowOverflow& pending : deferredOverflow) {
     if (!Platform::Windows::IsSameLiveWindow(pending.hwnd, pending.processId) ||
-        !g_wm.overflowWindows.count(pending.hwnd)) continue;
+        !g_wm.overflow.windows.count(pending.hwnd)) continue;
     for (const auto& key : g_workspaces.OwnersOf(pending.hwnd)) {
       Workspace workspace;
       if (!g_workspaces.Load(key, &workspace) || workspace.Layout() == TileLayout::Floating) continue;
@@ -316,41 +316,41 @@ static void CleanupWmThread() {
   Platform::WindowEvents::RemoveWinEventHooks();
   Platform::VirtualDesktop::CleanupVirtualDesktopAPI();
 
-  if (g_wm.lifecycleTimer) {
-    KillTimer(nullptr, g_wm.lifecycleTimer);
-    g_wm.lifecycleTimer = 0;
+  if (g_wm.timers.lifecycle) {
+    KillTimer(nullptr, g_wm.timers.lifecycle);
+    g_wm.timers.lifecycle = 0;
   }
-  if (g_wm.discoveryRetryTimer) {
-    KillTimer(nullptr, g_wm.discoveryRetryTimer);
-    g_wm.discoveryRetryTimer = 0;
+  if (g_wm.timers.discoveryRetry) {
+    KillTimer(nullptr, g_wm.timers.discoveryRetry);
+    g_wm.timers.discoveryRetry = 0;
   }
-  if (g_wm.maintenanceTimer) {
-    KillTimer(nullptr, g_wm.maintenanceTimer);
-    g_wm.maintenanceTimer = 0;
+  if (g_wm.timers.maintenance) {
+    KillTimer(nullptr, g_wm.timers.maintenance);
+    g_wm.timers.maintenance = 0;
   }
-  if (g_wm.conformanceTimer) {
-    KillTimer(nullptr, g_wm.conformanceTimer);
-    g_wm.conformanceTimer = 0;
+  if (g_wm.timers.conformance) {
+    KillTimer(nullptr, g_wm.timers.conformance);
+    g_wm.timers.conformance = 0;
   }
-  g_wm.lifecycleDirtyWindows.clear();
-  g_wm.pendingDiscoveryRetries.clear();
-  g_wm.pendingDesktopArranges.clear();
-  if (g_wm.overflowTimer) KillTimer(nullptr, g_wm.overflowTimer);
-  g_wm.overflowTimer = 0;
-  g_wm.overflowWindows.clear();
-  g_wm.pendingWindowOverflow.clear();
-  g_wm.pendingOverflowSwitch = {};
-  g_wm.windowRoutingReady = false;
-  g_wm.windowRoutingEvaluated.clear();
-  g_wm.pendingWindowRoutes.clear();
-  g_wm.pendingInitialPlacementSwitch = {};
-  g_wm.maintenanceAttempts = 0;
-  g_wm.maintenanceRunning = false;
-  g_wm.lifecycleRetryAfterPlatformRecovery = false;
-  g_wm.forceMonitorReconcile = false;
-  g_wm.reconciledDesktop = {};
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
-  g_wm.pendingDesktopSwitchFlyouts = false;
+  g_wm.lifecycle.dirtyWindows.clear();
+  g_wm.lifecycle.discoveryRetries.clear();
+  g_wm.lifecycle.pendingArranges.clear();
+  if (g_wm.timers.overflow) KillTimer(nullptr, g_wm.timers.overflow);
+  g_wm.timers.overflow = 0;
+  g_wm.overflow.windows.clear();
+  g_wm.overflow.queue.clear();
+  g_wm.overflow.follow = {};
+  g_wm.routing.ready = false;
+  g_wm.routing.evaluated.clear();
+  g_wm.routing.pending.clear();
+  g_wm.routing.follow = {};
+  g_wm.maintenance.attempts = 0;
+  g_wm.maintenance.running = false;
+  g_wm.lifecycle.retryAfterPlatformRecovery = false;
+  g_wm.lifecycle.forceMonitorReconcile = false;
+  g_wm.desktop.reconciled = {};
+  g_wm.desktop.state = ReconciledDesktopState::Unknown;
+  g_wm.desktop.pendingSwitchFlyouts = false;
   Placement::ClearAllConformanceLeases();
   Gestures::ClearAllMoveSizeSamples();
   Platform::Monitors::ClearMonitorIdentityCache();
@@ -394,13 +394,13 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
                     return rule.treatment == WindowRuleTreatment::InitialPlacement;
                   })) {
     ++Diagnostics::g_runtime.counters.enumWindowsPasses;
-    g_wm.windowRoutingReady = Platform::WindowEvents::g_hooks.hideDestroy && EnumWindows(
+    g_wm.routing.ready = Platform::WindowEvents::g_hooks.hideDestroy && EnumWindows(
         [](HWND hwnd, LPARAM) WINAPI -> BOOL {
           ++Diagnostics::g_runtime.counters.enumWindowsVisited;
-          g_wm.windowRoutingEvaluated.insert(hwnd);
+          g_wm.routing.evaluated.insert(hwnd);
           return TRUE;
         }, 0) != FALSE;
-    if (!g_wm.windowRoutingReady) Wh_Log(L"Initial placement baseline failed");
+    if (!g_wm.routing.ready) Wh_Log(L"Initial placement baseline failed");
   }
 
   Reconcile::ScheduleLifecycleReconcile(nullptr);

@@ -89,8 +89,8 @@ static HWND ResolveMoveSizeTarget(DWORD event, HWND hwnd) {
 // delayed message could mistake a reused HWND value for the old window.
 static void OnWindowDestroyed(HWND hwnd, bool tracked) {
   g_wm.CancelPendingWindowMoves(hwnd);
-  const bool routingKnown = g_wm.windowRoutingEvaluated.erase(hwnd) != 0;
-  const bool routingPending = g_wm.pendingWindowRoutes.erase(hwnd) != 0;
+  const bool routingKnown = g_wm.routing.evaluated.erase(hwnd) != 0;
+  const bool routingPending = g_wm.routing.pending.erase(hwnd) != 0;
   if (tracked || routingKnown || routingPending) QueueWindowEvent(EVENT_OBJECT_DESTROY, hwnd);
 }
 
@@ -99,7 +99,7 @@ static void OnWindowDestroyed(HWND hwnd, bool tracked) {
 // unexpected drift opens a bounded conformance lease.
 static void OnWindowLocationChanged(HWND hwnd, bool tracked) {
   if (!tracked) {
-    if (g_wm.pendingWindowRoutes.count(hwnd)) {
+    if (g_wm.routing.pending.count(hwnd)) {
       QueueWindowEvent(EVENT_OBJECT_LOCATIONCHANGE, hwnd);
       return;
     }
@@ -131,7 +131,7 @@ static bool IsDiscoveryPrompt(DWORD event, HWND hwnd) {
       event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED ||
       event == EVENT_OBJECT_STATECHANGE ||
       event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND ||
-      (IsMoveSizeEvent(event) && (g_wm.windowRoutingReady || RuntimeLifecycle::IsAutomaticMode()));
+      (IsMoveSizeEvent(event) && (g_wm.routing.ready || RuntimeLifecycle::IsAutomaticMode()));
   return discoveryEvent && GetAncestor(hwnd, GA_ROOT) == hwnd;
 }
 
@@ -140,9 +140,9 @@ static bool IsDiscoveryPrompt(DWORD event, HWND hwnd) {
 static void OnMoveSize(DWORD event, HWND hwnd, bool tracked) {
   if (event == EVENT_SYSTEM_MOVESIZESTART) {
     g_wm.CancelPendingWindowMoves(hwnd);
-    if (g_wm.windowRoutingReady) {
-      g_wm.windowRoutingEvaluated.insert(hwnd);
-      g_wm.pendingWindowRoutes.erase(hwnd);
+    if (g_wm.routing.ready) {
+      g_wm.routing.evaluated.insert(hwnd);
+      g_wm.routing.pending.erase(hwnd);
     }
     Placement::CancelConformanceLease(hwnd);
   }
@@ -173,8 +173,8 @@ static void OnLifecycleEvent(DWORD event, HWND hwnd) {
     // Older notification ABIs rely on the settled cloak/uncloak fallback to
     // discover desktop switches. Until that pass completes, make active-desktop
     // checks query Explorer directly.
-    if (g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown) {
-      g_wm.reconciledDesktopState = ReconciledDesktopState::TransitionPending;
+    if (g_wm.desktop.state != ReconciledDesktopState::Unknown) {
+      g_wm.desktop.state = ReconciledDesktopState::TransitionPending;
     }
   }
   QueueWindowEvent(event, hwnd);

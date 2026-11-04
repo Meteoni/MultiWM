@@ -92,8 +92,8 @@ static bool GetCurrentWorkspaceKey(
     HMONITOR monitor, DesktopMonitorKey* outKey) {
   if (!outKey || !IsLiveMonitorHandle(monitor)) return false;
   GUID desktopId{};
-  if (g_wm.reconciledDesktopState == ReconciledDesktopState::Settled) {
-    desktopId = g_wm.reconciledDesktop;
+  if (g_wm.desktop.state == ReconciledDesktopState::Settled) {
+    desktopId = g_wm.desktop.reconciled;
   } else {
     // Never collapse separate desktops into a zero-GUID workspace when the
     // private API is temporarily unavailable; let the caller retry after recovery.

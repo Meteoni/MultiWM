@@ -76,9 +76,9 @@ static size_t CountActiveConformanceLeases() {
 
 static void ScheduleNextConformanceTimer() {
   RuntimeLifecycle::AssertWmThread(L"ScheduleNextConformanceTimer");
-  if (g_wm.conformanceTimer) {
-    KillTimer(nullptr, g_wm.conformanceTimer);
-    g_wm.conformanceTimer = 0;
+  if (g_wm.timers.conformance) {
+    KillTimer(nullptr, g_wm.timers.conformance);
+    g_wm.timers.conformance = 0;
   }
 
   const ULONGLONG now = GetTickCount64();
@@ -94,8 +94,8 @@ static void ScheduleNextConformanceTimer() {
   if (!earliestDue) return;
   const ULONGLONG remaining = earliestDue > now ? earliestDue - now : 1;
   const UINT delayMs = static_cast<UINT>(std::min<ULONGLONG>(remaining, 0x7FFFFFFFULL));
-  g_wm.conformanceTimer = SetTimer(nullptr, 0, std::max<UINT>(1, delayMs), nullptr);
-  if (!g_wm.conformanceTimer) {
+  g_wm.timers.conformance = SetTimer(nullptr, 0, std::max<UINT>(1, delayMs), nullptr);
+  if (!g_wm.timers.conformance) {
     Wh_Log(L"Failed to schedule conformance repair/deadline timer");
   }
 }
@@ -644,9 +644,9 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
 }
 static void ProcessConformanceTimer() {
   RuntimeLifecycle::AssertWmThread(L"ProcessConformanceTimer");
-  if (g_wm.conformanceTimer) {
-    KillTimer(nullptr, g_wm.conformanceTimer);
-    g_wm.conformanceTimer = 0;
+  if (g_wm.timers.conformance) {
+    KillTimer(nullptr, g_wm.timers.conformance);
+    g_wm.timers.conformance = 0;
   }
 
   struct ExpiredCandidate {

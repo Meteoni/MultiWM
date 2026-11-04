@@ -198,7 +198,9 @@ struct PendingWindowOverflow {
   uint64_t tilingGeneration = 0;
 };
 
-struct PendingOverflowSwitch {
+// A requested switch to the desktop a window was moved to, cancelled if the
+// user acts first (input tick changes) or the deadline passes.
+struct PendingDesktopFollow {
   HWND hwnd = nullptr;
   DWORD processId = 0;
   GUID sourceDesktop{};
@@ -244,61 +246,86 @@ enum class ReconciledDesktopState {
   TransitionPending,
 };
 
-// Serialized actor/thread state. Management mode affects admission/retention
-// policy only; observation, reconciliation, resize learning, and arrangement
-// remain live in both modes. Only threadId is observed outside the actor.
+// An initial-placement rule frozen for one window: where it should go and
+// whether to follow it there. Values are copied when the rule first matches.
+struct PendingWindowRoute {
+  DWORD processId = 0;
+  GUID sourceDesktop{};
+  GUID targetDesktop{};
+  RuleMonitor monitor = RuleMonitor::Any;
+  std::wstring monitorId;
+  bool followWindow = false;
+  uint64_t visibleGeneration = 0;  // Counts a maximized arrival without admitting it.
+};
+
+// State of the WM thread (the "actor"): everything below is read and written
+// only on that thread, except `threadId`, which callbacks read to post messages.
+// Management mode affects admission/retention policy only; observation,
+// reconciliation, resize learning, and arrangement run in both modes.
 struct WmRuntime {
   HANDLE thread = nullptr;
   std::atomic<DWORD> threadId{0};
   HANDLE readyEvent = nullptr;
-
-  UINT_PTR lifecycleTimer = 0;
-  UINT_PTR discoveryRetryTimer = 0;
-  UINT_PTR overflowTimer = 0; // Checks desktop arrival, without activating HWNDs.
-  // Destroy events retire queued HWND lifetimes before deferred work runs.
-  std::unordered_set<HWND> overflowWindows;
-  std::vector<PendingWindowOverflow> pendingWindowOverflow;
-  PendingOverflowSwitch pendingOverflowSwitch{};
-  UINT_PTR maintenanceTimer = 0;
-  UINT_PTR conformanceTimer = 0;
-  UINT maintenanceAttempts = 0;
-  bool maintenanceRunning = false;
-  bool lifecycleRetryAfterPlatformRecovery = false;
-  bool forceMonitorReconcile = false;
   bool comInitialized = false;
-  GUID reconciledDesktop{};
-  ReconciledDesktopState reconciledDesktopState =
-      ReconciledDesktopState::Unknown;
-  bool pendingDesktopSwitchFlyouts = false;
-  std::vector<HWND> lifecycleDirtyWindows;
-  std::vector<PendingDiscoveryRetry> pendingDiscoveryRetries;
-  std::vector<PendingWorkspaceArrange> pendingDesktopArranges;
-  // Routing is independent of management and also works in Manual mode.
-  bool windowRoutingReady = false;
-  std::unordered_set<HWND> windowRoutingEvaluated;
-  struct PendingWindowRoute {
-    DWORD processId = 0;
-    GUID sourceDesktop{};
-    GUID targetDesktop{};
-    RuleMonitor monitor = RuleMonitor::Any;
-    std::wstring monitorId;
-    bool followWindow = false;
-    uint64_t visibleGeneration = 0; // Counts a maximized arrival without admitting it.
-  };
-  std::unordered_map<HWND, PendingWindowRoute> pendingWindowRoutes;
-  PendingOverflowSwitch pendingInitialPlacementSwitch{};
   ManagementMode managementMode = ManagementMode::Automatic;
+
+  // Thread timers created with SetTimer(nullptr, ...). 0 means not scheduled.
+  struct Timers {
+    UINT_PTR lifecycle = 0;       // Settles a burst of window events (ReconcileDelayMs).
+    UINT_PTR discoveryRetry = 0;  // Re-checks slow new windows (SlowApplicationDelayMs).
+    UINT_PTR overflow = 0;        // Checks desktop arrival, without activating HWNDs.
+    UINT_PTR maintenance = 0;     // Retries virtual-desktop COM / notification setup.
+    UINT_PTR conformance = 0;     // Next conformance-lease repair or deadline.
+  } timers;
+
+  // Work collected from window events, processed by the settled lifecycle pass.
+  struct Lifecycle {
+    std::vector<HWND> dirtyWindows;
+    std::vector<PendingWorkspaceArrange> pendingArranges;
+    std::vector<PendingDiscoveryRetry> discoveryRetries;
+    bool retryAfterPlatformRecovery = false;  // Last pass was deferred until COM recovers.
+    bool forceMonitorReconcile = false;       // Display topology changed.
+  } lifecycle;
+
+  // The virtual desktop the model was last reconciled against.
+  struct DesktopTracking {
+    GUID reconciled{};
+    ReconciledDesktopState state = ReconciledDesktopState::Unknown;
+    bool pendingSwitchFlyouts = false;  // Show "desktop N" toasts after the next pass.
+  } desktop;
+
+  struct Maintenance {
+    UINT attempts = 0;
+    bool running = false;
+  } maintenance;
+
+  // Automatic overflow: windows that exceeded a limit and are waiting to move.
+  struct Overflow {
+    // Destroy events retire queued HWND lifetimes before deferred work runs.
+    std::unordered_set<HWND> windows;
+    std::vector<PendingWindowOverflow> queue;
+    PendingDesktopFollow follow{};  // Switch to the desktop a window overflowed to.
+  } overflow;
+
+  // Initial-placement rules ("Open on monitor / desktop"). Independent of
+  // management mode, so it also works in Manual mode.
+  struct Routing {
+    bool ready = false;                     // Hooks needed for routing are installed.
+    std::unordered_set<HWND> evaluated;     // Rules already checked for these windows.
+    std::unordered_map<HWND, PendingWindowRoute> pending;
+    PendingDesktopFollow follow{};          // "Follow window" desktop switch.
+  } routing;
 
   // True when `hwnd` has a queued overflow request that has not run yet.
   bool HasPendingOverflow(HWND hwnd) const {
-    return std::any_of(pendingWindowOverflow.begin(), pendingWindowOverflow.end(),
+    return std::any_of(overflow.queue.begin(), overflow.queue.end(),
                        [hwnd](const PendingWindowOverflow& request) { return request.hwnd == hwnd; });
   }
 
   // Drops any queued overflow request for `hwnd`. Does not touch desktop switches.
   void CancelPendingOverflow(HWND hwnd) {
-    overflowWindows.erase(hwnd);
-    std::erase_if(pendingWindowOverflow,
+    overflow.windows.erase(hwnd);
+    std::erase_if(overflow.queue,
                   [hwnd](const PendingWindowOverflow& request) { return request.hwnd == hwnd; });
   }
 
@@ -306,11 +333,10 @@ struct WmRuntime {
   // Used when the window is destroyed or the user starts dragging it.
   void CancelPendingWindowMoves(HWND hwnd) {
     CancelPendingOverflow(hwnd);
-    if (pendingOverflowSwitch.hwnd == hwnd) pendingOverflowSwitch = {};
-    if (pendingInitialPlacementSwitch.hwnd == hwnd) pendingInitialPlacementSwitch = {};
+    if (overflow.follow.hwnd == hwnd) overflow.follow = {};
+    if (routing.follow.hwnd == hwnd) routing.follow = {};
   }
 };
-
 static SettingsState g_settings;
 static VirtualDesktopRuntime g_vd;
 static WmRuntime g_wm;

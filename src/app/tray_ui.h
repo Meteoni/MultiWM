@@ -251,8 +251,8 @@ static void SetTooltip(TileLayout layout) {
   } else {
     GUID desktopId{};
     bool haveDesktop = false;
-    if (g_wm.reconciledDesktopState == ReconciledDesktopState::Settled) {
-      desktopId = g_wm.reconciledDesktop;
+    if (g_wm.desktop.state == ReconciledDesktopState::Settled) {
+      desktopId = g_wm.desktop.reconciled;
       haveDesktop = true;
     } else {
       haveDesktop = Platform::VirtualDesktop::GetCurrentDesktopId(&desktopId);

@@ -279,8 +279,8 @@ static void QueueVirtualDesktopChangedNotification() {
 
   // The callback is the transition boundary. Keep using the live shell query until
   // the queued handler has reconciled the new desktop into actor-owned state.
-  if (g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown) {
-    g_wm.reconciledDesktopState =
+  if (g_wm.desktop.state != ReconciledDesktopState::Unknown) {
+    g_wm.desktop.state =
         ReconciledDesktopState::TransitionPending;
   }
 
@@ -877,9 +877,9 @@ bool RemoveEmptyOverflowDesktop(const GUID& desktopId, const GUID& fallbackDeskt
 bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, const GUID& desktopId,
                          WindowMovePurpose purpose) {
   auto requestPending = [&] {
-    if (purpose == WindowMovePurpose::Overflow) return g_wm.overflowWindows.count(hwnd) != 0;
-    const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
-    return pending != g_wm.pendingWindowRoutes.end() && pending->second.processId == processId &&
+    if (purpose == WindowMovePurpose::Overflow) return g_wm.overflow.windows.count(hwnd) != 0;
+    const auto pending = g_wm.routing.pending.find(hwnd);
+    return pending != g_wm.routing.pending.end() && pending->second.processId == processId &&
         IsEqualGUID(pending->second.sourceDesktop, sourceDesktop) &&
         IsEqualGUID(pending->second.targetDesktop, desktopId) && !Gestures::IsMoveSizeGestureInProgress(hwnd);
   };
@@ -961,9 +961,9 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
     if (!IsWindowOnDesktop(hwnd, desktopId) || !IsCurrentDesktop(sourceDesktop) ||
         !manager || g_vd.managerInternal != manager) return false;
     // Owner queries can pump destroy/user-gesture events. Check intent last.
-    const auto& initial = g_wm.pendingInitialPlacementSwitch;
+    const auto& initial = g_wm.routing.follow;
     const bool requestPending = purpose == WindowMovePurpose::Overflow
-        ? g_wm.overflowWindows.count(hwnd) != 0
+        ? g_wm.overflow.windows.count(hwnd) != 0
         : initial.hwnd == hwnd && initial.processId == processId &&
           initial.inputTickMs == inputTickMs && IsEqualGUID(initial.sourceDesktop, sourceDesktop) &&
           IsEqualGUID(initial.targetDesktop, desktopId) && !Gestures::IsMoveSizeGestureInProgress(hwnd);

@@ -953,10 +953,10 @@ static void DumpPlatformHealth(ReportBuilder& report) {
       notificationAttemptAge.c_str(), notificationSuccessAge.c_str());
   report.Line(
       L"Runtime maintenance: running=%d timerArmed=%d attempt=%u/%u deferredLifecycle=%d forceMonitorReconcile=%d",
-      g_wm.maintenanceRunning ? 1 : 0, g_wm.maintenanceTimer ? 1 : 0,
-      g_wm.maintenanceAttempts, RuntimeLifecycle::kMaintenanceMaxAttempts,
-      g_wm.lifecycleRetryAfterPlatformRecovery ? 1 : 0,
-      g_wm.forceMonitorReconcile ? 1 : 0);
+      g_wm.maintenance.running ? 1 : 0, g_wm.timers.maintenance ? 1 : 0,
+      g_wm.maintenance.attempts, RuntimeLifecycle::kMaintenanceMaxAttempts,
+      g_wm.lifecycle.retryAfterPlatformRecovery ? 1 : 0,
+      g_wm.lifecycle.forceMonitorReconcile ? 1 : 0);
   const Platform::WindowEvents::WinEventHooks& hooks = Platform::WindowEvents::g_hooks;
   report.Line(
       L"WinEvent hooks: foreground=%d location=%d moveSize=%d minimize=%d hideDestroy=%d cloak=%d state=%d",
@@ -1011,96 +1011,90 @@ static void DumpLifecycleBursts(ReportBuilder& report, ULONGLONG now) {
   }
 }
 
-static void WriteDiagnosticReport() {
-  InitializeProcessRuntime();
-  const ULONGLONG reportStartTickMs = GetTickCount64();
-  const DiagnosticCpuSnapshot reportStartCpu = CaptureDiagnosticCpuSnapshot();
-  const ULONGLONG now = reportStartTickMs;
-  const ULONGLONG uptimeMs = now - g_runtime.processStartedTickMs;
-  const ULONGLONG wmSessionMs = g_runtime.wmSessionStartedTickMs
-      ? now - g_runtime.wmSessionStartedTickMs
-      : 0;
-  const ULONGLONG intervalMs = g_runtime.lastReportTickMs
-      ? now - g_runtime.lastReportTickMs
-      : uptimeMs;
-  const Counters counters = g_runtime.counters;
-  const Counters previous = g_runtime.lastReportCounters;
-  const uint64_t reportSequence = g_runtime.reportSequence + 1;
+// --- Diagnostic report: sections ---------------------------------------------
 
-  std::vector<std::pair<DesktopMonitorKey, Workspace>> workspaces =
-      g_workspaces.Snapshot();
-  std::vector<std::pair<HWND, std::vector<DesktopMonitorKey>>> ownershipIndex =
-      g_workspaces.OwnershipIndexSnapshot();
-  std::sort(
-      workspaces.begin(), workspaces.end(),
-      [](const auto& a, const auto& b) {
-        std::wstring aDesktop = DiagnosticGuidString(a.first.desktopId);
-        std::wstring bDesktop = DiagnosticGuidString(b.first.desktopId);
-        if (aDesktop != bDesktop) return aDesktop < bDesktop;
-        return a.first.monitor.deviceId < b.first.monitor.deviceId;
-      });
-
+// Record counts and ownership-index consistency across every workspace.
+struct ReportOwnershipSummary {
   size_t totalRecords = 0;
-  size_t tiledCount = 0;
-  size_t floatingCount = 0;
-  size_t suspendedCount = 0;
-  size_t ignoredCount = 0;
+  size_t tiled = 0;
+  size_t floating = 0;
+  size_t suspended = 0;
+  size_t ignored = 0;
+  size_t duplicateOwners = 0;           // HWNDs recorded by more than one workspace.
+  size_t ownershipIndexMismatches = 0;  // Reverse index disagrees with the records.
+};
+
+static ReportOwnershipSummary SummarizeOwnership(
+    const std::vector<std::pair<DesktopMonitorKey, Workspace>>& workspaces,
+    const std::vector<std::pair<HWND, std::vector<DesktopMonitorKey>>>& ownershipIndex) {
+  ReportOwnershipSummary summary;
   std::unordered_map<HWND, size_t> ownerCounts;
   std::unordered_map<HWND, std::vector<DesktopMonitorKey>> expectedOwners;
   for (const auto& workspaceKv : workspaces) {
     for (const auto& recordKv : workspaceKv.second.Records()) {
-      ++totalRecords;
+      ++summary.totalRecords;
       ++ownerCounts[recordKv.first];
       expectedOwners[recordKv.first].push_back(workspaceKv.first);
       switch (recordKv.second.state) {
-        case ManageState::Tiled: ++tiledCount; break;
-        case ManageState::Floating: ++floatingCount; break;
-        case ManageState::Suspended: ++suspendedCount; break;
-        case ManageState::Ignored: ++ignoredCount; break;
+        case ManageState::Tiled: ++summary.tiled; break;
+        case ManageState::Floating: ++summary.floating; break;
+        case ManageState::Suspended: ++summary.suspended; break;
+        case ManageState::Ignored: ++summary.ignored; break;
       }
     }
   }
-  size_t duplicateOwners = 0;
   for (const auto& ownerKv : ownerCounts) {
-    if (ownerKv.second > 1) ++duplicateOwners;
+    if (ownerKv.second > 1) ++summary.duplicateOwners;
   }
 
-  auto sameKeySet = [](
-      const std::vector<DesktopMonitorKey>& a,
-      const std::vector<DesktopMonitorKey>& b) {
+  auto sameKeySet = [](const std::vector<DesktopMonitorKey>& a, const std::vector<DesktopMonitorKey>& b) {
     if (a.size() != b.size()) return false;
     for (const DesktopMonitorKey& key : a) {
-      if (std::none_of(
-              b.begin(), b.end(), [&](const DesktopMonitorKey& candidate) {
-                return Model::DesktopMonitorKeyEqual{}(key, candidate);
-              })) {
+      if (std::none_of(b.begin(), b.end(), [&](const DesktopMonitorKey& candidate) {
+            return Model::DesktopMonitorKeyEqual{}(key, candidate);
+          })) {
         return false;
       }
     }
     return true;
   };
-
-  size_t ownershipIndexMismatches = 0;
   std::unordered_set<HWND> indexedHwnds;
   for (const auto& indexKv : ownershipIndex) {
     indexedHwnds.insert(indexKv.first);
     auto expectedIt = expectedOwners.find(indexKv.first);
-    if (expectedIt == expectedOwners.end() ||
-        !sameKeySet(indexKv.second, expectedIt->second)) {
-      ++ownershipIndexMismatches;
+    if (expectedIt == expectedOwners.end() || !sameKeySet(indexKv.second, expectedIt->second)) {
+      ++summary.ownershipIndexMismatches;
     }
   }
   for (const auto& expectedKv : expectedOwners) {
-    if (indexedHwnds.find(expectedKv.first) == indexedHwnds.end()) {
-      ++ownershipIndexMismatches;
-    }
+    if (indexedHwnds.find(expectedKv.first) == indexedHwnds.end()) ++summary.ownershipIndexMismatches;
   }
+  return summary;
+}
 
+// Problems found while dumping individual workspaces, for the audit summary.
+struct ReportWorkspaceAudit {
+  size_t invariantFailures = 0;
+  size_t deadRecords = 0;
+  size_t pidMismatches = 0;
+  size_t recordsWithPlacementFailures = 0;
+  size_t staleMonitorWorkspaces = 0;  // Workspaces whose monitor is disconnected.
+  size_t recordsOnStaleMonitorWorkspaces = 0;
+  size_t currentDesktopRecordsOnStaleMonitorWorkspaces = 0;
+};
+
+// Timing values shared by several sections. All in milliseconds.
+struct ReportTiming {
+  ULONGLONG now = 0;
+  ULONGLONG uptimeMs = 0;
+  ULONGLONG wmSessionMs = 0;
+  ULONGLONG intervalMs = 0;  // Since the previous successful report.
+};
+
+static void DumpReportHeader(ReportBuilder& report, uint64_t reportSequence, const ReportTiming& timing) {
   SYSTEMTIME local{}, utc{};
   GetLocalTime(&local);
   GetSystemTime(&utc);
-
-  ReportBuilder report;
   report.Line(L"============================================================");
   report.Line(L"MULTIWM DIAGNOSTIC REPORT");
   report.Line(L"============================================================");
@@ -1108,44 +1102,49 @@ static void WriteDiagnosticReport() {
   report.Line(L"Report sequence: %llu", static_cast<unsigned long long>(reportSequence));
   report.Line(L"Generated local: %ls", DiagnosticSystemTimeString(local).c_str());
   report.Line(L"Generated UTC:   %ls", DiagnosticSystemTimeString(utc).c_str());
-  report.Line(L"Tool runtime:    %ls", DiagnosticDurationString(uptimeMs).c_str());
-  report.Line(L"WM session:      %ls", DiagnosticDurationString(wmSessionMs).c_str());
+  report.Line(L"Tool runtime:    %ls", DiagnosticDurationString(timing.uptimeMs).c_str());
+  report.Line(L"WM session:      %ls", DiagnosticDurationString(timing.wmSessionMs).c_str());
   report.Line(
       L"Since last report: %ls%ls",
-      DiagnosticDurationString(intervalMs).c_str(),
+      DiagnosticDurationString(timing.intervalMs).c_str(),
       g_runtime.lastReportTickMs ? L"" : L" (first report)");
   report.Line(L"PID: %lu", GetCurrentProcessId());
   report.Line(L"Privacy note: this report contains window titles and executable paths.");
+}
 
+static void DumpRuntimeSummary(
+    ReportBuilder& report, size_t workspaceCount, size_t indexEntries,
+    const ReportOwnershipSummary& summary, const Counters& counters) {
   report.Section(L"Current runtime summary");
   report.Line(L"Management mode: %ls", RuntimeLifecycle::IsAutomaticMode() ? L"Automatic" : L"Manual");
   report.Line(
       L"Workspaces=%zu records=%zu tiled=%zu suspended=%zu perWindowFloating=%zu ignored=%zu",
-      workspaces.size(), totalRecords, tiledCount, suspendedCount, floatingCount,
-      ignoredCount);
+      workspaceCount, summary.totalRecords, summary.tiled, summary.suspended, summary.floating,
+      summary.ignored);
   report.Line(
       L"Pending lifecycle HWNDs=%zu pending workspace reinforcements=%zu duplicate-owned HWNDs=%zu",
-      g_wm.lifecycleDirtyWindows.size(), g_wm.pendingDesktopArranges.size(),
-      duplicateOwners);
+      g_wm.lifecycle.dirtyWindows.size(), g_wm.lifecycle.pendingArranges.size(),
+      summary.duplicateOwners);
   report.Line(
       L"Active conformance leases=%zu pending layout mutations=%zu runtime-maintenance timer=%d attempt=%u",
       Placement::CountActiveConformanceLeases(), Placement::g_pendingLayoutMutations.size(),
-      g_wm.maintenanceTimer ? 1 : 0, g_wm.maintenanceAttempts);
+      g_wm.timers.maintenance ? 1 : 0, g_wm.maintenance.attempts);
   report.Line(
       L"Reverse ownership index: entries=%zu mismatches=%zu",
-      ownershipIndex.size(), ownershipIndexMismatches);
+      indexEntries, summary.ownershipIndexMismatches);
   report.Line(
       L"WM sessions started=%llu settings reloads=%llu prior reports written=%llu prior report write failures=%llu",
       static_cast<unsigned long long>(counters.wmSessionStarts),
       static_cast<unsigned long long>(counters.settingsReloads),
       static_cast<unsigned long long>(counters.reportsWritten),
       static_cast<unsigned long long>(counters.reportWriteFailures));
+}
 
+static void DumpConfigurationSnapshot(ReportBuilder& report) {
   report.Section(L"Configuration snapshot");
   report.Line(L"Fallback layout: %ls", DiagnosticLayoutName(g_settings.defaultLayout));
   report.TextLine(L"Layout cycle: ", DiagnosticLayoutCycleString(g_settings.layoutCycle));
-  report.Line(L"Workspace initialization rules: %zu",
-              g_settings.workspaceInitializationRules.size());
+  report.Line(L"Workspace initialization rules: %zu", g_settings.workspaceInitializationRules.size());
   report.Line(L"Tray click: %ls; toasts: %ls",
               TrayUi::g_trayClickOpensMenu ? L"context menu" : L"switch layout",
               TrayUi::g_showToasts ? L"enabled" : L"disabled");
@@ -1153,11 +1152,9 @@ static void WriteDiagnosticReport() {
       L"Workspace geometry (96-DPI logical px): gap=%ld insets=[%ld,%ld,%ld,%ld] floatingDefault=%ldx%ld",
       g_settings.gapDip, g_settings.insetsDip.left, g_settings.insetsDip.top,
       g_settings.insetsDip.right, g_settings.insetsDip.bottom,
-      g_settings.floatingDefaultSizeDip.width,
-      g_settings.floatingDefaultSizeDip.height);
+      g_settings.floatingDefaultSizeDip.width, g_settings.floatingDefaultSizeDip.height);
   report.Line(L"Master percent: %ld", g_settings.masterPercent);
-  report.Line(
-      L"Adaptive Dwindle slots: %zu", g_settings.adaptiveDwindleSlots);
+  report.Line(L"Adaptive Dwindle slots: %zu", g_settings.adaptiveDwindleSlots);
   report.Line(
       L"Adaptive Dwindle percentage: %ld (automatic envelope %.0f%%-%.0f%%)",
       g_settings.adaptiveDwindlePercentage,
@@ -1166,441 +1163,367 @@ static void WriteDiagnosticReport() {
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
   report.Line(
       L"Automatic insertion position: %ls",
-      g_settings.automaticNewWindowPosition ==
-              AutomaticNewWindowPosition::AfterFocused
-          ? L"After focused window"
-          : L"Last slot");
+      g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused
+          ? L"After focused window" : L"Last slot");
   report.Line(L"Tiled conformance lease: %u ms", g_settings.conformanceLeaseMs);
-  report.Line(
-      L"Conformance repair interval: %u ms",
-      g_settings.conformanceRepairIntervalMs);
+  report.Line(L"Conformance repair interval: %u ms", g_settings.conformanceRepairIntervalMs);
   report.Line(L"Lifecycle settle delay: %u ms", g_settings.reconcileDelayMs);
-  report.Line(L"Slow application discovery delay: %u ms",
-              g_settings.slowApplicationDelayMs);
+  report.Line(L"Slow application discovery delay: %u ms", g_settings.slowApplicationDelayMs);
   report.Line(L"Window rules: %zu", g_settings.windowRules.size());
   report.Line(L"Initial window placement: ready=%d pending=%zu",
-              g_wm.windowRoutingReady ? 1 : 0, g_wm.pendingWindowRoutes.size());
+              g_wm.routing.ready ? 1 : 0, g_wm.routing.pending.size());
   report.TextLine(L"Diagnostic output setting: ", g_settings.diagnosticsOutputPath);
   report.TextLine(L"Diagnostic output resolved: ", ExpandDiagnosticPath(g_settings.diagnosticsOutputPath));
+}
 
-  report.Section(L"Platform / hook health");
-  DumpPlatformHealth(report);
-
+static void DumpPerformanceSection(
+    ReportBuilder& report, const ReportTiming& timing, const DiagnosticCpuSnapshot& reportStartCpu,
+    const Counters& counters, const Counters& previous) {
   report.Section(L"Performance and churn counters");
-  DumpCpuUsage(report, uptimeMs, wmSessionMs, reportStartCpu);
+  DumpCpuUsage(report, timing.uptimeMs, timing.wmSessionMs, reportStartCpu);
   report.Line();
   DumpDerivedPerformanceIndicators(report, counters);
   report.Line();
-  report.Line(
-      L"Rates are normalized by tool runtime and by the interval since the previous successful report.");
-  DumpCounters(report, counters, previous, uptimeMs, intervalMs);
+  report.Line(L"Rates are normalized by tool runtime and by the interval since the previous successful report.");
+  DumpCounters(report, counters, previous, timing.uptimeMs, timing.intervalMs);
+}
 
+static void DumpRecentHistory(ReportBuilder& report, ULONGLONG now) {
   report.Section(L"Recent significant events (bounded in-memory tail)");
   report.Line(L"Newest events are at the bottom; at most %zu are retained.", kRecentEventLimit);
   DumpRecentEvents(report, now);
 
   report.Section(L"Recent lifecycle bursts (bounded in-memory tail)");
-  report.Line(
-      L"Newest bursts are at the bottom; at most %zu are retained.",
-      kLifecycleBurstLimit);
+  report.Line(L"Newest bursts are at the bottom; at most %zu are retained.", kLifecycleBurstLimit);
   DumpLifecycleBursts(report, now);
+}
 
-  report.Section(L"Workspace / window state");
-
-  size_t invariantFailures = 0;
-  size_t deadRecords = 0;
-  size_t pidMismatches = 0;
-  size_t recordsWithPlacementFailures = 0;
-  size_t staleMonitorWorkspaces = 0;
-  size_t recordsOnStaleMonitorWorkspaces = 0;
-  size_t currentDesktopRecordsOnStaleMonitorWorkspaces = 0;
-
-  for (size_t workspaceIndex = 0; workspaceIndex < workspaces.size(); ++workspaceIndex) {
-    const DesktopMonitorKey& key = workspaces[workspaceIndex].first;
-    const Workspace& state = workspaces[workspaceIndex].second;
-    const std::wstring desktopId = DiagnosticGuidString(key.desktopId);
-
-    size_t workspaceTiled = 0, workspaceFloating = 0, workspaceSuspended = 0,
-           workspaceIgnored = 0;
-    for (const auto& recordKv : state.Records()) {
-      switch (recordKv.second.state) {
-        case ManageState::Tiled: ++workspaceTiled; break;
-        case ManageState::Floating: ++workspaceFloating; break;
-        case ManageState::Suspended: ++workspaceSuspended; break;
-        case ManageState::Ignored: ++workspaceIgnored; break;
-      }
-    }
-
-    const HMONITOR resolvedMonitor = key.ResolveMonitor();
-    const bool pendingReinforcement = std::any_of(
-        g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
-        [&](const PendingWorkspaceArrange& pending) {
-          return resolvedMonitor && pending.monitor == resolvedMonitor &&
-                 IsEqualGUID(pending.desktopId, key.desktopId);
-        });
-
-    const bool liveMonitor = resolvedMonitor != nullptr;
-    if (!liveMonitor) {
-      ++staleMonitorWorkspaces;
-      recordsOnStaleMonitorWorkspaces += state.RecordCount();
-      if (g_vd.lastKnownDesktopValid &&
-          IsEqualGUID(key.desktopId, g_vd.lastKnownDesktop)) {
-        currentDesktopRecordsOnStaleMonitorWorkspaces += state.RecordCount();
-      }
-    }
-
-    std::vector<std::wstring> invariantErrors;
-    const bool invariantsValid =
-        state.Validate(key, L"diagnostic report", &invariantErrors, false);
-    if (!invariantsValid) ++invariantFailures;
-
-    report.Line();
-    report.Line(
-        L"---------------- Workspace %zu / %zu ----------------",
-        workspaceIndex + 1, workspaces.size());
-    report.Line(L"desktopId: %ls", desktopId.c_str());
-    report.Line(
-        L"currentDesktop: %ls",
-        !g_vd.lastKnownDesktopValid
-            ? L"unknown"
-            : (IsEqualGUID(key.desktopId, g_vd.lastKnownDesktop) ? L"YES" : L"no"));
-    report.Line(L"monitorId: %ls", key.monitor.deviceId.c_str());
-    report.Line(L"monitor:   %p", reinterpret_cast<void*>(resolvedMonitor));
-
-    MONITORINFOEXW monitorInfo{};
-    monitorInfo.cbSize = sizeof(monitorInfo);
-    if (resolvedMonitor && GetMonitorInfoW(
-            resolvedMonitor, reinterpret_cast<MONITORINFO*>(&monitorInfo))) {
-      report.Line(L"device:    %ls", monitorInfo.szDevice);
-      report.Line(L"monitorRect: %ls", DiagnosticRectString(monitorInfo.rcMonitor).c_str());
-      report.Line(L"systemWork:  %ls", DiagnosticRectString(monitorInfo.rcWork).c_str());
-      report.Line(L"monitorDpi:  %u", Platform::Monitors::GetMonitorEffectiveDpi(resolvedMonitor));
-      RECT configuredWork{};
-      if (Platform::Monitors::GetWorkspaceWorkArea(resolvedMonitor, &configuredWork)) {
-        report.Line(L"configuredWork: %ls", DiagnosticRectString(configuredWork).c_str());
-      }
-    } else {
-      report.Line(L"monitorInfo: <detached / currently unresolved>");
-    }
-
-    report.Line(
-        L"layout=%ls (%d) masterRatio=%.9g",
-        DiagnosticLayoutName(state.Layout()), static_cast<int>(state.Layout()),
-        state.MasterRatio());
-    report.Line(
-        L"counts: active=%zu records=%zu tiled=%zu suspended=%zu floating=%zu ignored=%zu",
-        state.ActiveCount(), state.Records().size(), workspaceTiled,
-        workspaceSuspended, workspaceFloating, workspaceIgnored);
-    report.Line(L"overflow: visibleTiled=%zu limit=%zu",
-                state.VisibleWindowCount(),
-                Placement::AutomaticWindowLimitForMonitor(key.monitor));
-    report.Line(L"pendingReinforcement=%d invariants=%ls",
-                pendingReinforcement ? 1 : 0,
-                invariantsValid ? L"PASS" : L"FAIL");
-    if (!invariantErrors.empty()) {
-      report.Line(L"invariantErrors:");
-      for (const std::wstring& error : invariantErrors) {
-        report.Line(L"  - %ls", error.c_str());
-      }
-    }
-    report.Line(
-        L"retainedFocus=%p tiledAdmissionAnchor=%p",
-        state.LastFocusedWindow(), state.LastFocusedTiledWindow());
-    report.Line(L"stackWeights: %ls", DiagnosticWeightsString(state.StackWeights()).c_str());
-    report.Line(L"gridWeights:  %ls", DiagnosticWeightsString(state.GridWeights()).c_str());
-    report.Line(
-        L"dwindlePreferredRatios: %ls",
-        DiagnosticWeightsString(state.DwindleRatios()).c_str());
-
-    struct LogicalRecordRef {
-      size_t logicalIndex;
-      HWND hwnd;
-      const WindowRecord* record;
-    };
-    std::vector<LogicalRecordRef> logicalRecords;
-    std::vector<std::pair<HWND, const WindowRecord*>> otherRecords;
-    logicalRecords.reserve(state.Records().size());
-    otherRecords.reserve(state.Records().size());
-
-    for (const auto& recordKv : state.Records()) {
-      const WindowRecord& record = recordKv.second;
-      size_t logicalIndex = DiagnosticLogicalIndex(state, recordKv.first, record);
-      if ((record.state == ManageState::Tiled || record.state == ManageState::Suspended) &&
-          logicalIndex != static_cast<size_t>(-1)) {
-        logicalRecords.push_back({logicalIndex, recordKv.first, &record});
-      } else {
-        otherRecords.push_back({recordKv.first, &record});
-      }
-    }
-
-    std::sort(
-        logicalRecords.begin(), logicalRecords.end(),
-        [](const LogicalRecordRef& a, const LogicalRecordRef& b) {
-          if (a.logicalIndex != b.logicalIndex) return a.logicalIndex < b.logicalIndex;
-          return reinterpret_cast<uintptr_t>(a.hwnd) < reinterpret_cast<uintptr_t>(b.hwnd);
-        });
-    std::sort(
-        otherRecords.begin(), otherRecords.end(),
-        [](const auto& a, const auto& b) {
-          if (a.second->state != b.second->state) {
-            return static_cast<int>(a.second->state) < static_cast<int>(b.second->state);
-          }
-          return reinterpret_cast<uintptr_t>(a.first) < reinterpret_cast<uintptr_t>(b.first);
-        });
-
-    report.Line(L"  logicalTiledOrder: %zu", logicalRecords.size());
-    if (logicalRecords.empty()) {
-      report.Line(L"    (none)");
-    } else {
-      for (size_t i = 0; i < logicalRecords.size(); ++i) {
-        DiagnosticRecordAudit audit = DiagnosticDumpWindowRecord(
-            report, state, logicalRecords[i].hwnd, *logicalRecords[i].record,
-            L"window", i);
-        deadRecords += audit.deadHwnd ? 1 : 0;
-        pidMismatches += audit.pidMismatch ? 1 : 0;
-        recordsWithPlacementFailures += audit.hasPlacementFailure ? 1 : 0;
-      }
-    }
-
-    report.Line(L"  nonLayoutRecords: %zu", otherRecords.size());
-    if (otherRecords.empty()) {
-      report.Line(L"    (none)");
-    } else {
-      for (size_t i = 0; i < otherRecords.size(); ++i) {
-        DiagnosticRecordAudit audit = DiagnosticDumpWindowRecord(
-            report, state, otherRecords[i].first, *otherRecords[i].second,
-            L"record", i);
-        deadRecords += audit.deadHwnd ? 1 : 0;
-        pidMismatches += audit.pidMismatch ? 1 : 0;
-        recordsWithPlacementFailures += audit.hasPlacementFailure ? 1 : 0;
-      }
+// One workspace: monitor, layout, weights, then every record in logical order
+// (tiled/suspended) followed by the rest. Adds any problems to `audit`.
+static void DumpWorkspace(
+    ReportBuilder& report, size_t workspaceIndex, size_t workspaceCount,
+    const DesktopMonitorKey& key, const Workspace& state, ReportWorkspaceAudit* audit) {
+  const std::wstring desktopId = DiagnosticGuidString(key.desktopId);
+  size_t workspaceTiled = 0, workspaceFloating = 0, workspaceSuspended = 0, workspaceIgnored = 0;
+  for (const auto& recordKv : state.Records()) {
+    switch (recordKv.second.state) {
+      case ManageState::Tiled: ++workspaceTiled; break;
+      case ManageState::Floating: ++workspaceFloating; break;
+      case ManageState::Suspended: ++workspaceSuspended; break;
+      case ManageState::Ignored: ++workspaceIgnored; break;
     }
   }
 
+  const HMONITOR resolvedMonitor = key.ResolveMonitor();
+  const bool pendingReinforcement = std::any_of(
+      g_wm.lifecycle.pendingArranges.begin(), g_wm.lifecycle.pendingArranges.end(),
+      [&](const PendingWorkspaceArrange& pending) {
+        return resolvedMonitor && pending.monitor == resolvedMonitor &&
+               IsEqualGUID(pending.desktopId, key.desktopId);
+      });
+  if (!resolvedMonitor) {
+    ++audit->staleMonitorWorkspaces;
+    audit->recordsOnStaleMonitorWorkspaces += state.RecordCount();
+    if (g_vd.lastKnownDesktopValid && IsEqualGUID(key.desktopId, g_vd.lastKnownDesktop)) {
+      audit->currentDesktopRecordsOnStaleMonitorWorkspaces += state.RecordCount();
+    }
+  }
+
+  std::vector<std::wstring> invariantErrors;
+  const bool invariantsValid = state.Validate(key, L"diagnostic report", &invariantErrors, false);
+  if (!invariantsValid) ++audit->invariantFailures;
+
+  report.Line();
+  report.Line(L"---------------- Workspace %zu / %zu ----------------", workspaceIndex + 1, workspaceCount);
+  report.Line(L"desktopId: %ls", desktopId.c_str());
+  report.Line(
+      L"currentDesktop: %ls",
+      !g_vd.lastKnownDesktopValid
+          ? L"unknown"
+          : (IsEqualGUID(key.desktopId, g_vd.lastKnownDesktop) ? L"YES" : L"no"));
+  report.Line(L"monitorId: %ls", key.monitor.deviceId.c_str());
+  report.Line(L"monitor:   %p", reinterpret_cast<void*>(resolvedMonitor));
+
+  MONITORINFOEXW monitorInfo{};
+  monitorInfo.cbSize = sizeof(monitorInfo);
+  if (resolvedMonitor && GetMonitorInfoW(resolvedMonitor, reinterpret_cast<MONITORINFO*>(&monitorInfo))) {
+    report.Line(L"device:    %ls", monitorInfo.szDevice);
+    report.Line(L"monitorRect: %ls", DiagnosticRectString(monitorInfo.rcMonitor).c_str());
+    report.Line(L"systemWork:  %ls", DiagnosticRectString(monitorInfo.rcWork).c_str());
+    report.Line(L"monitorDpi:  %u", Platform::Monitors::GetMonitorEffectiveDpi(resolvedMonitor));
+    RECT configuredWork{};
+    if (Platform::Monitors::GetWorkspaceWorkArea(resolvedMonitor, &configuredWork)) {
+      report.Line(L"configuredWork: %ls", DiagnosticRectString(configuredWork).c_str());
+    }
+  } else {
+    report.Line(L"monitorInfo: <detached / currently unresolved>");
+  }
+
+  report.Line(
+      L"layout=%ls (%d) masterRatio=%.9g",
+      DiagnosticLayoutName(state.Layout()), static_cast<int>(state.Layout()), state.MasterRatio());
+  report.Line(
+      L"counts: active=%zu records=%zu tiled=%zu suspended=%zu floating=%zu ignored=%zu",
+      state.ActiveCount(), state.Records().size(), workspaceTiled,
+      workspaceSuspended, workspaceFloating, workspaceIgnored);
+  report.Line(L"overflow: visibleTiled=%zu limit=%zu",
+              state.VisibleWindowCount(), Placement::AutomaticWindowLimitForMonitor(key.monitor));
+  report.Line(L"pendingReinforcement=%d invariants=%ls",
+              pendingReinforcement ? 1 : 0, invariantsValid ? L"PASS" : L"FAIL");
+  if (!invariantErrors.empty()) {
+    report.Line(L"invariantErrors:");
+    for (const std::wstring& error : invariantErrors) report.Line(L"  - %ls", error.c_str());
+  }
+  report.Line(L"retainedFocus=%p tiledAdmissionAnchor=%p",
+              state.LastFocusedWindow(), state.LastFocusedTiledWindow());
+  report.Line(L"stackWeights: %ls", DiagnosticWeightsString(state.StackWeights()).c_str());
+  report.Line(L"gridWeights:  %ls", DiagnosticWeightsString(state.GridWeights()).c_str());
+  report.Line(L"dwindlePreferredRatios: %ls", DiagnosticWeightsString(state.DwindleRatios()).c_str());
+
+  struct LogicalRecordRef {
+    size_t logicalIndex;
+    HWND hwnd;
+    const WindowRecord* record;
+  };
+  std::vector<LogicalRecordRef> logicalRecords;
+  std::vector<std::pair<HWND, const WindowRecord*>> otherRecords;
+  logicalRecords.reserve(state.Records().size());
+  otherRecords.reserve(state.Records().size());
+  for (const auto& recordKv : state.Records()) {
+    const WindowRecord& record = recordKv.second;
+    const size_t logicalIndex = DiagnosticLogicalIndex(state, recordKv.first, record);
+    if ((record.state == ManageState::Tiled || record.state == ManageState::Suspended) &&
+        logicalIndex != Workspace::kNotFound) {
+      logicalRecords.push_back({logicalIndex, recordKv.first, &record});
+    } else {
+      otherRecords.push_back({recordKv.first, &record});
+    }
+  }
+  std::sort(logicalRecords.begin(), logicalRecords.end(),
+            [](const LogicalRecordRef& a, const LogicalRecordRef& b) {
+              if (a.logicalIndex != b.logicalIndex) return a.logicalIndex < b.logicalIndex;
+              return reinterpret_cast<uintptr_t>(a.hwnd) < reinterpret_cast<uintptr_t>(b.hwnd);
+            });
+  std::sort(otherRecords.begin(), otherRecords.end(), [](const auto& a, const auto& b) {
+    if (a.second->state != b.second->state) {
+      return static_cast<int>(a.second->state) < static_cast<int>(b.second->state);
+    }
+    return reinterpret_cast<uintptr_t>(a.first) < reinterpret_cast<uintptr_t>(b.first);
+  });
+
+  auto dumpRecord = [&](HWND hwnd, const WindowRecord& record, const wchar_t* label, size_t index) {
+    const DiagnosticRecordAudit recordAudit = DiagnosticDumpWindowRecord(report, state, hwnd, record, label, index);
+    audit->deadRecords += recordAudit.deadHwnd ? 1 : 0;
+    audit->pidMismatches += recordAudit.pidMismatch ? 1 : 0;
+    audit->recordsWithPlacementFailures += recordAudit.hasPlacementFailure ? 1 : 0;
+  };
+  report.Line(L"  logicalTiledOrder: %zu", logicalRecords.size());
+  if (logicalRecords.empty()) report.Line(L"    (none)");
+  for (size_t i = 0; i < logicalRecords.size(); ++i) {
+    dumpRecord(logicalRecords[i].hwnd, *logicalRecords[i].record, L"window", i);
+  }
+  report.Line(L"  nonLayoutRecords: %zu", otherRecords.size());
+  if (otherRecords.empty()) report.Line(L"    (none)");
+  for (size_t i = 0; i < otherRecords.size(); ++i) {
+    dumpRecord(otherRecords[i].first, *otherRecords[i].second, L"record", i);
+  }
+}
+
+static void DumpPendingWork(ReportBuilder& report) {
   report.Section(L"Pending work");
   report.Line(L"automaticOverflow: routingReady=%d limit=%zu createDesktop=%d otherMonitors=%d pending=%zu follow=%p",
               Platform::WindowEvents::g_hooks.hideDestroy ? 1 : 0, g_settings.automaticWindowLimit,
               g_settings.overflowCreateDesktop ? 1 : 0, g_settings.overflowTryOtherMonitors ? 1 : 0,
-              g_wm.pendingWindowOverflow.size(), g_wm.pendingOverflowSwitch.hwnd);
-  if (g_wm.lifecycleDirtyWindows.empty()) {
+              g_wm.overflow.queue.size(), g_wm.overflow.follow.hwnd);
+  const auto& dirty = g_wm.lifecycle.dirtyWindows;
+  if (dirty.empty()) {
     report.Line(L"pendingLifecycleWindows: none");
   } else {
-    report.Line(L"pendingLifecycleWindows: %zu", g_wm.lifecycleDirtyWindows.size());
-    for (size_t i = 0; i < g_wm.lifecycleDirtyWindows.size(); ++i) {
-      report.Line(
-          L"  [%zu] hwnd=%p", i,
-          reinterpret_cast<void*>(g_wm.lifecycleDirtyWindows[i]));
+    report.Line(L"pendingLifecycleWindows: %zu", dirty.size());
+    for (size_t i = 0; i < dirty.size(); ++i) {
+      report.Line(L"  [%zu] hwnd=%p", i, reinterpret_cast<void*>(dirty[i]));
     }
   }
-
-  if (g_wm.pendingDesktopArranges.empty()) {
+  const auto& arranges = g_wm.lifecycle.pendingArranges;
+  if (arranges.empty()) {
     report.Line(L"pendingWorkspaceReinforcements: none");
   } else {
-    report.Line(
-        L"pendingWorkspaceReinforcements: %zu",
-        g_wm.pendingDesktopArranges.size());
-    for (size_t i = 0; i < g_wm.pendingDesktopArranges.size(); ++i) {
-      const std::wstring desktopId =
-          DiagnosticGuidString(g_wm.pendingDesktopArranges[i].desktopId);
-      report.Line(
-          L"  [%zu] desktopId=%ls monitor=%p", i, desktopId.c_str(),
-          reinterpret_cast<void*>(g_wm.pendingDesktopArranges[i].monitor));
+    report.Line(L"pendingWorkspaceReinforcements: %zu", arranges.size());
+    for (size_t i = 0; i < arranges.size(); ++i) {
+      const std::wstring desktopId = DiagnosticGuidString(arranges[i].desktopId);
+      report.Line(L"  [%zu] desktopId=%ls monitor=%p", i, desktopId.c_str(),
+                  reinterpret_cast<void*>(arranges[i].monitor));
     }
   }
+}
 
+// Cross-checks between counters that must add up. Prints one PASS/FAIL line per
+// check and returns true when all pass.
+static bool DumpTelemetryConsistency(ReportBuilder& report, const Counters& c) {
+  struct Check {
+    const wchar_t* label;
+    uint64_t actual;
+    uint64_t expected;
+    bool atMost;  // true: actual <= expected; false: actual == expected.
+  };
+  const Check checks[] = {
+      {L"lifecycle categories == lifecycle events",
+       c.lifecycleDestroy + c.lifecycleMinimizeStart + c.lifecycleMinimizeEnd + c.lifecycleStateChange +
+           c.lifecycleLocationChange + c.lifecycleHide + c.lifecycleShow + c.lifecycleCloaked +
+           c.lifecycleUncloaked,
+       c.lifecycleEventsProcessed, false},
+      {L"placement result sum == placement checks",
+       c.placementSuccess + c.placementSuppressedByPhysicalState + c.placementAdjusted +
+           c.placementAccessDenied + c.placementRefused + c.placementDead,
+       c.placementChecks, false},
+      {L"placement path sum == placement checks",
+       c.placementNoOps + c.placementPreflightStops + c.setWindowPosCalls, c.placementChecks, false},
+      {L"constraint probe results == attempts",
+       c.constraintProbeSuccesses + c.constraintProbeTimeouts + c.constraintProbeFailures,
+       c.constraintProbeAttempts, false},
+      {L"VD init successes + failures == attempts",
+       c.vdApiInitSuccesses + c.vdApiInitFailures, c.vdApiInitAttempts, false},
+      {L"VD notification successes + failures == attempts",
+       c.vdNotificationRegisterSuccesses + c.vdNotificationRegisterFailures,
+       c.vdNotificationRegisterAttempts, false},
+      {L"prior report results == measured diagnostic attempts",
+       c.reportsWritten + c.reportWriteFailures, g_runtime.lifetimeDiagnosticCost.attempts, false},
+      {L"classified gestures <= move/size end messages",
+       c.userMoveGestures + c.userResizeGestures + c.userNoopGestures, c.moveSizeEndMessages, true},
+  };
+  report.Line();
+  report.Line(L"Telemetry consistency:");
+  bool allPass = true;
+  for (const Check& check : checks) {
+    const bool pass = check.atMost ? check.actual <= check.expected : check.actual == check.expected;
+    allPass = allPass && pass;
+    report.Line(L"  %ls: %ls (%llu %ls %llu)", check.label, pass ? L"PASS" : L"FAIL",
+                static_cast<unsigned long long>(check.actual), check.atMost ? L"<=" : L"==",
+                static_cast<unsigned long long>(check.expected));
+  }
+  return allPass;
+}
+
+static void DumpAuditSummary(
+    ReportBuilder& report, const ReportOwnershipSummary& summary, const ReportWorkspaceAudit& audit,
+    const Counters& counters) {
   report.Section(L"Audit summary");
-  report.Line(L"Workspace invariant failures: %zu", invariantFailures);
-  report.Line(L"Duplicate-owned HWNDs:        %zu", duplicateOwners);
-  report.Line(L"Ownership-index mismatches:   %zu", ownershipIndexMismatches);
-  report.Line(L"Dead HWND records:            %zu", deadRecords);
-  report.Line(L"Live PID mismatches:           %zu", pidMismatches);
-  report.Line(L"Records with placement issue:  %zu", recordsWithPlacementFailures);
-
-  const uint64_t lifecycleCategorySum =
-      counters.lifecycleDestroy + counters.lifecycleMinimizeStart +
-      counters.lifecycleMinimizeEnd + counters.lifecycleStateChange +
-      counters.lifecycleLocationChange + counters.lifecycleHide +
-      counters.lifecycleShow + counters.lifecycleCloaked +
-      counters.lifecycleUncloaked;
-  const uint64_t placementResultSum =
-      counters.placementSuccess +
-      counters.placementSuppressedByPhysicalState +
-      counters.placementAdjusted + counters.placementAccessDenied +
-      counters.placementRefused + counters.placementDead;
-  const uint64_t placementPathSum =
-      counters.placementNoOps + counters.placementPreflightStops +
-      counters.setWindowPosCalls;
-  const uint64_t constraintProbeResultSum =
-      counters.constraintProbeSuccesses + counters.constraintProbeTimeouts +
-      counters.constraintProbeFailures;
-  const uint64_t vdInitResultSum =
-      counters.vdApiInitSuccesses + counters.vdApiInitFailures;
-  const uint64_t vdNotificationResultSum =
-      counters.vdNotificationRegisterSuccesses +
-      counters.vdNotificationRegisterFailures;
-  const uint64_t priorReportResultSum =
-      counters.reportsWritten + counters.reportWriteFailures;
-  const uint64_t classifiedGestureSum =
-      counters.userMoveGestures + counters.userResizeGestures +
-      counters.userNoopGestures;
-
-  const bool lifecycleAccountingOk =
-      lifecycleCategorySum == counters.lifecycleEventsProcessed;
-  const bool placementResultsOk =
-      placementResultSum == counters.placementChecks;
-  const bool placementPathsOk =
-      placementPathSum == counters.placementChecks;
-  const bool constraintProbeAccountingOk =
-      constraintProbeResultSum == counters.constraintProbeAttempts;
-  const bool vdInitAccountingOk =
-      vdInitResultSum == counters.vdApiInitAttempts;
-  const bool vdNotificationAccountingOk =
-      vdNotificationResultSum == counters.vdNotificationRegisterAttempts;
-  const bool reportAccountingOk =
-      priorReportResultSum == g_runtime.lifetimeDiagnosticCost.attempts;
-  const bool gestureAccountingOk =
-      classifiedGestureSum <= counters.moveSizeEndMessages;
-
+  report.Line(L"Workspace invariant failures: %zu", audit.invariantFailures);
+  report.Line(L"Duplicate-owned HWNDs:        %zu", summary.duplicateOwners);
+  report.Line(L"Ownership-index mismatches:   %zu", summary.ownershipIndexMismatches);
+  report.Line(L"Dead HWND records:            %zu", audit.deadRecords);
+  report.Line(L"Live PID mismatches:           %zu", audit.pidMismatches);
+  report.Line(L"Records with placement issue:  %zu", audit.recordsWithPlacementFailures);
   report.Line();
   report.Line(
       L"Detached/unresolved monitor workspaces: %zu (records attached: %zu; current-desktop records: %zu)",
-      staleMonitorWorkspaces, recordsOnStaleMonitorWorkspaces,
-      currentDesktopRecordsOnStaleMonitorWorkspaces);
+      audit.staleMonitorWorkspaces, audit.recordsOnStaleMonitorWorkspaces,
+      audit.currentDesktopRecordsOnStaleMonitorWorkspaces);
+  const bool telemetryHealthy = DumpTelemetryConsistency(report, counters);
 
-  report.Line();
-  report.Line(L"Telemetry consistency:");
-  report.Line(
-      L"  lifecycle categories == lifecycle events: %ls (%llu == %llu)",
-      lifecycleAccountingOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(lifecycleCategorySum),
-      static_cast<unsigned long long>(counters.lifecycleEventsProcessed));
-  report.Line(
-      L"  placement result sum == placement checks: %ls (%llu == %llu)",
-      placementResultsOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(placementResultSum),
-      static_cast<unsigned long long>(counters.placementChecks));
-  report.Line(
-      L"  placement path sum == placement checks: %ls (%llu == %llu)",
-      placementPathsOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(placementPathSum),
-      static_cast<unsigned long long>(counters.placementChecks));
-  report.Line(
-      L"  constraint probe results == attempts: %ls (%llu == %llu)",
-      constraintProbeAccountingOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(constraintProbeResultSum),
-      static_cast<unsigned long long>(counters.constraintProbeAttempts));
-  report.Line(
-      L"  VD init successes + failures == attempts: %ls (%llu == %llu)",
-      vdInitAccountingOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(vdInitResultSum),
-      static_cast<unsigned long long>(counters.vdApiInitAttempts));
-  report.Line(
-      L"  VD notification successes + failures == attempts: %ls (%llu == %llu)",
-      vdNotificationAccountingOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(vdNotificationResultSum),
-      static_cast<unsigned long long>(counters.vdNotificationRegisterAttempts));
-  report.Line(
-      L"  prior report results == measured diagnostic attempts: %ls (%llu == %llu)",
-      reportAccountingOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(priorReportResultSum),
-      static_cast<unsigned long long>(
-          g_runtime.lifetimeDiagnosticCost.attempts));
-  report.Line(
-      L"  classified gestures <= move/size end messages: %ls (%llu <= %llu)",
-      gestureAccountingOk ? L"PASS" : L"FAIL",
-      static_cast<unsigned long long>(classifiedGestureSum),
-      static_cast<unsigned long long>(counters.moveSizeEndMessages));
-
-  const bool allWinEventHooks = Platform::WindowEvents::AllWinEventHooksInstalled();
-  DWORD auditShellPid = 0;
-  HWND auditShell = GetShellWindow();
-  if (auditShell && IsWindow(auditShell)) {
-    GetWindowThreadProcessId(auditShell, &auditShellPid);
-  }
-  const bool shellBindingHealthy =
-      !g_vd.initialized ||
-      (auditShellPid != 0 && g_vd.shellPid == auditShellPid);
+  DWORD shellPid = 0;
+  const HWND shell = GetShellWindow();
+  if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &shellPid);
+  const bool shellBindingHealthy = !g_vd.initialized || (shellPid != 0 && g_vd.shellPid == shellPid);
   const bool vdCoreHealthy = g_vd.initialized && g_vd.abiResolved;
-  const bool vdNotificationsHealthy =
-      g_vd.abi.notification.methodCount <= 0 || g_vd.notificationsRegistered;
-  const bool currentDesktopHealthy =
-      !g_vd.initialized || g_vd.lastKnownDesktopValid;
+  const bool vdNotificationsHealthy = g_vd.abi.notification.methodCount <= 0 || g_vd.notificationsRegistered;
+  const bool currentDesktopHealthy = !g_vd.initialized || g_vd.lastKnownDesktopValid;
 
   const bool structuralHealthy =
-      invariantFailures == 0 && duplicateOwners == 0 &&
-      ownershipIndexMismatches == 0;
+      audit.invariantFailures == 0 && summary.duplicateOwners == 0 && summary.ownershipIndexMismatches == 0;
   const bool runtimeWindowHealthy =
-      deadRecords == 0 && pidMismatches == 0 &&
-      recordsWithPlacementFailures == 0 &&
-      currentDesktopRecordsOnStaleMonitorWorkspaces == 0 && allWinEventHooks &&
-      shellBindingHealthy && vdCoreHealthy && vdNotificationsHealthy &&
-      currentDesktopHealthy;
-  const bool telemetryHealthy =
-      lifecycleAccountingOk && placementResultsOk && placementPathsOk &&
-      constraintProbeAccountingOk && vdInitAccountingOk &&
-      vdNotificationAccountingOk && reportAccountingOk && gestureAccountingOk;
-  const bool overallHealthy =
-      structuralHealthy && runtimeWindowHealthy && telemetryHealthy;
-
+      audit.deadRecords == 0 && audit.pidMismatches == 0 && audit.recordsWithPlacementFailures == 0 &&
+      audit.currentDesktopRecordsOnStaleMonitorWorkspaces == 0 &&
+      Platform::WindowEvents::AllWinEventHooksInstalled() && shellBindingHealthy && vdCoreHealthy &&
+      vdNotificationsHealthy && currentDesktopHealthy;
+  const bool overallHealthy = structuralHealthy && runtimeWindowHealthy && telemetryHealthy;
+  auto verdict = [](bool healthy) { return healthy ? L"PASS" : L"REVIEW NEEDED"; };
   report.Line();
-  report.Line(
-      L"Model structural audit:       %ls",
-      structuralHealthy ? L"PASS" : L"REVIEW NEEDED");
-  report.Line(
-      L"Runtime / window health:      %ls",
-      runtimeWindowHealthy ? L"PASS" : L"REVIEW NEEDED");
-  report.Line(
-      L"Telemetry accounting audit:   %ls",
-      telemetryHealthy ? L"PASS" : L"REVIEW NEEDED");
-  report.Line(
-      L"Overall diagnostic status:    %ls",
-      overallHealthy ? L"PASS" : L"REVIEW NEEDED");
+  report.Line(L"Model structural audit:       %ls", verdict(structuralHealthy));
+  report.Line(L"Runtime / window health:      %ls", verdict(runtimeWindowHealthy));
+  report.Line(L"Telemetry accounting audit:   %ls", verdict(telemetryHealthy));
+  report.Line(L"Overall diagnostic status:    %ls", verdict(overallHealthy));
+}
 
+// How much the diagnostic reports themselves have cost, so they can be ruled
+// out as a source of load.
+static void DumpReportSelfCost(
+    ReportBuilder& report, ULONGLONG reportStartTickMs, const DiagnosticCpuSnapshot& reportStartCpu) {
   const ULONGLONG buildEndTickMs = GetTickCount64();
   const DiagnosticCpuSnapshot buildEndCpu = CaptureDiagnosticCpuSnapshot();
   const ULONGLONG currentBuildWallMs =
-      buildEndTickMs >= reportStartTickMs
-          ? buildEndTickMs - reportStartTickMs
-          : 0;
+      buildEndTickMs >= reportStartTickMs ? buildEndTickMs - reportStartTickMs : 0;
   const uint64_t currentBuildProcessCpu100ns =
       reportStartCpu.processAvailable && buildEndCpu.processAvailable
-          ? DiagnosticCpuDelta100ns(
-                buildEndCpu.ProcessTotal100ns(),
-                reportStartCpu.ProcessTotal100ns())
+          ? DiagnosticCpuDelta100ns(buildEndCpu.ProcessTotal100ns(), reportStartCpu.ProcessTotal100ns())
           : 0;
   const uint64_t currentBuildWmCpu100ns =
       reportStartCpu.wmAvailable && buildEndCpu.wmAvailable
-          ? DiagnosticCpuDelta100ns(
-                buildEndCpu.WmTotal100ns(), reportStartCpu.WmTotal100ns())
+          ? DiagnosticCpuDelta100ns(buildEndCpu.WmTotal100ns(), reportStartCpu.WmTotal100ns())
           : 0;
+  auto duration = [](ULONGLONG ms) { return DiagnosticDurationString(ms); };
+  const DiagnosticCost& lifetime = g_runtime.lifetimeDiagnosticCost;
 
   report.Section(L"Diagnostic reporting self-cost");
-  report.Line(
-      L"Prior diagnostic attempts: %llu lifetime, %llu current WM session",
-      static_cast<unsigned long long>(
-          g_runtime.lifetimeDiagnosticCost.attempts),
-      static_cast<unsigned long long>(
-          g_runtime.wmSessionDiagnosticCost.attempts));
+  report.Line(L"Prior diagnostic attempts: %llu lifetime, %llu current WM session",
+              static_cast<unsigned long long>(lifetime.attempts),
+              static_cast<unsigned long long>(g_runtime.wmSessionDiagnosticCost.attempts));
   report.Line(
       L"Prior completed diagnostic cost (includes file writes): wall=%ls processCPU=%ls wmCPU=%ls",
-      DiagnosticDurationString(
-          g_runtime.lifetimeDiagnosticCost.wallMs).c_str(),
-      DiagnosticDurationString(
-          Diagnostic100nsToMilliseconds(
-              g_runtime.lifetimeDiagnosticCost.processCpu100ns)).c_str(),
-      DiagnosticDurationString(
-          Diagnostic100nsToMilliseconds(
-              g_runtime.lifetimeDiagnosticCost.wmCpu100ns)).c_str());
+      duration(lifetime.wallMs).c_str(),
+      duration(Diagnostic100nsToMilliseconds(lifetime.processCpu100ns)).c_str(),
+      duration(Diagnostic100nsToMilliseconds(lifetime.wmCpu100ns)).c_str());
   report.Line(
       L"Current report construction so far (file write excluded): wall=%ls processCPU=%ls wmCPU=%ls",
-      DiagnosticDurationString(currentBuildWallMs).c_str(),
-      DiagnosticDurationString(
-          Diagnostic100nsToMilliseconds(currentBuildProcessCpu100ns)).c_str(),
-      DiagnosticDurationString(
-          Diagnostic100nsToMilliseconds(currentBuildWmCpu100ns)).c_str());
-  report.Line(
-      L"Note: the next report's prior-cost totals include this report's final file-write cost.");
+      duration(currentBuildWallMs).c_str(),
+      duration(Diagnostic100nsToMilliseconds(currentBuildProcessCpu100ns)).c_str(),
+      duration(Diagnostic100nsToMilliseconds(currentBuildWmCpu100ns)).c_str());
+  report.Line(L"Note: the next report's prior-cost totals include this report's final file-write cost.");
+}
 
+// Writes a full diagnostic report to the configured folder (hotkey command).
+// Reads model/runtime state only; on success updates the "since last report"
+// baselines. WM thread only.
+static void WriteDiagnosticReport() {
+  InitializeProcessRuntime();
+  const ULONGLONG reportStartTickMs = GetTickCount64();
+  const DiagnosticCpuSnapshot reportStartCpu = CaptureDiagnosticCpuSnapshot();
+  ReportTiming timing;
+  timing.now = reportStartTickMs;
+  timing.uptimeMs = timing.now - g_runtime.processStartedTickMs;
+  timing.wmSessionMs = g_runtime.wmSessionStartedTickMs ? timing.now - g_runtime.wmSessionStartedTickMs : 0;
+  timing.intervalMs = g_runtime.lastReportTickMs ? timing.now - g_runtime.lastReportTickMs : timing.uptimeMs;
+  const Counters counters = g_runtime.counters;
+  const Counters previous = g_runtime.lastReportCounters;
+  const uint64_t reportSequence = g_runtime.reportSequence + 1;
+
+  std::vector<std::pair<DesktopMonitorKey, Workspace>> workspaces = g_workspaces.Snapshot();
+  const auto ownershipIndex = g_workspaces.OwnershipIndexSnapshot();
+  std::sort(workspaces.begin(), workspaces.end(), [](const auto& a, const auto& b) {
+    const std::wstring aDesktop = DiagnosticGuidString(a.first.desktopId);
+    const std::wstring bDesktop = DiagnosticGuidString(b.first.desktopId);
+    if (aDesktop != bDesktop) return aDesktop < bDesktop;
+    return a.first.monitor.deviceId < b.first.monitor.deviceId;
+  });
+  const ReportOwnershipSummary summary = SummarizeOwnership(workspaces, ownershipIndex);
+
+  ReportBuilder report;
+  DumpReportHeader(report, reportSequence, timing);
+  DumpRuntimeSummary(report, workspaces.size(), ownershipIndex.size(), summary, counters);
+  DumpConfigurationSnapshot(report);
+  report.Section(L"Platform / hook health");
+  DumpPlatformHealth(report);
+  DumpPerformanceSection(report, timing, reportStartCpu, counters, previous);
+  DumpRecentHistory(report, timing.now);
+
+  report.Section(L"Workspace / window state");
+  ReportWorkspaceAudit audit;
+  for (size_t i = 0; i < workspaces.size(); ++i) {
+    DumpWorkspace(report, i, workspaces.size(), workspaces[i].first, workspaces[i].second, &audit);
+  }
+  DumpPendingWork(report);
+  DumpAuditSummary(report, summary, audit, counters);
+  DumpReportSelfCost(report, reportStartTickMs, reportStartCpu);
   report.Line();
   report.Line(L"========================== END REPORT ==========================");
 
@@ -1608,9 +1531,8 @@ static void WriteDiagnosticReport() {
   DWORD writeError = ERROR_SUCCESS;
   if (!WriteReportToConfiguredDirectory(report.Text(), &outputPath, &writeError)) {
     ++g_runtime.counters.reportWriteFailures;
-    Wh_Log(
-        L"Failed to write diagnostic report to '%ls' (error=%lu)",
-        g_settings.diagnosticsOutputPath.c_str(), writeError);
+    Wh_Log(L"Failed to write diagnostic report to '%ls' (error=%lu)",
+           g_settings.diagnosticsOutputPath.c_str(), writeError);
     RecordEvent(L"diagnostic report write failed error=%lu", writeError);
     AccumulateDiagnosticSelfCost(reportStartTickMs, reportStartCpu);
     return;
@@ -1629,6 +1551,5 @@ static void WriteDiagnosticReport() {
   // report-generation time is not charged to the next "since dump" period.
   g_runtime.lastReportTickMs = GetTickCount64();
 }
-
 }  // namespace Diagnostics
 

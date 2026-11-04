@@ -42,8 +42,8 @@ static bool ValidateSnapshotDesktop(const GUID& expectedDesktop) {
       IsEqualGUID(currentDesktop, expectedDesktop)) {
     return true;
   }
-  if (g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown) {
-    g_wm.reconciledDesktopState = ReconciledDesktopState::TransitionPending;
+  if (g_wm.desktop.state != ReconciledDesktopState::Unknown) {
+    g_wm.desktop.state = ReconciledDesktopState::TransitionPending;
   }
   Diagnostics::RecordEvent(
       L"desktop snapshot deferred expected=%08X observed=%08X",
@@ -768,12 +768,12 @@ static void AddPendingWorkspaceArrange(const GUID& desktopId, HMONITOR monitor) 
   if (!Platform::Monitors::IsLiveMonitorHandle(monitor)) return;
   // Only if not scheduled already
   auto it = std::find_if(
-      g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
+      g_wm.lifecycle.pendingArranges.begin(), g_wm.lifecycle.pendingArranges.end(),
       [&](const PendingWorkspaceArrange& pending) {
         return pending.monitor == monitor && IsEqualGUID(pending.desktopId, desktopId);
       });
-  if (it == g_wm.pendingDesktopArranges.end()) {
-    g_wm.pendingDesktopArranges.push_back({desktopId, monitor});
+  if (it == g_wm.lifecycle.pendingArranges.end()) {
+    g_wm.lifecycle.pendingArranges.push_back({desktopId, monitor});
   }
 }
 
@@ -1039,8 +1039,8 @@ static void HandleVirtualDesktopChanged() {
   Diagnostics::RecordEvent(
       L"virtual desktop changed currentDesktop=%08X", currentDesktop.Data1);
   const bool desktopActuallyChanged =
-      g_wm.reconciledDesktopState == ReconciledDesktopState::Unknown ||
-      !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
+      g_wm.desktop.state == ReconciledDesktopState::Unknown ||
+      !IsEqualGUID(g_wm.desktop.reconciled, currentDesktop);
   if (desktopActuallyChanged) {
     // A lease describes post-placement behavior on one active desktop. Never carry
     // it across DWM's cloak/uncloak transition; the incoming settled arrange pass
@@ -1048,13 +1048,13 @@ static void HandleVirtualDesktopChanged() {
     Placement::ClearAllConformanceLeases();
     Placement::ScheduleNextConformanceTimer();
   }
-  g_wm.reconciledDesktop = currentDesktop;
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  g_wm.desktop.reconciled = currentDesktop;
+  g_wm.desktop.state = ReconciledDesktopState::Settled;
   // The visual transition belongs to the settled desktop state, not the raw COM
   // callback. Coalesce rapid switches and emit one monitor-local OSD per connected
   // display after reconciliation has finished. Duplicate callbacks for the already
   // represented desktop do not generate another visual transition.
-  if (desktopActuallyChanged) g_wm.pendingDesktopSwitchFlyouts = true;
+  if (desktopActuallyChanged) g_wm.desktop.pendingSwitchFlyouts = true;
 
   // A native VD transition is an authoritative reason to repair desktop ownership.
   // Do not infer monitor migration here; defer visibility/window-state participation
@@ -1104,19 +1104,19 @@ static void HandleVirtualDesktopChanged() {
 static void ScheduleLifecycleReconcile(HWND hwnd) {
   ++Diagnostics::g_runtime.counters.lifecycleScheduleRequests;
   // HotkeyThreadProc owns this vector/timer; no additional lock is required.
-  if (hwnd && std::find(g_wm.lifecycleDirtyWindows.begin(), g_wm.lifecycleDirtyWindows.end(), hwnd) ==
-                  g_wm.lifecycleDirtyWindows.end()) {
-    g_wm.lifecycleDirtyWindows.push_back(hwnd);
+  if (hwnd && std::find(g_wm.lifecycle.dirtyWindows.begin(), g_wm.lifecycle.dirtyWindows.end(), hwnd) ==
+                  g_wm.lifecycle.dirtyWindows.end()) {
+    g_wm.lifecycle.dirtyWindows.push_back(hwnd);
   }
 
-  if (g_wm.lifecycleTimer) {
+  if (g_wm.timers.lifecycle) {
     ++Diagnostics::g_runtime.counters.lifecycleTimerResets;
-    KillTimer(nullptr, g_wm.lifecycleTimer);
-    g_wm.lifecycleTimer = 0;
+    KillTimer(nullptr, g_wm.timers.lifecycle);
+    g_wm.timers.lifecycle = 0;
   }
 
-  g_wm.lifecycleTimer = SetTimer(nullptr, 0, g_settings.reconcileDelayMs, nullptr);
-  if (!g_wm.lifecycleTimer) {
+  g_wm.timers.lifecycle = SetTimer(nullptr, 0, g_settings.reconcileDelayMs, nullptr);
+  if (!g_wm.timers.lifecycle) {
     Wh_Log(L"Failed to schedule lifecycle timer; queueing immediate reconciliation");
     const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
     if (threadId) {
@@ -1126,24 +1126,24 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
 }
 
 static void ScheduleNextDiscoveryRetryTimer() {
-  if (g_wm.discoveryRetryTimer) {
-    KillTimer(nullptr, g_wm.discoveryRetryTimer);
-    g_wm.discoveryRetryTimer = 0;
+  if (g_wm.timers.discoveryRetry) {
+    KillTimer(nullptr, g_wm.timers.discoveryRetry);
+    g_wm.timers.discoveryRetry = 0;
   }
-  if (g_wm.pendingDiscoveryRetries.empty()) return;
+  if (g_wm.lifecycle.discoveryRetries.empty()) return;
 
   const ULONGLONG now = GetTickCount64();
-  ULONGLONG earliestDue = g_wm.pendingDiscoveryRetries.front().dueTickMs;
-  for (const auto& pending : g_wm.pendingDiscoveryRetries) {
+  ULONGLONG earliestDue = g_wm.lifecycle.discoveryRetries.front().dueTickMs;
+  for (const auto& pending : g_wm.lifecycle.discoveryRetries) {
     earliestDue = std::min(earliestDue, pending.dueTickMs);
   }
   const UINT delayMs = earliestDue > now
                            ? static_cast<UINT>(earliestDue - now)
                            : 1;
-  g_wm.discoveryRetryTimer = SetTimer(nullptr, 0, delayMs, nullptr);
-  if (!g_wm.discoveryRetryTimer) {
+  g_wm.timers.discoveryRetry = SetTimer(nullptr, 0, delayMs, nullptr);
+  if (!g_wm.timers.discoveryRetry) {
     Wh_Log(L"Failed to schedule slow-application discovery timer");
-    g_wm.pendingDiscoveryRetries.clear();
+    g_wm.lifecycle.discoveryRetries.clear();
   }
 }
 
@@ -1151,27 +1151,27 @@ static void ScheduleNextDiscoveryRetryTimer() {
 // ArrangeWorkspace establishes any needed post-placement conformance lease.
 static void ProcessDiscoveryRetryTimer() {
   RuntimeLifecycle::AssertWmThread(L"ProcessDiscoveryRetryTimer");
-  if (g_wm.discoveryRetryTimer) {
-    KillTimer(nullptr, g_wm.discoveryRetryTimer);
-    g_wm.discoveryRetryTimer = 0;
+  if (g_wm.timers.discoveryRetry) {
+    KillTimer(nullptr, g_wm.timers.discoveryRetry);
+    g_wm.timers.discoveryRetry = 0;
   }
-  if (!RuntimeLifecycle::IsAutomaticMode() && !g_wm.windowRoutingReady) {
-    g_wm.pendingDiscoveryRetries.clear();
+  if (!RuntimeLifecycle::IsAutomaticMode() && !g_wm.routing.ready) {
+    g_wm.lifecycle.discoveryRetries.clear();
     return;
   }
 
   const ULONGLONG now = GetTickCount64();
   std::vector<PendingDiscoveryRetry> due;
-  g_wm.pendingDiscoveryRetries.erase(
+  g_wm.lifecycle.discoveryRetries.erase(
       std::remove_if(
-          g_wm.pendingDiscoveryRetries.begin(),
-          g_wm.pendingDiscoveryRetries.end(),
+          g_wm.lifecycle.discoveryRetries.begin(),
+          g_wm.lifecycle.discoveryRetries.end(),
           [&](const PendingDiscoveryRetry& pending) {
             if (pending.dueTickMs > now) return false;
             due.push_back(pending);
             return true;
           }),
-      g_wm.pendingDiscoveryRetries.end());
+      g_wm.lifecycle.discoveryRetries.end());
   ScheduleNextDiscoveryRetryTimer();
 
   std::vector<HMONITOR> monitors;
@@ -1186,7 +1186,7 @@ static void ProcessDiscoveryRetryTimer() {
   }
   RouteNewWindows(monitors);
   for (HMONITOR monitor : monitors) DiscoverCurrentWorkspaceOnMonitor(monitor);
-  if (!g_wm.pendingWindowOverflow.empty()) ScheduleLifecycleReconcile(nullptr);
+  if (!g_wm.overflow.queue.empty()) ScheduleLifecycleReconcile(nullptr);
 }
 
 // --- Settled lifecycle pass: stages ------------------------------------------
@@ -1194,8 +1194,8 @@ static void ProcessDiscoveryRetryTimer() {
 // Puts dirty windows back so the next pass handles them again (no duplicates).
 static void RequeueDirtyWindows(const std::vector<HWND>& dirtyWindows) {
   for (HWND hwnd : dirtyWindows) {
-    if (hwnd && !Model::ContainsWindow(g_wm.lifecycleDirtyWindows, hwnd)) {
-      g_wm.lifecycleDirtyWindows.push_back(hwnd);
+    if (hwnd && !Model::ContainsWindow(g_wm.lifecycle.dirtyWindows, hwnd)) {
+      g_wm.lifecycle.dirtyWindows.push_back(hwnd);
     }
   }
 }
@@ -1216,7 +1216,7 @@ static void HandleMissedDesktopSwitch(const GUID& currentDesktop) {
   if (g_vd.abi.notification.methodCount > 0 && !g_vd.notificationsRegistered) {
     RuntimeLifecycle::RequestMaintenance(true);
   }
-  g_wm.pendingDesktopSwitchFlyouts = true;
+  g_wm.desktop.pendingSwitchFlyouts = true;
 }
 
 // Chooses the monitors this pass must discover on. After a desktop switch or a
@@ -1228,7 +1228,7 @@ static std::vector<HMONITOR> CollectMonitorsForPass(
     const GUID& currentDesktop, bool desktopSwitched, const std::vector<HWND>& dirtyWindows,
     std::vector<DesktopMonitorKey>* globallyChanged) {
   std::vector<HMONITOR> monitors;
-  if (desktopSwitched || g_wm.forceMonitorReconcile) {
+  if (desktopSwitched || g_wm.lifecycle.forceMonitorReconcile) {
     // Authoritative desktop/topology passes derive their boundary set from the OS,
     // not from whatever workspace keys happened to exist before the transition.
     EnumerateCurrentMonitors(monitors);
@@ -1242,9 +1242,9 @@ static std::vector<HMONITOR> CollectMonitorsForPass(
     monitors = g_workspaces.MonitorsOnDesktop(currentDesktop);
   }
 
-  if (g_wm.forceMonitorReconcile) {
+  if (g_wm.lifecycle.forceMonitorReconcile) {
     ReconcileKnownWindows(ReconcileScope::Monitor, globallyChanged);
-    g_wm.forceMonitorReconcile = false;
+    g_wm.lifecycle.forceMonitorReconcile = false;
   }
 
   for (HWND hwnd : dirtyWindows) {
@@ -1271,7 +1271,7 @@ static std::vector<DesktopMonitorKey> DiscoverAndArrangeMonitors(
         monitor, currentDesktop, snapshots[monitorIndex], &suspendedSnapshots[monitorIndex]);
     for (const auto& key : discovery.ownershipChanges) AddUniqueWorkspaceKey(*globallyChanged, key);
     const bool pendingArrange = std::any_of(
-        g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
+        g_wm.lifecycle.pendingArranges.begin(), g_wm.lifecycle.pendingArranges.end(),
         [&](const PendingWorkspaceArrange& pending) {
           return pending.monitor == monitor && IsEqualGUID(pending.desktopId, currentDesktop);
         });
@@ -1288,7 +1288,7 @@ static std::vector<DesktopMonitorKey> DiscoverAndArrangeMonitors(
 // application initialization or shell desktop registration. Give it one
 // independent re-observation after SlowApplicationDelayMs, without polling.
 static void ScheduleDiscoveryRetries(const std::vector<HWND>& dirtyWindows) {
-  if (!(RuntimeLifecycle::IsAutomaticMode() || g_wm.windowRoutingReady) ||
+  if (!(RuntimeLifecycle::IsAutomaticMode() || g_wm.routing.ready) ||
       !g_settings.slowApplicationDelayMs) {
     return;
   }
@@ -1296,7 +1296,7 @@ static void ScheduleDiscoveryRetries(const std::vector<HWND>& dirtyWindows) {
   const ULONGLONG dueTickMs = GetTickCount64() + g_settings.slowApplicationDelayMs;
   for (HWND hwnd : dirtyWindows) {
     if (!hwnd || !IsWindow(hwnd) || Platform::Windows::IsWindowTrackedInAnyState(hwnd) ||
-        !(RuntimeLifecycle::IsAutomaticMode() || !g_wm.windowRoutingEvaluated.count(hwnd)) ||
+        !(RuntimeLifecycle::IsAutomaticMode() || !g_wm.routing.evaluated.count(hwnd)) ||
         Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
         GetAncestor(hwnd, GA_ROOT) != hwnd) {
       continue;
@@ -1306,13 +1306,13 @@ static void ScheduleDiscoveryRetries(const std::vector<HWND>& dirtyWindows) {
     if (!processId) continue;
 
     auto existing = std::find_if(
-        g_wm.pendingDiscoveryRetries.begin(), g_wm.pendingDiscoveryRetries.end(),
+        g_wm.lifecycle.discoveryRetries.begin(), g_wm.lifecycle.discoveryRetries.end(),
         [&](const PendingDiscoveryRetry& pending) { return pending.hwnd == hwnd; });
-    if (existing != g_wm.pendingDiscoveryRetries.end()) {
+    if (existing != g_wm.lifecycle.discoveryRetries.end()) {
       if (existing->processId == processId) continue;
       *existing = {hwnd, processId, dueTickMs};
     } else {
-      g_wm.pendingDiscoveryRetries.push_back({hwnd, processId, dueTickMs});
+      g_wm.lifecycle.discoveryRetries.push_back({hwnd, processId, dueTickMs});
     }
     addedRetry = true;
   }
@@ -1327,14 +1327,14 @@ static void ScheduleDiscoveryRetries(const std::vector<HWND>& dirtyWindows) {
 // work; nothing it already committed is lost. WM thread only.
 static void ReconcileDeferredLifecycle() {
   ++Diagnostics::g_runtime.counters.lifecycleReconciles;
-  if (g_wm.lifecycleTimer) {
-    KillTimer(nullptr, g_wm.lifecycleTimer);
-    g_wm.lifecycleTimer = 0;
+  if (g_wm.timers.lifecycle) {
+    KillTimer(nullptr, g_wm.timers.lifecycle);
+    g_wm.timers.lifecycle = 0;
   }
 
   std::vector<HWND> dirtyWindows;
-  dirtyWindows.swap(g_wm.lifecycleDirtyWindows);
-  Diagnostics::RecordLifecycleBurst(dirtyWindows.size(), g_wm.pendingDesktopArranges.size());
+  dirtyWindows.swap(g_wm.lifecycle.dirtyWindows);
+  Diagnostics::RecordLifecycleBurst(dirtyWindows.size(), g_wm.lifecycle.pendingArranges.size());
 
   // 1. Resolve desktop identity before mutating model state. If Explorer is still
   // coming up (or restarting), preserve the dirty set and let the single runtime
@@ -1343,7 +1343,7 @@ static void ReconcileDeferredLifecycle() {
   if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI() ||
       !Platform::VirtualDesktop::GetCurrentDesktopId(&currentDesktop)) {
     RequeueDirtyWindows(dirtyWindows);
-    g_wm.lifecycleRetryAfterPlatformRecovery = true;
+    g_wm.lifecycle.retryAfterPlatformRecovery = true;
     RuntimeLifecycle::RequestMaintenance(false);
     Wh_Log(L"Lifecycle reconcile deferred: current virtual desktop unavailable");
     return;
@@ -1351,11 +1351,11 @@ static void ReconcileDeferredLifecycle() {
   Diagnostics::g_runtime.counters.lifecycleDirtyWindowsProcessed += dirtyWindows.size();
 
   const bool missedDesktopSwitch =
-      g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown &&
-      !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
+      g_wm.desktop.state != ReconciledDesktopState::Unknown &&
+      !IsEqualGUID(g_wm.desktop.reconciled, currentDesktop);
   if (missedDesktopSwitch) HandleMissedDesktopSwitch(currentDesktop);
-  g_wm.reconciledDesktop = currentDesktop;
-  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  g_wm.desktop.reconciled = currentDesktop;
+  g_wm.desktop.state = ReconciledDesktopState::Settled;
 
   // 2. Repair liveness/exclusions and settled suspended participation globally
   // before doing current-desktop discovery. Dirty tracked HWNDs also get a
@@ -1401,13 +1401,13 @@ static void ReconcileDeferredLifecycle() {
   // 5. Discovery/placement can itself take time. Do not consume pending work for
   // a pass overtaken by another switch.
   if (!snapshotStillCurrent()) return;
-  std::erase_if(g_wm.pendingDesktopArranges, [&](const PendingWorkspaceArrange& pending) {
+  std::erase_if(g_wm.lifecycle.pendingArranges, [&](const PendingWorkspaceArrange& pending) {
     return IsEqualGUID(pending.desktopId, currentDesktop);
   });
 
-  g_wm.lifecycleRetryAfterPlatformRecovery = false;
-  if (g_wm.pendingDesktopSwitchFlyouts) {
-    g_wm.pendingDesktopSwitchFlyouts = false;
+  g_wm.lifecycle.retryAfterPlatformRecovery = false;
+  if (g_wm.desktop.pendingSwitchFlyouts) {
+    g_wm.desktop.pendingSwitchFlyouts = false;
     TrayUi::ShowDesktopSwitchFlyouts(currentDesktop);
   }
   ProcessWindowOverflow();

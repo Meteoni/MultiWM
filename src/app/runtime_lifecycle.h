@@ -9,20 +9,20 @@ static constexpr UINT kMaintenanceRetryMs = 1000;
 static constexpr UINT kMaintenanceMaxAttempts = 30;
 
 static void CancelMaintenanceTimer() {
-  if (!g_wm.maintenanceTimer) return;
-  KillTimer(nullptr, g_wm.maintenanceTimer);
-  g_wm.maintenanceTimer = 0;
+  if (!g_wm.timers.maintenance) return;
+  KillTimer(nullptr, g_wm.timers.maintenance);
+  g_wm.timers.maintenance = 0;
 }
 
 static void ArmMaintenanceTimer() {
-  if (g_wm.maintenanceTimer ||
-      g_wm.maintenanceAttempts >= kMaintenanceMaxAttempts) {
+  if (g_wm.timers.maintenance ||
+      g_wm.maintenance.attempts >= kMaintenanceMaxAttempts) {
     return;
   }
 
-  g_wm.maintenanceTimer =
+  g_wm.timers.maintenance =
       SetTimer(nullptr, 0, kMaintenanceRetryMs, nullptr);
-  if (!g_wm.maintenanceTimer) {
+  if (!g_wm.timers.maintenance) {
     Wh_Log(L"Failed to schedule runtime maintenance retry");
   }
 }
@@ -35,19 +35,19 @@ void RequestMaintenance(bool resetAttempts) {
   // starts a fresh burst automatically; calls made from inside the active
   // maintenance attempt never reset their own budget.
   const bool exhaustedAndDemandedAgain =
-      !g_wm.maintenanceRunning && !g_wm.maintenanceTimer &&
-      g_wm.maintenanceAttempts >= kMaintenanceMaxAttempts;
+      !g_wm.maintenance.running && !g_wm.timers.maintenance &&
+      g_wm.maintenance.attempts >= kMaintenanceMaxAttempts;
   if (resetAttempts || exhaustedAndDemandedAgain) {
-    g_wm.maintenanceAttempts = 0;
+    g_wm.maintenance.attempts = 0;
   }
-  g_wm.lifecycleRetryAfterPlatformRecovery = true;
-  if (!g_wm.maintenanceRunning) ArmMaintenanceTimer();
+  g_wm.lifecycle.retryAfterPlatformRecovery = true;
+  if (!g_wm.maintenance.running) ArmMaintenanceTimer();
 }
 
 void RunMaintenanceNow() {
   AssertWmThread(L"RuntimeLifecycle::RunMaintenanceNow");
   CancelMaintenanceTimer();
-  g_wm.maintenanceRunning = true;
+  g_wm.maintenance.running = true;
   ++Diagnostics::g_runtime.counters.runtimeMaintenanceRuns;
 
   const bool hooksReady = Platform::WindowEvents::InstallWinEventHooks();
@@ -58,25 +58,25 @@ void RunMaintenanceNow() {
 
   if (hooksReady && vdCoreReady && notificationsReady) {
     const bool recoveredDeferredWork =
-        g_wm.lifecycleRetryAfterPlatformRecovery;
-    g_wm.maintenanceAttempts = 0;
-    g_wm.lifecycleRetryAfterPlatformRecovery = false;
+        g_wm.lifecycle.retryAfterPlatformRecovery;
+    g_wm.maintenance.attempts = 0;
+    g_wm.lifecycle.retryAfterPlatformRecovery = false;
 
     if (recoveredDeferredWork) {
       Diagnostics::RecordEvent(L"runtime platform maintenance recovered");
       // Startup/settings-reload may have skipped the initial current-workspace
       // arrangement while Explorer was unavailable. The recovery pass must do
       // more than rediscover membership: explicitly reinforce known current workspaces.
-      g_wm.forceMonitorReconcile = true;
+      g_wm.lifecycle.forceMonitorReconcile = true;
       Reconcile::ScheduleLifecycleReconcile(nullptr);
     }
-    g_wm.maintenanceRunning = false;
+    g_wm.maintenance.running = false;
     return;
   }
 
-  g_wm.lifecycleRetryAfterPlatformRecovery = true;
-  ++g_wm.maintenanceAttempts;
-  if (g_wm.maintenanceAttempts < kMaintenanceMaxAttempts) {
+  g_wm.lifecycle.retryAfterPlatformRecovery = true;
+  ++g_wm.maintenance.attempts;
+  if (g_wm.maintenance.attempts < kMaintenanceMaxAttempts) {
     ++Diagnostics::g_runtime.counters.runtimeMaintenanceRetries;
     ArmMaintenanceTimer();
   } else {
@@ -84,14 +84,14 @@ void RunMaintenanceNow() {
     ++Diagnostics::g_runtime.counters.runtimeMaintenanceExhausted;
     Diagnostics::RecordEvent(
         L"runtime maintenance retry burst exhausted attempts=%u hooks=%d vdCore=%d notifications=%d",
-        g_wm.maintenanceAttempts, hooksReady ? 1 : 0, vdCoreReady ? 1 : 0,
+        g_wm.maintenance.attempts, hooksReady ? 1 : 0, vdCoreReady ? 1 : 0,
         notificationsReady ? 1 : 0);
     Wh_Log(
         L"Runtime maintenance retry burst exhausted (hooks=%d vdCore=%d notifications=%d)",
         hooksReady ? 1 : 0, vdCoreReady ? 1 : 0,
         notificationsReady ? 1 : 0);
   }
-  g_wm.maintenanceRunning = false;
+  g_wm.maintenance.running = false;
 }
 
 void NotifyShellRestarted() {
@@ -114,15 +114,15 @@ void NotifyShellRestarted() {
 
   if (shellReplaced) {
     Platform::VirtualDesktop::AbandonVirtualDesktopAPIForShellRestart();
-    g_wm.reconciledDesktop = {};
-    g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
+    g_wm.desktop.reconciled = {};
+    g_wm.desktop.state = ReconciledDesktopState::Unknown;
   }
 
   // A shell replacement can move/recreate windows asynchronously. Never let a
   // pre-restart conformance rectangle fight the replacement shell.
   Placement::ClearAllConformanceLeases();
   Placement::ScheduleNextConformanceTimer();
-  g_wm.forceMonitorReconcile = true;
+  g_wm.lifecycle.forceMonitorReconcile = true;
   const bool platformNeedsRecovery =
       !Platform::WindowEvents::AllWinEventHooksInstalled() ||
       !g_vd.initialized ||
@@ -141,14 +141,14 @@ void NotifyDisplayTopologyChanged() {
   // Cancel it before Windows' own topology-induced LOCATIONCHANGE burst arrives.
   Placement::ClearAllConformanceLeases();
   Placement::ScheduleNextConformanceTimer();
-  g_wm.pendingDesktopArranges.erase(
+  g_wm.lifecycle.pendingArranges.erase(
       std::remove_if(
-          g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
+          g_wm.lifecycle.pendingArranges.begin(), g_wm.lifecycle.pendingArranges.end(),
           [](const PendingWorkspaceArrange& pending) {
             return !Platform::Monitors::IsLiveMonitorHandle(pending.monitor);
           }),
-      g_wm.pendingDesktopArranges.end());
-  g_wm.forceMonitorReconcile = true;
+      g_wm.lifecycle.pendingArranges.end());
+  g_wm.lifecycle.forceMonitorReconcile = true;
 
   // Display/work-area changes normally require only model/geometry reconciliation.
   // Do not start a COM retry burst unless platform resources are already unhealthy.

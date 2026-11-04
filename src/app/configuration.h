@@ -145,63 +145,102 @@ UINT ParseHotkeyKey(PCWSTR str) {
   return 0;
 }
 
-static bool ParseWorkspaceInsetsSetting(PCWSTR text, WorkspaceInsets* outInsets) {
-  if (!text || !outInsets) return false;
-
+// Parses exactly `count` (at most 4) comma-separated integers, each within
+// [minimum, maximum], e.g. "6, 6, 6, 6". Whitespace around numbers is allowed.
+// On failure `out` is left unchanged.
+static bool ParseBoundedIntegerList(PCWSTR text, size_t count, long minimum, long maximum, LONG* out) {
+  if (!text || !out || count > 4) return false;
   LONG values[4]{};
   const wchar_t* cursor = text;
-
-  for (size_t i = 0; i < 4; ++i) {
+  for (size_t i = 0; i < count; ++i) {
     while (*cursor && std::iswspace(*cursor)) ++cursor;
-
     wchar_t* end = nullptr;
-    long value = std::wcstol(cursor, &end, 10);
-    if (end == cursor || value < 0 || value > 500) return false;
+    const long value = std::wcstol(cursor, &end, 10);
+    if (end == cursor || value < minimum || value > maximum) return false;
     values[i] = static_cast<LONG>(value);
     cursor = end;
-
     while (*cursor && std::iswspace(*cursor)) ++cursor;
-    if (i < 3) {
+    if (i + 1 < count) {
       if (*cursor != L',') return false;
       ++cursor;
     }
   }
-
   while (*cursor && std::iswspace(*cursor)) ++cursor;
   if (*cursor != L'\0') return false;
+  std::copy(values, values + count, out);
+  return true;
+}
 
+// "left, top, right, bottom", each 0..500 DIP.
+static bool ParseWorkspaceInsetsSetting(PCWSTR text, WorkspaceInsets* outInsets) {
+  LONG values[4]{};
+  if (!outInsets || !ParseBoundedIntegerList(text, 4, 0, 500, values)) return false;
   *outInsets = {values[0], values[1], values[2], values[3]};
   return true;
 }
 
-static bool ParseFloatingDefaultSizeSetting(
-    PCWSTR text, FloatingDefaultSize* outSize) {
-  if (!text || !outSize) return false;
-
+// "width, height", each 100..4000 DIP.
+static bool ParseFloatingDefaultSizeSetting(PCWSTR text, FloatingDefaultSize* outSize) {
   LONG values[2]{};
-  const wchar_t* cursor = text;
-  for (size_t i = 0; i < 2; ++i) {
-    while (*cursor && std::iswspace(*cursor)) ++cursor;
-    wchar_t* end = nullptr;
-    long value = std::wcstol(cursor, &end, 10);
-    if (end == cursor || value < 100 || value > 4000) return false;
-    values[i] = static_cast<LONG>(value);
-    cursor = end;
-    while (*cursor && std::iswspace(*cursor)) ++cursor;
-    if (i == 0) {
-      if (*cursor != L',') return false;
-      ++cursor;
-    }
-  }
-  while (*cursor && std::iswspace(*cursor)) ++cursor;
-  if (*cursor != L'\0') return false;
+  if (!outSize || !ParseBoundedIntegerList(text, 2, 100, 4000, values)) return false;
   *outSize = {values[0], values[1]};
   return true;
 }
 
-// Replaces workspace rules in settings order. Disabled rows and malformed rows
-// retain their distinct skip/termination policies. WM thread only.
-static void LoadWorkspaceRules() {
+// Monitor selector shared by limit, workspace and window rules. "primary",
+// "non_primary" and "specific" always parse. With `allowAny`, blank and "any"
+// mean Any. Anything else is invalid (no value).
+static std::optional<RuleMonitor> ParseRuleMonitor(PCWSTR text, bool allowAny) {
+  if (_wcsicmp(text, L"primary") == 0) return RuleMonitor::Primary;
+  if (_wcsicmp(text, L"non_primary") == 0) return RuleMonitor::NonPrimary;
+  if (_wcsicmp(text, L"specific") == 0) return RuleMonitor::Specific;
+  if (allowAny && (!*text || _wcsicmp(text, L"any") == 0)) return RuleMonitor::Any;
+  return std::nullopt;
+}
+
+enum class MonitorIdParse { Valid, Empty, Invalid };
+
+// A monitor ID pasted from the diagnostic report: trimmed, upper-cased, and
+// required to start with "IFACE:" or "GDI:". `out` receives the normalized text.
+static MonitorIdParse ParseMonitorIdSetting(PCWSTR text, std::wstring* out) {
+  *out = TrimSettingText(text);
+  if (out->empty()) return MonitorIdParse::Empty;
+  Model::NormalizeMonitorIdentityToken(out);
+  return out->rfind(L"IFACE:", 0) == 0 || out->rfind(L"GDI:", 0) == 0 ? MonitorIdParse::Valid
+                                                                       : MonitorIdParse::Invalid;
+}
+
+// Splits a rule match field ("a.exe, b.exe") into trimmed, non-empty values.
+// "\," is a literal comma inside a value.
+static std::vector<std::wstring> ParseWindowRuleList(const wchar_t* text) {
+  std::vector<std::wstring> values;
+  std::wstring value;
+  for (const wchar_t* cursor = text; ; ++cursor) {
+    if (*cursor == L'\\' && cursor[1] == L',') {
+      value.push_back(L',');
+      ++cursor;
+      continue;
+    }
+    if (*cursor != L',' && *cursor != L'\0') {
+      value.push_back(*cursor);
+      continue;
+    }
+
+    size_t first = 0;
+    while (first < value.size() && std::iswspace(value[first])) ++first;
+    size_t last = value.size();
+    while (last > first && std::iswspace(value[last - 1])) --last;
+    if (first < last) values.emplace_back(value.substr(first, last - first));
+
+    value.clear();
+    if (*cursor == L'\0') break;
+  }
+  return values;
+}
+
+// Per-monitor overflow limits. A fully blank row ends the list; a "disabled"
+// row is skipped without reading its hidden fields. WM thread only.
+static void LoadMonitorWindowLimits() {
   using WindhawkUtils::StringSetting;
   g_settings.monitorWindowLimits.clear();
   for (int i = 0;; ++i) {
@@ -209,24 +248,22 @@ static void LoadWorkspaceRules() {
     auto monitorId = StringSetting::make(L"workspace.Overflow.MonitorLimits[%d].MonitorId", i);
     const int limit = Wh_GetIntSetting(L"workspace.Overflow.MonitorLimits[%d].Limit", i);
     if (!*monitor.get() && !*monitorId.get() && limit == 0) break;
-    // Disabled rows do not terminate the list or inspect their hidden fields.
     if (!*monitor.get() || _wcsicmp(monitor.get(), L"disabled") == 0) continue;
     if (limit < 0) {
       Wh_Log(L"Ignoring negative per-monitor limit at rule %d", i + 1);
       continue;
     }
     SettingsState::MonitorWindowLimit rule;
-    if (_wcsicmp(monitor.get(), L"primary") == 0) rule.monitor = RuleMonitor::Primary;
-    else if (_wcsicmp(monitor.get(), L"non_primary") == 0) rule.monitor = RuleMonitor::NonPrimary;
-    else if (_wcsicmp(monitor.get(), L"specific") != 0) {
+    const auto selector = ParseRuleMonitor(monitor.get(), /*allowAny=*/false);
+    if (!selector) {
       Wh_Log(L"Ignoring invalid monitor selector at limit rule %d", i + 1);
       continue;
     }
+    rule.monitor = *selector;
     if (rule.monitor == RuleMonitor::Specific) {
-      rule.monitorId = TrimSettingText(monitorId.get());
-      if (rule.monitorId.empty()) continue;
-      Model::NormalizeMonitorIdentityToken(&rule.monitorId);
-      if (rule.monitorId.rfind(L"IFACE:", 0) != 0 && rule.monitorId.rfind(L"GDI:", 0) != 0) {
+      const MonitorIdParse id = ParseMonitorIdSetting(monitorId.get(), &rule.monitorId);
+      if (id == MonitorIdParse::Empty) continue;  // Not filled in yet: skip quietly.
+      if (id == MonitorIdParse::Invalid) {
         Wh_Log(L"Ignoring invalid monitor ID at limit rule %d", i + 1);
         continue;
       }
@@ -234,21 +271,20 @@ static void LoadWorkspaceRules() {
     rule.limit = static_cast<size_t>(limit);
     g_settings.monitorWindowLimits.push_back(std::move(rule));
   }
+}
 
+// Initial-layout rules for new workspaces. Added rows can omit unchanged fields,
+// so the whole row is read before detecting the end; a blank Layout only
+// disables that row. WM thread only.
+static void LoadWorkspaceInitializationRules() {
+  using WindhawkUtils::StringSetting;
   g_settings.workspaceInitializationRules.clear();
   for (int i = 0;; ++i) {
-    auto ruleLayout =
-        StringSetting::make(L"workspace.InitializationRules[%d].Layout", i);
-    auto desktopName = StringSetting::make(
-        L"workspace.InitializationRules[%d].DesktopNameContains", i);
-    auto monitor =
-        StringSetting::make(L"workspace.InitializationRules[%d].Monitor", i);
-    auto monitorId =
-        StringSetting::make(L"workspace.InitializationRules[%d].MonitorId", i);
-    const int desktopNumber = Wh_GetIntSetting(
-        L"workspace.InitializationRules[%d].DesktopNumber", i);
-    // Added rows can omit unchanged fields, including Monitor. Read the whole
-    // row before detecting the end, as blank Layout only disables that row.
+    auto ruleLayout = StringSetting::make(L"workspace.InitializationRules[%d].Layout", i);
+    auto desktopName = StringSetting::make(L"workspace.InitializationRules[%d].DesktopNameContains", i);
+    auto monitor = StringSetting::make(L"workspace.InitializationRules[%d].Monitor", i);
+    auto monitorId = StringSetting::make(L"workspace.InitializationRules[%d].MonitorId", i);
+    const int desktopNumber = Wh_GetIntSetting(L"workspace.InitializationRules[%d].DesktopNumber", i);
     if (!*ruleLayout.get() && !*desktopName.get() && !*monitor.get() &&
         !*monitorId.get() && desktopNumber == 0) {
       break;
@@ -258,35 +294,26 @@ static void LoadWorkspaceRules() {
     WorkspaceInitializationRule rule;
     rule.settingsIndex = i + 1;
     rule.desktopNumber = desktopNumber;
-    if (rule.desktopNumber < 0 ||
-        !TryParseLayoutSetting(ruleLayout.get(), &rule.layout)) {
+    if (rule.desktopNumber < 0 || !TryParseLayoutSetting(ruleLayout.get(), &rule.layout)) {
       Wh_Log(L"Ignoring invalid workspace initialization rule %d", i + 1);
       continue;
     }
-    if (_wcsicmp(monitor.get(), L"primary") == 0) {
-      rule.monitor = RuleMonitor::Primary;
-    } else if (_wcsicmp(monitor.get(), L"non_primary") == 0) {
-      rule.monitor = RuleMonitor::NonPrimary;
-    } else if (_wcsicmp(monitor.get(), L"specific") == 0) {
-      rule.monitor = RuleMonitor::Specific;
-    } else if (*monitor.get() && _wcsicmp(monitor.get(), L"any") != 0) {
+    const auto selector = ParseRuleMonitor(monitor.get(), /*allowAny=*/true);
+    if (!selector) {
       Wh_Log(L"Ignoring invalid monitor selector at workspace rule %d", i + 1);
       continue;
     }
+    rule.monitor = *selector;
     rule.desktopNameContains = TrimSettingText(desktopName.get());
     std::transform(
         rule.desktopNameContains.begin(), rule.desktopNameContains.end(),
-        rule.desktopNameContains.begin(),
-        [](wchar_t ch) { return std::towlower(ch); });
-    if (rule.monitor == RuleMonitor::Specific) {
-      rule.monitorId = TrimSettingText(monitorId.get());
-      Model::NormalizeMonitorIdentityToken(&rule.monitorId);
-      if (rule.monitorId.empty() || (rule.monitorId.rfind(L"IFACE:", 0) != 0 &&
-                                   rule.monitorId.rfind(L"GDI:", 0) != 0)) {
-        Wh_Log(L"Ignoring invalid monitor ID at workspace rule %d", i + 1);
-        continue;
-      }
+        rule.desktopNameContains.begin(), [](wchar_t ch) { return std::towlower(ch); });
+    if (rule.monitor == RuleMonitor::Specific &&
+        ParseMonitorIdSetting(monitorId.get(), &rule.monitorId) != MonitorIdParse::Valid) {
+      Wh_Log(L"Ignoring invalid monitor ID at workspace rule %d", i + 1);
+      continue;
     }
+    // A rule with no condition at all would match everything; ignore it.
     if (rule.desktopNameContains.empty() && rule.desktopNumber == 0 &&
         rule.monitor == RuleMonitor::Any && rule.monitorId.empty()) {
       continue;
@@ -295,118 +322,90 @@ static void LoadWorkspaceRules() {
   }
 }
 
-// Replaces window rules in settings order. A blank match row ends the list;
-// escaped commas remain part of a match value. WM thread only.
+static void LoadWorkspaceRules() {
+  LoadMonitorWindowLimits();
+  LoadWorkspaceInitializationRules();
+}
+
+// Fills the "Open on monitor / desktop" part of a window rule. False (after
+// logging) when the row is invalid; also false, silently, when it names no
+// destination at all.
+static bool ParseInitialPlacementRule(int i, PCWSTR monitor, PCWSTR monitorId,
+                                      PCWSTR desktopName, int desktopNumber, WindowRule* rule) {
+  const auto selector = ParseRuleMonitor(monitor, /*allowAny=*/true);
+  if (!selector) {
+    Wh_Log(L"Ignoring invalid monitor selector at window rule %d", i + 1);
+    return false;
+  }
+  rule->monitor = *selector;
+  if (rule->monitor == RuleMonitor::Specific &&
+      ParseMonitorIdSetting(monitorId, &rule->monitorId) != MonitorIdParse::Valid) {
+    Wh_Log(L"Ignoring invalid monitor target at window rule %d", i + 1);
+    return false;
+  }
+  rule->desktopNumber = desktopNumber;
+  rule->desktopNameContains = TrimSettingText(desktopName);
+  if (desktopNumber < 0) {
+    Wh_Log(L"Ignoring invalid desktop number at window rule %d", i + 1);
+    return false;
+  }
+  rule->followWindow = Wh_GetIntSetting(L"windowRules.Rules[%d].FollowWindow", i) != 0;
+  return !(rule->monitor == RuleMonitor::Any && !desktopNumber && rule->desktopNameContains.empty());
+}
+
+// Window rules in settings order. A row with no match fields ends the list.
+// WM thread only.
 static void LoadWindowRules() {
   using WindhawkUtils::StringSetting;
-  auto parseWindowRuleList = [](const wchar_t* text) {
-    std::vector<std::wstring> values;
-    std::wstring value;
-    for (const wchar_t* cursor = text; ; ++cursor) {
-      if (*cursor == L'\\' && cursor[1] == L',') {
-        value.push_back(L',');
-        ++cursor;
-        continue;
-      }
-      if (*cursor != L',' && *cursor != L'\0') {
-        value.push_back(*cursor);
-        continue;
-      }
-
-      size_t first = 0;
-      while (first < value.size() && std::iswspace(value[first])) ++first;
-      size_t last = value.size();
-      while (last > first && std::iswspace(value[last - 1])) --last;
-      if (first < last) {
-        values.emplace_back(value.substr(first, last - first));
-      }
-
-      value.clear();
-      if (*cursor == L'\0') break;
-    }
-    return values;
-  };
-
   g_settings.windowRules.clear();
   for (int i = 0;; ++i) {
-    auto process =
-        StringSetting::make(L"windowRules.Rules[%d].Process", i);
-    auto className =
-        StringSetting::make(L"windowRules.Rules[%d].Class", i);
-    auto titleContains =
-        StringSetting::make(L"windowRules.Rules[%d].TitleContains", i);
-    auto treatment =
-        StringSetting::make(L"windowRules.Rules[%d].Treatment", i);
+    auto process = StringSetting::make(L"windowRules.Rules[%d].Process", i);
+    auto className = StringSetting::make(L"windowRules.Rules[%d].Class", i);
+    auto titleContains = StringSetting::make(L"windowRules.Rules[%d].TitleContains", i);
+    auto treatment = StringSetting::make(L"windowRules.Rules[%d].Treatment", i);
     auto size = StringSetting::make(L"windowRules.Rules[%d].Size", i);
     auto monitor = StringSetting::make(L"windowRules.Rules[%d].Monitor", i);
     auto monitorId = StringSetting::make(L"windowRules.Rules[%d].MonitorId", i);
     auto desktopName = StringSetting::make(L"windowRules.Rules[%d].DesktopNameContains", i);
     const int desktopNumber = Wh_GetIntSetting(L"windowRules.Rules[%d].DesktopNumber", i);
     if (!*process.get() && !*className.get() && !*titleContains.get()) {
-      Wh_Log(
-          L"Window rule %d is blank; later rules will not be loaded",
-          i + 1);
+      Wh_Log(L"Window rule %d is blank; later rules will not be loaded", i + 1);
       break;
     }
 
     WindowRule rule;
-    if (_wcsicmp(treatment.get(), L"default_to_floating") == 0) {
+    const PCWSTR kind = treatment.get();
+    if (_wcsicmp(kind, L"default_to_floating") == 0) {
       rule.treatment = WindowRuleTreatment::DefaultToFloating;
-    } else if (_wcsicmp(treatment.get(), L"always_floating") == 0) {
+    } else if (_wcsicmp(kind, L"always_floating") == 0) {
       rule.treatment = WindowRuleTreatment::AlwaysFloating;
-    } else if (_wcsicmp(treatment.get(), L"trace_to_owner") == 0) {
+    } else if (_wcsicmp(kind, L"trace_to_owner") == 0) {
       rule.treatment = WindowRuleTreatment::TraceToOwner;
-    } else if (_wcsicmp(treatment.get(), L"open_on_monitor") == 0) {
+    } else if (_wcsicmp(kind, L"open_on_monitor") == 0) {
       rule.treatment = WindowRuleTreatment::InitialPlacement;
-      if (_wcsicmp(monitor.get(), L"primary") == 0) rule.monitor = RuleMonitor::Primary;
-      else if (_wcsicmp(monitor.get(), L"non_primary") == 0) rule.monitor = RuleMonitor::NonPrimary;
-      else if (_wcsicmp(monitor.get(), L"specific") == 0) rule.monitor = RuleMonitor::Specific;
-      else if (*monitor.get() && _wcsicmp(monitor.get(), L"any") != 0) {
-        Wh_Log(L"Ignoring invalid monitor selector at window rule %d", i + 1);
+      if (!ParseInitialPlacementRule(i, monitor.get(), monitorId.get(), desktopName.get(),
+                                     desktopNumber, &rule)) {
         continue;
       }
-      if (rule.monitor == RuleMonitor::Specific) {
-        rule.monitorId = TrimSettingText(monitorId.get());
-        Model::NormalizeMonitorIdentityToken(&rule.monitorId);
-        if (rule.monitorId.empty() || (rule.monitorId.rfind(L"IFACE:", 0) != 0 &&
-                                     rule.monitorId.rfind(L"GDI:", 0) != 0)) {
-          Wh_Log(L"Ignoring invalid monitor target at window rule %d", i + 1);
-          continue;
-        }
-      }
-      rule.desktopNumber = desktopNumber;
-      rule.desktopNameContains = TrimSettingText(desktopName.get());
-      if (desktopNumber < 0) {
-        Wh_Log(L"Ignoring invalid desktop number at window rule %d", i + 1);
-        continue;
-      }
-      rule.followWindow = Wh_GetIntSetting(L"windowRules.Rules[%d].FollowWindow", i) != 0;
-      if (rule.monitor == RuleMonitor::Any && !desktopNumber && rule.desktopNameContains.empty()) continue;
-    } else if (_wcsicmp(
-                   treatment.get(), L"preserve_size_when_centering") == 0) {
+    } else if (_wcsicmp(kind, L"preserve_size_when_centering") == 0) {
       rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
       rule.preserveFloatingSize = true;
-    } else if (_wcsicmp(
-                   treatment.get(), L"override_size_when_centering") == 0) {
+    } else if (_wcsicmp(kind, L"override_size_when_centering") == 0) {
       rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
       if (_wcsicmp(size.get(), L"Workspace") == 0) {
         rule.useWorkspaceSize = true;
-      } else if (!ParseFloatingDefaultSizeSetting(
-                     size.get(), &rule.floatingSizeDip)) {
-        Wh_Log(
-            L"Ignoring invalid centered size override at rule %d: %s",
-            i + 1, size.get());
+      } else if (!ParseFloatingDefaultSizeSetting(size.get(), &rule.floatingSizeDip)) {
+        Wh_Log(L"Ignoring invalid centered size override at rule %d: %s", i + 1, size.get());
         continue;
       }
       rule.preserveFloatingSize = false;
     } else {
       rule.treatment = WindowRuleTreatment::Exclude;
     }
-    rule.processNames = parseWindowRuleList(process.get());
-    rule.classNames = parseWindowRuleList(className.get());
-    rule.titleFragments = parseWindowRuleList(titleContains.get());
-    if (rule.processNames.empty() && rule.classNames.empty() &&
-        rule.titleFragments.empty()) {
+    rule.processNames = ParseWindowRuleList(process.get());
+    rule.classNames = ParseWindowRuleList(className.get());
+    rule.titleFragments = ParseWindowRuleList(titleContains.get());
+    if (rule.processNames.empty() && rule.classNames.empty() && rule.titleFragments.empty()) {
       Wh_Log(L"Ignoring window rule %d with no usable match values", i + 1);
       continue;
     }
@@ -414,110 +413,91 @@ static void LoadWindowRules() {
   }
 }
 
-// Replaces configured policy on the WM thread. Reads stay in settings order;
-// bounds/defaults are explicit here, while rule loaders own list semantics.
+// True when the string setting `name` equals `value`, ignoring case.
+static bool StringSettingIs(PCWSTR name, PCWSTR value) {
+  auto setting = WindhawkUtils::StringSetting::make(name);
+  return _wcsicmp(setting.get(), value) == 0;
+}
+
+// Layouts used by Cycle Layout, in order, without duplicates. Invalid entries
+// are skipped; an empty result falls back to the built-in sequence.
+static std::vector<TileLayout> ReadLayoutCycleSetting() {
+  std::vector<TileLayout> cycle;
+  for (int i = 0; i < 32; ++i) {
+    auto entry = WindhawkUtils::StringSetting::make(L"workspace.LayoutCycle[%d]", i);
+    if (!*entry.get()) break;
+    TileLayout layout{};
+    if (!TryParseLayoutSetting(entry.get(), &layout)) {
+      Wh_Log(L"Ignoring invalid LayoutCycle[%d] entry: %s", i, entry.get());
+      continue;
+    }
+    if (std::find(cycle.begin(), cycle.end(), layout) == cycle.end()) cycle.push_back(layout);
+  }
+  if (cycle.empty()) {
+    Wh_Log(L"LayoutCycle is empty or invalid; using the built-in layout sequence");
+    cycle = MakeBuiltInLayoutCycle();
+  }
+  return cycle;
+}
+
+// Replaces configured policy on the WM thread. Reads stay in settings order.
+// Invalid numbers use the documented default; they are not clamped unless noted.
 void LoadSettings() {
   using WindhawkUtils::StringSetting;
 
-  g_settings.tilingModifiers =
-      ReadModifierSetting(L"hotkeys.TilingModifier", MOD_ALT);
+  g_settings.tilingModifiers = ReadModifierSetting(L"hotkeys.TilingModifier", MOD_ALT);
 
+  // Geometry (DIP values; converted to physical pixels per monitor).
   auto insets = StringSetting::make(L"workspace.WorkspaceInsets");
-  WorkspaceInsets parsedInsets{};
-  if (ParseWorkspaceInsetsSetting(insets.get(), &parsedInsets)) {
-    g_settings.insetsDip = parsedInsets;
-  } else {
+  if (!ParseWorkspaceInsetsSetting(insets.get(), &g_settings.insetsDip)) {
     g_settings.insetsDip = {};
     Wh_Log(L"Invalid WorkspaceInsets setting; using 6, 6, 6, 6");
   }
   g_settings.gapDip = ReadBoundedIntSetting(L"workspace.TileGap", 0, 100, 6);
-
-  auto floatingSize =
-      StringSetting::make(L"windowBehavior.FloatingDefaultSize");
-  FloatingDefaultSize parsedFloatingSize{};
-  if (ParseFloatingDefaultSizeSetting(floatingSize.get(), &parsedFloatingSize)) {
-    g_settings.floatingDefaultSizeDip = parsedFloatingSize;
-  } else {
+  auto floatingSize = StringSetting::make(L"windowBehavior.FloatingDefaultSize");
+  if (!ParseFloatingDefaultSizeSetting(floatingSize.get(), &g_settings.floatingDefaultSizeDip)) {
     g_settings.floatingDefaultSizeDip = {};
     Wh_Log(L"Invalid FloatingDefaultSize setting; using 960, 640");
   }
-  g_settings.masterPercent = ReadBoundedIntSetting(L"workspace.MasterPercent", 1, 99, 50);
-  g_settings.reverseDwindle =
-      Wh_GetIntSetting(L"workspace.ReverseDwindle") != 0;
-  const int adaptiveDwindleSlots =
-      Wh_GetIntSetting(L"workspace.AdaptiveDwindleSlots");
-  g_settings.adaptiveDwindleSlots = static_cast<size_t>(
-      std::clamp(adaptiveDwindleSlots, 0, 64));
-  const int adaptiveDwindlePercentage =
-      Wh_GetIntSetting(L"workspace.AdaptiveDwindlePercentage");
-  g_settings.adaptiveDwindlePercentage =
-      std::clamp(adaptiveDwindlePercentage, 0, 40);
 
+  // Layouts.
+  g_settings.masterPercent = ReadBoundedIntSetting(L"workspace.MasterPercent", 1, 99, 50);
+  g_settings.reverseDwindle = Wh_GetIntSetting(L"workspace.ReverseDwindle") != 0;
+  // These two are clamped rather than reset to a default.
+  g_settings.adaptiveDwindleSlots =
+      static_cast<size_t>(std::clamp(Wh_GetIntSetting(L"workspace.AdaptiveDwindleSlots"), 0, 64));
+  g_settings.adaptiveDwindlePercentage =
+      std::clamp(Wh_GetIntSetting(L"workspace.AdaptiveDwindlePercentage"), 0, 40);
   auto layout = StringSetting::make(L"workspace.DefaultLayout");
   g_settings.defaultLayout = ParseLayoutSetting(layout.get());
+  g_settings.layoutCycle = ReadLayoutCycleSetting();
 
-  g_settings.layoutCycle.clear();
-  for (int i = 0; i < 32; ++i) {
-    auto cycleEntry =
-        StringSetting::make(L"workspace.LayoutCycle[%d]", i);
-    if (!*cycleEntry.get()) break;
-
-    TileLayout cycleLayout{};
-    if (!TryParseLayoutSetting(cycleEntry.get(), &cycleLayout)) {
-      Wh_Log(L"Ignoring invalid LayoutCycle[%d] entry: %s", i, cycleEntry.get());
-      continue;
-    }
-    if (std::find(g_settings.layoutCycle.begin(), g_settings.layoutCycle.end(),
-                  cycleLayout) == g_settings.layoutCycle.end()) {
-      g_settings.layoutCycle.push_back(cycleLayout);
-    }
-  }
-  if (g_settings.layoutCycle.empty()) {
-    g_settings.layoutCycle = MakeBuiltInLayoutCycle();
-    Wh_Log(L"LayoutCycle is empty or invalid; using the built-in layout sequence");
-  }
-
-  g_settings.automaticWindowLimit = static_cast<size_t>(
-      std::max(0, Wh_GetIntSetting(L"workspace.Overflow.WindowLimit")));
-  auto overflowAction = StringSetting::make(L"workspace.Overflow.Action");
-  g_settings.overflowCreateDesktop =
-      _wcsicmp(overflowAction.get(), L"new_desktop") == 0;
-  g_settings.overflowTryOtherMonitors =
-      Wh_GetIntSetting(L"workspace.Overflow.TryOtherMonitors") != 0;
+  // Overflow and workspace rules.
+  g_settings.automaticWindowLimit =
+      static_cast<size_t>(std::max(0, Wh_GetIntSetting(L"workspace.Overflow.WindowLimit")));
+  g_settings.overflowCreateDesktop = StringSettingIs(L"workspace.Overflow.Action", L"new_desktop");
+  g_settings.overflowTryOtherMonitors = Wh_GetIntSetting(L"workspace.Overflow.TryOtherMonitors") != 0;
   LoadWorkspaceRules();
 
-  auto mouseBehavior =
-      StringSetting::make(L"windowBehavior.MouseMoveBehavior");
-  g_settings.mouseMoveBehavior =
-      _wcsicmp(mouseBehavior.get(), L"swap") == 0
-          ? MouseMoveBehavior::Swap
-          : MouseMoveBehavior::Float;
-
-  auto automaticNewWindowPosition =
-      StringSetting::make(L"general.AutomaticNewWindowPosition");
+  // Behavior choices.
+  g_settings.mouseMoveBehavior = StringSettingIs(L"windowBehavior.MouseMoveBehavior", L"swap")
+      ? MouseMoveBehavior::Swap : MouseMoveBehavior::Float;
   g_settings.automaticNewWindowPosition =
-      _wcsicmp(automaticNewWindowPosition.get(), L"after_focused") == 0
-          ? AutomaticNewWindowPosition::AfterFocused
-          : AutomaticNewWindowPosition::LastSlot;
+      StringSettingIs(L"general.AutomaticNewWindowPosition", L"after_focused")
+      ? AutomaticNewWindowPosition::AfterFocused : AutomaticNewWindowPosition::LastSlot;
+  g_wm.managementMode = StringSettingIs(L"general.DefaultWindowManagementMode", L"manual")
+      ? ManagementMode::Manual : ManagementMode::Automatic;
 
-  auto managementMode =
-      StringSetting::make(L"general.DefaultWindowManagementMode");
-  g_wm.managementMode =
-      _wcsicmp(managementMode.get(), L"manual") == 0
-          ? ManagementMode::Manual
-          : ManagementMode::Automatic;
-
-  g_settings.conformanceLeaseMs = ReadBoundedIntSetting(
-      L"advanced.ConformanceLeaseMs", 0, 10000, 3000);
-  g_settings.conformanceRepairIntervalMs = ReadBoundedIntSetting(
-      L"advanced.ConformanceRepairIntervalMs", 20, 2000, 75);
-  g_settings.reconcileDelayMs = ReadBoundedIntSetting(
-      L"advanced.ReconcileDelayMs", 20, 2000, 50);
-  g_settings.slowApplicationDelayMs = ReadBoundedIntSetting(
-      L"advanced.SlowApplicationDelayMs", 0, 2000, 250);
+  // Timing.
+  g_settings.conformanceLeaseMs = ReadBoundedIntSetting(L"advanced.ConformanceLeaseMs", 0, 10000, 3000);
+  g_settings.conformanceRepairIntervalMs =
+      ReadBoundedIntSetting(L"advanced.ConformanceRepairIntervalMs", 20, 2000, 75);
+  g_settings.reconcileDelayMs = ReadBoundedIntSetting(L"advanced.ReconcileDelayMs", 20, 2000, 50);
+  g_settings.slowApplicationDelayMs = ReadBoundedIntSetting(L"advanced.SlowApplicationDelayMs", 0, 2000, 250);
 
   LoadWindowRules();
 
+  // Hotkeys. Blank disables a hotkey; an unparseable key is logged and disabled.
   const std::pair<PCWSTR, UINT*> hotkeys[] = {
       {L"hotkeys.TileKey", &g_settings.tileKey},
       {L"hotkeys.LayoutKey", &g_settings.layoutKey},
@@ -532,16 +512,11 @@ void LoadSettings() {
     *destination = ReadHotkeySetting<UINT>(settingName, ParseHotkeyKey);
   }
 
-  auto diagnosticsPath =
-      StringSetting::make(L"diagnostics.DiagnosticsOutputPath");
-  if (*diagnosticsPath.get()) {
-    g_settings.diagnosticsOutputPath = diagnosticsPath.get();
-  } else {
-    g_settings.diagnosticsOutputPath =
-        L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";
-  }
+  auto diagnosticsPath = StringSetting::make(L"diagnostics.DiagnosticsOutputPath");
+  g_settings.diagnosticsOutputPath = *diagnosticsPath.get()
+      ? std::wstring(diagnosticsPath.get())
+      : std::wstring(L"%USERPROFILE%\\Documents\\MultiWMDiagnostics");
 
   TrayUi::LoadSettings();
 }
-
 } // namespace Configuration
