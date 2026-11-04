@@ -347,6 +347,189 @@ static void RunWinEventRoutingTests() {
   std::printf("Passed %u WinEvent routing checks.\n", checks);
 }
 
+// Characterizes Placement::HandleTiledWindowLocationChange: when a tiled window
+// reports a new position, does MultiWM ignore it, open a conformance lease,
+// defer, reinforce the tile, or reject the observation?
+//
+// Uses one real window that is visible to the API but invisible to the user:
+// fully transparent, click-through, never activated, and a tool window (which
+// MultiWM itself never manages, so a live MultiWM instance ignores it too).
+static void RunConformanceLocationTests() {
+  unsigned checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  uint64_t digest = 1469598103934665603ull;
+  auto mix = [&](uint64_t value) { digest ^= value; digest *= 1099511628211ull; };
+  auto mixRect = [&](const RECT& r) {
+    mix(static_cast<uint32_t>(r.left)); mix(static_cast<uint32_t>(r.top));
+    mix(static_cast<uint32_t>(r.right)); mix(static_cast<uint32_t>(r.bottom));
+  };
+
+  // MultiWM runs per-monitor DPI aware; without this, a scaled display makes
+  // window rectangles (logical) and DWM frames (physical) disagree.
+  const DPI_AWARENESS_CONTEXT previousDpiContext =
+      SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  TestWindowDesktops windows;
+  TestManager manager;
+  GUID desktop{};
+  desktop.Data1 = 0xC0F0A11;
+  windows.desktop = desktop;
+  manager.desktop.id = desktop;
+  g_vd.initialized = true;
+  g_vd.desktopManager = &windows;
+  g_vd.managerInternal = &manager;
+  g_wm.reconciledDesktop = desktop;
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  g_wm.managementMode = ManagementMode::Manual;
+
+  const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  DesktopMonitorKey key;
+  check(DesktopMonitorKey::FromHMonitor(desktop, monitor, &key), "resolve conformance test monitor");
+  const HWND hwnd = CreateWindowExW(
+      WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+      L"STATIC", L"MultiWM conformance test", WS_POPUP, 0, 0, 300, 300,
+      nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  check(hwnd != nullptr, "create transparent test window");
+  SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+  ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+  const HWND neighbour = reinterpret_cast<HWND>(0x7100004);
+
+  auto seed = [&](TileLayout layout, DWORD pid) {
+    Workspace workspace;
+    workspace.SetLayout(layout);
+    for (HWND member : {hwnd, neighbour}) {
+      WindowRecord record;
+      record.hwnd = member;
+      record.pid = member == hwnd ? pid : 4242;
+      record.canMove = true;
+      workspace.AdmitTiled(record);
+      workspace.ClearInsertionPlacement(member);
+    }
+    g_workspaces.Save(key, workspace);
+    return workspace;
+  };
+  auto authoritativeRect = [&] {
+    Workspace workspace;
+    RECT rect{};
+    check(g_workspaces.Load(key, &workspace) &&
+          Placement::GetCurrentAuthoritativeTiledRect(key, workspace, hwnd, &rect),
+          "plan authoritative tile");
+    return rect;
+  };
+  auto moveTo = [&](const RECT& r) {
+    SetWindowPos(hwnd, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+  };
+  auto offset = [](RECT r, LONG dx) { r.left += dx; r.right += dx; return r; };
+  auto leaseOf = [&]() -> const Placement::ConformanceLease* {
+    auto it = Placement::g_conformanceLeases.leases.find(hwnd);
+    return it == Placement::g_conformanceLeases.leases.end() ? nullptr : &it->second;
+  };
+  // One step: optional setup, call the handler, record the observable outcome.
+  auto step = [&](const char* name) {
+    const bool handled = Placement::HandleTiledWindowLocationChange(hwnd);
+    const Placement::ConformanceLease* lease = leaseOf();
+    RECT frame{};
+    Platform::Windows::GetWindowFrameRect(hwnd, &frame);
+    Workspace workspace;
+    const bool loaded = g_workspaces.Load(key, &workspace);
+    const WindowRecord* record = loaded ? workspace.Find(hwnd) : nullptr;
+    mix(std::hash<std::string>{}(name));
+    mix(handled ? 1 : 0);
+    mix(lease ? 1 : 0);
+    if (lease) {
+      mixRect(lease->expectedRect);
+      mix(lease->attempts);
+      mix(lease->repairDueTickMs ? 1 : 0);
+      mix(lease->lastRepairTickMs ? 1 : 0);
+    }
+    mixRect(frame);
+    mix(record ? static_cast<uint64_t>(record->state) + 1 : 0);
+    mix(loaded ? static_cast<uint64_t>(workspace.Layout()) : 99);
+    return handled;
+  };
+  auto resetLease = [&] {
+    Placement::g_conformanceLeases.leases.clear();
+    if (g_wm.conformanceTimer) KillTimer(nullptr, g_wm.conformanceTimer);
+    g_wm.conformanceTimer = 0;
+  };
+
+  const DWORD pid = GetCurrentProcessId();
+  seed(TileLayout::Columns, pid);
+  const RECT tile = authoritativeRect();
+  check(Layout::RectWidth(tile) > 0 && Layout::RectHeight(tile) > 0, "tile has an area");
+
+  // 1. Already on its tile: just our own placement echo.
+  moveTo(tile);
+  check(step("on tile") && !leaseOf(), "window on its tile needs no lease");
+
+  // 2. Drifted off the tile: open a lease aimed at the tile.
+  moveTo(offset(tile, 37));
+  check(step("drift opens lease"), "drift is handled");
+  check(leaseOf() && Layout::RectsNear(leaseOf()->expectedRect, tile), "drift opens a lease for the tile");
+
+  // 3. Repair already scheduled: wait for it.
+  check(step("repair scheduled"), "scheduled repair defers");
+
+  // 4. Repair due now: reinforce the tile.
+  Placement::g_conformanceLeases.leases[hwnd].repairDueTickMs = 0;
+  Placement::g_conformanceLeases.leases[hwnd].lastRepairTickMs = 0;
+  check(step("repair due"), "due repair is handled");
+
+  // 5. Recently repaired: rate-limited into one deferred re-check.
+  moveTo(offset(tile, 51));
+  if (Placement::g_conformanceLeases.leases.count(hwnd)) {
+    Placement::g_conformanceLeases.leases[hwnd].repairDueTickMs = 0;
+    Placement::g_conformanceLeases.leases[hwnd].lastRepairTickMs = GetTickCount64();
+  }
+  step("rate limited");
+
+  // 6. Lease aimed at an old tile: replaced by one for the current tile.
+  if (Placement::g_conformanceLeases.leases.count(hwnd)) {
+    Placement::g_conformanceLeases.leases[hwnd].expectedRect = offset(tile, 400);
+  }
+  step("stale target replaced");
+
+  // 7. Lease already past its deadline: leave it to the expiry timer.
+  if (Placement::g_conformanceLeases.leases.count(hwnd)) {
+    Placement::g_conformanceLeases.leases[hwnd].expiresAtTickMs = 1;
+  }
+  check(step("expired lease"), "expired lease is left to the timer");
+  resetLease();
+
+  // 8-10. Ineligible observations are rejected and cancel any lease.
+  Placement::BeginConformanceLease(hwnd, tile);
+  seed(TileLayout::Floating, pid);
+  check(!step("floating layout"), "floating layout rejects the observation");
+  resetLease();
+  Placement::BeginConformanceLease(hwnd, tile);
+  seed(TileLayout::Columns, pid + 1);
+  check(!step("pid mismatch"), "reused HWND (pid mismatch) rejects the observation");
+  check(!leaseOf(), "rejection cancels the lease");
+  resetLease();
+  seed(TileLayout::Columns, pid);
+  ShowWindow(hwnd, SW_HIDE);
+  Placement::BeginConformanceLease(hwnd, tile);
+  check(!step("hidden"), "hidden window rejects the observation");
+  check(!leaseOf(), "hidden window cancels the lease");
+  resetLease();
+
+  Reconcile::ForgetManagedWindow(hwnd);
+  Reconcile::ForgetManagedWindow(neighbour);
+  DestroyWindow(hwnd);
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
+  g_vd.desktopManager = nullptr;
+  g_vd.managerInternal = nullptr;
+  g_vd.initialized = false;
+  SetThreadDpiAwarenessContext(previousDpiContext);
+  // Recorded from the implementation as of 2026-11-04 (commit after 59f0168).
+  check(digest == 0x19b1f6837e1683fcull, "conformance location trace matches recorded behavior");
+  std::printf("Passed %u conformance location checks (trace digest %016llx).\n",
+              checks, static_cast<unsigned long long>(digest));
+}
+
 static void RunDiscoveryResultTests() {
   unsigned checks = 0;
   auto check = [&](bool passed, const char* message) {
@@ -403,4 +586,5 @@ int main() {
   RunDesktopReconciliationTests();
   RunDiscoveryResultTests();
   RunWinEventRoutingTests();
+  RunConformanceLocationTests();
 }

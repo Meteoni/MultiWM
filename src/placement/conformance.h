@@ -443,83 +443,80 @@ static void FinalizeExpiredConformanceLease(
   ArrangeWorkspace(key, lease.preferredTiledWindow);
 }
 
-// A tracked tiled HWND either confirms its authoritative rectangle or opens/reuses
-// one bounded conformance lease. Native user gestures remain authoritative and
-// are handled separately after MOVESIZEEND.
-// Returns true when handled/deferred. False may cancel a stale lease; it does not
-// imply that this routine had no effects. All rectangles are physical screen pixels.
-static bool HandleTiledWindowLocationChange(HWND hwnd) {
-  if (Gestures::IsMoveSizeGestureInProgress(hwnd)) return true;
+// --- Reacting to a tiled window that moved -----------------------------------
 
-  ConformanceLease lease;
-  const ConformanceLeaseReadResult leaseState =
-      ReadConformanceLease(hwnd, &lease);
-  if (leaseState == ConformanceLeaseReadResult::Expired) {
-    ScheduleNextConformanceTimer();
-    return true;
-  }
-  const bool hasLease = leaseState == ConformanceLeaseReadResult::Active;
-  auto rejectObservation = [&] {
-    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
-    return false;
-  };
+// What a location-change check observed, copied so nothing points into the
+// repository. `authoritative` is the window's tile in the current layout plan;
+// `current` is where the window actually is. Physical screen pixels.
+struct TiledLocationObservation {
+  DesktopMonitorKey key;
+  Workspace workspace;
+  RECT authoritative{};
+  RECT current{};
+};
 
+// Loads the owning workspace and both rectangles. No value means the
+// observation does not apply (window gone, suspended, cloaked, not tiled here,
+// HWND reused by another process, or no tile can be planned).
+static std::optional<TiledLocationObservation> ObserveTiledWindowLocation(HWND hwnd) {
   if (!IsWindow(hwnd) ||
       Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
       Platform::Windows::IsWindowCloaked(hwnd)) {
-    return rejectObservation();
+    return std::nullopt;
   }
 
-  auto currentWorkspace = LoadConformanceWorkspace(hwnd);
-  if (!currentWorkspace) return rejectObservation();
-  const auto& key = currentWorkspace->key;
-  Workspace& workspace = currentWorkspace->workspace;
-  const WindowRecord* record = workspace.Find(hwnd);
+  auto owner = LoadConformanceWorkspace(hwnd);
+  if (!owner) return std::nullopt;
+  TiledLocationObservation observed;
+  observed.key = owner->key;
+  observed.workspace = std::move(owner->workspace);
+  const WindowRecord* record = observed.workspace.Find(hwnd);
   if (!record || record->state != ManageState::Tiled ||
-      workspace.Layout() == TileLayout::Floating ||
+      observed.workspace.Layout() == TileLayout::Floating ||
       !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
-    return rejectObservation();
+    return std::nullopt;
   }
 
   // A lease is target-specific. Layout/order/weight changes can alter a tile
   // without necessarily issuing SetWindowPos for this HWND, so never reinforce
   // the copied target until it is checked against the current layout plan.
-  RECT authoritative{};
-  if (!GetCurrentAuthoritativeTiledRect(
-          key, workspace, hwnd, &authoritative)) {
-    return rejectObservation();
+  if (!GetCurrentAuthoritativeTiledRect(observed.key, observed.workspace, hwnd, &observed.authoritative) ||
+      !Platform::Windows::GetWindowFrameRect(hwnd, &observed.current)) {
+    return std::nullopt;
   }
+  return observed;
+}
 
-  RECT current{};
-  if (!Platform::Windows::GetWindowFrameRect(hwnd, &current)) {
-    return rejectObservation();
-  }
-  if (Layout::RectsNear(current, authoritative)) {
-    return true;  // Our own placement/event echo; nothing to repair.
-  }
+enum class ConformanceRepairTiming {
+  RepairNow,    // Go ahead and reinforce the tile.
+  Waiting,      // A repair is already scheduled, or one was just deferred.
+  DeferFailed,  // Rate-limited, but the lease vanished before it could be deferred.
+};
 
-  if (!hasLease || !Layout::RectsNear(authoritative, lease.expectedRect)) {
-    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
-    BeginConformanceLease(hwnd, authoritative, true);
-    return true;
-  }
-
+// Repairs are rate-limited to one per ConformanceRepairIntervalMs. A burst of
+// snap-back events inside that window is not dropped: one delayed re-check is
+// scheduled so the app's final move still gets corrected.
+static ConformanceRepairTiming CheckConformanceRepairTiming(HWND hwnd, const ConformanceLease& lease) {
   const ULONGLONG now = GetTickCount64();
-  if (lease.repairDueTickMs && now < lease.repairDueTickMs) {
-    return true;
+  if (lease.repairDueTickMs && now < lease.repairDueTickMs) return ConformanceRepairTiming::Waiting;
+  if (!lease.lastRepairTickMs || now - lease.lastRepairTickMs >= g_settings.conformanceRepairIntervalMs) {
+    return ConformanceRepairTiming::RepairNow;
   }
-  if (lease.lastRepairTickMs &&
-      now - lease.lastRepairTickMs < g_settings.conformanceRepairIntervalMs) {
-    const ULONGLONG due =
-        lease.lastRepairTickMs + g_settings.conformanceRepairIntervalMs;
-    // Do not simply drop a bursty snap-back event: schedule one delayed re-check
-    // so a final app move inside the rate window cannot leave the tile displaced.
-    if (DeferConformanceLeaseRepair(hwnd, lease.generation, due)) {
-      ++Diagnostics::g_runtime.counters.conformanceLeaseDeferredRepairs;
-      return true;
-    }
-    return false;
-  }
+  const ULONGLONG due = lease.lastRepairTickMs + g_settings.conformanceRepairIntervalMs;
+  if (!DeferConformanceLeaseRepair(hwnd, lease.generation, due)) return ConformanceRepairTiming::DeferFailed;
+  ++Diagnostics::g_runtime.counters.conformanceLeaseDeferredRepairs;
+  return ConformanceRepairTiming::Waiting;
+}
+
+// Moves the window back onto its tile once more, after re-checking everything
+// that could have changed since the observation. Saves the workspace and may
+// float or forget the window if placement reports it cannot be managed.
+// Returns false when the lease or window turned out to be stale.
+static bool ReinforceConformanceTile(
+    HWND hwnd, const ConformanceLease& lease, TiledLocationObservation& observed) {
+  const DesktopMonitorKey& key = observed.key;
+  Workspace& workspace = observed.workspace;
+  const WindowRecord* record = workspace.Find(hwnd);
 
   // A copied observation must still refer to the same active lease immediately
   // before we act. Earlier actor work can have cancelled or replaced it; the
@@ -557,8 +554,8 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
     return true;
   }
 
-  PlacementObservation observation =
-      Platform::Windows::PlaceWindowChecked(hwnd, record->canMove, authoritative);
+  PlacementObservation placement =
+      Platform::Windows::PlaceWindowChecked(hwnd, record->canMove, observed.authoritative);
 
   // Count every issued reinforcement attempt, not only successful ones. A failed
   // checked placement is still part of the lease's cadence and must not look like
@@ -567,13 +564,12 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   const bool leaseRetained =
       RecordConformanceLeaseAttempt(hwnd, lease.generation, &attemptNumber);
 
-  Workspace::PlacementAction action =
-      workspace.ApplyPlacementObservation(hwnd, observation);
+  const Workspace::PlacementAction action = workspace.ApplyPlacementObservation(hwnd, placement);
 
   ++Diagnostics::g_runtime.counters.conformanceLeaseRepairs;
   Diagnostics::RecordEvent(
       L"conformance lease reinforced hwnd=%p attempt=%u result=%d",
-      hwnd, attemptNumber, static_cast<int>(observation.result));
+      hwnd, attemptNumber, static_cast<int>(placement.result));
 
   if (action == Workspace::PlacementAction::Forget) {
     CancelConformanceLease(hwnd, lease.generation);
@@ -591,7 +587,7 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   }
 
   g_workspaces.Save(key, workspace);
-  if (observation.result != PlacementResult::Success && leaseRetained) {
+  if (placement.result != PlacementResult::Success && leaseRetained) {
     // Adjusted/refused placements are exactly the cases where relying on another
     // LOCATIONCHANGE is unsafe: the application may already be sitting at its
     // final self-selected rectangle. Keep the lease alive and schedule one more
@@ -607,6 +603,45 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
   return true;
 }
 
+// A tracked tiled HWND either confirms its authoritative rectangle or opens/reuses
+// one bounded conformance lease. Native user gestures remain authoritative and
+// are handled separately after MOVESIZEEND.
+// Returns true when handled/deferred. False may cancel a stale lease; it does not
+// imply that this routine had no effects. All rectangles are physical screen pixels.
+static bool HandleTiledWindowLocationChange(HWND hwnd) {
+  if (Gestures::IsMoveSizeGestureInProgress(hwnd)) return true;
+
+  ConformanceLease lease;
+  const ConformanceLeaseReadResult leaseState = ReadConformanceLease(hwnd, &lease);
+  if (leaseState == ConformanceLeaseReadResult::Expired) {
+    ScheduleNextConformanceTimer();  // The deadline verdict belongs to the timer.
+    return true;
+  }
+  const bool hasLease = leaseState == ConformanceLeaseReadResult::Active;
+
+  auto observed = ObserveTiledWindowLocation(hwnd);
+  if (!observed) {
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
+    return false;
+  }
+  if (Layout::RectsNear(observed->current, observed->authoritative)) {
+    return true;  // Our own placement/event echo; nothing to repair.
+  }
+
+  // Off its tile. Without a lease for this exact tile, start a fresh one.
+  if (!hasLease || !Layout::RectsNear(observed->authoritative, lease.expectedRect)) {
+    if (hasLease) CancelConformanceLease(hwnd, lease.generation);
+    BeginConformanceLease(hwnd, observed->authoritative, true);
+    return true;
+  }
+
+  switch (CheckConformanceRepairTiming(hwnd, lease)) {
+    case ConformanceRepairTiming::Waiting: return true;
+    case ConformanceRepairTiming::DeferFailed: return false;
+    case ConformanceRepairTiming::RepairNow: break;
+  }
+  return ReinforceConformanceTile(hwnd, lease, *observed);
+}
 static void ProcessConformanceTimer() {
   RuntimeLifecycle::AssertWmThread(L"ProcessConformanceTimer");
   if (g_wm.conformanceTimer) {

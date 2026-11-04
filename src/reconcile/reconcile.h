@@ -1189,9 +1189,142 @@ static void ProcessDiscoveryRetryTimer() {
   if (!g_wm.pendingWindowOverflow.empty()) ScheduleLifecycleReconcile(nullptr);
 }
 
+// --- Settled lifecycle pass: stages ------------------------------------------
+
+// Puts dirty windows back so the next pass handles them again (no duplicates).
+static void RequeueDirtyWindows(const std::vector<HWND>& dirtyWindows) {
+  for (HWND hwnd : dirtyWindows) {
+    if (hwnd && !Model::ContainsWindow(g_wm.lifecycleDirtyWindows, hwnd)) {
+      g_wm.lifecycleDirtyWindows.push_back(hwnd);
+    }
+  }
+}
+
+// Native notifications are primary, but a settled cloak/uncloak burst can
+// independently detect a missed subscription/callback. This is the first point
+// where the WM can prove the active desktop changed, so discard leases created
+// on the old desktop before ownership repair and incoming-workspace work.
+static void HandleMissedDesktopSwitch(const GUID& currentDesktop) {
+  Placement::ClearAllConformanceLeases();
+  Placement::ScheduleNextConformanceTimer();
+  ++Diagnostics::g_runtime.counters.virtualDesktopFallbackChanges;
+  Diagnostics::RecordEvent(
+      L"virtual desktop change recovered from settled WinEvents currentDesktop=%08X",
+      currentDesktop.Data1);
+  // A missed native callback is also a high-confidence signal that an exhausted
+  // subscription retry burst deserves one fresh attempt sequence.
+  if (g_vd.abi.notification.methodCount > 0 && !g_vd.notificationsRegistered) {
+    RuntimeLifecycle::RequestMaintenance(true);
+  }
+  g_wm.pendingDesktopSwitchFlyouts = true;
+}
+
+// Chooses the monitors this pass must discover on. After a desktop switch or a
+// display change, that is every connected monitor (and existing workspaces are
+// re-arranged); otherwise only monitors with a known workspace. Either way, add
+// monitors showing a dirty window, so a new desktop+monitor workspace can start.
+// May reconcile monitor ownership (topology changes) into `globallyChanged`.
+static std::vector<HMONITOR> CollectMonitorsForPass(
+    const GUID& currentDesktop, bool desktopSwitched, const std::vector<HWND>& dirtyWindows,
+    std::vector<DesktopMonitorKey>* globallyChanged) {
+  std::vector<HMONITOR> monitors;
+  if (desktopSwitched || g_wm.forceMonitorReconcile) {
+    // Authoritative desktop/topology passes derive their boundary set from the OS,
+    // not from whatever workspace keys happened to exist before the transition.
+    EnumerateCurrentMonitors(monitors);
+    for (HMONITOR monitor : monitors) {
+      DesktopMonitorKey key{};
+      if (!DesktopMonitorKey::FromHMonitor(currentDesktop, monitor, &key)) continue;
+      Workspace existing;
+      if (g_workspaces.Load(key, &existing)) AddPendingWorkspaceArrange(currentDesktop, monitor);
+    }
+  } else {
+    monitors = g_workspaces.MonitorsOnDesktop(currentDesktop);
+  }
+
+  if (g_wm.forceMonitorReconcile) {
+    ReconcileKnownWindows(ReconcileScope::Monitor, globallyChanged);
+    g_wm.forceMonitorReconcile = false;
+  }
+
+  for (HWND hwnd : dirtyWindows) {
+    if (!hwnd || !IsWindow(hwnd)) continue;
+    BOOL onCurrent = FALSE;
+    if (!Platform::VirtualDesktop::IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) continue;
+    AddUniqueMonitor(monitors, Platform::Windows::GetWindowPhysicalMonitor(hwnd));
+  }
+  return monitors;
+}
+
+// Runs discovery for each monitor's snapshot and arranges every workspace that
+// was saved or has a pending arrange request. Returns the keys it arranged;
+// ownership repairs found along the way are added to `globallyChanged`.
+static std::vector<DesktopMonitorKey> DiscoverAndArrangeMonitors(
+    const GUID& currentDesktop, const std::vector<HMONITOR>& monitors,
+    const std::vector<std::vector<HWND>>& snapshots,
+    const std::vector<std::vector<HWND>>& suspendedSnapshots,
+    std::vector<DesktopMonitorKey>* globallyChanged) {
+  std::vector<DesktopMonitorKey> arrangedKeys;
+  for (size_t monitorIndex = 0; monitorIndex < monitors.size(); ++monitorIndex) {
+    const HMONITOR monitor = monitors[monitorIndex];
+    const auto discovery = DiscoverWorkspaceWindows(
+        monitor, currentDesktop, snapshots[monitorIndex], &suspendedSnapshots[monitorIndex]);
+    for (const auto& key : discovery.ownershipChanges) AddUniqueWorkspaceKey(*globallyChanged, key);
+    const bool pendingArrange = std::any_of(
+        g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
+        [&](const PendingWorkspaceArrange& pending) {
+          return pending.monitor == monitor && IsEqualGUID(pending.desktopId, currentDesktop);
+        });
+    if (discovery.status == WorkspaceDiscoveryStatus::Saved || pendingArrange) {
+      Placement::ArrangeWorkspace(discovery.key);
+      AddUniqueWorkspaceKey(arrangedKeys, discovery.key);
+    }
+  }
+  return arrangedKeys;
+}
+
+// Admission is intentionally decided only after the settled snapshot. If a
+// plausible candidate is still unknown, its first observation may have raced
+// application initialization or shell desktop registration. Give it one
+// independent re-observation after SlowApplicationDelayMs, without polling.
+static void ScheduleDiscoveryRetries(const std::vector<HWND>& dirtyWindows) {
+  if (!(RuntimeLifecycle::IsAutomaticMode() || g_wm.windowRoutingReady) ||
+      !g_settings.slowApplicationDelayMs) {
+    return;
+  }
+  bool addedRetry = false;
+  const ULONGLONG dueTickMs = GetTickCount64() + g_settings.slowApplicationDelayMs;
+  for (HWND hwnd : dirtyWindows) {
+    if (!hwnd || !IsWindow(hwnd) || Platform::Windows::IsWindowTrackedInAnyState(hwnd) ||
+        !(RuntimeLifecycle::IsAutomaticMode() || !g_wm.windowRoutingEvaluated.count(hwnd)) ||
+        Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+        GetAncestor(hwnd, GA_ROOT) != hwnd) {
+      continue;
+    }
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hwnd, &processId);
+    if (!processId) continue;
+
+    auto existing = std::find_if(
+        g_wm.pendingDiscoveryRetries.begin(), g_wm.pendingDiscoveryRetries.end(),
+        [&](const PendingDiscoveryRetry& pending) { return pending.hwnd == hwnd; });
+    if (existing != g_wm.pendingDiscoveryRetries.end()) {
+      if (existing->processId == processId) continue;
+      *existing = {hwnd, processId, dueTickMs};
+    } else {
+      g_wm.pendingDiscoveryRetries.push_back({hwnd, processId, dueTickMs});
+    }
+    addedRetry = true;
+  }
+  if (addedRetry) ScheduleNextDiscoveryRetryTimer();
+}
+
 // After a lifecycle burst settles, reconcile tracked-window physical and desktop
 // state, discover eligible windows only on the current desktop, then arrange each
 // changed or pending workspace once and refresh the tray.
+//
+// If the active desktop changes while this runs, the pass stops and requeues its
+// work; nothing it already committed is lost. WM thread only.
 static void ReconcileDeferredLifecycle() {
   ++Diagnostics::g_runtime.counters.lifecycleReconciles;
   if (g_wm.lifecycleTimer) {
@@ -1201,208 +1334,76 @@ static void ReconcileDeferredLifecycle() {
 
   std::vector<HWND> dirtyWindows;
   dirtyWindows.swap(g_wm.lifecycleDirtyWindows);
-  Diagnostics::RecordLifecycleBurst(
-      dirtyWindows.size(), g_wm.pendingDesktopArranges.size());
+  Diagnostics::RecordLifecycleBurst(dirtyWindows.size(), g_wm.pendingDesktopArranges.size());
 
-  // Resolve desktop identity before mutating model state. If Explorer is still
+  // 1. Resolve desktop identity before mutating model state. If Explorer is still
   // coming up (or restarting), preserve the dirty set and let the single runtime
   // maintenance owner recover COM before this exact work is retried.
   GUID currentDesktop{};
-  if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI() || !Platform::VirtualDesktop::GetCurrentDesktopId(&currentDesktop)) {
-    for (HWND hwnd : dirtyWindows) {
-      if (hwnd && std::find(g_wm.lifecycleDirtyWindows.begin(),
-                            g_wm.lifecycleDirtyWindows.end(), hwnd) ==
-                      g_wm.lifecycleDirtyWindows.end()) {
-        g_wm.lifecycleDirtyWindows.push_back(hwnd);
-      }
-    }
+  if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI() ||
+      !Platform::VirtualDesktop::GetCurrentDesktopId(&currentDesktop)) {
+    RequeueDirtyWindows(dirtyWindows);
     g_wm.lifecycleRetryAfterPlatformRecovery = true;
     RuntimeLifecycle::RequestMaintenance(false);
     Wh_Log(L"Lifecycle reconcile deferred: current virtual desktop unavailable");
     return;
   }
-
   Diagnostics::g_runtime.counters.lifecycleDirtyWindowsProcessed += dirtyWindows.size();
 
-  // Native notifications are primary, but a settled cloak/uncloak burst can
-  // independently detect a missed subscription/callback. Treat an observed GUID
-  // change as a real desktop transition: repair global desktop ownership and
-  // reinforce all known/current monitors on the incoming desktop.
-  const bool fallbackDesktopChange =
+  const bool missedDesktopSwitch =
       g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown &&
       !IsEqualGUID(g_wm.reconciledDesktop, currentDesktop);
-  if (fallbackDesktopChange) {
-    // The native callback was missed, so this is the first point where the WM can
-    // prove that the active desktop changed. Discard any lease created on the old
-    // desktop before doing ownership repair or incoming-workspace reinforcement.
-    Placement::ClearAllConformanceLeases();
-    Placement::ScheduleNextConformanceTimer();
-    ++Diagnostics::g_runtime.counters.virtualDesktopFallbackChanges;
-    Diagnostics::RecordEvent(
-        L"virtual desktop change recovered from settled WinEvents currentDesktop=%08X",
-        currentDesktop.Data1);
-    // A missed native callback is also a high-confidence signal that an exhausted
-    // subscription retry burst deserves one fresh attempt sequence.
-    if (g_vd.abi.notification.methodCount > 0 &&
-        !g_vd.notificationsRegistered) {
-      RuntimeLifecycle::RequestMaintenance(true);
-    }
-    g_wm.pendingDesktopSwitchFlyouts = true;
-  }
+  if (missedDesktopSwitch) HandleMissedDesktopSwitch(currentDesktop);
   g_wm.reconciledDesktop = currentDesktop;
   g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
 
-  // Repair liveness/exclusions and settled suspended participation globally
-  // before doing current-desktop discovery.
+  // 2. Repair liveness/exclusions and settled suspended participation globally
+  // before doing current-desktop discovery. Dirty tracked HWNDs also get a
+  // desktop ownership check; per-window moves do not emit a desktop change.
   std::vector<DesktopMonitorKey> globallyChanged;
   ReconcileKnownWindows(ReconcileScope::Participation, &globallyChanged);
-  if (fallbackDesktopChange) {
-    ReconcileKnownWindows(ReconcileScope::Desktop, &globallyChanged);
-  }
-
-  // Dirty tracked HWNDs also get a desktop ownership check; per-window moves do
-  // not emit CurrentVirtualDesktopChanged.
+  if (missedDesktopSwitch) ReconcileKnownWindows(ReconcileScope::Desktop, &globallyChanged);
   for (HWND hwnd : dirtyWindows) {
     if (!hwnd || !Platform::Windows::IsWindowTrackedInAnyState(hwnd)) continue;
     ReconcileKnownWindows(ReconcileScope::Desktop, &globallyChanged, hwnd);
   }
 
-  std::vector<HMONITOR> monitors;
-  if (fallbackDesktopChange || g_wm.forceMonitorReconcile) {
-    // Authoritative desktop/topology passes derive their boundary set from the OS,
-    // not from whatever workspace keys happened to exist before the transition.
-    EnumerateCurrentMonitors(monitors);
-    for (HMONITOR monitor : monitors) {
-      DesktopMonitorKey key{};
-      if (!DesktopMonitorKey::FromHMonitor(currentDesktop, monitor, &key)) continue;
-      Workspace existing;
-      if (g_workspaces.Load(key, &existing)) {
-        AddPendingWorkspaceArrange(currentDesktop, monitor);
-      }
-    }
-  } else {
-    // Incremental lifecycle work stays cheap: start from known live workspace
-    // boundaries and add only monitors implicated by this burst.
-    monitors = g_workspaces.MonitorsOnDesktop(currentDesktop);
-  }
-
-  if (g_wm.forceMonitorReconcile) {
-    ReconcileKnownWindows(ReconcileScope::Monitor, &globallyChanged);
-    g_wm.forceMonitorReconcile = false;
-  }
-
-  // Also include monitors implicated by the shell burst so automatic discovery
-  // can seed a new desktop+monitor workspace.
-  for (HWND hwnd : dirtyWindows) {
-    if (!hwnd || !IsWindow(hwnd)) continue;
-    BOOL onCurrent = FALSE;
-    if (!Platform::VirtualDesktop::IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) continue;
-    AddUniqueMonitor(monitors, Platform::Windows::GetWindowPhysicalMonitor(hwnd));
-  }
-
+  // 3. Snapshot the monitors involved (one top-level enumeration for all).
+  std::vector<HMONITOR> monitors =
+      CollectMonitorsForPass(currentDesktop, missedDesktopSwitch, dirtyWindows, &globallyChanged);
   RouteNewWindows(monitors);
-
-  // One top-level enumeration is enough for every monitor involved in this burst.
-  std::vector<std::vector<HWND>> snapshots =
+  const std::vector<std::vector<HWND>> snapshots =
       Platform::Windows::CollectTileWindowsForMonitors(monitors, currentDesktop);
-  std::vector<std::vector<HWND>> suspendedSnapshots =
+  const std::vector<std::vector<HWND>> suspendedSnapshots =
       CollectDirtySuspendedWindowsForMonitors(dirtyWindows, monitors, currentDesktop);
 
+  // The snapshots are only valid while the desktop has not changed. On a change,
+  // retain dirty suspended admissions and already-committed ownership changes.
   auto snapshotStillCurrent = [&] {
     if (ValidateSnapshotDesktop(currentDesktop)) return true;
-    // A retry must retain dirty suspended admissions and any already-committed
-    // participation/ownership changes, not just rediscover visible windows.
-    for (HWND hwnd : dirtyWindows) {
-      if (hwnd && !Model::ContainsWindow(g_wm.lifecycleDirtyWindows, hwnd)) {
-        g_wm.lifecycleDirtyWindows.push_back(hwnd);
-      }
-    }
-    for (const auto& key : globallyChanged) {
-      AddPendingWorkspaceArrange(key.desktopId, key.ResolveMonitor());
-    }
+    RequeueDirtyWindows(dirtyWindows);
+    for (const auto& key : globallyChanged) AddPendingWorkspaceArrange(key.desktopId, key.ResolveMonitor());
     return false;
   };
   if (!snapshotStillCurrent()) return;
 
-  std::vector<DesktopMonitorKey> arrangedKeys;
-  for (size_t monitorIndex = 0; monitorIndex < monitors.size(); ++monitorIndex) {
-    HMONITOR monitor = monitors[monitorIndex];
-    const std::vector<HWND>& snapshot = snapshots[monitorIndex];
-    const std::vector<HWND>& suspendedSnapshot = suspendedSnapshots[monitorIndex];
-    const auto discovery = DiscoverWorkspaceWindows(
-        monitor, currentDesktop, snapshot, &suspendedSnapshot);
-    for (const auto& key : discovery.ownershipChanges) AddUniqueWorkspaceKey(globallyChanged, key);
-    const bool pendingArrange = std::any_of(
-        g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
-        [&](const PendingWorkspaceArrange& pending) {
-          return pending.monitor == monitor &&
-                 IsEqualGUID(pending.desktopId, currentDesktop);
-        });
-    if (discovery.status == WorkspaceDiscoveryStatus::Saved || pendingArrange) {
-      Placement::ArrangeWorkspace(discovery.key);
-      AddUniqueWorkspaceKey(arrangedKeys, discovery.key);
-    }
-  }
-
-  // Admission is intentionally decided only after the settled snapshot. If a
-  // plausible Automatic-mode candidate is still unknown, its first observation
-  // may have raced application initialization or shell desktop registration.
-  // Give it one independent re-observation without turning discovery into polling.
-  if ((RuntimeLifecycle::IsAutomaticMode() || g_wm.windowRoutingReady) &&
-      g_settings.slowApplicationDelayMs) {
-    bool addedRetry = false;
-    const ULONGLONG dueTickMs =
-        GetTickCount64() + g_settings.slowApplicationDelayMs;
-    for (HWND hwnd : dirtyWindows) {
-      if (hwnd && IsWindow(hwnd) && !Platform::Windows::IsWindowTrackedInAnyState(hwnd) &&
-          (RuntimeLifecycle::IsAutomaticMode() || !g_wm.windowRoutingEvaluated.count(hwnd)) &&
-          Platform::Windows::GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
-          GetAncestor(hwnd, GA_ROOT) == hwnd) {
-        DWORD processId = 0;
-        GetWindowThreadProcessId(hwnd, &processId);
-        if (!processId) continue;
-
-        auto existing = std::find_if(
-            g_wm.pendingDiscoveryRetries.begin(),
-            g_wm.pendingDiscoveryRetries.end(),
-            [&](const PendingDiscoveryRetry& pending) {
-              return pending.hwnd == hwnd;
-            });
-        if (existing != g_wm.pendingDiscoveryRetries.end()) {
-          if (existing->processId == processId) continue;
-          *existing = {hwnd, processId, dueTickMs};
-        } else {
-          g_wm.pendingDiscoveryRetries.push_back(
-              {hwnd, processId, dueTickMs});
-        }
-        addedRetry = true;
-      }
-    }
-
-    if (addedRetry) {
-      ScheduleNextDiscoveryRetryTimer();
-    }
-  }
-
+  // 4. Discover, arrange, and give slow new windows one more look.
+  const std::vector<DesktopMonitorKey> arrangedKeys = DiscoverAndArrangeMonitors(
+      currentDesktop, monitors, snapshots, suspendedSnapshots, &globallyChanged);
+  ScheduleDiscoveryRetries(dirtyWindows);
   for (const auto& key : globallyChanged) {
     if (std::none_of(arrangedKeys.begin(), arrangedKeys.end(),
-                     [&](const DesktopMonitorKey& arranged) {
-                       return SameWorkspaceKey(arranged, key);
-                     })) {
+                     [&](const DesktopMonitorKey& arranged) { return SameWorkspaceKey(arranged, key); })) {
       Placement::ArrangeWorkspace(key);
     }
   }
 
-  // Discovery/placement can itself take time. Do not consume pending work for
+  // 5. Discovery/placement can itself take time. Do not consume pending work for
   // a pass overtaken by another switch.
   if (!snapshotStillCurrent()) return;
-  g_wm.pendingDesktopArranges.erase(
-      std::remove_if(
-          g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
-          [&](const PendingWorkspaceArrange& pending) {
-            return IsEqualGUID(pending.desktopId, currentDesktop);
-          }),
-      g_wm.pendingDesktopArranges.end());
+  std::erase_if(g_wm.pendingDesktopArranges, [&](const PendingWorkspaceArrange& pending) {
+    return IsEqualGUID(pending.desktopId, currentDesktop);
+  });
 
   g_wm.lifecycleRetryAfterPlatformRecovery = false;
   if (g_wm.pendingDesktopSwitchFlyouts) {
@@ -1416,7 +1417,6 @@ static void ReconcileDeferredLifecycle() {
   // retargets that single shell icon to another monitor.
   TrayUi::RefreshDisplayedMonitor();
 }
-
 static void ReconcileManagedWindowStateNow(
     HWND hwnd, ReconcileScope scope = ReconcileScope::Participation) {
   std::vector<DesktopMonitorKey> changedKeys;
