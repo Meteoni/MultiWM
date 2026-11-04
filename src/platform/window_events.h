@@ -32,11 +32,14 @@ static bool HasTrackedMonitorOwnershipMismatch(HWND hwnd) {
       [&](const DesktopMonitorKey& owner) { return owner.monitor != observedId; });
 }
 
-// Out-of-context WinEvents are delivered on this WM thread. Keep the callback
-// observation-only and post accepted work so reentrant delivery can't recursively
-// mutate workspace state.
-void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
-  RuntimeLifecycle::AssertWmThread(L"WinEventProc");
+// --- WinEvent callback -------------------------------------------------------
+//
+// Out-of-context WinEvents are delivered on the WM thread, possibly re-entrantly
+// while other WM code is waiting on a native call. So the callback only observes
+// and posts work; it never changes workspace state. The helpers below each handle
+// one family of events and are called only from WinEventProc.
+
+static bool IsSubscribedWinEvent(DWORD event) {
   switch (event) {
     case EVENT_SYSTEM_FOREGROUND:
     case EVENT_SYSTEM_MOVESIZESTART:
@@ -50,109 +53,91 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_OBJECT_HIDE:
     case EVENT_OBJECT_CLOAKED:
     case EVENT_OBJECT_UNCLOAKED:
-      break;
+      return true;
     default:
-      return;
+      return false;
   }
+}
 
-  // Retain foreground state on the serialized WM thread. Unknown HWNDs
-  // deliberately do not clear managed focus: a just-created window can become
-  // foreground before Automatic discovery admits it, matching FancyWM's
-  // race-safe focus semantics.
-  if (event == EVENT_SYSTEM_FOREGROUND) {
-    const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
-    if (threadId) {
-      PostThreadMessage(
-          threadId, WM_APP_FOREGROUND_CHANGED,
-          reinterpret_cast<WPARAM>(hwnd), 0);
-    }
-    return;
+static bool IsMoveSizeEvent(DWORD event) {
+  return event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND;
+}
+
+// Unknown HWNDs deliberately do not clear managed focus: a just-created window
+// can become foreground before Automatic discovery admits it, matching FancyWM's
+// race-safe focus semantics. The WM thread decides what the change means.
+static void PostForegroundChanged(HWND hwnd) {
+  const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
+  if (threadId) {
+    PostThreadMessage(threadId, WM_APP_FOREGROUND_CHANGED, reinterpret_cast<WPARAM>(hwnd), 0);
   }
+}
 
-  // For window-level events only.
-  if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
-
-  // Opt-in rules can bridge custom frame/helper HWNDs to an already-managed root
-  // owner for native move/size boundaries. Lifecycle events retain exact identity.
-  if ((event == EVENT_SYSTEM_MOVESIZESTART ||
-       event == EVENT_SYSTEM_MOVESIZEEND) &&
-      !Platform::Windows::IsWindowTrackedInAnyState(hwnd) &&
-      Platform::Windows::FindMatchingWindowRule(
-          hwnd, WindowRuleTreatment::TraceToOwner)) {
-    HWND rootOwner = GetAncestor(hwnd, GA_ROOTOWNER);
-    if (rootOwner && Platform::Windows::IsWindowTrackedInAnyState(rootOwner)) {
-      hwnd = rootOwner;
-    }
+// A "Trace to owner" rule lets a custom title bar or helper window stand in for
+// its managed root owner during a move/resize. Returns the HWND the gesture
+// should be attributed to. Other events always keep their exact HWND.
+static HWND ResolveMoveSizeTarget(DWORD event, HWND hwnd) {
+  if (!IsMoveSizeEvent(event) || Platform::Windows::IsWindowTrackedInAnyState(hwnd) ||
+      !Platform::Windows::FindMatchingWindowRule(hwnd, WindowRuleTreatment::TraceToOwner)) {
+    return hwnd;
   }
+  const HWND rootOwner = GetAncestor(hwnd, GA_ROOTOWNER);
+  return rootOwner && Platform::Windows::IsWindowTrackedInAnyState(rootOwner) ? rootOwner : hwnd;
+}
 
-  const bool tracked = Platform::Windows::IsWindowTrackedInAnyState(hwnd);
-  if (event == EVENT_OBJECT_DESTROY) {
-    // Retire lifetime metadata when destruction is observed, before a delayed
-    // model message could mistake a reused HWND for the old routed window.
-    g_wm.CancelPendingWindowMoves(hwnd);
-    const bool routingKnown = g_wm.windowRoutingEvaluated.erase(hwnd) != 0;
-    const bool routingPending = g_wm.pendingWindowRoutes.erase(hwnd) != 0;
-    if (tracked || routingKnown || routingPending) QueueWindowEvent(event, hwnd);
-    return;
-  }
+// Retires per-HWND bookkeeping as soon as destruction is observed, before a
+// delayed message could mistake a reused HWND value for the old window.
+static void OnWindowDestroyed(HWND hwnd, bool tracked) {
+  g_wm.CancelPendingWindowMoves(hwnd);
+  const bool routingKnown = g_wm.windowRoutingEvaluated.erase(hwnd) != 0;
+  const bool routingPending = g_wm.pendingWindowRoutes.erase(hwnd) != 0;
+  if (tracked || routingKnown || routingPending) QueueWindowEvent(EVENT_OBJECT_DESTROY, hwnd);
+}
 
-  // A tiled LOCATIONCHANGE is classified later on the WM actor. Expected placement
-  // echoes are cheap no-ops there; unexpected same-monitor drift opens a bounded
-  // conformance lease instead of being silently discarded.
-  if (event == EVENT_OBJECT_LOCATIONCHANGE) {
-    if (!tracked) {
-      if (g_wm.pendingWindowRoutes.count(hwnd)) {
-        QueueWindowEvent(event, hwnd);
-        return;
-      }
-      // A newly created window can already be minimized, maximized, or fullscreen
-      // before the ordinary discovery snapshot sees it. Queue those states for the
-      // inactive-admission path.
-      const SuspensionReason reason = Platform::Windows::GetPhysicalSuspensionReason(hwnd);
-      if ((reason != SuspensionReason::Minimized &&
-           reason != SuspensionReason::Maximized) ||
-          !Platform::Windows::WindowCanBeManaged(hwnd)) {
-        return;
-      }
-      QueueWindowEvent(event, hwnd);
-      return;
-    }
-
-    const bool stateOrLeaseNeedsObservation =
-        g_wm.HasPendingOverflow(hwnd) || g_workspaces.IsSuspendedMaximized(hwnd) ||
-        Placement::HasActiveConformanceLease(hwnd) ||
-        g_workspaces.IsTiled(hwnd);
-    if (!stateOrLeaseNeedsObservation &&
-        !HasTrackedMonitorOwnershipMismatch(hwnd)) {
-      return;
-    }
-
-    QueueWindowEvent(event, hwnd);
-    return;
-  }
-
-  // Unknown top-level lifecycle events are only discovery prompts. Do not apply
-  // the full eligibility policy inside the callback: a newly shown framework
-  // window can still be acquiring its final styles, owner, title, or desktop
-  // registration. The settled snapshot remains authoritative for admission, and
-  // Manual mode still blocks admission at the model boundary.
+// LOCATIONCHANGE fires constantly, so only forward the ones the WM thread needs.
+// For tiled windows, expected placement echoes are cheap no-ops there, while
+// unexpected drift opens a bounded conformance lease.
+static void OnWindowLocationChanged(HWND hwnd, bool tracked) {
   if (!tracked) {
-    const bool discoveryEvent =
-        event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED ||
-        event == EVENT_OBJECT_STATECHANGE ||
-        event == EVENT_SYSTEM_MINIMIZESTART ||
-        event == EVENT_SYSTEM_MINIMIZEEND ||
-        ((event == EVENT_SYSTEM_MOVESIZESTART ||
-          event == EVENT_SYSTEM_MOVESIZEEND) &&
-         (g_wm.windowRoutingReady || RuntimeLifecycle::IsAutomaticMode()));
-    if (!discoveryEvent || GetAncestor(hwnd, GA_ROOT) != hwnd) {
+    if (g_wm.pendingWindowRoutes.count(hwnd)) {
+      QueueWindowEvent(EVENT_OBJECT_LOCATIONCHANGE, hwnd);
       return;
     }
+    // A newly created window can already be minimized, maximized, or fullscreen
+    // before the ordinary discovery snapshot sees it. Queue those states for the
+    // inactive-admission path.
+    const SuspensionReason reason = Platform::Windows::GetPhysicalSuspensionReason(hwnd);
+    if ((reason != SuspensionReason::Minimized && reason != SuspensionReason::Maximized) ||
+        !Platform::Windows::WindowCanBeManaged(hwnd)) {
+      return;
+    }
+    QueueWindowEvent(EVENT_OBJECT_LOCATIONCHANGE, hwnd);
+    return;
   }
 
-  // Explicit user manipulation always wins over a transient placement lease.
-  // Lease cancellation is actor-local; workspace mutation remains deferred until
-  // normal message dispatch.
+  const bool stateOrLeaseNeedsObservation =
+      g_wm.HasPendingOverflow(hwnd) || g_workspaces.IsSuspendedMaximized(hwnd) ||
+      Placement::HasActiveConformanceLease(hwnd) || g_workspaces.IsTiled(hwnd);
+  if (!stateOrLeaseNeedsObservation && !HasTrackedMonitorOwnershipMismatch(hwnd)) return;
+  QueueWindowEvent(EVENT_OBJECT_LOCATIONCHANGE, hwnd);
+}
+
+// For an untracked window, true when `event` should trigger discovery.
+// Eligibility is deliberately not checked here: a newly shown framework window
+// can still be acquiring its final styles, owner, title, or desktop. The settled
+// snapshot decides admission, and Manual mode still blocks it in the model.
+static bool IsDiscoveryPrompt(DWORD event, HWND hwnd) {
+  const bool discoveryEvent =
+      event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED ||
+      event == EVENT_OBJECT_STATECHANGE ||
+      event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND ||
+      (IsMoveSizeEvent(event) && (g_wm.windowRoutingReady || RuntimeLifecycle::IsAutomaticMode()));
+  return discoveryEvent && GetAncestor(hwnd, GA_ROOT) == hwnd;
+}
+
+// A user drag or resize always wins over pending automatic work for that window.
+// For managed windows, records the start/end frames that Gestures classifies later.
+static void OnMoveSize(DWORD event, HWND hwnd, bool tracked) {
   if (event == EVENT_SYSTEM_MOVESIZESTART) {
     g_wm.CancelPendingWindowMoves(hwnd);
     if (g_wm.windowRoutingReady) {
@@ -164,43 +149,61 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
   // Untracked drags only cancel initial routing. They must not reach the
   // managed-window gesture handler or leave samples for an unrelated workspace.
-  if (!tracked && (event == EVENT_SYSTEM_MOVESIZESTART ||
-                   event == EVENT_SYSTEM_MOVESIZEEND)) {
+  if (!tracked) {
     if (event == EVENT_SYSTEM_MOVESIZEEND) QueueWindowEvent(EVENT_OBJECT_SHOW, hwnd);
     return;
   }
 
-  // Cache user move/resize boundaries. The callback only records facts; model
-  // mutation and layout work happen later on the WM thread.
-  if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
-    RECT r{};
-    if (Platform::Windows::GetWindowFrameRect(hwnd, &r)) {
-      if (event == EVENT_SYSTEM_MOVESIZESTART) {
-        Gestures::g_moveSize.startRects[hwnd] = r;
-      } else {
-        Gestures::g_moveSize.endRects[hwnd] = r;
-        POINT pt{};
-        if (GetCursorPos(&pt)) Gestures::g_moveSize.endPoints[hwnd] = pt;
-      }
+  RECT frame{};
+  if (Platform::Windows::GetWindowFrameRect(hwnd, &frame)) {
+    if (event == EVENT_SYSTEM_MOVESIZESTART) {
+      Gestures::g_moveSize.startRects[hwnd] = frame;
+    } else {
+      Gestures::g_moveSize.endRects[hwnd] = frame;
+      POINT cursor{};
+      if (GetCursorPos(&cursor)) Gestures::g_moveSize.endPoints[hwnd] = cursor;
     }
-    if (event == EVENT_SYSTEM_MOVESIZEEND) OnWindowMoveSizeEnd(hwnd);
-    return;
   }
+  if (event == EVENT_SYSTEM_MOVESIZEEND) OnWindowMoveSizeEnd(hwnd);
+}
 
-  // Accepted lifecycle events are serialized on the WM thread.
-  // PostThreadMessage keeps model mutation out of the WinEvent callback.
+// Show/hide/cloak/minimize/state changes: forward to the WM thread.
+static void OnLifecycleEvent(DWORD event, HWND hwnd) {
   if (event == EVENT_OBJECT_CLOAKED || event == EVENT_OBJECT_UNCLOAKED) {
     // Older notification ABIs rely on the settled cloak/uncloak fallback to
-    // discover desktop switches. Until that pass completes, preserve the current
-    // behavior by making active-desktop checks query Explorer directly.
+    // discover desktop switches. Until that pass completes, make active-desktop
+    // checks query Explorer directly.
     if (g_wm.reconciledDesktopState != ReconciledDesktopState::Unknown) {
-      g_wm.reconciledDesktopState =
-          ReconciledDesktopState::TransitionPending;
+      g_wm.reconciledDesktopState = ReconciledDesktopState::TransitionPending;
     }
   }
   QueueWindowEvent(event, hwnd);
 }
 
+void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+  RuntimeLifecycle::AssertWmThread(L"WinEventProc");
+  if (!IsSubscribedWinEvent(event)) return;
+  if (event == EVENT_SYSTEM_FOREGROUND) {
+    PostForegroundChanged(hwnd);
+    return;
+  }
+  // Only whole top-level-window events; ignore child objects such as scroll bars.
+  if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+
+  hwnd = ResolveMoveSizeTarget(event, hwnd);
+  const bool tracked = Platform::Windows::IsWindowTrackedInAnyState(hwnd);
+  if (event == EVENT_OBJECT_DESTROY) {
+    OnWindowDestroyed(hwnd, tracked);
+  } else if (event == EVENT_OBJECT_LOCATIONCHANGE) {
+    OnWindowLocationChanged(hwnd, tracked);
+  } else if (!tracked && !IsDiscoveryPrompt(event, hwnd)) {
+    return;  // Unknown window, and not an event that should trigger discovery.
+  } else if (IsMoveSizeEvent(event)) {
+    OnMoveSize(event, hwnd, tracked);
+  } else {
+    OnLifecycleEvent(event, hwnd);
+  }
+}
 bool AllWinEventHooksInstalled() {
   return g_hooks.foreground && g_hooks.locationChange && g_hooks.moveSize &&
          g_hooks.minimize && g_hooks.hideDestroy && g_hooks.cloak && g_hooks.state;

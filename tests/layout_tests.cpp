@@ -279,7 +279,95 @@ static void RunWeightedResizeTests() {
   std::printf("Passed %d weighted resize checks.\n", checks);
 }
 
+// Characterization test for the Dwindle planner. Generates many deterministic
+// workspaces (window counts, areas, gaps, saved ratios, minimum sizes, reverse
+// and adaptive settings) and folds every planner output into one digest.
+// The digest is the behavior: a pure refactor must print the same value, and an
+// intended behavior change must update kExpectedDigest deliberately.
+static void RunDwindlePlannerDigest() {
+  // Recorded from the implementation as of 2026-11-04 (commit 59f0168).
+  constexpr uint64_t kExpectedDigest = 0x2c5aa1a1e5f7011eull;
+  uint64_t digest = 1469598103934665603ull;
+  auto mix = [&](uint64_t value) {
+    digest ^= value;
+    digest *= 1099511628211ull;
+  };
+  auto mixRect = [&](const RECT& rect) {
+    mix(static_cast<uint32_t>(rect.left)); mix(static_cast<uint32_t>(rect.top));
+    mix(static_cast<uint32_t>(rect.right)); mix(static_cast<uint32_t>(rect.bottom));
+  };
+  uint32_t seed = 20261104;
+  auto random = [&](uint32_t bound) {
+    seed = seed * 1664525u + 1013904223u;
+    return (seed >> 8) % bound;
+  };
+
+  const SettingsState savedSettings = g_settings;
+  size_t cases = 0, planned = 0, reassigned = 0;
+  for (int iteration = 0; iteration < 4000; ++iteration) {
+    g_settings.reverseDwindle = random(2) != 0;
+    g_settings.adaptiveDwindleSlots = random(4);
+    g_settings.adaptiveDwindlePercentage = static_cast<LONG>(random(41));
+    const LONG gap = static_cast<LONG>(random(20));
+    const size_t count = 2 + random(6);
+    const RECT area{0, 0, 800 + static_cast<LONG>(random(1800)), 600 + static_cast<LONG>(random(900))};
+
+    std::vector<double> ratios(count);
+    for (double& ratio : ratios) ratio = 0.2 + random(61) / 100.0;
+    std::vector<RECT> frames(count);
+    Layout::LayoutDwindle(area, gap, 0, count, ratios, g_settings.reverseDwindle, frames);
+
+    std::vector<WorkspaceGeometryItem> items;
+    for (size_t i = 0; i < count; ++i) {
+      WindowRecord record;
+      record.hwnd = reinterpret_cast<HWND>(0x1000 + i * 4);
+      record.pid = 1;
+      record.canMove = false;
+      if (random(3) != 0) {
+        record.constraints.valid = true;
+        record.constraints.minWidth = 1 + static_cast<LONG>(random(1200));
+        record.constraints.minHeight = 1 + static_cast<LONG>(random(800));
+      }
+      items.push_back({record, frames[i]});
+    }
+    const Workspace workspace = Workspace::AdoptGeometry(TileLayout::Dwindle, area, gap, 0.5, items);
+
+    std::vector<RECT> plan;
+    const auto status = Layout::BuildWorkspaceLayoutPlan(workspace, area, gap, &plan);
+    mix(static_cast<uint64_t>(status));
+    if (status == Layout::LayoutPlanStatus::Success) {
+      ++planned;
+      for (const RECT& rect : plan) mixRect(rect);
+    }
+
+    Workspace converted = workspace;
+    size_t moved = 0;
+    const bool ok = Layout::ReassignDwindleLayoutConversionForConstraints(converted, area, gap, &moved);
+    mix(ok ? 1 : 0);
+    if (ok) {
+      ++reassigned;
+      mix(moved);
+      for (HWND hwnd : converted.TiledWindows()) mix(reinterpret_cast<uintptr_t>(hwnd));
+    }
+    ++cases;
+  }
+  g_settings = savedSettings;
+
+  if (planned == 0 || reassigned == 0 || planned == cases) {
+    std::fprintf(stderr, "FAILED: digest inputs do not exercise all planner outcomes\n");
+    std::exit(1);
+  }
+  if (kExpectedDigest && digest != kExpectedDigest) {
+    std::fprintf(stderr, "FAILED: Dwindle planner digest %016llx != expected %016llx\n",
+                 static_cast<unsigned long long>(digest), static_cast<unsigned long long>(kExpectedDigest));
+    std::exit(1);
+  }
+  std::printf("Dwindle planner digest %016llx over %zu cases (%zu planned, %zu reassigned).\n",
+              static_cast<unsigned long long>(digest), cases, planned, reassigned);
+}
+
 int main() {
   RunAdaptiveDwindleTests();
   RunWeightedResizeTests();
+  RunDwindlePlannerDigest();
 }

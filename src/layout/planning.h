@@ -365,6 +365,123 @@ static bool ApplyTiledWindowOrder(
   return true;
 }
 
+// Memo key for the Dwindle conversion search: which windows are placed, which
+// slot is next, and the size of the area still to fill. A key that failed once
+// fails again, so it is recorded and skipped.
+struct DwindleSearchKey {
+  uint64_t usedMask = 0;
+  uint32_t slotIndex = 0;
+  LONG width = 0;
+  LONG height = 0;
+  bool operator==(const DwindleSearchKey& other) const noexcept {
+    return usedMask == other.usedMask && slotIndex == other.slotIndex &&
+        width == other.width && height == other.height;
+  }
+};
+
+struct DwindleSearchKeyHash {
+  size_t operator()(const DwindleSearchKey& key) const noexcept {
+    size_t value = std::hash<uint64_t>{}(key.usedMask);
+    value ^= std::hash<uint32_t>{}(key.slotIndex) + 0x9e3779b9u + (value << 6) + (value >> 2);
+    value ^= std::hash<LONG>{}(key.width) + 0x9e3779b9u + (value << 6) + (value >> 2);
+    value ^= std::hash<LONG>{}(key.height) + 0x9e3779b9u + (value << 6) + (value >> 2);
+    return value;
+  }
+};
+
+// Splits `area` for Dwindle slot `slotIndex` with an explicit leading size.
+// False when the split is impossible or leaves no room for the remaining slots.
+static bool SplitDwindleSlot(
+    const RECT& area, size_t slotIndex, LONG firstSpan, LONG gap, RECT* first, RECT* remaining) {
+  if (!first || !remaining) return false;
+  const bool vertical = (slotIndex % 2) == 0;
+  const LONG span = vertical ? RectWidth(area) : RectHeight(area);
+  if (span < 2) return false;
+  const LONG usable = UsableSplitSpan(span, gap);
+  if (firstSpan < 1 || firstSpan >= usable) return false;
+  SplitDwindleArea(area, vertical, firstSpan, span - usable, g_settings.reverseDwindle, first, remaining);
+  return RectWidth(*remaining) > 0 && RectHeight(*remaining) > 0;
+}
+
+// Places every window not yet `used` into the fixed-ratio Dwindle slots from
+// `slotIndex` onward inside `area`. Windows keep their current position where it
+// fits; the rest are assigned by bipartite matching. On success writes those
+// slots of `desiredOrder` and returns true; on failure `desiredOrder` may hold
+// partial assignments that the caller discards.
+static bool MatchDwindleTail(
+    size_t slotIndex, const RECT& area, LONG gap,
+    const std::vector<HWND>& windows, const std::vector<WindowConstraints>& constraints,
+    const std::vector<double>& ratios, const std::vector<bool>& used,
+    std::vector<HWND>* desiredOrder) {
+  const size_t count = windows.size();
+  const size_t tailCount = count - slotIndex;
+  if (tailCount == 0) return true;
+
+  std::vector<size_t> remainingWindows;
+  remainingWindows.reserve(tailCount);
+  for (size_t windowIndex = 0; windowIndex < count; ++windowIndex) {
+    if (!used[windowIndex]) remainingWindows.push_back(windowIndex);
+  }
+  if (remainingWindows.size() != tailCount) return false;
+
+  std::vector<RECT> allSlots(count);
+  LayoutDwindle(area, gap, slotIndex, tailCount, ratios, g_settings.reverseDwindle, allSlots);
+  std::vector<RECT> tailSlots(allSlots.begin() + slotIndex, allSlots.end());
+  std::vector<WindowConstraints> tailConstraints;
+  tailConstraints.reserve(tailCount);
+  for (size_t windowIndex : remainingWindows) {
+    tailConstraints.push_back(constraints[windowIndex]);
+  }
+  const ConstraintSlotCompatibility compatibility =
+      BuildConstraintSlotCompatibility(tailConstraints, tailSlots, true);
+  for (const auto& compatibleSlots : compatibility.slotsByWindow) {
+    if (compatibleSlots.empty()) return false;
+  }
+
+  constexpr size_t kUnassigned = static_cast<size_t>(-1);
+  std::vector<size_t> slotOwner(tailCount, kUnassigned);
+  std::vector<bool> fixed(tailCount, false);
+
+  // Seed surviving exact positions first so a layout conversion disturbs as
+  // little order as possible before augmenting paths are allowed to move them.
+  for (size_t localWindow = 0; localWindow < tailCount; ++localWindow) {
+    const size_t originalIndex = remainingWindows[localWindow];
+    if (originalIndex < slotIndex) continue;
+    const size_t localSlot = originalIndex - slotIndex;
+    if (localSlot >= tailCount || slotOwner[localSlot] != kUnassigned) continue;
+    const auto& compatibleSlots = compatibility.slotsByWindow[localWindow];
+    if (std::find(compatibleSlots.begin(), compatibleSlots.end(), localSlot) != compatibleSlots.end()) {
+      slotOwner[localSlot] = localWindow;
+    }
+  }
+
+  // Assign the most constrained windows first; ties keep their original order.
+  std::vector<size_t> assignmentOrder(tailCount);
+  for (size_t i = 0; i < tailCount; ++i) assignmentOrder[i] = i;
+  std::stable_sort(
+      assignmentOrder.begin(), assignmentOrder.end(),
+      [&](size_t first, size_t second) {
+        const size_t firstChoices = compatibility.slotsByWindow[first].size();
+        const size_t secondChoices = compatibility.slotsByWindow[second].size();
+        return firstChoices != secondChoices
+            ? firstChoices < secondChoices
+            : remainingWindows[first] < remainingWindows[second];
+      });
+
+  for (size_t localWindow : assignmentOrder) {
+    if (std::find(slotOwner.begin(), slotOwner.end(), localWindow) != slotOwner.end()) continue;
+    std::vector<bool> visitedSlots(tailCount, false);
+    if (!TryAssignConstraintWindow(localWindow, compatibility, &slotOwner, fixed, &visitedSlots, true)) {
+      return false;
+    }
+  }
+
+  for (size_t localSlot = 0; localSlot < tailCount; ++localSlot) {
+    if (slotOwner[localSlot] == kUnassigned) return false;
+    (*desiredOrder)[slotIndex + localSlot] = windows[remainingWindows[slotOwner[localSlot]]];
+  }
+  return true;
+}
 // Layout conversion has different semantics from an explicit order mutation.
 // Preserve the existing order first (the caller already tried that), but if the
 // new Dwindle geometry cannot host that order, find a compatible permutation.
@@ -403,141 +520,8 @@ static bool ReassignDwindleLayoutConversionForConstraints(
   bool searchLimitReached = false;
   constexpr size_t kMaxSearchNodes = 250000;
 
-  struct SearchKey {
-    uint64_t usedMask = 0;
-    uint32_t slotIndex = 0;
-    LONG width = 0;
-    LONG height = 0;
-    bool operator==(const SearchKey& other) const noexcept {
-      return usedMask == other.usedMask && slotIndex == other.slotIndex &&
-          width == other.width && height == other.height;
-    }
-  };
-  struct SearchKeyHash {
-    size_t operator()(const SearchKey& key) const noexcept {
-      size_t value = std::hash<uint64_t>{}(key.usedMask);
-      value ^= std::hash<uint32_t>{}(key.slotIndex) +
-          0x9e3779b9u + (value << 6) + (value >> 2);
-      value ^= std::hash<LONG>{}(key.width) +
-          0x9e3779b9u + (value << 6) + (value >> 2);
-      value ^= std::hash<LONG>{}(key.height) +
-          0x9e3779b9u + (value << 6) + (value >> 2);
-      return value;
-    }
-  };
-  std::unordered_set<SearchKey, SearchKeyHash> deadStates;
+  std::unordered_set<DwindleSearchKey, DwindleSearchKeyHash> deadStates;
   const bool canMemoize = count <= 64;
-
-  auto makeSplit = [&](const RECT& area, size_t slotIndex, LONG firstSpan,
-                       RECT* first, RECT* remaining) {
-    if (!first || !remaining) return false;
-    const bool vertical = (slotIndex % 2) == 0;
-    const LONG span = vertical ? RectWidth(area) : RectHeight(area);
-    if (span < 2) return false;
-    const LONG usable = UsableSplitSpan(span, gap);
-    const LONG effectiveGap = span - usable;
-    if (firstSpan < 1 || firstSpan >= usable) return false;
-
-    *remaining = area;
-    if (vertical) {
-      if (g_settings.reverseDwindle) {
-        *first = {area.right - firstSpan, area.top, area.right, area.bottom};
-        remaining->right = first->left - effectiveGap;
-      } else {
-        *first = {area.left, area.top, area.left + firstSpan, area.bottom};
-        remaining->left = first->right + effectiveGap;
-      }
-    } else {
-      if (g_settings.reverseDwindle) {
-        *first = {area.left, area.bottom - firstSpan, area.right, area.bottom};
-        remaining->bottom = first->top - effectiveGap;
-      } else {
-        *first = {area.left, area.top, area.right, area.top + firstSpan};
-        remaining->top = first->bottom + effectiveGap;
-      }
-    }
-    return RectWidth(*remaining) > 0 && RectHeight(*remaining) > 0;
-  };
-
-  auto matchFixedTail = [&](size_t slotIndex, const RECT& area) {
-    const size_t tailCount = count - slotIndex;
-    if (tailCount == 0) return true;
-
-    std::vector<size_t> remainingWindows;
-    remainingWindows.reserve(tailCount);
-    for (size_t windowIndex = 0; windowIndex < count; ++windowIndex) {
-      if (!used[windowIndex]) remainingWindows.push_back(windowIndex);
-    }
-    if (remainingWindows.size() != tailCount) return false;
-
-    std::vector<RECT> allSlots(count);
-    LayoutDwindle(
-        area, gap, slotIndex, tailCount, ratios,
-        g_settings.reverseDwindle, allSlots);
-    std::vector<RECT> tailSlots(
-        allSlots.begin() + slotIndex, allSlots.end());
-    std::vector<WindowConstraints> tailConstraints;
-    tailConstraints.reserve(tailCount);
-    for (size_t windowIndex : remainingWindows) {
-      tailConstraints.push_back(constraints[windowIndex]);
-    }
-    const ConstraintSlotCompatibility compatibility =
-        BuildConstraintSlotCompatibility(tailConstraints, tailSlots, true);
-    for (const auto& compatibleSlots : compatibility.slotsByWindow) {
-      if (compatibleSlots.empty()) return false;
-    }
-
-    constexpr size_t kUnassigned = static_cast<size_t>(-1);
-    std::vector<size_t> slotOwner(tailCount, kUnassigned);
-    std::vector<bool> fixed(tailCount, false);
-
-    // Seed surviving exact positions first so a layout conversion disturbs as
-    // little order as possible before augmenting paths are allowed to move them.
-    for (size_t localWindow = 0; localWindow < tailCount; ++localWindow) {
-      const size_t originalIndex = remainingWindows[localWindow];
-      if (originalIndex < slotIndex) continue;
-      const size_t localSlot = originalIndex - slotIndex;
-      if (localSlot >= tailCount || slotOwner[localSlot] != kUnassigned) continue;
-      const auto& compatibleSlots = compatibility.slotsByWindow[localWindow];
-      if (std::find(
-              compatibleSlots.begin(), compatibleSlots.end(), localSlot) !=
-          compatibleSlots.end()) {
-        slotOwner[localSlot] = localWindow;
-      }
-    }
-
-    std::vector<size_t> assignmentOrder(tailCount);
-    for (size_t i = 0; i < tailCount; ++i) assignmentOrder[i] = i;
-    std::stable_sort(
-        assignmentOrder.begin(), assignmentOrder.end(),
-        [&](size_t first, size_t second) {
-          const size_t firstChoices = compatibility.slotsByWindow[first].size();
-          const size_t secondChoices = compatibility.slotsByWindow[second].size();
-          return firstChoices != secondChoices
-              ? firstChoices < secondChoices
-              : remainingWindows[first] < remainingWindows[second];
-        });
-
-    for (size_t localWindow : assignmentOrder) {
-      if (std::find(slotOwner.begin(), slotOwner.end(), localWindow) !=
-          slotOwner.end()) {
-        continue;
-      }
-      std::vector<bool> visitedSlots(tailCount, false);
-      if (!TryAssignConstraintWindow(
-              localWindow, compatibility, &slotOwner, fixed,
-              &visitedSlots, true)) {
-        return false;
-      }
-    }
-
-    for (size_t localSlot = 0; localSlot < tailCount; ++localSlot) {
-      if (slotOwner[localSlot] == kUnassigned) return false;
-      desiredOrder[slotIndex + localSlot] =
-          windows[remainingWindows[slotOwner[localSlot]]];
-    }
-    return true;
-  };
 
   auto search = [&](auto&& self, size_t slotIndex, const RECT& area) -> bool {
     if (++searchNodes > kMaxSearchNodes) {
@@ -546,7 +530,7 @@ static bool ReassignDwindleLayoutConversionForConstraints(
     }
     if (slotIndex >= count) return true;
 
-    SearchKey key{};
+    DwindleSearchKey key{};
     if (canMemoize) {
       key = {usedMask, static_cast<uint32_t>(slotIndex),
              RectWidth(area), RectHeight(area)};
@@ -554,7 +538,8 @@ static bool ReassignDwindleLayoutConversionForConstraints(
     }
 
     if (slotIndex >= adaptiveSplitCount || slotIndex + 1 >= count) {
-      const bool matched = matchFixedTail(slotIndex, area);
+      const bool matched = MatchDwindleTail(
+          slotIndex, area, gap, windows, constraints, ratios, used, &desiredOrder);
       if (!matched && canMemoize) deadStates.insert(key);
       return matched;
     }
@@ -602,7 +587,7 @@ static bool ReassignDwindleLayoutConversionForConstraints(
 
       RECT first{};
       RECT remaining{};
-      if (!makeSplit(area, slotIndex, firstSpan, &first, &remaining) ||
+      if (!SplitDwindleSlot(area, slotIndex, firstSpan, gap, &first, &remaining) ||
           !WindowConstraintFitsSlot(constraint, first)) {
         continue;
       }

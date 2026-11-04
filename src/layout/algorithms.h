@@ -224,6 +224,32 @@ struct DwindleSplit {
   RECT remaining{};
 };
 
+// Cuts `area` into a leading rectangle `firstSpan` pixels wide (splitAlongX) or
+// tall, and the remainder, with `effectiveGap` pixels between them. With
+// `reverse`, the leading rectangle sits at the right/bottom edge instead.
+static void SplitDwindleArea(
+    const RECT& area, bool splitAlongX, LONG firstSpan, LONG effectiveGap, bool reverse,
+    RECT* first, RECT* remaining) {
+  *remaining = area;
+  if (splitAlongX) {
+    if (reverse) {
+      *first = {area.right - firstSpan, area.top, area.right, area.bottom};
+      remaining->right = first->left - effectiveGap;
+    } else {
+      *first = {area.left, area.top, area.left + firstSpan, area.bottom};
+      remaining->left = first->right + effectiveGap;
+    }
+  } else {
+    if (reverse) {
+      *first = {area.left, area.bottom - firstSpan, area.right, area.bottom};
+      remaining->bottom = first->top - effectiveGap;
+    } else {
+      *first = {area.left, area.top, area.right, area.top + firstSpan};
+      remaining->top = first->bottom + effectiveGap;
+    }
+  }
+}
+
 // Ordered-chain Dwindle: each node gives its first child to startIndex and
 // recursively gives its second child to all later windows. Ratios belong to
 // those split nodes, so swapping windows exchanges leaves without reshaping the
@@ -258,28 +284,9 @@ void LayoutDwindle(
       ? ClampSplitRatio(splitRatios[startIndex])
       : 0.5;
   const LONG firstSpan = SplitLeadingSpan(usableSpan, ratio);
-  RECT remaining = area;
-  if (splitAlongX) {
-    if (reverse) {
-      outRects[startIndex] = {
-          area.right - firstSpan, area.top, area.right, area.bottom};
-      remaining.right = outRects[startIndex].left - effectiveGap;
-    } else {
-      outRects[startIndex] = {
-          area.left, area.top, area.left + firstSpan, area.bottom};
-      remaining.left = outRects[startIndex].right + effectiveGap;
-    }
-  } else {
-    if (reverse) {
-      outRects[startIndex] = {
-          area.left, area.bottom - firstSpan, area.right, area.bottom};
-      remaining.bottom = outRects[startIndex].top - effectiveGap;
-    } else {
-      outRects[startIndex] = {
-          area.left, area.top, area.right, area.top + firstSpan};
-      remaining.top = outRects[startIndex].bottom + effectiveGap;
-    }
-  }
+  RECT remaining{};
+  SplitDwindleArea(area, splitAlongX, firstSpan, effectiveGap, reverse,
+                   &outRects[startIndex], &remaining);
 
   if (outSplits) {
     if (outSplits->size() < startIndex + count - 1) {

@@ -215,6 +215,138 @@ static void RunDesktopReconciliationTests() {
   std::printf("Passed %d desktop reconciliation checks.\n", checks);
 }
 
+// WinEventProc must only observe and post. These checks pin which events reach
+// the WM thread, as which message, and which per-window bookkeeping is cleared.
+// Uses hidden windows owned by this test; no hooks are installed.
+static void RunWinEventRoutingTests() {
+  unsigned checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  struct Posted { UINT message; WPARAM wParam; LPARAM lParam; };
+  auto drain = [] {
+    std::vector<Posted> posted;
+    MSG msg{};
+    while (PeekMessageW(&msg, reinterpret_cast<HWND>(-1), WM_APP, WM_APP + 64, PM_REMOVE)) {
+      posted.push_back({msg.message, msg.wParam, msg.lParam});
+    }
+    return posted;
+  };
+  auto postedOnly = [&](UINT message, WPARAM wParam, LPARAM lParam) {
+    const auto posted = drain();
+    return posted.size() == 1 && posted[0].message == message &&
+        posted[0].wParam == wParam && posted[0].lParam == lParam;
+  };
+  auto windowEvent = [&](DWORD event, HWND hwnd) {
+    return postedOnly(WM_APP_WINDOW_EVENT, static_cast<WPARAM>(event), reinterpret_cast<LPARAM>(hwnd));
+  };
+  auto send = [](DWORD event, HWND hwnd, LONG idObject = OBJID_WINDOW) {
+    Platform::WindowEvents::WinEventProc(nullptr, event, hwnd, idObject, CHILDID_SELF, 0, 0);
+  };
+  auto makeWindow = [](DWORD style, HWND parent) {
+    return CreateWindowExW(0, L"STATIC", L"MultiWM WinEvent test", style, 0, 0, 300, 300,
+                           parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+  };
+
+  g_wm.threadId.store(GetCurrentThreadId(), std::memory_order_release);
+  drain();
+  const HWND tracked = makeWindow(WS_OVERLAPPEDWINDOW, nullptr);
+  const HWND untracked = makeWindow(WS_OVERLAPPEDWINDOW, nullptr);
+  const HWND child = makeWindow(WS_CHILD, untracked);
+  check(tracked && untracked && child, "create WinEvent test windows");
+
+  DesktopMonitorKey key;
+  GUID desktop{};
+  desktop.Data1 = 0x5EE7E57;
+  check(DesktopMonitorKey::FromHMonitor(desktop, MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &key),
+        "resolve WinEvent test monitor");
+  Workspace workspace;
+  WindowRecord record;
+  record.hwnd = tracked;
+  record.pid = GetCurrentProcessId();
+  record.canMove = false;
+  check(workspace.AdmitTiled(record), "seed tracked WinEvent window");
+  g_workspaces.Save(key, workspace);
+
+  // Filtering before any window-specific work.
+  send(EVENT_OBJECT_FOCUS, tracked);
+  check(drain().empty(), "unsubscribed event is ignored");
+  send(EVENT_SYSTEM_FOREGROUND, untracked);
+  check(postedOnly(WM_APP_FOREGROUND_CHANGED, reinterpret_cast<WPARAM>(untracked), 0),
+        "foreground change is forwarded for any window");
+  send(EVENT_OBJECT_LOCATIONCHANGE, tracked, OBJID_CLIENT);
+  check(drain().empty(), "non-window object event is ignored");
+
+  // Untracked windows: only discovery prompts on top-level windows get through.
+  g_wm.managementMode = ManagementMode::Manual;
+  g_wm.windowRoutingReady = false;
+  send(EVENT_OBJECT_SHOW, untracked);
+  check(windowEvent(EVENT_OBJECT_SHOW, untracked), "untracked show prompts discovery");
+  send(EVENT_OBJECT_SHOW, child);
+  check(drain().empty(), "child window show is ignored");
+  send(EVENT_SYSTEM_MOVESIZEEND, untracked);
+  check(drain().empty(), "Manual untracked drag end is not a discovery prompt");
+  g_wm.managementMode = ManagementMode::Automatic;
+  send(EVENT_SYSTEM_MOVESIZEEND, untracked);
+  check(windowEvent(EVENT_OBJECT_SHOW, untracked), "Automatic untracked drag end prompts discovery as SHOW");
+  check(!Gestures::g_moveSize.endRects.count(untracked), "untracked drag records no gesture samples");
+  send(EVENT_OBJECT_LOCATIONCHANGE, untracked);
+  check(drain().empty(), "untracked restored-window location change is ignored");
+
+  // Initial-placement routing state for untracked windows.
+  g_wm.windowRoutingReady = true;
+  g_wm.pendingWindowRoutes[untracked] = {};
+  send(EVENT_OBJECT_LOCATIONCHANGE, untracked);
+  check(windowEvent(EVENT_OBJECT_LOCATIONCHANGE, untracked), "location change of a routed window is forwarded");
+  send(EVENT_SYSTEM_MOVESIZESTART, untracked);
+  check(drain().empty(), "untracked drag start posts nothing");
+  check(!g_wm.pendingWindowRoutes.count(untracked) && g_wm.windowRoutingEvaluated.count(untracked),
+        "user drag cancels initial routing");
+  send(EVENT_OBJECT_DESTROY, untracked);
+  check(windowEvent(EVENT_OBJECT_DESTROY, untracked), "destroy of a routing-known window is forwarded");
+  check(!g_wm.windowRoutingEvaluated.count(untracked), "destroy retires routing bookkeeping");
+  send(EVENT_OBJECT_DESTROY, untracked);
+  check(drain().empty(), "destroy of an unknown window is ignored");
+
+  // Tracked windows.
+  send(EVENT_OBJECT_LOCATIONCHANGE, tracked);
+  check(windowEvent(EVENT_OBJECT_LOCATIONCHANGE, tracked), "tiled window location change is forwarded");
+  Placement::g_conformanceLeases.leases[tracked] = Placement::ConformanceLease{};
+  g_wm.overflowWindows.insert(tracked);
+  g_wm.pendingWindowOverflow.push_back({tracked});
+  send(EVENT_SYSTEM_MOVESIZESTART, tracked);
+  check(drain().empty(), "tracked drag start posts nothing");
+  check(!Placement::g_conformanceLeases.leases.count(tracked), "drag start cancels the conformance lease");
+  check(!g_wm.HasPendingOverflow(tracked) && !g_wm.overflowWindows.count(tracked), "drag start cancels queued overflow");
+  check(Gestures::g_moveSize.startRects.count(tracked) == 1, "drag start records the start frame");
+  send(EVENT_SYSTEM_MOVESIZEEND, tracked);
+  check(postedOnly(WM_APP_MOVE_SIZE_END, reinterpret_cast<WPARAM>(tracked), 0), "drag end posts MOVE_SIZE_END");
+  check(Gestures::g_moveSize.endRects.count(tracked) == 1, "drag end records the end frame");
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  send(EVENT_OBJECT_CLOAKED, tracked);
+  check(windowEvent(EVENT_OBJECT_CLOAKED, tracked), "cloak is forwarded");
+  check(g_wm.reconciledDesktopState == ReconciledDesktopState::TransitionPending, "cloak marks a possible desktop switch");
+  send(EVENT_OBJECT_HIDE, tracked);
+  check(windowEvent(EVENT_OBJECT_HIDE, tracked), "tracked hide is forwarded");
+  g_wm.pendingOverflowSwitch.hwnd = tracked;
+  send(EVENT_OBJECT_DESTROY, tracked);
+  check(windowEvent(EVENT_OBJECT_DESTROY, tracked), "tracked destroy is forwarded");
+  check(!g_wm.pendingOverflowSwitch.hwnd, "destroy cancels a pending desktop follow");
+
+  Reconcile::ForgetManagedWindow(tracked);
+  DestroyWindow(child);
+  DestroyWindow(untracked);
+  DestroyWindow(tracked);
+  drain();
+  g_wm.windowRoutingEvaluated.clear();
+  g_wm.pendingWindowRoutes.clear();
+  g_wm.windowRoutingReady = false;
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
+  g_wm.threadId.store(0, std::memory_order_release);
+  std::printf("Passed %u WinEvent routing checks.\n", checks);
+}
+
 static void RunDiscoveryResultTests() {
   unsigned checks = 0;
   auto check = [&](bool passed, const char* message) {
@@ -270,4 +402,5 @@ static void RunDiscoveryResultTests() {
 int main() {
   RunDesktopReconciliationTests();
   RunDiscoveryResultTests();
+  RunWinEventRoutingTests();
 }

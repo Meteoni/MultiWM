@@ -93,9 +93,124 @@ static HMONITOR ResolveInitialRouteMonitor(
   return targetMonitor;
 }
 
-// Processes one observed HWND. Updates pending/evaluated routing state and may
-// move the native window; ordinary destination discovery still owns admission.
-// Keep request values copied locally across application and shell calls.
+// --- Routing one window to its initial-placement destination ----------------
+
+// Result of one routing stage. Retry keeps the request for a later pass;
+// Abandon drops it, leaving the window where it is now.
+enum class RouteStep { Continue, Retry, Abandon };
+
+// One routing attempt. Values are copied up front because native calls below
+// can deliver events that change or remove the stored request.
+struct InitialRouteAttempt {
+  HWND hwnd = nullptr;
+  DWORD processId = 0;
+  GUID sourceDesktop{};
+  WmRuntime::PendingWindowRoute request;
+  HMONITOR sourceMonitor = nullptr;
+  HMONITOR targetMonitor = nullptr;
+
+  bool ChangesDesktop() const { return !IsEqualGUID(request.targetDesktop, sourceDesktop); }
+  bool ChangesMonitor() const { return targetMonitor != sourceMonitor; }
+};
+
+// True while the request is still pending and the window is still the same,
+// unmanaged, restored, visible window on its source desktop, which is active.
+// Re-check after every native call: they can run application or shell code.
+static bool IsInitialRouteStillValid(const InitialRouteAttempt& route) {
+  const HWND hwnd = route.hwnd;
+  const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
+  if (pending == g_wm.pendingWindowRoutes.end() || pending->second.processId != route.processId) return false;
+  return Platform::Windows::IsSameLiveWindow(hwnd, route.processId) &&
+      !Platform::Windows::IsWindowTrackedInAnyState(hwnd) &&
+      !Gestures::IsMoveSizeGestureInProgress(hwnd) && !Platform::Windows::IsWindowCloaked(hwnd) &&
+      Platform::Windows::GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
+      Platform::VirtualDesktop::IsWindowOnDesktop(hwnd, route.sourceDesktop) &&
+      Platform::VirtualDesktop::IsCurrentDesktop(route.sourceDesktop) &&
+      g_wm.pendingWindowRoutes.count(hwnd);  // COM calls above may have cancelled the route.
+}
+
+// A minimized or maximized window is routed once it is restored. Meanwhile a
+// maximized one gets an arrival generation so its source workspace can count it.
+static void DeferSuspendedInitialRoute(const InitialRouteAttempt& route, SuspensionReason reason) {
+  const auto pending = g_wm.pendingWindowRoutes.find(route.hwnd);
+  if (pending == g_wm.pendingWindowRoutes.end()) return;
+  if (reason == SuspensionReason::Maximized) {
+    if (!pending->second.visibleGeneration) pending->second.visibleGeneration = Model::NextTilingGeneration();
+    AddPendingWorkspaceArrange(route.sourceDesktop, route.sourceMonitor);
+  } else {
+    pending->second.visibleGeneration = 0;
+  }
+}
+
+// The target desktop was frozen as a GUID when the rule matched. It must still
+// exist; reordering desktops must not retarget the window.
+static RouteStep CheckRouteDesktopExists(const InitialRouteAttempt& route) {
+  std::vector<GUID> order;
+  if (!Platform::VirtualDesktop::GetDesktopIdsInOrder(&order)) return RouteStep::Retry;
+  const bool exists = std::any_of(order.begin(), order.end(), [&](const GUID& id) {
+    return IsEqualGUID(id, route.request.targetDesktop);
+  });
+  return exists ? RouteStep::Continue : RouteStep::Abandon;
+}
+
+// Centers the window on the target monitor, keeping its size, and confirms it
+// arrived. `sourceFrame` receives the original frame for rollback.
+static RouteStep MoveToRouteMonitor(
+    const InitialRouteAttempt& route, RECT* sourceFrame, std::vector<HMONITOR>& monitors) {
+  const HWND hwnd = route.hwnd;
+  RECT workArea{};
+  if (!Platform::Windows::GetWindowFrameRect(hwnd, sourceFrame) || Layout::RectWidth(*sourceFrame) <= 0 ||
+      Layout::RectHeight(*sourceFrame) <= 0 ||
+      !Platform::Monitors::GetWorkspaceWorkArea(route.targetMonitor, &workArea)) {
+    return RouteStep::Abandon;
+  }
+  const RECT target = Placement::CenteredRect(
+      Placement::RectCenter(workArea), Layout::RectWidth(*sourceFrame), Layout::RectHeight(*sourceFrame));
+  const auto placed = Platform::Windows::PlaceWindowChecked(hwnd, true, target, true);
+  if (placed.result == PlacementResult::SuppressedByPhysicalState) return RouteStep::Retry;
+  AddUniqueMonitor(monitors, Platform::Windows::GetWindowPhysicalMonitor(hwnd));
+  if (placed.result != PlacementResult::Success ||
+      Platform::Windows::GetWindowPhysicalMonitor(hwnd) != route.targetMonitor) {
+    Diagnostics::RecordEvent(L"initial placement monitor refused hwnd=%p target=%p result=%d",
+                             hwnd, route.targetMonitor, static_cast<int>(placed.result));
+    return RouteStep::Abandon;
+  }
+  return RouteStep::Continue;
+}
+
+// After a failed desktop move, puts the window back on its original monitor, but
+// only if we moved it, the user has not acted since, and the request is still live.
+static void UndoRouteMonitorMove(const InitialRouteAttempt& route, const RECT& sourceFrame, DWORD inputTickMs) {
+  LASTINPUTINFO latestInput{sizeof(latestInput)};
+  if (route.ChangesMonitor() && GetLastInputInfo(&latestInput) &&
+      latestInput.dwTime == inputTickMs && IsInitialRouteStillValid(route)) {
+    Platform::Windows::PlaceWindowChecked(route.hwnd, true, sourceFrame, true);
+  }
+}
+
+// The window now lives on another desktop. Make sure a workspace exists there and
+// let the ordinary discovery pass admit it, which enforces fit and window limits
+// even when several windows arrive together. Optionally follow it.
+static void PrepareRouteDestination(const InitialRouteAttempt& route, HWND foregroundWindow, DWORD inputTickMs) {
+  DesktopMonitorKey targetKey{};
+  Workspace workspace;
+  if (DesktopMonitorKey::FromHMonitor(route.request.targetDesktop, route.targetMonitor, &targetKey) &&
+      !g_workspaces.Load(targetKey, &workspace)) {
+    g_workspaces.Save(targetKey, MakeDefaultWorkspace(targetKey));
+  }
+  AddPendingWorkspaceArrange(route.request.targetDesktop, route.targetMonitor);
+  if (route.request.followWindow &&
+      (!g_wm.pendingInitialPlacementSwitch.hwnd || route.hwnd == foregroundWindow)) {
+    g_wm.pendingInitialPlacementSwitch = {route.hwnd, route.processId, route.sourceDesktop,
+                                          route.request.targetDesktop, {}, 0, inputTickMs};
+  }
+  ScheduleLifecycleReconcile(nullptr);
+}
+
+// Processes one observed HWND: matches an initial-placement rule (once), then
+// moves the window to the rule's monitor and/or desktop. Updates the
+// pending/evaluated routing sets and may move the native window. Admission is
+// left to ordinary discovery at the destination. WM thread only.
 static void ProcessInitialWindowRoute(
     HWND hwnd, HWND foregroundWindow, std::vector<HMONITOR>& monitors) {
   // Explicit admission and user gestures override pending initial placement.
@@ -116,29 +231,30 @@ static void ProcessInitialWindowRoute(
   if (!processId || !Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &sourceDesktop) ||
       IsEqualGUID(sourceDesktop, GUID_NULL)) return;
 
+  // 1. Find (or create, by matching rules) the pending request.
   if (!g_wm.pendingWindowRoutes.count(hwnd) &&
       !TryQueueInitialWindowRoute(hwnd, processId, sourceDesktop)) return;
   // Never retain map iterators or references across native calls.
   const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
   if (pending == g_wm.pendingWindowRoutes.end()) return;
-  const auto request = pending->second;
-  if (request.processId != processId || !IsEqualGUID(request.sourceDesktop, sourceDesktop)) {
-    g_wm.pendingWindowRoutes.erase(hwnd); // The app or user relocated it.
+  InitialRouteAttempt route{hwnd, processId, sourceDesktop, pending->second};
+  if (route.request.processId != processId || !IsEqualGUID(route.request.sourceDesktop, sourceDesktop)) {
+    g_wm.pendingWindowRoutes.erase(hwnd);  // The app or user relocated it.
     return;
   }
   if (!Platform::VirtualDesktop::IsCurrentDesktop(sourceDesktop) ||
       Platform::Windows::IsWindowCloaked(hwnd)) return;
 
-  const HMONITOR sourceMonitor = Platform::Windows::GetWindowPhysicalMonitor(hwnd);
-  AddUniqueMonitor(monitors, sourceMonitor);
-  const HMONITOR targetMonitor = ResolveInitialRouteMonitor(request, sourceMonitor);
-  if (!targetMonitor) {
+  // 2. Decide where it goes.
+  route.sourceMonitor = Platform::Windows::GetWindowPhysicalMonitor(hwnd);
+  AddUniqueMonitor(monitors, route.sourceMonitor);
+  route.targetMonitor = ResolveInitialRouteMonitor(route.request, route.sourceMonitor);
+  if (!route.targetMonitor) {
     Wh_Log(L"Initial placement monitor unavailable for HWND %p", hwnd);
     g_wm.pendingWindowRoutes.erase(hwnd);
     return;
   }
-  const bool changeDesktop = !IsEqualGUID(request.targetDesktop, sourceDesktop);
-  if (!changeDesktop && targetMonitor == sourceMonitor) {
+  if (!route.ChangesDesktop() && !route.ChangesMonitor()) {
     // Already at its destination: normal suspended admission must still count
     // maximized windows, without waiting for an unnecessary physical move.
     g_wm.pendingWindowRoutes.erase(hwnd);
@@ -146,97 +262,43 @@ static void ProcessInitialWindowRoute(
   }
   const SuspensionReason suspensionReason = Platform::Windows::GetPhysicalSuspensionReason(hwnd);
   if (suspensionReason != SuspensionReason::None) {
-    const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
-    if (pending != g_wm.pendingWindowRoutes.end()) {
-      if (suspensionReason == SuspensionReason::Maximized) {
-        if (!pending->second.visibleGeneration) pending->second.visibleGeneration = Model::NextTilingGeneration();
-        AddPendingWorkspaceArrange(sourceDesktop, sourceMonitor);
-      } else {
-        pending->second.visibleGeneration = 0;
-      }
-    }
+    DeferSuspendedInitialRoute(route, suspensionReason);
     return;
   }
-  // A frozen GUID must still exist; desktop reordering must not retarget it.
-  if (changeDesktop) {
-    std::vector<GUID> order;
-    if (!Platform::VirtualDesktop::GetDesktopIdsInOrder(&order)) return;
-    if (std::none_of(order.begin(), order.end(), [&](const GUID& id) {
-          return IsEqualGUID(id, request.targetDesktop);
-        })) {
-      g_wm.pendingWindowRoutes.erase(hwnd);
-      return;
-    }
+  if (route.ChangesDesktop()) {
+    const RouteStep step = CheckRouteDesktopExists(route);
+    if (step == RouteStep::Abandon) g_wm.pendingWindowRoutes.erase(hwnd);
+    if (step != RouteStep::Continue) return;
   }
-  auto canRoute = [&] {
-    const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
-    if (pending == g_wm.pendingWindowRoutes.end() || pending->second.processId != processId) return false;
-    return Platform::Windows::IsSameLiveWindow(hwnd, processId) &&
-        !Platform::Windows::IsWindowTrackedInAnyState(hwnd) &&
-        !Gestures::IsMoveSizeGestureInProgress(hwnd) && !Platform::Windows::IsWindowCloaked(hwnd) &&
-        Platform::Windows::GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
-        Platform::VirtualDesktop::IsWindowOnDesktop(hwnd, sourceDesktop) &&
-        Platform::VirtualDesktop::IsCurrentDesktop(sourceDesktop) &&
-        g_wm.pendingWindowRoutes.count(hwnd);  // COM calls above may have cancelled the route.
-  };
+
+  // 3. Move it: monitor first (while still visible), then desktop.
   LASTINPUTINFO input{sizeof(input)};
-  if (!GetLastInputInfo(&input) || !canRoute()) return;
+  if (!GetLastInputInfo(&input) || !IsInitialRouteStillValid(route)) return;
   RECT sourceFrame{};
-  if (targetMonitor != sourceMonitor) {
-    RECT workArea{};
-    if (!Platform::Windows::GetWindowFrameRect(hwnd, &sourceFrame) || Layout::RectWidth(sourceFrame) <= 0 ||
-        Layout::RectHeight(sourceFrame) <= 0 || !Platform::Monitors::GetWorkspaceWorkArea(targetMonitor, &workArea)) {
-      g_wm.pendingWindowRoutes.erase(hwnd);
-      return;
-    }
-    const RECT target = Placement::CenteredRect(Placement::RectCenter(workArea), Layout::RectWidth(sourceFrame), Layout::RectHeight(sourceFrame));
-    const auto placed = Platform::Windows::PlaceWindowChecked(hwnd, true, target, true);
-    if (placed.result == PlacementResult::SuppressedByPhysicalState) return;
-    AddUniqueMonitor(monitors, Platform::Windows::GetWindowPhysicalMonitor(hwnd));
-    if (placed.result != PlacementResult::Success || Platform::Windows::GetWindowPhysicalMonitor(hwnd) != targetMonitor) {
-      Diagnostics::RecordEvent(L"initial placement monitor refused hwnd=%p target=%p result=%d",
-                               hwnd, targetMonitor, static_cast<int>(placed.result));
-      g_wm.pendingWindowRoutes.erase(hwnd);
-      return;
-    }
+  if (route.ChangesMonitor()) {
+    const RouteStep step = MoveToRouteMonitor(route, &sourceFrame, monitors);
+    if (step == RouteStep::Abandon) g_wm.pendingWindowRoutes.erase(hwnd);
+    if (step != RouteStep::Continue) return;
   }
-  if (!canRoute()) return;
-  if (changeDesktop && !Platform::VirtualDesktop::MoveWindowToDesktop(
-          hwnd, processId, sourceDesktop, request.targetDesktop,
+  if (!IsInitialRouteStillValid(route)) return;
+  if (route.ChangesDesktop() && !Platform::VirtualDesktop::MoveWindowToDesktop(
+          hwnd, processId, sourceDesktop, route.request.targetDesktop,
           Platform::VirtualDesktop::WindowMovePurpose::InitialPlacement)) {
-    // Undo only our monitor move, and only while the original request is live.
-    LASTINPUTINFO latestInput{sizeof(latestInput)};
-    if (targetMonitor != sourceMonitor && GetLastInputInfo(&latestInput) &&
-        latestInput.dwTime == input.dwTime && canRoute()) {
-      Platform::Windows::PlaceWindowChecked(hwnd, true, sourceFrame, true);
-    }
+    UndoRouteMonitorMove(route, sourceFrame, input.dwTime);
     g_wm.pendingWindowRoutes.erase(hwnd);
     return;
   }
-  if (!Platform::VirtualDesktop::IsWindowOnDesktop(hwnd, request.targetDesktop)) return;
-  if (!g_wm.pendingWindowRoutes.count(hwnd) || !Platform::Windows::IsSameLiveWindow(hwnd, processId)) return;
-  g_wm.pendingWindowRoutes.erase(hwnd); // Overflow must never reapply this rule.
-  AddUniqueMonitor(monitors, targetMonitor);
-  if (changeDesktop) {
-    DesktopMonitorKey targetKey{};
-    Workspace workspace;
-    if (DesktopMonitorKey::FromHMonitor(request.targetDesktop, targetMonitor, &targetKey) &&
-        !g_workspaces.Load(targetKey, &workspace)) {
-      g_workspaces.Save(targetKey, MakeDefaultWorkspace(targetKey));
-    }
-    // Off-desktop windows stay unadmitted until the ordinary destination pass.
-    // That pass enforces fit/limits, including when several windows arrive together.
-    AddPendingWorkspaceArrange(request.targetDesktop, targetMonitor);
-    if (request.followWindow && (!g_wm.pendingInitialPlacementSwitch.hwnd || hwnd == foregroundWindow)) {
-      g_wm.pendingInitialPlacementSwitch =
-          {hwnd, processId, sourceDesktop, request.targetDesktop, {}, 0, input.dwTime};
-    }
-    ScheduleLifecycleReconcile(nullptr);
-  }
-  Diagnostics::RecordEvent(L"initial placement hwnd=%p targetDesktop=%08X monitor=%p follow=%d",
-                           hwnd, request.targetDesktop.Data1, targetMonitor, request.followWindow ? 1 : 0);
-}
 
+  // 4. Confirm and commit.
+  if (!Platform::VirtualDesktop::IsWindowOnDesktop(hwnd, route.request.targetDesktop)) return;
+  if (!g_wm.pendingWindowRoutes.count(hwnd) || !Platform::Windows::IsSameLiveWindow(hwnd, processId)) return;
+  g_wm.pendingWindowRoutes.erase(hwnd);  // Overflow must never reapply this rule.
+  AddUniqueMonitor(monitors, route.targetMonitor);
+  if (route.ChangesDesktop()) PrepareRouteDestination(route, foregroundWindow, input.dwTime);
+  Diagnostics::RecordEvent(L"initial placement hwnd=%p targetDesktop=%08X monitor=%p follow=%d",
+                           hwnd, route.request.targetDesktop.Data1, route.targetMonitor,
+                           route.request.followWindow ? 1 : 0);
+}
 // Run before snapshots are built. A rule chooses the initial destination once;
 // admission and overflow remain owned by the destination's ordinary active pass.
 static void RouteNewWindows(std::vector<HMONITOR>& monitors) {
