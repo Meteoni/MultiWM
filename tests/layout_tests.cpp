@@ -366,7 +366,77 @@ static void RunDwindlePlannerDigest() {
               static_cast<unsigned long long>(digest), cases, planned, reassigned);
 }
 
+// Characterizes the pure settings parsers over awkward inputs (spacing, bounds,
+// separators, case, junk). The digest pins accepted values and rejections.
+static void RunSettingsParserDigest() {
+  uint64_t digest = 1469598103934665603ull;
+  auto mix = [&](uint64_t value) { digest ^= value; digest *= 1099511628211ull; };
+  const PCWSTR corpus[] = {
+      L"", L" ", L"6, 6, 6, 6", L"0,0,0,0", L"500,500,500,500", L"501,0,0,0", L"-1,0,0,0",
+      L"  1 ,2,  3,4  ", L"1,2,3", L"1,2,3,4,5", L"1;2;3;4", L"a,b,c,d", L"1,2,3,4x", L"\t7,\t8,\t9,\t10\t",
+      L"960, 640", L"100,100", L"4000,4000", L"99,100", L"100,4001", L"960 640", L"960,", L",640",
+      L" 1200 , 800 ", L"960,640,1", L"0x10,200",
+      L"T", L"t", L"F5", L"f12", L"F13", L"F0", L"Space", L"space", L"PgDn", L"Del", L"Return",
+      L",", L".", L"<", L"?", L"~", L"!", L"(", L"9", L"AB", L"Esc", L"Left",
+      L"alt", L"ctrl", L"alt+shift", L"ctrl+alt", L"ctrl+shift", L"win", L"ALT",
+      L"master_stack", L"master_stack_h", L"columns", L"rows", L"dwindle", L"bsp", L"monocle",
+      L"floating", L"Floating", L"unknown",
+  };
+  for (PCWSTR text : corpus) {
+    WorkspaceInsets insets{};
+    const bool insetsOk = Configuration::ParseWorkspaceInsetsSetting(text, &insets);
+    mix(insetsOk);
+    if (insetsOk) { mix(insets.left); mix(insets.top); mix(insets.right); mix(insets.bottom); }
+    FloatingDefaultSize size{};
+    const bool sizeOk = Configuration::ParseFloatingDefaultSizeSetting(text, &size);
+    mix(sizeOk);
+    if (sizeOk) { mix(size.width); mix(size.height); }
+    mix(Configuration::ParseHotkeyKey(text));
+    mix(Configuration::ParseModifiers(text));
+    TileLayout layout{};
+    mix(Configuration::TryParseLayoutSetting(text, &layout) ? 1 + static_cast<uint64_t>(layout) : 0);
+  }
+  // Recorded from the implementation as of 2026-11-04.
+  if (digest != 0x88d4c12ceb48ea3eull) {
+    std::fprintf(stderr, "FAILED: settings parser digest %016llx changed\n", static_cast<unsigned long long>(digest));
+    std::exit(1);
+  }
+  std::printf("Settings parser digest %016llx over %zu inputs.\n",
+              static_cast<unsigned long long>(digest), std::size(corpus));
+}
+
+static void RunRuleFieldParserTests() {
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  using Configuration::MonitorIdParse;
+  check(Configuration::ParseRuleMonitor(L"Primary", false) == RuleMonitor::Primary, "selector ignores case");
+  check(Configuration::ParseRuleMonitor(L"non_primary", false) == RuleMonitor::NonPrimary, "non-primary selector");
+  check(Configuration::ParseRuleMonitor(L"specific", false) == RuleMonitor::Specific, "specific selector");
+  check(Configuration::ParseRuleMonitor(L"", true) == RuleMonitor::Any, "blank means Any where allowed");
+  check(Configuration::ParseRuleMonitor(L"any", true) == RuleMonitor::Any, "\"any\" where allowed");
+  check(!Configuration::ParseRuleMonitor(L"any", false), "limit rules reject \"any\"");
+  check(!Configuration::ParseRuleMonitor(L"left", true), "unknown selector is invalid");
+
+  std::wstring id;
+  check(Configuration::ParseMonitorIdSetting(L"  ", &id) == MonitorIdParse::Empty, "blank ID is Empty");
+  check(Configuration::ParseMonitorIdSetting(L" iface:abc ", &id) == MonitorIdParse::Valid && id == L"IFACE:ABC",
+        "ID is trimmed and upper-cased");
+  check(Configuration::ParseMonitorIdSetting(L"GDI:\\\\.\\DISPLAY1", &id) == MonitorIdParse::Valid, "GDI fallback ID");
+  check(Configuration::ParseMonitorIdSetting(L"DISPLAY1", &id) == MonitorIdParse::Invalid, "ID needs a known prefix");
+
+  const auto values = Configuration::ParseWindowRuleList(L" a.exe , b\\,c.exe,, ,d ");
+  check(values == std::vector<std::wstring>{L"a.exe", L"b,c.exe", L"d"},
+        "rule list trims, drops blanks and keeps escaped commas");
+  check(Configuration::ParseWindowRuleList(L"").empty(), "empty rule list");
+  std::printf("Passed %d rule field parser checks.\n", checks);
+}
+
 int main() {
+  RunSettingsParserDigest();
+  RunRuleFieldParserTests();
   RunAdaptiveDwindleTests();
   RunWeightedResizeTests();
   RunDwindlePlannerDigest();
