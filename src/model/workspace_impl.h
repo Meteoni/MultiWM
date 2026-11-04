@@ -10,8 +10,6 @@ static void NormalizeMonitorIdentityToken(std::wstring* value) {
       [](wchar_t ch) { return static_cast<wchar_t>(std::towupper(ch)); });
 }
 
-
-
 bool ContainsWindow(const std::vector<HWND>& windows, HWND hwnd) {
   for (HWND w : windows) {
     if (w == hwnd) return true;
@@ -232,23 +230,23 @@ bool Workspace::IsTiled(HWND hwnd) const {
 
 size_t Workspace::TiledIndex(HWND hwnd) const {
   auto it = std::find(windows_.begin(), windows_.end(), hwnd);
-  return it == windows_.end() ? static_cast<size_t>(-1)
+  return it == windows_.end() ? kNotFound
                               : static_cast<size_t>(it - windows_.begin());
 }
 
 size_t Workspace::LogicalIndex(HWND hwnd) const {
   const WindowRecord* record = Find(hwnd);
-  if (!record) return static_cast<size_t>(-1);
+  if (!record) return kNotFound;
   if (record->state == ManageState::Suspended && record->hasSavedSlot) {
     return record->savedSlot.index;
   }
   if (record->state == ManageState::Tiled) {
     const size_t activeIndex = TiledIndex(hwnd);
-    if (activeIndex != static_cast<size_t>(-1)) {
+    if (activeIndex != kNotFound) {
       return ActiveIndexToLogicalIndex(activeIndex);
     }
   }
-  return static_cast<size_t>(-1);
+  return kNotFound;
 }
 
 bool Workspace::RememberFocusedWindow(HWND hwnd) {
@@ -396,20 +394,13 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
   }
 
   const size_t anchorActiveIndex = TiledIndex(anchor);
-  if (anchorActiveIndex == static_cast<size_t>(-1)) {
+  if (anchorActiveIndex == kNotFound) {
     return AdmitTiled(std::move(record));
   }
 
   const size_t insertionLogicalIndex =
       ActiveIndexToLogicalIndex(anchorActiveIndex) + 1;
-  for (auto& kv : records_) {
-    WindowRecord& existing = kv.second;
-    if (existing.state == ManageState::Suspended &&
-        existing.hasSavedSlot &&
-        existing.savedSlot.index >= insertionLogicalIndex) {
-      ++existing.savedSlot.index;
-    }
-  }
+  OpenLogicalGapAt(insertionLogicalIndex);
 
   EnsureWeights();
   const size_t insertionActiveIndex =
@@ -472,9 +463,6 @@ bool Workspace::RememberFloatingGeometry(
   return true;
 }
 
-// Pure model import: interprets an already-observed geometry snapshot as
-// authoritative workspace ordering and resize weights. No Win32 queries happen
-// inside Workspace.
 // Logical slots, suspension, layout changes and rollback.
 void Workspace::EnsureWeights() {
   if (IsMasterStackLayout(layout_)) {
@@ -583,6 +571,16 @@ void Workspace::CloseLogicalGapAfterRemoval(
         record.hasSavedSlot &&
         record.savedSlot.index > removedLogicalIndex) {
       --record.savedSlot.index;
+    }
+  }
+}
+
+void Workspace::OpenLogicalGapAt(size_t logicalIndex) {
+  for (auto& kv : records_) {
+    WindowRecord& existing = kv.second;
+    if (existing.state == ManageState::Suspended && existing.hasSavedSlot &&
+        existing.savedSlot.index >= logicalIndex) {
+      ++existing.savedSlot.index;
     }
   }
 }
@@ -699,20 +697,13 @@ bool Workspace::AdmitInitialAfter(
   }
 
   const size_t anchorActiveIndex = TiledIndex(anchor);
-  if (anchorActiveIndex == static_cast<size_t>(-1)) {
+  if (anchorActiveIndex == kNotFound) {
     return AdmitInitial(std::move(record), reason);
   }
 
   const size_t insertionLogicalIndex =
       ActiveIndexToLogicalIndex(anchorActiveIndex) + 1;
-  for (auto& kv : records_) {
-    WindowRecord& existing = kv.second;
-    if (existing.state == ManageState::Suspended &&
-        existing.hasSavedSlot &&
-        existing.savedSlot.index >= insertionLogicalIndex) {
-      ++existing.savedSlot.index;
-    }
-  }
+  OpenLogicalGapAt(insertionLogicalIndex);
 
   if (!record.tilingGeneration) {
     record.tilingGeneration = NextTilingGeneration();
@@ -721,10 +712,7 @@ bool Workspace::AdmitInitialAfter(
   record.pendingInsertionPlacement = true;
   record.suspensionReason = reason;
   record.savedSlot.index = insertionLogicalIndex;
-  if (IsGridLayout(layout_)) {
-    record.savedSlot.weight = 1.0;
-    record.savedSlot.hasWeight = true;
-  } else if (IsMasterStackLayout(layout_)) {
+  if (IsGridLayout(layout_) || IsMasterStackLayout(layout_)) {
     record.savedSlot.weight = 1.0;
     record.savedSlot.hasWeight = true;
   } else if (layout_ == TileLayout::Dwindle) {
@@ -1232,13 +1220,7 @@ bool Workspace::MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex) {
   CloseLogicalGapAfterRemoval(oldLogicalIndex, hwnd);
 
   const size_t insertionLogicalIndex = ActiveIndexToLogicalIndex(targetIndex);
-  for (auto& kv : records_) {
-    WindowRecord& existing = kv.second;
-    if (existing.state == ManageState::Suspended && existing.hasSavedSlot &&
-        existing.savedSlot.index >= insertionLogicalIndex) {
-      ++existing.savedSlot.index;
-    }
-  }
+  OpenLogicalGapAt(insertionLogicalIndex);
 
   windows_.insert(windows_.begin() + targetIndex, hwnd);
   if (IsGridLayout(layout_)) {
