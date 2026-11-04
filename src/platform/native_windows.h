@@ -1,5 +1,5 @@
 // Native window observations, eligibility and checked placement.
-// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
+// Part of MultiWM's single source file; see the include order in src/multiwm.cpp.
 
 namespace Platform::Windows {
 

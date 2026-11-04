@@ -176,11 +176,11 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     RECT r{};
     if (Platform::Windows::GetWindowFrameRect(hwnd, &r)) {
       if (event == EVENT_SYSTEM_MOVESIZESTART) {
-        g_moveSize.startRects[hwnd] = r;
+        Gestures::g_moveSize.startRects[hwnd] = r;
       } else {
-        g_moveSize.endRects[hwnd] = r;
+        Gestures::g_moveSize.endRects[hwnd] = r;
         POINT pt{};
-        if (GetCursorPos(&pt)) g_moveSize.endPoints[hwnd] = pt;
+        if (GetCursorPos(&pt)) Gestures::g_moveSize.endPoints[hwnd] = pt;
       }
     }
     if (event == EVENT_SYSTEM_MOVESIZEEND) OnWindowMoveSizeEnd(hwnd);

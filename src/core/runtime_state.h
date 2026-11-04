@@ -1,5 +1,5 @@
 // Shared WM actor state, diagnostic recording and thread-affinity policy.
-// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
+// Part of MultiWM's single source file; see the include order in src/multiwm.cpp.
 
 namespace Diagnostics {
 
@@ -183,7 +183,6 @@ static void BeginWmSession() {
 }  // namespace Diagnostics
 
 // Serialized actor state and thread-affinity policy.
-// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
 
 struct PendingWorkspaceArrange {
   GUID desktopId{};
@@ -351,12 +350,23 @@ static std::vector<MonitorIdentityCacheEntry> g_monitorIdentityCache;
 
 } // namespace Platform::Monitors
 
+// The one repository of workspace state. WM thread only.
+static WorkspaceRepository g_workspaces;
+
+namespace Gestures {
+// Frame rectangles captured by the WinEvent callback at the start and end of a
+// user move/resize, consumed later on the WM thread to classify the gesture.
 struct MoveSizeTracker {
   std::unordered_map<HWND, RECT> startRects;
   std::unordered_map<HWND, RECT> endRects;
   std::unordered_map<HWND, POINT> endPoints;
 };
 
+static MoveSizeTracker g_moveSize;
+}  // namespace Gestures
+
+namespace Platform::WindowEvents {
+// Installed SetWinEventHook handles. Null means that hook is not installed.
 struct WinEventHooks {
   HWINEVENTHOOK moveSize = nullptr;
   HWINEVENTHOOK minimize = nullptr;
@@ -367,9 +377,10 @@ struct WinEventHooks {
   HWINEVENTHOOK locationChange = nullptr;
 };
 
-static WorkspaceRepository g_workspaces;
-static MoveSizeTracker g_moveSize;
 static WinEventHooks g_hooks;
+}  // namespace Platform::WindowEvents
+
+namespace Placement {
 
 enum class UserLayoutMutationKind {
   Resize,
@@ -377,6 +388,8 @@ enum class UserLayoutMutationKind {
   LayoutChange,
 };
 
+// A user change (resize, reorder, layout switch) that has been applied but not yet
+// proven: if the windows refuse their new tiles, `previous` is restored.
 struct PendingLayoutMutation {
   Workspace previous;
   Workspace candidate;
@@ -403,6 +416,8 @@ struct PendingAdmissionRecovery {
 static std::unordered_map<HWND, PendingAdmissionRecovery>
     g_pendingAdmissionRecoveries;
 
+// A bounded period after placement during which a window is pushed back onto its
+// tile if it drifts (see the glossary in CONTRIBUTING.md).
 struct ConformanceLease {
   RECT expectedRect{};
   // Preserve the user action that produced this target through asynchronous
@@ -432,3 +447,4 @@ enum class ConformanceLeaseReadResult {
   Expired,
 };
 
+}  // namespace Placement

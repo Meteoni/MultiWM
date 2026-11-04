@@ -26,35 +26,29 @@ continuous polling.
 
 ## Source layout
 
-`src/multiwm.cpp` includes the implementation in dependency order and is the entry point for Windhawk amalgamation. The headers share one translation unit.
+Windhawk builds a mod from one source file. `src/multiwm.cpp` holds the mod's
+metadata and settings, and includes the headers below in a fixed order; WHAM
+combines them into `output/multiwm.wh.cpp`. Each header is a chapter of that one
+file, so build `src/multiwm.cpp` rather than a header on its own.
 
-The headers are dependency-ordered implementation/declaration fragments for this
-Windhawk build. They are read through the entry point, rather than compiled in
-isolation. Namespaces identify a few shared responsibilities across files.
+```
+src/
+  multiwm.cpp     Windhawk metadata, settings schema, entry points, include order
+  core/           shared types, settings, messages, WM thread state
+  model/          Workspace and WorkspaceRepository
+  layout/         rectangle math, constraint planning, resize learning
+  placement/      floating geometry, applying layouts, conformance leases
+  reconcile/      discovery, ownership repair, window routing and overflow
+  commands/       hotkey/tray commands and drag/resize gestures
+  platform/       Windows APIs: windows, monitors, WinEvents, virtual desktops
+  app/            settings loading, tray UI, diagnostics, WM thread lifecycle
+  windhawk/       Windhawk's standard tool-mod launcher
+tests/            regression suites (run with tests/run.ps1)
+```
 
-| Responsibility / namespace | Files under `src/includes` |
-| --- | --- |
-| Shared declarations and actor state | `multiwm_core.h`, `multiwm_workspace.h`, `multiwm_runtime_state.h`, `multiwm_interfaces.h` |
-| `Model`: membership, preferences, validation and snapshot storage | `multiwm_workspace_model.h`, `multiwm_workspace_repository.h` |
-| `Layout`: allocation, cached constraint planning and resize learning | `multiwm_layout.h`, `multiwm_workspace_planning.h` |
-| `Placement`: floating geometry, tiled arrangement and conformance leases | `multiwm_floating_placement.h`, `multiwm_workspace_arrangement.h`, `multiwm_conformance.h` |
-| `Reconcile`: observed ownership, discovery and routing | `multiwm_reconcile.h`, `multiwm_window_routing.h` |
-| `Platform`: native adapters | `multiwm_monitors.h`, `multiwm_windows.h`, `multiwm_window_events.h`, `multiwm_virtual_desktop.h` |
-| Settings and gestures | `multiwm_configuration.h`, `multiwm_gestures.h` |
-| Commands and runtime lifecycle | `multiwm_commands.h`, `multiwm_bootstrap.h`, `multiwm_runtime_lifecycle.h` |
-| Presentation and diagnostics | `multiwm_tray_ui.h`, `multiwm_diagnostics.h` |
-
-`multiwm_workspace.h` declares the model. Runtime instances and diagnostic state
-live in `multiwm_runtime_state.h`; the small interfaces fragment resolves calls
-that must precede their definitions. Model resize methods are defined explicitly
-inside `namespace Model` beside the planner they use. Native monitor conversion
-methods likewise stay beside the monitor adapter. Namespaces communicate
-ownership within the shared translation unit, rather than enforcing privacy.
-
-Keep layout preferences in the model and temporary constraint adjustments in the planner. Recovery searches produce local candidate workspaces; the caller commits them after retaining any required rollback state. Native queries can outlive a desktop transition, so retain the ownership checks at discovery and migration boundaries.
-
-See [Maintaining MultiWM](CONTRIBUTING.md) for readability rules, contracts, units,
-ownership, the project glossary, and review tooling.
+Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit
+together, then [CONTRIBUTING.md](CONTRIBUTING.md) for coding rules, units, the
+glossary, and testing.
 
 ## Layouts
 - Floating

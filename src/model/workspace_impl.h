@@ -1,5 +1,5 @@
 // Workspace value-model operations and validation.
-// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
+// Part of MultiWM's single source file; see the include order in src/multiwm.cpp.
 
 namespace Model {
 

@@ -7,7 +7,7 @@ namespace Commands {
 // minimum that an application changes only during the resulting placement.
 static bool ValidateUserLayoutMutation(
     const DesktopMonitorKey& key, HMONITOR monitor,
-    Workspace& candidate, HWND subject, UserLayoutMutationKind kind,
+    Workspace& candidate, HWND subject, Placement::UserLayoutMutationKind kind,
     const wchar_t* action) {
   // A same-DPI native minimum can change while no placement is occurring.
   // Refresh the committed workspace first, persist that application-owned state,
@@ -38,7 +38,7 @@ static bool ValidateUserLayoutMutation(
         candidate, metrics.workArea, metrics.gap, &rects);
     if (status == Layout::LayoutPlanStatus::Unsatisfiable &&
         candidate.Layout() == TileLayout::Dwindle) {
-      if (kind == UserLayoutMutationKind::LayoutChange) {
+      if (kind == Placement::UserLayoutMutationKind::LayoutChange) {
         Workspace reassigned = candidate;
         size_t movedWindowCount = 0;
         if (Layout::ReassignDwindleLayoutConversionForConstraints(
@@ -105,13 +105,13 @@ void SwapMaster() {
   HWND oldMaster = nullptr;
   if (!resolved || !candidate.MakeMaster(resolved, &oldMaster)) return;
   if (!ValidateUserLayoutMutation(
-          key, monitor, candidate, resolved, UserLayoutMutationKind::Order,
+          key, monitor, candidate, resolved, Placement::UserLayoutMutationKind::Order,
           L"Set master")) {
     return;
   }
 
   Placement::RememberPendingLayoutMutation(
-      key, workspace, candidate, resolved, UserLayoutMutationKind::Order,
+      key, workspace, candidate, resolved, Placement::UserLayoutMutationKind::Order,
       L"Set master");
   g_workspaces.Save(key, candidate);
   Gestures::ClearMoveSizeSamples(oldMaster);
@@ -165,13 +165,13 @@ static void MoveFocusedWindowOneSlot(bool promote) {
   Workspace candidate = workspace;
   if (!candidate.SwapTiled(resolved, other)) return;
   if (!ValidateUserLayoutMutation(
-          key, monitor, candidate, resolved, UserLayoutMutationKind::Order,
+          key, monitor, candidate, resolved, Placement::UserLayoutMutationKind::Order,
           promote ? L"Promote" : L"Demote")) {
     return;
   }
 
   Placement::RememberPendingLayoutMutation(
-      key, workspace, candidate, resolved, UserLayoutMutationKind::Order,
+      key, workspace, candidate, resolved, Placement::UserLayoutMutationKind::Order,
       promote ? L"Promote" : L"Demote");
   g_workspaces.Save(key, candidate);
   Gestures::ClearMoveSizeSamples(resolved);
@@ -258,11 +258,11 @@ static bool CommitWorkspaceLayoutChange(
   const TileLayout previousLayout = workspace.Layout();
   if (!ValidateUserLayoutMutation(
           key, monitor, candidate, nullptr,
-          UserLayoutMutationKind::LayoutChange, L"Change layout")) {
+          Placement::UserLayoutMutationKind::LayoutChange, L"Change layout")) {
     return false;
   }
   Placement::RememberPendingLayoutMutation(
-      key, workspace, candidate, nullptr, UserLayoutMutationKind::LayoutChange,
+      key, workspace, candidate, nullptr, Placement::UserLayoutMutationKind::LayoutChange,
       L"Change layout");
   workspace = std::move(candidate);
   if (previousLayout != TileLayout::Floating &&
@@ -387,9 +387,9 @@ static void HandleUserMove(
     if (candidate.SwapTiled(hwnd, target) &&
         ValidateUserLayoutMutation(
             key, key.ResolveMonitor(), candidate, hwnd,
-            UserLayoutMutationKind::Order, L"Swap")) {
+            Placement::UserLayoutMutationKind::Order, L"Swap")) {
       Placement::RememberPendingLayoutMutation(
-          key, workspace, candidate, hwnd, UserLayoutMutationKind::Order,
+          key, workspace, candidate, hwnd, Placement::UserLayoutMutationKind::Order,
           L"Swap");
       workspace = std::move(candidate);
       preferredTiledWindow = hwnd;
@@ -450,12 +450,12 @@ static void HandleUserResize(
   if (changed) {
     if (!ValidateUserLayoutMutation(
             key, key.ResolveMonitor(), candidate, hwnd,
-            UserLayoutMutationKind::Resize, L"Resize")) {
+            Placement::UserLayoutMutationKind::Resize, L"Resize")) {
       Placement::ArrangeWorkspace(key, hwnd);
       return;
     }
     Placement::RememberPendingLayoutMutation(
-        key, workspace, candidate, hwnd, UserLayoutMutationKind::Resize,
+        key, workspace, candidate, hwnd, Placement::UserLayoutMutationKind::Resize,
         L"Resize");
     workspace = std::move(candidate);
     g_workspaces.Save(key, workspace);

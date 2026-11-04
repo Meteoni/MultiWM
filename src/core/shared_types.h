@@ -1,5 +1,5 @@
 // Shared platform declarations, configuration values and message types.
-// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
+// Part of MultiWM's single source file; see the include order in src/multiwm.cpp.
 
 #include <dwmapi.h>
 #include <initguid.h>
@@ -62,10 +62,10 @@
 // RuntimeLifecycle         STA dispatch, hotkeys, startup and recovery
 // TrayUi / Diagnostics     presentation and observability
 //
-// Related files reopen these namespaces. They communicate ownership within the
-// one Windhawk translation unit; they do not enforce separate module privacy.
-// src/multiwm.cpp specifies the fragment order. The small interfaces fragment
-// declares cross-file calls needed before their definitions.
+// Each namespace lives in the matching src/ folder (Model -> model/, Platform ->
+// platform/, and so on). Namespaces show who owns a function; because everything
+// is one source file, they do not hide anything from other code.
+// core/forward_declarations.h lists the calls needed before their definition.
 //
 // Model invariants
 // ----------------

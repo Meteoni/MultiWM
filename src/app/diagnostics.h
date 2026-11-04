@@ -957,17 +957,18 @@ static void DumpPlatformHealth(ReportBuilder& report) {
       g_wm.maintenanceAttempts, RuntimeLifecycle::kMaintenanceMaxAttempts,
       g_wm.lifecycleRetryAfterPlatformRecovery ? 1 : 0,
       g_wm.forceMonitorReconcile ? 1 : 0);
+  const Platform::WindowEvents::WinEventHooks& hooks = Platform::WindowEvents::g_hooks;
   report.Line(
       L"WinEvent hooks: foreground=%d location=%d moveSize=%d minimize=%d hideDestroy=%d cloak=%d state=%d",
-      g_hooks.foreground ? 1 : 0, g_hooks.locationChange ? 1 : 0,
-      g_hooks.moveSize ? 1 : 0, g_hooks.minimize ? 1 : 0,
-      g_hooks.hideDestroy ? 1 : 0, g_hooks.cloak ? 1 : 0,
-      g_hooks.state ? 1 : 0);
+      hooks.foreground ? 1 : 0, hooks.locationChange ? 1 : 0,
+      hooks.moveSize ? 1 : 0, hooks.minimize ? 1 : 0,
+      hooks.hideDestroy ? 1 : 0, hooks.cloak ? 1 : 0,
+      hooks.state ? 1 : 0);
 
   size_t moveStarts = 0, moveEnds = 0, movePoints = 0;
-  moveStarts = g_moveSize.startRects.size();
-  moveEnds = g_moveSize.endRects.size();
-  movePoints = g_moveSize.endPoints.size();
+  moveStarts = Gestures::g_moveSize.startRects.size();
+  moveEnds = Gestures::g_moveSize.endRects.size();
+  movePoints = Gestures::g_moveSize.endPoints.size();
   report.Line(
       L"Move/size cache: starts=%zu ends=%zu endPoints=%zu", moveStarts,
       moveEnds, movePoints);
@@ -1128,7 +1129,7 @@ static void WriteDiagnosticReport() {
       duplicateOwners);
   report.Line(
       L"Active conformance leases=%zu pending layout mutations=%zu runtime-maintenance timer=%d attempt=%u",
-      Placement::CountActiveConformanceLeases(), g_pendingLayoutMutations.size(),
+      Placement::CountActiveConformanceLeases(), Placement::g_pendingLayoutMutations.size(),
       g_wm.maintenanceTimer ? 1 : 0, g_wm.maintenanceAttempts);
   report.Line(
       L"Reverse ownership index: entries=%zu mismatches=%zu",
@@ -1378,7 +1379,7 @@ static void WriteDiagnosticReport() {
 
   report.Section(L"Pending work");
   report.Line(L"automaticOverflow: routingReady=%d limit=%zu createDesktop=%d otherMonitors=%d pending=%zu follow=%p",
-              g_hooks.hideDestroy ? 1 : 0, g_settings.automaticWindowLimit,
+              Platform::WindowEvents::g_hooks.hideDestroy ? 1 : 0, g_settings.automaticWindowLimit,
               g_settings.overflowCreateDesktop ? 1 : 0, g_settings.overflowTryOtherMonitors ? 1 : 0,
               g_wm.pendingWindowOverflow.size(), g_wm.pendingOverflowSwitch.hwnd);
   if (g_wm.lifecycleDirtyWindows.empty()) {
@@ -1510,9 +1511,7 @@ static void WriteDiagnosticReport() {
       static_cast<unsigned long long>(classifiedGestureSum),
       static_cast<unsigned long long>(counters.moveSizeEndMessages));
 
-  const bool allWinEventHooks =
-      g_hooks.foreground && g_hooks.locationChange && g_hooks.moveSize &&
-      g_hooks.minimize && g_hooks.hideDestroy && g_hooks.cloak && g_hooks.state;
+  const bool allWinEventHooks = Platform::WindowEvents::AllWinEventHooksInstalled();
   DWORD auditShellPid = 0;
   HWND auditShell = GetShellWindow();
   if (auditShell && IsWindow(auditShell)) {

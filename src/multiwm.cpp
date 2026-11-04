@@ -393,30 +393,50 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 */
 // ==/WindhawkModSettings==
 
-#include "includes/multiwm_core.h"
-#include "includes/multiwm_workspace.h"
-#include "includes/multiwm_runtime_state.h"
-#include "includes/multiwm_interfaces.h"
-#include "includes/multiwm_layout.h"
-#include "includes/multiwm_gestures.h"
-#include "includes/multiwm_configuration.h"
-#include "includes/multiwm_monitors.h"
-#include "includes/multiwm_workspace_model.h"
-#include "includes/multiwm_windows.h"
-#include "includes/multiwm_floating_placement.h"
-#include "includes/multiwm_workspace_repository.h"
-#include "includes/multiwm_workspace_planning.h"
-#include "includes/multiwm_workspace_arrangement.h"
-#include "includes/multiwm_conformance.h"
-#include "includes/multiwm_reconcile.h"
-#include "includes/multiwm_window_routing.h"
-#include "includes/multiwm_commands.h"
-#include "includes/multiwm_window_events.h"
-#include "includes/multiwm_virtual_desktop.h"
-#include "includes/multiwm_runtime_lifecycle.h"
-#include "includes/multiwm_tray_ui.h"
-#include "includes/multiwm_diagnostics.h"
-#include "includes/multiwm_bootstrap.h"
+// Windhawk compiles a mod as ONE source file, so the headers below are not
+// independent headers: they are chapters of this file, pasted in this order by
+// the compiler (and by WHAM when it generates output/multiwm.wh.cpp). A chapter
+// may use anything from an earlier chapter. core/forward_declarations.h declares
+// the few functions that are needed before their chapter.
+//
+// Read docs/ARCHITECTURE.md for what each folder owns and how an event flows.
+
+// Shared vocabulary: platform declarations, settings, messages, model types, actor state.
+#include "core/shared_types.h"
+#include "model/workspace.h"
+#include "core/runtime_state.h"
+#include "core/forward_declarations.h"
+
+// Pure geometry and the observation/model layer.
+#include "layout/algorithms.h"
+#include "commands/gestures.h"
+#include "app/configuration.h"
+#include "platform/monitors.h"
+#include "model/workspace_impl.h"
+#include "platform/native_windows.h"
+#include "placement/floating.h"
+#include "model/repository.h"
+
+// Planning and placing tiled windows.
+#include "layout/planning.h"
+#include "layout/resize_learning.h"
+#include "placement/arrangement.h"
+#include "placement/conformance.h"
+
+// Turning observed OS state into model changes, and user commands.
+#include "reconcile/reconcile.h"
+#include "reconcile/window_routing.h"
+#include "commands/commands.h"
+
+// Windows integration: WinEvent hooks and the private virtual-desktop COM API.
+#include "platform/window_events.h"
+#include "platform/virtual_desktop.h"
+
+// Process lifetime, presentation and the WM thread's message loop.
+#include "app/runtime_lifecycle.h"
+#include "app/tray_ui.h"
+#include "app/diagnostics.h"
+#include "app/wm_thread.h"
 
 //=============================================================================
 // Windhawk Tool Mod Entry Points
@@ -466,173 +486,4 @@ void WhTool_ModSettingsChanged() {
   }
 }
 
-//=============================================================================
-// Windhawk tool mod implementation for mods which don't need to inject into other
-// processes or hook other functions. Context:
-// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
-//
-// This mod launches a dedicated copy of its configured host executable.
-//=============================================================================
-
-bool g_isToolModProcessLauncher;
-HANDLE g_toolModProcessMutex;
-
-// Ends only the dedicated worker's bootstrap thread at its normal entry point;
-// the already-started hotkey thread keeps the tool process alive.
-void WINAPI EntryPoint_Hook() {
-  Wh_Log(L">");
-  ExitThread(0);
-}
-
-// Routes each host executable instance into its tool-mod role. Normal instances act
-// as launchers; only the worker tagged with this mod ID enforces singleton
-// ownership and initializes the tiling service.
-BOOL Wh_ModInit() {
-  DWORD sessionId;
-  if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
-      sessionId == 0) {
-    return FALSE;
-  }
-
-  bool isExcluded = false;
-  bool isToolModProcess = false;
-  bool isCurrentToolModProcess = false;
-  int argc;
-  LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
-  if (!argv) {
-    Wh_Log(L"CommandLineToArgvW failed");
-    return FALSE;
-  }
-
-  for (int i = 1; i < argc; i++) {
-    if (wcscmp(argv[i], L"-service") == 0 ||
-        wcscmp(argv[i], L"-service-start") == 0 ||
-        wcscmp(argv[i], L"-service-stop") == 0) {
-      isExcluded = true;
-      break;
-    }
-  }
-
-  for (int i = 1; i < argc - 1; i++) {
-    if (wcscmp(argv[i], L"-tool-mod") == 0) {
-      isToolModProcess = true;
-      if (wcscmp(argv[i + 1], WH_MOD_ID) == 0) {
-        isCurrentToolModProcess = true;
-      }
-      break;
-    }
-  }
-
-  LocalFree(argv);
-
-  if (isExcluded) {
-    return FALSE;
-  }
-
-  if (isCurrentToolModProcess) {
-    g_toolModProcessMutex =
-        CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
-    if (!g_toolModProcessMutex) {
-      Wh_Log(L"CreateMutex failed");
-      ExitProcess(1);
-    }
-
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-      Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
-      ExitProcess(1);
-    }
-
-    if (!WhTool_ModInit()) {
-      ExitProcess(1);
-    }
-
-    IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
-    IMAGE_NT_HEADERS* ntHeaders =
-        (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
-
-    DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-    void* entryPoint = (BYTE*)dosHeader + entryPointRVA;
-
-    Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
-    return TRUE;
-  }
-
-  if (isToolModProcess) {
-    return FALSE;
-  }
-
-  g_isToolModProcessLauncher = true;
-  return TRUE;
-}
-
-// Launcher-side phase: starts a copy of the current host executable tagged as this mod's
-// dedicated tool process, then releases the returned process and thread handles.
-void Wh_ModAfterInit() {
-  if (!g_isToolModProcessLauncher) {
-    return;
-  }
-
-  WCHAR currentProcessPath[MAX_PATH];
-  switch (GetModuleFileName(nullptr, currentProcessPath, ARRAYSIZE(currentProcessPath))) {
-    case 0:
-    case ARRAYSIZE(currentProcessPath):
-      Wh_Log(L"GetModuleFileName failed");
-      return;
-  }
-
-  WCHAR commandLine[MAX_PATH + 2 + (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) - 1];
-  swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", currentProcessPath, WH_MOD_ID);
-
-  HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
-  if (!kernelModule) {
-    kernelModule = GetModuleHandle(L"kernel32.dll");
-    if (!kernelModule) {
-      Wh_Log(L"No kernelbase.dll/kernel32.dll");
-      return;
-    }
-  }
-
-  using CreateProcessInternalW_t = BOOL(WINAPI*)(
-      HANDLE hUserToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-      LPSECURITY_ATTRIBUTES lpThreadAttributes, WINBOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-      LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation,
-      PHANDLE hRestrictedUserToken);
-  CreateProcessInternalW_t pCreateProcessInternalW =
-      (CreateProcessInternalW_t)GetProcAddress(kernelModule, "CreateProcessInternalW");
-  if (!pCreateProcessInternalW) {
-    Wh_Log(L"No CreateProcessInternalW");
-    return;
-  }
-
-  STARTUPINFO si{
-      .cb = sizeof(STARTUPINFO),
-      .dwFlags = STARTF_FORCEOFFFEEDBACK,
-  };
-  PROCESS_INFORMATION pi;
-  if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
-                               nullptr, nullptr, &si, &pi, nullptr)) {
-    Wh_Log(L"CreateProcess failed");
-    return;
-  }
-
-  CloseHandle(pi.hProcess);
-  CloseHandle(pi.hThread);
-}
-
-void Wh_ModSettingsChanged() {
-  if (g_isToolModProcessLauncher) {
-    return;
-  }
-
-  
-  WhTool_ModSettingsChanged();
-}
-
-void Wh_ModUninit() {
-  if (g_isToolModProcessLauncher) {
-    return;
-  }
-
-  WhTool_ModUninit();
-  ExitProcess(0);
-}
+#include "windhawk/tool_mod_launcher.h"

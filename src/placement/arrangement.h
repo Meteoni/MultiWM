@@ -1,5 +1,5 @@
 // Workspace transactions, arrangement and placement outcomes.
-// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
+// Part of MultiWM's single source file; see the include order in src/multiwm.cpp.
 
 namespace Placement {
 
@@ -387,7 +387,7 @@ static bool FloatAutomaticOverflowWindow(
   const DWORD processId = record->pid;
   const bool monitorFixed = record->automaticOverflowMonitorFixed;
   const uint64_t generation = record->tilingGeneration;
-  const bool route = RuntimeLifecycle::IsAutomaticMode() && g_hooks.hideDestroy &&
+  const bool route = RuntimeLifecycle::IsAutomaticMode() && Platform::WindowEvents::g_hooks.hideDestroy &&
       (g_settings.overflowCreateDesktop || g_settings.overflowTryOtherMonitors);
   CancelConformanceLease(hwnd);
   DiscardPendingAdmissionRecovery(hwnd);

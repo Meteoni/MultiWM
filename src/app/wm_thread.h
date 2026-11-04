@@ -1,5 +1,5 @@
 // Hotkeys, WM dispatch and tool-thread lifecycle.
-// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
+// Part of MultiWM's single source file; see the include order in src/multiwm.cpp.
 
 namespace RuntimeLifecycle {
 
@@ -394,7 +394,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
                     return rule.treatment == WindowRuleTreatment::InitialPlacement;
                   })) {
     ++Diagnostics::g_runtime.counters.enumWindowsPasses;
-    g_wm.windowRoutingReady = g_hooks.hideDestroy && EnumWindows(
+    g_wm.windowRoutingReady = Platform::WindowEvents::g_hooks.hideDestroy && EnumWindows(
         [](HWND hwnd, LPARAM) WINAPI -> BOOL {
           ++Diagnostics::g_runtime.counters.enumWindowsVisited;
           g_wm.windowRoutingEvaluated.insert(hwnd);

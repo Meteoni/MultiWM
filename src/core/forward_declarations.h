@@ -1,6 +1,11 @@
-// Shared placement input types and forward declarations for cross-file calls in the Windhawk translation unit.
-// Types and runtime state precede this file. Helpers remain with their owner;
-// these declarations resolve ordering, rather than enforcing module privacy.
+// Declarations of functions that earlier chapters call before the chapter that
+// defines them (see the include order in src/multiwm.cpp). For example, layout
+// placement/arrangement.h starts conformance leases, but BeginConformanceLease is
+// defined later, in placement/conformance.h.
+//
+// When you get "use of undeclared identifier" for a function defined in a later
+// file, add its declaration here, next to its owner's namespace. Keep the
+// signature (including default arguments) identical to the definition.
 namespace Placement {
 enum class FloatingPlacementIntent {
   PassiveRestore,

@@ -1,5 +1,5 @@
 // Workspace model interface and invariants.
-// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
+// Part of MultiWM's single source file; see the include order in src/multiwm.cpp.
 
 namespace Model {
 
@@ -374,6 +374,10 @@ class WorkspaceRepository {
 
 }  // namespace Model
 
+// These model types are the vocabulary of the whole window manager, used in
+// nearly every file. Writing Model::Workspace at ~1,500 call sites would add
+// noise, not clarity, so they are deliberately available unqualified. Model
+// *functions* are not aliased; call them through the type or namespace.
 using Model::DesktopMonitorKey;
 using Model::ManageState;
 using Model::PlacementObservation;

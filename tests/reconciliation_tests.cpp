@@ -1,0 +1,273 @@
+#include "../src/multiwm.cpp"
+#include <cstdio>
+
+struct TestDesktop final : Platform::VirtualDesktop::IVirtualDesktop {
+  GUID id{};
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
+  ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+  HRESULT STDMETHODCALLTYPE IsViewVisible(IUnknown*, BOOL*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetId(GUID* result) override { *result = id; return S_OK; }
+};
+struct TestManager final : Platform::VirtualDesktop::IVirtualDesktopManagerInternal {
+  TestDesktop desktop;
+  GUID nextDesktop{};
+  unsigned currentQueries = 0;
+  unsigned switchAfter = UINT_MAX;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
+  ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+  virtual HRESULT STDMETHODCALLTYPE Reserved3() { return E_NOTIMPL; }
+  virtual HRESULT STDMETHODCALLTYPE Reserved4() { return E_NOTIMPL; }
+  virtual HRESULT STDMETHODCALLTYPE Reserved5() { return E_NOTIMPL; }
+  virtual HRESULT STDMETHODCALLTYPE Current(Platform::VirtualDesktop::IVirtualDesktop** result) {
+    if (++currentQueries > switchAfter) desktop.id = nextDesktop;
+    *result = &desktop;
+    return S_OK;
+  }
+};
+struct TestWindowDesktops final : IVirtualDesktopManager {
+  GUID desktop{};
+  bool fail = false;
+  unsigned queries = 0;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
+  ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+  HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND, BOOL* current) override {
+    *current = TRUE;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetWindowDesktopId(HWND, GUID* result) override {
+    ++queries;
+    if (fail) return E_FAIL;
+    *result = desktop;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND, REFGUID) override { return E_NOTIMPL; }
+};
+
+static void RunDesktopReconciliationTests() {
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  TestWindowDesktops windows;
+  TestManager manager;
+  g_vd.initialized = true;
+  g_vd.desktopManager = &windows;
+  g_vd.managerInternal = &manager;
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
+  DesktopMonitorKey source;
+  source.desktopId.Data1 = 0xFF00065C;
+  source.monitor.deviceId = L"TEST_MONITOR";
+  DesktopMonitorKey target = source;
+  target.desktopId.Data1 = 0x3E3FD57C;
+  const std::vector<HWND> snapshot{reinterpret_cast<HWND>(1), reinterpret_cast<HWND>(2), reinterpret_cast<HWND>(3)};
+  const std::vector<HWND> reordered{snapshot[2], snapshot[0], snapshot[1]};
+  const RECT area{0, 0, 1000, 1000};
+  for (TileLayout layout : {TileLayout::Dwindle, TileLayout::Columns, TileLayout::Rows,
+                            TileLayout::MasterStack, TileLayout::MasterStackH}) {
+    for (ManagementMode mode : {ManagementMode::Automatic, ManagementMode::Manual}) {
+      g_wm.managementMode = mode;
+      Workspace original;
+      original.SetLayout(layout);
+      for (HWND hwnd : snapshot) {
+        WindowRecord record;
+        record.hwnd = hwnd;
+        record.pid = 123;
+        record.canMove = false; // No real window positioning in this test.
+        check(original.AdmitTiled(record), "seed original window");
+      }
+      std::vector<RECT> rects;
+      check(Layout::BuildWorkspaceLayoutPlan(original, area, 0, &rects) == Layout::LayoutPlanStatus::Success, "plan original layout");
+      MoveSizeGesture drag;
+      drag.hasRects = true;
+      drag.start = drag.end = rects[0];
+      if (layout == TileLayout::Rows || layout == TileLayout::MasterStackH) drag.end.bottom += 100;
+      else drag.end.right += 100;
+      check(layout == TileLayout::Dwindle ? original.LearnDwindleResize(area, 0, 0, drag)
+            : layout == TileLayout::Columns || layout == TileLayout::Rows ? original.LearnGridResize(area, 0, 0, drag)
+            : original.LearnMasterStackResize(area, 0, 0, drag), "save custom ratio or weights");
+      original.RememberFocusedWindow(snapshot[1]);
+      check(original.Suspend(snapshot[2], SuspensionReason::Minimized), "preserve suspended slot");
+      Workspace floating;
+      floating.SetLayout(TileLayout::Floating);
+      g_workspaces.Save(source, original);
+      g_workspaces.Save(target, floating);
+      windows.desktop = source.desktopId;
+      windows.fail = false;
+      windows.queries = 0;
+      const auto migrations = Diagnostics::g_runtime.counters.workspaceMigrations;
+      std::vector<DesktopMonitorKey> changed;
+      check(!Reconcile::ReconcileTrackedSnapshotOwnership(target, snapshot, &changed), "reject stale destination");
+      Workspace after;
+      check(g_workspaces.Load(source, &after) && after.HasSameLayoutStateAs(original), "preserve weights, order, focus membership and saved slots");
+      check(g_workspaces.Load(target, &after) && after.RecordCount() == 0, "floating destination remains empty");
+      check(windows.queries == snapshot.size() && changed.empty(), "verify ownership before each possible migration");
+      check(!Reconcile::ReconcileTrackedSnapshotOwnership(source, reordered, &changed), "correction is a no-op after rejected stale snapshot");
+      check(g_workspaces.Load(source, &after) && after.HasSameLayoutStateAs(original), "correction preserves custom layout");
+      check(Diagnostics::g_runtime.counters.workspaceMigrations == migrations, "no out-and-back migrations");
+      windows.fail = true;
+      check(!Reconcile::ReconcileTrackedSnapshotOwnership(target, snapshot, &changed), "query failure preserves ownership");
+      check(g_workspaces.Load(source, &after) && after.HasSameLayoutStateAs(original), "query failure preserves saved layout");
+      windows.fail = false;
+      windows.desktop = target.desktopId;
+      check(!Reconcile::ReconcileTrackedSnapshotOwnership(source, snapshot, &changed), "reject stale source after actual move");
+      check(Reconcile::ReconcileTrackedSnapshotOwnership(target, snapshot, &changed), "accept verified actual desktop departure");
+      check(g_workspaces.Load(source, &after) && after.RecordCount() == 0, "actual departure removes old owner");
+      check(g_workspaces.Load(target, &after) && after.RecordCount() == (mode == ManagementMode::Automatic ? 3 : 0), "Automatic migrates and Manual forgets");
+      for (HWND hwnd : snapshot) Reconcile::ForgetManagedWindow(hwnd);
+    }
+  }
+
+  // Exercise the complete retry path with hidden windows owned by this test.
+  // Manual discovery cannot adopt or move any other process's windows.
+  g_wm.managementMode = ManagementMode::Manual;
+  DesktopMonitorKey liveKey;
+  const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  check(DesktopMonitorKey::FromHMonitor(source.desktopId, monitor, &liveKey), "resolve test monitor");
+  Workspace hidden;
+  hidden.SetLayout(TileLayout::Dwindle);
+  std::vector<HWND> hiddenWindows;
+  for (int index = 0; index < 3; ++index) {
+    const HWND hwnd = CreateWindowExW(0, L"STATIC", L"MultiWM reconciliation test", WS_OVERLAPPEDWINDOW,
+                                     0, 0, 300, 300, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    check(hwnd != nullptr, "create hidden test window");
+    hiddenWindows.push_back(hwnd);
+    WindowRecord record;
+    record.hwnd = hwnd;
+    record.pid = GetCurrentProcessId();
+    record.canMove = false;
+    check(hidden.AdmitTiled(record), "seed hidden test record");
+  }
+  MoveSizeGesture hiddenDrag;
+  hiddenDrag.start = {0, 0, 500, 1000};
+  hiddenDrag.end = {0, 0, 600, 1000};
+  hiddenDrag.hasRects = true;
+  check(hidden.LearnDwindleResize(area, 0, 0, hiddenDrag), "save hidden test ratio");
+  g_workspaces.Save(liveKey, hidden);
+  Workspace expectedHidden = hidden;
+  for (HWND hwnd : hiddenWindows) expectedHidden.Suspend(hwnd, SuspensionReason::Hidden);
+  windows.desktop = source.desktopId;
+  manager.desktop.id = source.desktopId;
+  manager.nextDesktop = target.desktopId;
+  manager.currentQueries = 0;
+  manager.switchAfter = 1;
+  g_wm.reconciledDesktop = source.desktopId;
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  g_wm.lifecycleDirtyWindows = hiddenWindows;
+  Reconcile::ReconcileDeferredLifecycle();
+  check(g_wm.reconciledDesktopState == ReconciledDesktopState::TransitionPending,
+        "whole pass detects desktop change during enumeration");
+  for (HWND hwnd : hiddenWindows) {
+    check(Model::ContainsWindow(g_wm.lifecycleDirtyWindows, hwnd), "retry retains dirty window");
+  }
+  check(g_wm.lifecycleTimer != 0, "whole pass schedules retry");
+  check(std::any_of(g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
+        [&](const PendingWorkspaceArrange& pending) { return IsEqualGUID(pending.desktopId, source.desktopId) && pending.monitor == monitor; }),
+        "retry retains arrangement for participation changes");
+  Workspace retried;
+  check(g_workspaces.Load(liveKey, &retried) && retried.HasSameLayoutStateAs(expectedHidden),
+        "retry preserves logical slots and weights while updating physical suspension");
+
+  // Desktop transitions can hide a window while old placement work is pending.
+  // Neither lease expiry nor a late location event may float it or lose its slot.
+  Placement::ConformanceLease hiddenLease;
+  hiddenLease.generation = 42;
+  hiddenLease.expiresAtTickMs = GetTickCount64() + 3000;
+  hiddenLease.expectedRect = {0, 0, 500, 1000};
+  Placement::FinalizeExpiredConformanceLease(hiddenWindows.front(), hiddenLease);
+  check(g_workspaces.Load(liveKey, &retried) && retried.HasSameLayoutStateAs(expectedHidden),
+        "lease expiry preserves hidden members and saved slots");
+  Placement::g_conformanceLeases.leases[hiddenWindows.front()] = hiddenLease;
+  check(!Placement::HandleTiledWindowLocationChange(hiddenWindows.front()), "hidden location event is ineligible for repair");
+  check(!Placement::g_conformanceLeases.leases.count(hiddenWindows.front()), "hidden location event cancels stale placement work");
+  check(g_workspaces.Load(liveKey, &retried) && retried.HasSameLayoutStateAs(expectedHidden),
+        "late location event preserves hidden members and saved slots");
+  for (HWND hwnd : hiddenWindows) {
+    Reconcile::ForgetManagedWindow(hwnd);
+    DestroyWindow(hwnd);
+  }
+  KillTimer(nullptr, g_wm.lifecycleTimer);
+  g_wm.lifecycleTimer = 0;
+  g_wm.lifecycleDirtyWindows.clear();
+  g_wm.pendingDesktopArranges.clear();
+  manager.switchAfter = UINT_MAX;
+
+  manager.desktop.id = source.desktopId;
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  check(Reconcile::ValidateSnapshotDesktop(source.desktopId), "stable snapshot accepted");
+  check(g_wm.lifecycleTimer == 0, "stable snapshot does not poll");
+  manager.desktop.id = target.desktopId;
+  check(!Reconcile::ValidateSnapshotDesktop(source.desktopId), "desktop switch invalidates snapshot");
+  check(g_wm.reconciledDesktopState == ReconciledDesktopState::TransitionPending && g_wm.lifecycleTimer != 0, "switch schedules settled retry");
+  KillTimer(nullptr, g_wm.lifecycleTimer);
+  g_wm.lifecycleTimer = 0;
+  g_vd.managerInternal = nullptr;
+  check(!Reconcile::ValidateSnapshotDesktop(source.desktopId), "missing current desktop invalidates snapshot");
+  check(g_wm.lifecycleTimer != 0 && g_wm.lifecycleRetryAfterPlatformRecovery, "unavailable desktop retains recovery path");
+  KillTimer(nullptr, g_wm.lifecycleTimer);
+  KillTimer(nullptr, g_wm.maintenanceTimer);
+  g_wm.lifecycleTimer = g_wm.maintenanceTimer = 0;
+  g_vd.desktopManager = nullptr;
+  g_vd.initialized = false;
+  std::printf("Passed %d desktop reconciliation checks.\n", checks);
+}
+
+static void RunDiscoveryResultTests() {
+  unsigned checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  using Reconcile::WorkspaceDiscoveryStatus;
+  TestWindowDesktops windows;
+  TestManager manager;
+  GUID current{17}, previous{23};
+  windows.desktop = current; manager.desktop.id = current;
+  g_vd.initialized = true;
+  g_vd.desktopManager = &windows; g_vd.managerInternal = &manager;
+  g_wm.managementMode = ManagementMode::Manual;
+  g_wm.reconciledDesktop = current;
+  g_wm.reconciledDesktopState = ReconciledDesktopState::Settled;
+  const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  DesktopMonitorKey key;
+  check(DesktopMonitorKey::FromHMonitor(current, monitor, &key), "resolve live monitor");
+  Workspace empty; empty.SetLayout(TileLayout::Dwindle);
+  g_workspaces.Save(key, empty);
+  auto result = Reconcile::DiscoverWorkspaceWindows(nullptr, current, {});
+  check(result.status == WorkspaceDiscoveryStatus::Unavailable, "invalid monitor is Unavailable");
+  check(!result.key.monitor && result.ownershipChanges.empty(), "Unavailable has no resolved key or ownership changes");
+  result = Reconcile::DiscoverWorkspaceWindows(monitor, current, {});
+  check(result.status == WorkspaceDiscoveryStatus::Unchanged, "existing empty workspace is Unchanged");
+  check(Model::DesktopMonitorKeyEqual{}(result.key, key), "Unchanged returns the resolved key");
+  check(result.ownershipChanges.empty(), "Unchanged reports no incidental ownership changes");
+  DesktopMonitorKey oldKey = key; oldKey.desktopId = previous;
+  HWND phantom = reinterpret_cast<HWND>(0x70000001);
+  Workspace old;
+  WindowRecord record; record.hwnd = phantom; record.pid = 100;
+  old.AdmitTiled(record); g_workspaces.Save(oldKey, old);
+  const auto saves = Diagnostics::g_runtime.counters.workspaceSaves;
+  result = Reconcile::DiscoverWorkspaceWindows(monitor, current, {phantom});
+  check(result.status == WorkspaceDiscoveryStatus::Saved, "verified Manual departure saves requested workspace");
+  check(result.ownershipChanges.size() == 1 && Model::DesktopMonitorKeyEqual{}(result.ownershipChanges.front(), oldKey),
+        "result reports repaired source ownership");
+  check(g_workspaces.OwnersOf(phantom).empty(), "Manual policy still forgets cross-desktop membership");
+  check(Diagnostics::g_runtime.counters.workspaceSaves == saves + 2, "exact source and requested workspace saves");
+  manager.desktop.id = previous;
+  result = Reconcile::DiscoverWorkspaceWindows(monitor, current, {});
+  check(result.status == WorkspaceDiscoveryStatus::DesktopChanged, "stale snapshot is DesktopChanged");
+  check(Model::DesktopMonitorKeyEqual{}(result.key, key), "DesktopChanged retains requested key");
+  check(result.ownershipChanges.empty(), "stale snapshot makes no ownership repairs");
+  check(g_wm.lifecycleTimer != 0 && g_wm.reconciledDesktopState == ReconciledDesktopState::TransitionPending,
+        "DesktopChanged retains deferred retry effects");
+  KillTimer(nullptr, g_wm.lifecycleTimer); g_wm.lifecycleTimer = 0;
+  g_vd.desktopManager = nullptr; g_vd.managerInternal = nullptr; g_vd.initialized = false;
+  std::printf("Passed %u discovery result contract checks.\n", checks);
+}
+
+int main() {
+  RunDesktopReconciliationTests();
+  RunDiscoveryResultTests();
+}

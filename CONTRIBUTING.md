@@ -1,32 +1,27 @@
 # Maintaining MultiWM
 
-Start with the [source map](README.md#source-layout) and the invariants in
-`multiwm_core.h`. The implementation headers share one translation unit; compile
-`src/multiwm.cpp` or its WHAM output rather than a header in isolation.
+Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the invariants at the
+top of `src/core/shared_types.h`. The headers are chapters of one source file;
+compile `src/multiwm.cpp` (or run the tests) rather than a header on its own.
 
 ## File and namespace ownership
 
-Use the existing responsibilities in the source map. Related files reopen a
-shared namespace: `Layout` owns planning, `Placement` owns floating/tiled placement
-and conformance, and `Reconcile` owns discovery and routing. A new file does not
-require a new subsystem, manager class, or namespace. Split when responsibilities
-differ; keep cohesive algorithms and their local helpers together.
+Each `src/` folder has one owner namespace (see the table in ARCHITECTURE.md).
+Put new code in the folder whose owner it belongs to. A new file does not need a
+new namespace or manager class; split a file when its responsibilities differ,
+and keep an algorithm together with its local helpers.
 
 Define model members inside `namespace Model`. Qualify calls across owners,
 especially `Platform::Windows`, `Platform::Monitors`, and
 `Platform::VirtualDesktop`, so native boundaries are visible. Keep same-owner
-calls concise. Common model value-type aliases are allowed; global aliases for
-platform operations hide their effects.
+calls short. The core model types (`Workspace`, `WindowRecord`, …) are
+deliberately usable unqualified; do not add global aliases for functions,
+because they hide which owner has side effects.
 
-The `.h` files here are deliberately dependency-ordered fragments for the
-Windhawk translation unit. `multiwm_workspace.h` holds model declarations;
-`multiwm_runtime_state.h` holds actor instances and diagnostic state;
-`multiwm_interfaces.h` holds the few shared placement types and forward calls
-needed by the include order. Keep implementation helpers with their owner.
-Namespaces organize this code; they do not create separate compilation units.
-
-The [file-boundary review](docs/file-boundaries-review.md) records the concrete
-changes and references used to keep this organization proportionate.
+Shared state that belongs to one owner lives in that owner's namespace in
+`src/core/runtime_state.h` (for example `Placement::g_conformanceLeases`). If a
+function from a later chapter is needed earlier, declare it in
+`src/core/forward_declarations.h`.
 
 ## Readability rules
 
