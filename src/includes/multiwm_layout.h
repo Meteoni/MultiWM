@@ -1,4 +1,83 @@
+// Layout calculations use physical screen pixels and never query native windows.
+// Ratios and weights are preferences; callers own all model/placement changes.
 namespace Layout {
+
+static inline bool Differs(LONG a, LONG b, LONG tol = 1) {
+    return (a > b) ? (a - b > tol) : (b - a > tol);
+}
+
+inline double ClampDouble(double value, double minVal, double maxVal) {
+  if (value < minVal) return minVal;
+  if (value > maxVal) return maxVal;
+  return value;
+}
+
+// Divider ratios (master size, Dwindle splits) are kept within 10%..90% so neither
+// side of a divider can collapse to nothing.
+inline double ClampSplitRatio(double ratio) {
+  return ClampDouble(ratio, 0.1, 0.9);
+}
+
+// Pixels left for the two sides of a split after removing the gap between them.
+// The gap shrinks if needed so each side keeps at least one pixel.
+// Requires span >= 2.
+inline LONG UsableSplitSpan(LONG span, LONG gap) {
+  return span - std::clamp<LONG>(gap, 0, span - 2);
+}
+
+// Size of the first side of a split: `ratio` of `usable`, rounded to whole pixels,
+// always leaving at least one pixel for each side. Requires usable >= 2.
+inline LONG SplitLeadingSpan(LONG usable, double ratio) {
+  return std::clamp<LONG>(static_cast<LONG>(std::llround(usable * ratio)), 1, usable - 1);
+}
+
+// Orders `indices` by distance from `origin` (closest first); ties keep the
+// lower index first. Used to prefer moving a window as little as possible.
+inline void SortByDistanceFrom(std::vector<size_t>& indices, size_t origin) {
+  auto distance = [origin](size_t index) {
+    return index > origin ? index - origin : origin - index;
+  };
+  std::stable_sort(indices.begin(), indices.end(), [&](size_t first, size_t second) {
+    return distance(first) != distance(second) ? distance(first) < distance(second)
+                                               : first < second;
+  });
+}
+
+std::vector<double> DefaultWeights(size_t count) {
+  return std::vector<double>(count, 1.0);
+}
+
+static inline long long RectAreaLL(const RECT& r) {
+  long long w = (long long)r.right - (long long)r.left;
+  long long h = (long long)r.bottom - (long long)r.top;
+  if (w <= 0 || h <= 0) return 0;
+  return w * h;
+}
+
+static LONG RectWidth(const RECT& rect) {
+  return rect.right - rect.left;
+}
+
+static LONG RectHeight(const RECT& rect) {
+  return rect.bottom - rect.top;
+}
+
+static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPlacementTolerancePx) {
+  return !Differs(a.left, b.left, tolerance) &&
+         !Differs(a.top, b.top, tolerance) &&
+         !Differs(a.right, b.right, tolerance) &&
+         !Differs(a.bottom, b.bottom, tolerance);
+}
+
+// Axis along which windows divide the available span: X is width, Y is height.
+// For MasterStack this is the master divider; stack members use the other axis.
+enum class Axis { X, Y };
+
+// Divider axis of a weighted layout: Master + Stack (Vertical) and Columns split
+// the width; the Horizontal and Rows variants split the height.
+constexpr Axis LayoutAxis(TileLayout layout) {
+  return layout == TileLayout::MasterStackH || layout == TileLayout::Rows ? Axis::Y : Axis::X;
+}
 
 std::vector<LONG> ComputeWeightedSizes(
     LONG totalSize, LONG gap, const std::vector<double>& weights,
@@ -53,8 +132,9 @@ std::vector<LONG> ComputeWeightedSizes(
 
 void LayoutGridWeighted(
     const RECT& area, LONG gap, size_t windowCount,
-    std::vector<RECT>& outRects, bool horizontal,
+    std::vector<RECT>& outRects, Axis axis,
     const std::vector<double>& weights) {
+  const bool alongY = axis == Axis::Y;
   outRects.resize(windowCount);
   if (windowCount == 0) return;
 
@@ -65,24 +145,25 @@ void LayoutGridWeighted(
     effectiveWeights = &defaultWeights;
   }
 
-  LONG totalSize = horizontal ? (area.bottom - area.top) : (area.right - area.left);
+  LONG totalSize = alongY ? (area.bottom - area.top) : (area.right - area.left);
   LONG effectiveGap = 0;
   std::vector<LONG> sizes =
       ComputeWeightedSizes(totalSize, gap, *effectiveWeights, &effectiveGap);
-  LONG position = horizontal ? area.top : area.left;
+  LONG position = alongY ? area.top : area.left;
 
   for (size_t i = 0; i < windowCount; ++i) {
     LONG size = sizes[i];
-    LONG end = (i == windowCount - 1) ? (horizontal ? area.bottom : area.right) : position + size;
-    outRects[i] = horizontal ? RECT{area.left, position, area.right, end} : RECT{position, area.top, end, area.bottom};
+    LONG end = (i == windowCount - 1) ? (alongY ? area.bottom : area.right) : position + size;
+    outRects[i] = alongY ? RECT{area.left, position, area.right, end} : RECT{position, area.top, end, area.bottom};
     position = end + effectiveGap;
   }
 }
 
 void LayoutMasterStackWeighted(
     const RECT& area, LONG gap, size_t windowCount,
-    std::vector<RECT>& outRects, bool horizontal,
+    std::vector<RECT>& outRects, Axis axis,
     double masterRatio, const std::vector<double>& stackWeights) {
+  const bool alongY = axis == Axis::Y;
   outRects.resize(windowCount);
   if (windowCount == 0) return;
   if (windowCount == 1) {
@@ -90,7 +171,7 @@ void LayoutMasterStackWeighted(
     return;
   }
 
-  LONG totalSize = horizontal ? (area.bottom - area.top) : (area.right - area.left);
+  LONG totalSize = alongY ? (area.bottom - area.top) : (area.right - area.left);
   if (totalSize < 2) {
     std::fill(outRects.begin(), outRects.end(), area);
     return;
@@ -108,7 +189,7 @@ void LayoutMasterStackWeighted(
   std::vector<double> weights = stackWeights;
   if (weights.size() != stackCount) weights = DefaultWeights(stackCount);
 
-  if (horizontal) {
+  if (alongY) {
     outRects[0] = {area.left, area.top, area.right, area.top + masterSize};
     LONG stackTop = area.top + masterSize + masterGap;
     LONG stackGap = 0;
@@ -136,7 +217,7 @@ void LayoutMasterStackWeighted(
 }
 
 struct DwindleSplit {
-  bool vertical = false;
+  Axis axis = Axis::Y; // Unvisited nodes retain the legacy Y-axis default.
   LONG usableSpan = 0;
   LONG firstSpan = 0;
   RECT first{};
@@ -161,9 +242,9 @@ void LayoutDwindle(
 
   const LONG width = area.right - area.left;
   const LONG height = area.bottom - area.top;
-  const bool splitVertical = (startIndex % 2) == 0;
+  const bool splitAlongX = (startIndex % 2) == 0;
 
-  const LONG span = splitVertical ? width : height;
+  const LONG span = splitAlongX ? width : height;
   if (span < 2) {
     std::fill(
         outRects.begin() + startIndex,
@@ -171,16 +252,14 @@ void LayoutDwindle(
     return;
   }
 
-  const LONG effectiveGap = std::clamp<LONG>(gap, 0, span - 2);
-  const LONG usableSpan = span - effectiveGap;
+  const LONG usableSpan = UsableSplitSpan(span, gap);
+  const LONG effectiveGap = span - usableSpan;
   const double ratio = startIndex < splitRatios.size()
-      ? ClampDouble(splitRatios[startIndex], 0.1, 0.9)
+      ? ClampSplitRatio(splitRatios[startIndex])
       : 0.5;
-  const LONG firstSpan = std::clamp<LONG>(
-      static_cast<LONG>(std::llround(usableSpan * ratio)),
-      1, usableSpan - 1);
+  const LONG firstSpan = SplitLeadingSpan(usableSpan, ratio);
   RECT remaining = area;
-  if (splitVertical) {
+  if (splitAlongX) {
     if (reverse) {
       outRects[startIndex] = {
           area.right - firstSpan, area.top, area.right, area.bottom};
@@ -207,7 +286,7 @@ void LayoutDwindle(
       outSplits->resize(startIndex + count - 1);
     }
     (*outSplits)[startIndex] = {
-        splitVertical, usableSpan, firstSpan,
+        splitAlongX ? Axis::X : Axis::Y, usableSpan, firstSpan,
         outRects[startIndex], remaining};
   }
 
@@ -383,8 +462,9 @@ static bool ChooseConstrainedSplit(
 bool LayoutGridConstrained(
     const RECT& area, LONG gap, const std::vector<double>& weights,
     const std::vector<Model::WindowConstraints>& constraints,
-    bool horizontal, std::vector<RECT>* outRects,
+    Axis axis, std::vector<RECT>* outRects,
     double* outWeightPerPixel = nullptr) {
+  const bool alongY = axis == Axis::Y;
   if (outWeightPerPixel) *outWeightPerPixel = 0.0;
   if (!outRects) return false;
   const size_t count = constraints.size();
@@ -392,11 +472,11 @@ bool LayoutGridConstrained(
   if (count == 0) return true;
 
   const LONG crossSpan =
-      horizontal ? area.right - area.left : area.bottom - area.top;
+      alongY ? area.right - area.left : area.bottom - area.top;
   std::vector<LONG> mins(count);
   for (size_t i = 0; i < count; ++i) {
     const ConstraintExtent c = ToConstraintExtent(constraints[i]);
-    if (horizontal) {
+    if (alongY) {
       if (!ConstraintDimensionFits(crossSpan, c.minWidth)) {
         return false;
       }
@@ -410,7 +490,7 @@ bool LayoutGridConstrained(
   }
 
   const LONG total =
-      horizontal ? area.bottom - area.top : area.right - area.left;
+      alongY ? area.bottom - area.top : area.right - area.left;
   LONG effectiveGap = 0;
   std::vector<LONG> sizes;
   if (!ComputeConstrainedWeightedSizes(
@@ -419,13 +499,13 @@ bool LayoutGridConstrained(
     return false;
   }
 
-  LONG position = horizontal ? area.top : area.left;
+  LONG position = alongY ? area.top : area.left;
   for (size_t i = 0; i < count; ++i) {
     const LONG end =
         i + 1 == count
-            ? (horizontal ? area.bottom : area.right)
+            ? (alongY ? area.bottom : area.right)
             : position + sizes[i];
-    (*outRects)[i] = horizontal
+    (*outRects)[i] = alongY
         ? RECT{area.left, position, area.right, end}
         : RECT{position, area.top, end, area.bottom};
     position = end + effectiveGap;
@@ -434,11 +514,12 @@ bool LayoutGridConstrained(
 }
 
 bool LayoutMasterStackConstrained(
-    const RECT& area, LONG gap, bool horizontal, double masterRatio,
+    const RECT& area, LONG gap, Axis axis, double masterRatio,
     const std::vector<double>& stackWeights,
     const std::vector<Model::WindowConstraints>& constraints,
     std::vector<RECT>* outRects,
     double* outStackWeightPerPixel = nullptr) {
+  const bool alongY = axis == Axis::Y;
   if (outStackWeightPerPixel) *outStackWeightPerPixel = 0.0;
   if (!outRects) return false;
   const size_t count = constraints.size();
@@ -455,10 +536,10 @@ bool LayoutMasterStackConstrained(
   const ConstraintExtent master = ToConstraintExtent(constraints[0]);
   const LONG areaWidth = area.right - area.left;
   const LONG areaHeight = area.bottom - area.top;
-  const LONG splitSpan = horizontal ? areaHeight : areaWidth;
-  const LONG innerSpan = horizontal ? areaWidth : areaHeight;
+  const LONG splitSpan = alongY ? areaHeight : areaWidth;
+  const LONG innerSpan = alongY ? areaWidth : areaHeight;
 
-  if (horizontal) {
+  if (alongY) {
     if (!ConstraintDimensionFits(areaWidth, master.minWidth)) {
       return false;
     }
@@ -471,7 +552,7 @@ bool LayoutMasterStackConstrained(
   innerMins.reserve(count - 1);
   for (size_t i = 1; i < count; ++i) {
     const ConstraintExtent c = ToConstraintExtent(constraints[i]);
-    if (horizontal) {
+    if (alongY) {
       stackSplitMin = std::max(stackSplitMin, c.minHeight);
       innerMins.push_back(c.minWidth);
     } else {
@@ -484,7 +565,7 @@ bool LayoutMasterStackConstrained(
   LONG masterGap = 0;
   if (!ChooseConstrainedSplit(
           splitSpan, gap, masterRatio,
-          horizontal ? master.minHeight : master.minWidth,
+          alongY ? master.minHeight : master.minWidth,
           stackSplitMin,
           &masterSize, &masterGap)) {
     return false;
@@ -498,7 +579,7 @@ bool LayoutMasterStackConstrained(
     return false;
   }
 
-  if (horizontal) {
+  if (alongY) {
     (*outRects)[0] = {
         area.left, area.top, area.right, area.top + masterSize};
     const LONG stackTop = area.top + masterSize + masterGap;
@@ -537,7 +618,6 @@ bool LayoutMonocleConstrained(
   }
   return true;
 }
-
 
 }  // namespace Layout
 

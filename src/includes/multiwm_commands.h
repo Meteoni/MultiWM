@@ -1,35 +1,5 @@
-// Consumes and clears the WinEvent samples for one completed gesture.
-// The WM core never reads these caches piecemeal after this boundary.
-static MoveSizeGesture ConsumeMoveSizeGesture(HWND hwnd) {
-  AssertWmThread(L"ConsumeMoveSizeGesture");
-  MoveSizeGesture gesture;
 
-  auto startIt = g_moveSize.startRects.find(hwnd);
-  auto endIt = g_moveSize.endRects.find(hwnd);
-  auto pointIt = g_moveSize.endPoints.find(hwnd);
 
-  if (startIt != g_moveSize.startRects.end() && endIt != g_moveSize.endRects.end()) {
-    gesture.start = startIt->second;
-    gesture.end = endIt->second;
-    gesture.hasRects = true;
-  }
-  if (pointIt != g_moveSize.endPoints.end()) {
-    gesture.dropPoint = pointIt->second;
-    gesture.hasDropPoint = true;
-  }
-
-  g_moveSize.startRects.erase(hwnd);
-  g_moveSize.endRects.erase(hwnd);
-  g_moveSize.endPoints.erase(hwnd);
-  if (gesture.hasRects) {
-    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
-  }
-  return gesture;
-}
-
-//=============================================================================
-// User commands
-//=============================================================================
 namespace Commands {
 
 // User-authored geometry changes are rejected before commit when cached native
@@ -47,7 +17,7 @@ static bool ValidateUserLayoutMutation(
   bool committedConstraintsChanged = false;
   if (g_workspaces.Load(key, &current)) {
     committedConstraintsChanged =
-        RefreshWorkspaceNativeConstraints(current, true, L"user mutation");
+        Placement::RefreshWorkspaceNativeConstraints(current, true, L"user mutation");
     if (committedConstraintsChanged) {
       g_workspaces.Save(key, current);
     }
@@ -59,19 +29,19 @@ static bool ValidateUserLayoutMutation(
     }
   }
 
-  WorkspaceMetrics metrics;
+  Platform::Monitors::WorkspaceMetrics metrics;
   std::vector<RECT> rects;
-  LayoutPlanStatus status = LayoutPlanStatus::Unsatisfiable;
-  if (GetWorkspaceMetrics(monitor, &metrics)) {
+  Layout::LayoutPlanStatus status = Layout::LayoutPlanStatus::Unsatisfiable;
+  if (Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) {
     ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
-    status = BuildWorkspaceLayoutPlan(
+    status = Layout::BuildWorkspaceLayoutPlan(
         candidate, metrics.workArea, metrics.gap, &rects);
-    if (status == LayoutPlanStatus::Unsatisfiable &&
+    if (status == Layout::LayoutPlanStatus::Unsatisfiable &&
         candidate.Layout() == TileLayout::Dwindle) {
       if (kind == UserLayoutMutationKind::LayoutChange) {
         Workspace reassigned = candidate;
         size_t movedWindowCount = 0;
-        if (ReassignDwindleLayoutConversionForConstraints(
+        if (Layout::ReassignDwindleLayoutConversionForConstraints(
                 reassigned, metrics.workArea, metrics.gap,
                 &movedWindowCount)) {
           candidate = std::move(reassigned);
@@ -83,26 +53,26 @@ static bool ValidateUserLayoutMutation(
       }
     }
   }
-  if (status == LayoutPlanStatus::Success ||
-      status == LayoutPlanStatus::NotApplicable) {
+  if (status == Layout::LayoutPlanStatus::Success ||
+      status == Layout::LayoutPlanStatus::NotApplicable) {
     return true;
   }
 
-  ReportRejectedLayoutMutation(
+  Placement::ReportRejectedLayoutMutation(
       key, monitor, kind, action ? action : L"Layout mutation", subject,
       candidate, rects);
   // If the rejection exposed a changed native contract, reconcile the committed
   // layout only when that existing layout is itself no longer feasible. Avoid an
   // unnecessary reflow merely because the rejected candidate needed fresh data.
   if (committedConstraintsChanged) {
-    WorkspaceMetrics committedMetrics;
+    Platform::Monitors::WorkspaceMetrics committedMetrics;
     std::vector<RECT> committedRects;
-    if (GetWorkspaceMetrics(monitor, &committedMetrics)) {
+    if (Platform::Monitors::GetWorkspaceMetrics(monitor, &committedMetrics)) {
       ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
-      if (BuildWorkspaceLayoutPlan(
+      if (Layout::BuildWorkspaceLayoutPlan(
               current, committedMetrics.workArea, committedMetrics.gap,
-              &committedRects) == LayoutPlanStatus::Unsatisfiable) {
-        ArrangeWorkspace(key);
+              &committedRects) == Layout::LayoutPlanStatus::Unsatisfiable) {
+        Placement::ArrangeWorkspace(key);
       }
     }
   }
@@ -116,11 +86,11 @@ void SwapMaster() {
   HWND fg = GetForegroundWindow();
   if (!fg) return;
 
-  HMONITOR monitor = GetWindowPhysicalMonitor(fg);
+  HMONITOR monitor = Platform::Windows::GetWindowPhysicalMonitor(fg);
   if (!monitor) return;
 
   GUID desktopId{};
-  if (!GetWindowDesktopIdSafe(fg, &desktopId)) return;
+  if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(fg, &desktopId)) return;
 
   DesktopMonitorKey key{};
   if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
@@ -130,7 +100,7 @@ void SwapMaster() {
     return;
   }
 
-  HWND resolved = ResolveToTiledWindow(fg, workspace.TiledWindows());
+  HWND resolved = Platform::Windows::ResolveToTiledWindow(fg, workspace.TiledWindows());
   Workspace candidate = workspace;
   HWND oldMaster = nullptr;
   if (!resolved || !candidate.MakeMaster(resolved, &oldMaster)) return;
@@ -140,13 +110,13 @@ void SwapMaster() {
     return;
   }
 
-  RememberPendingLayoutMutation(
+  Placement::RememberPendingLayoutMutation(
       key, workspace, candidate, resolved, UserLayoutMutationKind::Order,
       L"Set master");
   g_workspaces.Save(key, candidate);
-  ClearMoveSizeSamples(oldMaster);
-  ClearMoveSizeSamples(resolved);
-  ArrangeWorkspace(key, resolved);
+  Gestures::ClearMoveSizeSamples(oldMaster);
+  Gestures::ClearMoveSizeSamples(resolved);
+  Placement::ArrangeWorkspace(key, resolved);
   Diagnostics::RecordEvent(
       L"Swap Master old=%p new=%p", oldMaster, resolved);
 }
@@ -164,11 +134,11 @@ static void MoveFocusedWindowOneSlot(bool promote) {
   HWND fg = GetForegroundWindow();
   if (!fg) return;
 
-  HMONITOR monitor = GetWindowPhysicalMonitor(fg);
+  HMONITOR monitor = Platform::Windows::GetWindowPhysicalMonitor(fg);
   if (!monitor) return;
 
   GUID desktopId{};
-  if (!GetWindowDesktopIdSafe(fg, &desktopId)) return;
+  if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(fg, &desktopId)) return;
 
   DesktopMonitorKey key{};
   if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
@@ -179,7 +149,7 @@ static void MoveFocusedWindowOneSlot(bool promote) {
     return;
   }
 
-  HWND resolved = ResolveToTiledWindow(fg, workspace.TiledWindows());
+  HWND resolved = Platform::Windows::ResolveToTiledWindow(fg, workspace.TiledWindows());
   if (!resolved) return;
 
   const size_t index = workspace.TiledIndex(resolved);
@@ -200,13 +170,13 @@ static void MoveFocusedWindowOneSlot(bool promote) {
     return;
   }
 
-  RememberPendingLayoutMutation(
+  Placement::RememberPendingLayoutMutation(
       key, workspace, candidate, resolved, UserLayoutMutationKind::Order,
       promote ? L"Promote" : L"Demote");
   g_workspaces.Save(key, candidate);
-  ClearMoveSizeSamples(resolved);
-  ClearMoveSizeSamples(other);
-  ArrangeWorkspace(key, resolved);
+  Gestures::ClearMoveSizeSamples(resolved);
+  Gestures::ClearMoveSizeSamples(other);
+  Placement::ArrangeWorkspace(key, resolved);
 
   Diagnostics::RecordEvent(
       promote ? L"Promote Window hwnd=%p from=%zu to=%zu"
@@ -227,9 +197,9 @@ void FloatFocusedWindow() {
   HWND hwnd = GetForegroundWindow();
   if (!hwnd) return;
 
-  HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
+  HMONITOR monitor = Platform::Windows::GetWindowPhysicalMonitor(hwnd);
   GUID desktopId{};
-  if (!monitor || !GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
+  if (!monitor || !Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
 
   DesktopMonitorKey key{};
   if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
@@ -237,23 +207,19 @@ void FloatFocusedWindow() {
   if (!g_workspaces.Load(key, &workspace)) return;
 
   // Explicit floating also cancels a queued overflow of this focused HWND.
-  g_wm.overflowWindows.erase(hwnd);
-  g_wm.pendingWindowOverflow.erase(
-      std::remove_if(g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
-                     [hwnd](const PendingWindowOverflow& request) { return request.hwnd == hwnd; }),
-      g_wm.pendingWindowOverflow.end());
-  HWND tiled = ResolveToTiledWindow(hwnd, workspace.TiledWindows());
+  g_wm.CancelPendingOverflow(hwnd);
+  HWND tiled = Platform::Windows::ResolveToTiledWindow(hwnd, workspace.TiledWindows());
   if (!tiled) return;
 
-  FloatingPlacementHint hint;
-  hint.intent = FloatingPlacementIntent::CenterWithFloatingSize;
+  Placement::FloatingPlacementHint hint;
+  hint.intent = Placement::FloatingPlacementIntent::CenterWithFloatingSize;
 
-  CancelConformanceLease(tiled);
-  DiscardPendingAdmissionRecovery(tiled);
+  Placement::CancelConformanceLease(tiled);
+  Placement::DiscardPendingAdmissionRecovery(tiled);
   if (!workspace.Float(tiled)) return;
-  RepairFloatingGeometry(key, workspace, tiled, hint);
+  Placement::RepairFloatingGeometry(key, workspace, tiled, hint);
   g_workspaces.Save(key, workspace);
-  ArrangeWorkspace(key);
+  Placement::ArrangeWorkspace(key);
   Wh_Log(L"Focused window floated %p", tiled);
   Diagnostics::RecordEvent(L"Float Focused hwnd=%p", tiled);
 }
@@ -262,21 +228,21 @@ void FloatFocusedWindow() {
 // geometry. Automatic events never call this with adoptCurrentGeometry=true.
 void TileWindows(HMONITOR monitor = nullptr) {
   ++Diagnostics::g_runtime.counters.tileCommands;
-  if (!monitor) monitor = GetWorkspaceCommandMonitor();
+  if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
   if (!monitor) return;
 
   std::vector<DesktopMonitorKey> changedKeys;
   Reconcile::ReconcileKnownWindows(Reconcile::ReconcileScope::All, &changedKeys);
 
   DesktopMonitorKey targetKey{};
-  if (!GetCurrentWorkspaceKey(monitor, &targetKey)) return;
+  if (!Platform::Monitors::GetCurrentWorkspaceKey(monitor, &targetKey)) return;
   if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, true, &changedKeys)) return;
 
   // Ensure other affected current workspaces also lose stale slots. Keep the
   // target workspace until after geometry adoption so manual tiling does not
   // overwrite the user's geometry before capturing it.
   for (const auto& key : changedKeys) {
-    if (!Reconcile::SameWorkspaceKey(key, targetKey)) ArrangeWorkspace(key);
+    if (!Reconcile::SameWorkspaceKey(key, targetKey)) Placement::ArrangeWorkspace(key);
   }
 
   TrayUi::RefreshForMonitor(monitor);
@@ -284,18 +250,44 @@ void TileWindows(HMONITOR monitor = nullptr) {
   Diagnostics::RecordEvent(L"Tile Workspace command completed monitor=%p", monitor);
 }
 
+// Validate the candidate, retain rollback geometry, then commit and present it.
+// Rejection keeps the user's layout; validation may still refresh native reports.
+static bool CommitWorkspaceLayoutChange(
+    const DesktopMonitorKey& key, HMONITOR monitor,
+    Workspace& workspace, Workspace candidate) {
+  const TileLayout previousLayout = workspace.Layout();
+  if (!ValidateUserLayoutMutation(
+          key, monitor, candidate, nullptr,
+          UserLayoutMutationKind::LayoutChange, L"Change layout")) {
+    return false;
+  }
+  Placement::RememberPendingLayoutMutation(
+      key, workspace, candidate, nullptr, UserLayoutMutationKind::LayoutChange,
+      L"Change layout");
+  workspace = std::move(candidate);
+  if (previousLayout != TileLayout::Floating &&
+      workspace.Layout() == TileLayout::Floating) {
+    Placement::RestoreWorkspaceFloatingGeometry(key, workspace);
+  }
+  g_workspaces.Save(key, workspace);
+  Placement::ArrangeWorkspace(key);
+  TrayUi::UpdateIcon(workspace.Layout(), monitor);
+  TrayUi::ShowLayoutFlyout(workspace.Layout(), monitor);
+  return true;
+}
+
 // Advances the current workspace layout and invalidates layout-specific hints in
 // suspended slots before persisting, arranging, and updating UI feedback.
 void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
   ++Diagnostics::g_runtime.counters.layoutCycleCommands;
-  if (!monitor) monitor = GetWorkspaceCommandMonitor();
+  if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
   if (!monitor) return;
   DesktopMonitorKey key{};
-  if (!GetCurrentWorkspaceKey(monitor, &key)) return;
+  if (!Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key)) return;
 
   Workspace state;
   if (!g_workspaces.Load(key, &state)) {
-    if (IsAutomaticMode()) {
+    if (RuntimeLifecycle::IsAutomaticMode()) {
       if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, false) ||
           !g_workspaces.Load(key, &state)) {
         return;
@@ -308,23 +300,7 @@ void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
   const TileLayout previousLayout = state.Layout();
   Workspace candidate = state;
   if (!candidate.CycleLayout(g_settings.layoutCycle)) return;
-  if (!ValidateUserLayoutMutation(
-          key, monitor, candidate, nullptr,
-          UserLayoutMutationKind::LayoutChange, L"Change layout")) {
-    return;
-  }
-  RememberPendingLayoutMutation(
-      key, state, candidate, nullptr, UserLayoutMutationKind::LayoutChange,
-      L"Change layout");
-  state = std::move(candidate);
-  if (previousLayout != TileLayout::Floating &&
-      state.Layout() == TileLayout::Floating) {
-    RestoreWorkspaceFloatingGeometry(key, state);
-  }
-  g_workspaces.Save(key, state);
-  ArrangeWorkspace(key);
-  TrayUi::UpdateIcon(state.Layout(), monitor);
-  TrayUi::ShowLayoutFlyout(state.Layout(), monitor);
+  if (!CommitWorkspaceLayoutChange(key, monitor, state, std::move(candidate))) return;
   Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.Layout()));
   Diagnostics::RecordEvent(
       L"layout cycle desktop=%08X monitorId=%ls from=%d to=%d", key.desktopId.Data1,
@@ -337,16 +313,16 @@ void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
 // depend on its current position in the configured cycle.
 void SetCurrentWorkspaceLayout(TileLayout layout, HMONITOR monitor = nullptr) {
   if (layout == TileLayout::COUNT) return;
-  if (!monitor) monitor = GetWorkspaceCommandMonitor();
+  if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
   if (!monitor) return;
 
   DesktopMonitorKey key{};
-  if (!GetCurrentWorkspaceKey(monitor, &key)) return;
+  if (!Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key)) return;
 
   Workspace state;
   bool workspaceCreated = false;
   if (!g_workspaces.Load(key, &state)) {
-    if (IsAutomaticMode()) {
+    if (RuntimeLifecycle::IsAutomaticMode()) {
       if (!Reconcile::EnsureWorkspaceFromSnapshot(monitor, false) ||
           !g_workspaces.Load(key, &state)) {
         return;
@@ -367,22 +343,7 @@ void SetCurrentWorkspaceLayout(TileLayout layout, HMONITOR monitor = nullptr) {
 
   Workspace candidate = state;
   candidate.SetLayout(layout);
-  if (!ValidateUserLayoutMutation(
-          key, monitor, candidate, nullptr,
-          UserLayoutMutationKind::LayoutChange, L"Change layout")) {
-    return;
-  }
-  RememberPendingLayoutMutation(
-      key, state, candidate, nullptr, UserLayoutMutationKind::LayoutChange,
-      L"Change layout");
-  state = std::move(candidate);
-  if (previousLayout != TileLayout::Floating && layout == TileLayout::Floating) {
-    RestoreWorkspaceFloatingGeometry(key, state);
-  }
-  g_workspaces.Save(key, state);
-  ArrangeWorkspace(key);
-  TrayUi::UpdateIcon(layout, monitor);
-  TrayUi::ShowLayoutFlyout(layout, monitor);
+  if (!CommitWorkspaceLayoutChange(key, monitor, state, std::move(candidate))) return;
   Wh_Log(L"Workspace layout set to %d", static_cast<int>(layout));
   Diagnostics::RecordEvent(
       L"layout set desktop=%08X monitorId=%ls from=%d to=%d", key.desktopId.Data1,
@@ -394,17 +355,17 @@ static void HandleUserMove(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const MoveSizeGesture& gesture) {
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
-    CancelConformanceLease(hwnd);
-    DiscardPendingAdmissionRecovery(hwnd);
+    Placement::CancelConformanceLease(hwnd);
+    Placement::DiscardPendingAdmissionRecovery(hwnd);
     if (workspace.Float(hwnd)) {
-      RepairFloatingGeometry(
-          key, workspace, hwnd, MakeFloatingPlacementHintFromGesture(gesture));
+      Placement::RepairFloatingGeometry(
+          key, workspace, hwnd, Placement::MakeFloatingPlacementHintFromGesture(gesture));
       g_workspaces.Save(key, workspace);
       ++Diagnostics::g_runtime.counters.tiledFloatActions;
       Wh_Log(L"User move floated managed window %p", hwnd);
       Diagnostics::RecordEvent(L"user drag floated hwnd=%p", hwnd);
     }
-    ArrangeWorkspace(key);
+    Placement::ArrangeWorkspace(key);
     return;
   }
 
@@ -414,7 +375,7 @@ static void HandleUserMove(
     for (HWND candidate : workspace.TiledWindows()) {
       if (candidate == hwnd) continue;
       RECT rect{};
-      if (GetWindowFrameRect(candidate, &rect) && PtInRect(&rect, gesture.dropPoint)) {
+      if (Platform::Windows::GetWindowFrameRect(candidate, &rect) && PtInRect(&rect, gesture.dropPoint)) {
         target = candidate;
         break;
       }
@@ -427,7 +388,7 @@ static void HandleUserMove(
         ValidateUserLayoutMutation(
             key, key.ResolveMonitor(), candidate, hwnd,
             UserLayoutMutationKind::Order, L"Swap")) {
-      RememberPendingLayoutMutation(
+      Placement::RememberPendingLayoutMutation(
           key, workspace, candidate, hwnd, UserLayoutMutationKind::Order,
           L"Swap");
       workspace = std::move(candidate);
@@ -441,20 +402,20 @@ static void HandleUserMove(
   }
 
   // No target means the source remains tiled and simply snaps back to its slot.
-  ArrangeWorkspace(key, preferredTiledWindow);
+  Placement::ArrangeWorkspace(key, preferredTiledWindow);
 }
 
 static void HandleUserResize(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const RECT& workArea, LONG gap, const MoveSizeGesture& gesture) {
   if (!gesture.hasRects) {
-    ArrangeWorkspace(key);
+    Placement::ArrangeWorkspace(key);
     return;
   }
 
   const size_t resizedIndex = workspace.TiledIndex(hwnd);
   if (resizedIndex == static_cast<size_t>(-1)) {
-    ArrangeWorkspace(key);
+    Placement::ArrangeWorkspace(key);
     return;
   }
 
@@ -490,10 +451,10 @@ static void HandleUserResize(
     if (!ValidateUserLayoutMutation(
             key, key.ResolveMonitor(), candidate, hwnd,
             UserLayoutMutationKind::Resize, L"Resize")) {
-      ArrangeWorkspace(key, hwnd);
+      Placement::ArrangeWorkspace(key, hwnd);
       return;
     }
-    RememberPendingLayoutMutation(
+    Placement::RememberPendingLayoutMutation(
         key, workspace, candidate, hwnd, UserLayoutMutationKind::Resize,
         L"Resize");
     workspace = std::move(candidate);
@@ -502,7 +463,7 @@ static void HandleUserResize(
     Wh_Log(L"User resize updated local divider state for %p", hwnd);
     Diagnostics::RecordEvent(L"user resize updated divider hwnd=%p", hwnd);
   }
-  ArrangeWorkspace(key, changed ? hwnd : nullptr);
+  Placement::ArrangeWorkspace(key, changed ? hwnd : nullptr);
 }
 
 // Consumes one completed user gesture and routes it to the move or resize policy.
@@ -510,16 +471,16 @@ static void HandleUserResize(
 void ApplyUserMoveSize(HWND hwnd) {
   if (!IsWindow(hwnd)) return;
 
-  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
-    ClearMoveSizeSamples(hwnd);
+  if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+    Gestures::ClearMoveSizeSamples(hwnd);
     return;
   }
 
-  HMONITOR monitor = GetWindowPhysicalMonitor(hwnd);
+  HMONITOR monitor = Platform::Windows::GetWindowPhysicalMonitor(hwnd);
   if (!monitor) return;
 
   GUID desktopId{};
-  if (!GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
+  if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
 
   DesktopMonitorKey key{};
   if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
@@ -529,7 +490,7 @@ void ApplyUserMoveSize(HWND hwnd) {
   // Classify every completed move/size gesture at the common boundary before
   // routing it to tiled or floating policy. This makes the counters describe
   // actual user gestures instead of only gestures that reached tiled handlers.
-  MoveSizeGesture gesture = ConsumeMoveSizeGesture(hwnd);
+  MoveSizeGesture gesture = Gestures::ConsumeMoveSizeGesture(hwnd);
   switch (gesture.intent) {
     case MoveSizeIntent::Move:
       ++Diagnostics::g_runtime.counters.userMoveGestures;
@@ -546,7 +507,7 @@ void ApplyUserMoveSize(HWND hwnd) {
   if (directRecord &&
       (state.Layout() == TileLayout::Floating ||
        directRecord->state == ManageState::Floating)) {
-    if (RememberCurrentFloatingGeometry(key, state, hwnd)) {
+    if (Placement::RememberCurrentFloatingGeometry(key, state, hwnd)) {
       g_workspaces.Save(key, state);
       if (gesture.intent != MoveSizeIntent::None) {
         ++Diagnostics::g_runtime.counters.floatingGeometryUserUpdates;
@@ -559,12 +520,12 @@ void ApplyUserMoveSize(HWND hwnd) {
     return;
   }
 
-  WorkspaceMetrics metrics;
-  if (!GetWorkspaceMetrics(monitor, &metrics)) return;
+  Platform::Monitors::WorkspaceMetrics metrics;
+  if (!Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) return;
 
   HWND tiledHwnd = state.IsTiled(hwnd)
       ? hwnd
-      : ResolveToTiledWindow(hwnd, state.TiledWindows());
+      : Platform::Windows::ResolveToTiledWindow(hwnd, state.TiledWindows());
   if (!tiledHwnd) {
     Wh_Log(L"Unresolved window");
     return;
@@ -572,7 +533,7 @@ void ApplyUserMoveSize(HWND hwnd) {
 
   switch (gesture.intent) {
     case MoveSizeIntent::None:
-      ArrangeWorkspace(key);
+      Placement::ArrangeWorkspace(key);
       break;
 
     case MoveSizeIntent::Move:

@@ -1,7 +1,3 @@
-//=============================================================================
-// Move/size gesture tracking + classification
-//=============================================================================
-
 
 
 enum class MoveSizeIntent {
@@ -19,10 +15,7 @@ struct MoveSizeGesture {
   bool hasDropPoint = false;
 };
 
-static inline bool Differs(LONG a, LONG b, LONG tol = 1) {
-    return (a > b) ? (a - b > tol) : (b - a > tol);
-}
-
+namespace Gestures {
 // Classify the user's *gesture*, not whether position and size both happened to
 // change. WinUI/DWM windows can perturb one frame edge slightly during a pure
 // move, while a legitimate top/left-edge resize necessarily changes position
@@ -63,7 +56,7 @@ MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LON
 }
 
 static MoveSizeGesture PeekMoveSizeGesture(HWND hwnd) {
-  AssertWmThread(L"PeekMoveSizeGesture");
+  RuntimeLifecycle::AssertWmThread(L"PeekMoveSizeGesture");
   MoveSizeGesture gesture;
   auto startIt = g_moveSize.startRects.find(hwnd);
   auto endIt = g_moveSize.endRects.find(hwnd);
@@ -85,15 +78,54 @@ static MoveSizeGesture PeekMoveSizeGesture(HWND hwnd) {
 }
 
 static bool IsMoveSizeGestureInProgress(HWND hwnd) {
-  AssertWmThread(L"IsMoveSizeGestureInProgress");
+  RuntimeLifecycle::AssertWmThread(L"IsMoveSizeGestureInProgress");
   if (!hwnd) return false;
   const bool started = g_moveSize.startRects.find(hwnd) != g_moveSize.startRects.end();
   const bool ended = g_moveSize.endRects.find(hwnd) != g_moveSize.endRects.end();
   return started && !ended;
 }
 
+static void ClearMoveSizeSamples(HWND hwnd) {
+  RuntimeLifecycle::AssertWmThread(L"ClearMoveSizeSamples");
+  g_moveSize.startRects.erase(hwnd);
+  g_moveSize.endRects.erase(hwnd);
+  g_moveSize.endPoints.erase(hwnd);
+}
 
+static void ClearAllMoveSizeSamples() {
+  RuntimeLifecycle::AssertWmThread(L"ClearAllMoveSizeSamples");
+  g_moveSize.startRects.clear();
+  g_moveSize.endRects.clear();
+  g_moveSize.endPoints.clear();
+}
 
+// Consumes and clears the WinEvent samples for one completed gesture.
+// The WM core never reads these caches piecemeal after this boundary.
+static MoveSizeGesture ConsumeMoveSizeGesture(HWND hwnd) {
+  RuntimeLifecycle::AssertWmThread(L"ConsumeMoveSizeGesture");
+  MoveSizeGesture gesture;
 
+  auto startIt = g_moveSize.startRects.find(hwnd);
+  auto endIt = g_moveSize.endRects.find(hwnd);
+  auto pointIt = g_moveSize.endPoints.find(hwnd);
 
+  if (startIt != g_moveSize.startRects.end() && endIt != g_moveSize.endRects.end()) {
+    gesture.start = startIt->second;
+    gesture.end = endIt->second;
+    gesture.hasRects = true;
+  }
+  if (pointIt != g_moveSize.endPoints.end()) {
+    gesture.dropPoint = pointIt->second;
+    gesture.hasDropPoint = true;
+  }
 
+  g_moveSize.startRects.erase(hwnd);
+  g_moveSize.endRects.erase(hwnd);
+  g_moveSize.endPoints.erase(hwnd);
+  if (gesture.hasRects) {
+    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
+  }
+  return gesture;
+}
+
+} // namespace Gestures

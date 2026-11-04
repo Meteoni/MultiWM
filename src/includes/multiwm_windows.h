@@ -1,6 +1,52 @@
-//=============================================================================
-// Window observation + eligibility
-//=============================================================================
+// Native window observations, eligibility and checked placement.
+// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
+
+namespace Platform::Windows {
+
+bool GetWindowFrameRect(HWND hwnd, RECT* outRect) {
+  if (!hwnd || !outRect) return false;
+  if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, outRect, sizeof(*outRect)))) {
+    return true;
+  }
+  return GetWindowRect(hwnd, outRect) != FALSE;
+}
+
+// True when `hwnd` still names a live window owned by `processId`.
+// HWND values are recycled by Windows, so a handle saved earlier may now belong to
+// a different window. Re-check after any call that can run other code (COM, shell,
+// SendMessage) before acting on a saved handle. Pure query; never pumps messages.
+static bool IsSameLiveWindow(HWND hwnd, DWORD processId) {
+  DWORD livePid = 0;
+  GetWindowThreadProcessId(hwnd, &livePid);
+  return IsWindow(hwnd) && livePid == processId;
+}
+
+// One authoritative HWND -> physical-monitor observation for routing workspace
+// ownership. Restored/maximized windows prefer the DWM frame so every caller uses
+// the same monitor-boundary rule. Minimized windows deliberately fall back to
+// MonitorFromWindow(), which Windows resolves from the pre-minimize rectangle.
+static HMONITOR GetWindowPhysicalMonitor(HWND hwnd) {
+  if (!hwnd || !IsWindow(hwnd)) return nullptr;
+
+  if (!IsIconic(hwnd)) {
+    RECT frame{};
+    if (GetWindowFrameRect(hwnd, &frame) &&
+        frame.right > frame.left && frame.bottom > frame.top) {
+      HMONITOR monitor = MonitorFromRect(&frame, MONITOR_DEFAULTTONULL);
+      if (monitor) return monitor;
+    }
+  }
+
+  return MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+}
+
+static inline long long WindowAreaOnWorkArea(HWND hwnd, const RECT& workArea) {
+  RECT r{};
+  if (!GetWindowFrameRect(hwnd, &r)) return 0;
+  RECT inter{};
+  if (!IntersectRect(&inter, &r, &workArea)) return 0;
+  return Layout::RectAreaLL(inter);
+}
 
 // Win32 observation lives here, outside Model. These helpers translate live HWND
 // properties/geometry into value objects consumed by Workspace and reconciliation.
@@ -69,7 +115,7 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
 
   HMONITOR monitor =
       MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-  constraints.dpi = GetMonitorEffectiveDpi(monitor);
+  constraints.dpi = Platform::Monitors::GetMonitorEffectiveDpi(monitor);
 
   const LONG defaultMinWidth = std::max<LONG>(
       1, GetSystemMetricForDpiCompat(SM_CXMINTRACK, constraints.dpi));
@@ -128,30 +174,78 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
   return constraints;
 }
 
-static bool SameConstraintGeometry(
-    const WindowConstraints& a, const WindowConstraints& b) {
-  return a.minWidth == b.minWidth &&
-         a.minHeight == b.minHeight &&
-         a.dpi == b.dpi &&
-         a.valid == b.valid;
-}
+static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
+  if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
+  if (IsIconic(hwnd)) return SuspensionReason::Minimized;
+  DWORD cloaked = 0;
+  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+  if (!IsWindowVisible(hwnd) || (cloaked & DWM_CLOAKED_APP)) return SuspensionReason::Hidden;
+  if (IsZoomed(hwnd)) return SuspensionReason::Maximized;
 
-static WindowConstraints MergeConstraintProbeWithCache(
-    const WindowConstraints& cached, WindowConstraints observed) {
-  if (!observed.valid && cached.valid) {
-    const DWORD error = observed.lastProbeError;
-    observed = cached;
-    observed.lastProbeError = error;
+  // Chromium and similar apps can cover the full monitor while Windows still
+  // reports the HWND as restored. Fullscreen and native maximize have identical
+  // suspend/save-slot/restore semantics here.
+  RECT windowRect{};
+  if (GetWindowRect(hwnd, &windowRect)) {
+    HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONULL);
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    constexpr LONG kFullscreenTolerancePx = 2;
+    if (monitor && GetMonitorInfoW(monitor, &monitorInfo) &&
+        !Layout::Differs(windowRect.left, monitorInfo.rcMonitor.left,
+                 kFullscreenTolerancePx) &&
+        !Layout::Differs(windowRect.top, monitorInfo.rcMonitor.top,
+                 kFullscreenTolerancePx) &&
+        !Layout::Differs(windowRect.right, monitorInfo.rcMonitor.right,
+                 kFullscreenTolerancePx) &&
+        !Layout::Differs(windowRect.bottom, monitorInfo.rcMonitor.bottom,
+                 kFullscreenTolerancePx)) {
+      return SuspensionReason::Maximized;
+    }
   }
-  return observed;
+  return SuspensionReason::None;
 }
 
-static LONG RectWidth(const RECT& rect) {
-  return rect.right - rect.left;
-}
+// Workspace initialization needs a broader physical snapshot than normal layout
+// participation. A visible top-level window can already belong to this workspace
+// while minimized, maximized, or fullscreen, even though active collection
+// correctly excludes it from placement.
+static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
+    HMONITOR monitor, const GUID& desktopId) {
+  std::vector<HWND> windows;
+  if (!monitor) return windows;
 
-static LONG RectHeight(const RECT& rect) {
-  return rect.bottom - rect.top;
+  struct EnumContext {
+    HMONITOR targetMonitor;
+    GUID desktopId;
+    std::vector<HWND>* windowList;
+  } context = {monitor, desktopId, &windows};
+
+  ++Diagnostics::g_runtime.counters.enumWindowsPasses;
+  EnumWindows(
+      [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
+        ++Diagnostics::g_runtime.counters.enumWindowsVisited;
+        auto* ctx = reinterpret_cast<EnumContext*>(lParam);
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        if (!WindowCanBeManaged(hwnd)) return TRUE;
+        if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
+
+        GUID windowDesktop{};
+        if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+            !IsEqualGUID(windowDesktop, ctx->desktopId)) {
+          return TRUE;
+        }
+
+        if (GetWindowPhysicalMonitor(hwnd) != ctx->targetMonitor) {
+          return TRUE;
+        }
+
+        ctx->windowList->push_back(hwnd);
+        ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&context));
+
+  return windows;
 }
 
 static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState::Tiled) {
@@ -177,7 +271,7 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
         frame.right > frame.left && frame.bottom > frame.top) {
       record.floatingRect = frame;
       record.floatingMonitor = monitor;
-      record.floatingDpi = GetMonitorEffectiveDpi(monitor);
+      record.floatingDpi = Platform::Monitors::GetMonitorEffectiveDpi(monitor);
       record.hasFloatingRect = true;
     }
   }
@@ -190,18 +284,18 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
 HWND ResolveToTiledWindow(HWND hwnd, const std::vector<HWND>& candidates) {
   if (!hwnd || !IsWindow(hwnd)) return nullptr;
 
-  if (ContainsWindow(candidates, hwnd)) {
+  if (Model::ContainsWindow(candidates, hwnd)) {
     return hwnd;
   }
 
   HWND rootOwner = GetAncestor(hwnd, GA_ROOTOWNER);
-  if (rootOwner && ContainsWindow(candidates, rootOwner)) {
+  if (rootOwner && Model::ContainsWindow(candidates, rootOwner)) {
     return rootOwner;
   }
 
   HWND owner = GetWindow(hwnd, GW_OWNER);
   while (owner) {
-    if (ContainsWindow(candidates, owner)) {
+    if (Model::ContainsWindow(candidates, owner)) {
       return owner;
     }
     owner = GetWindow(owner, GW_OWNER);
@@ -461,7 +555,7 @@ static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize) {
     bool alwaysFloating = false;
     const bool startsFloating =
         ShouldWindowStartFloating(hwnd, &alwaysFloating);
-    if (!alwaysFloating && !(IsAutomaticMode() && startsFloating)) return false;
+    if (!alwaysFloating && !(RuntimeLifecycle::IsAutomaticMode() && startsFloating)) return false;
   }
 
   LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
@@ -498,13 +592,13 @@ static HMONITOR GetCurrentManagedWindowMonitor(
   if (expectedDesktop) {
     // Bind enumeration to one desktop, rather than a moving "current" predicate.
     GUID windowDesktop{};
-    if (!GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+    if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
         !IsEqualGUID(windowDesktop, *expectedDesktop)) {
       return nullptr;
     }
   } else {
     BOOL onCurrent = FALSE;
-    if (!IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) {
+    if (!Platform::VirtualDesktop::IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) {
       return nullptr;
     }
   }
@@ -512,15 +606,11 @@ static HMONITOR GetCurrentManagedWindowMonitor(
   return GetWindowPhysicalMonitor(hwnd);
 }
 
-static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPlacementTolerancePx) {
-  return !Differs(a.left, b.left, tolerance) &&
-         !Differs(a.top, b.top, tolerance) &&
-         !Differs(a.right, b.right, tolerance) &&
-         !Differs(a.bottom, b.bottom, tolerance);
-}
-
 // Positions one observed HWND without mutating logical workspace state. The
 // resulting value object is folded into Workspace separately.
+// WM thread only. Input/output frames are physical screen pixels. A non-success
+// result can follow an issued native placement; inspect placementIssued and the
+// observed frame rather than assuming failure left the HWND untouched.
 static PlacementObservation PlaceWindowChecked(
     HWND hwnd, bool canMove, const RECT& targetRect,
     bool positionOnly = false) {
@@ -576,7 +666,7 @@ static PlacementObservation PlaceWindowChecked(
   RECT currentFrame{};
   if (GetWindowFrameRect(hwnd, &currentFrame)) {
     observation.observed = currentFrame;
-    if (RectsNear(currentFrame, targetRect)) {
+    if (Layout::RectsNear(currentFrame, targetRect)) {
       ++Diagnostics::g_runtime.counters.placementNoOps;
       return finish(PlacementResult::Success);
     }
@@ -632,31 +722,21 @@ static PlacementObservation PlaceWindowChecked(
   }
 
   observation.observed = observed;
-  return finish(RectsNear(observed, targetRect)
+  return finish(Layout::RectsNear(observed, targetRect)
                     ? PlacementResult::Success
                     : PlacementResult::AdjustedByWindow);
 }
 
-static void ArrangeWorkspace(
-    const DesktopMonitorKey& key, HWND preferredTiledWindow = nullptr);
-static bool ClearSettledInsertionPlacements(
-    const DesktopMonitorKey& key, Workspace& workspace);
-
-static void ClearMoveSizeSamples(HWND hwnd) {
-  AssertWmThread(L"ClearMoveSizeSamples");
-  g_moveSize.startRects.erase(hwnd);
-  g_moveSize.endRects.erase(hwnd);
-  g_moveSize.endPoints.erase(hwnd);
+// Uses aggregate work-area coverage as a coarse guard against learning arbitrary
+// floating geometry as an authoritative tiled layout.
+static bool SnapshotLooksTiled(const std::vector<HWND>& windows, const RECT& workArea) {
+  if (windows.empty()) return false;
+  const long long workAreaArea = Layout::RectAreaLL(workArea);
+  long long sumArea = 0;
+  for (HWND w : windows) sumArea += WindowAreaOnWorkArea(w, workArea);
+  const long long lo = (workAreaArea * 85) / 100;
+  const long long hi = (windows.size() <= 2) ? (workAreaArea * 115) / 100 : (workAreaArea * 105) / 100;
+  return sumArea >= lo && sumArea <= hi;
 }
 
-static void ClearAllMoveSizeSamples() {
-  AssertWmThread(L"ClearAllMoveSizeSamples");
-  g_moveSize.startRects.clear();
-  g_moveSize.endRects.clear();
-  g_moveSize.endPoints.clear();
-}
-
-
-
-
-
+} // namespace Platform::Windows

@@ -1,6 +1,3 @@
-//=============================================================================
-// Notification-area layout indicator + layout flyout
-//=============================================================================
 //
 // UI boundary for the tool mod. This subsystem is Win32/GDI-only: no Explorer
 // hooks, XAML, WinUI, or Windows App SDK dependency. The tray uses two-letter
@@ -8,10 +5,6 @@
 // small non-activating card shown only after an explicit layout change.
 
 namespace TrayUi {
-
-//-----------------------------------------------------------------------------
-// Settings + naming
-//-----------------------------------------------------------------------------
 
 constexpr wchar_t kTrayWindowClassName[] = L"WindhawkMultiWMTrayWindow";
 constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkMultiWMStatusFlyout";
@@ -111,17 +104,13 @@ static void LoadSettings() {
         StringSetting::make(L"appearance.CustomIcons[%d].Layout", i);
     if (!*layoutName.get()) break;
     auto path = StringSetting::make(L"appearance.CustomIcons[%d].Path", i);
-    size_t index = static_cast<size_t>(ParseLayoutSetting(layoutName.get()));
+    size_t index = static_cast<size_t>(Configuration::ParseLayoutSetting(layoutName.get()));
     if (*path.get() && index < g_customIconPaths.size() &&
         g_customIconPaths[index].empty()) {
       g_customIconPaths[index] = path.get();
     }
   }
 }
-
-//-----------------------------------------------------------------------------
-// Theme-aware tray icons
-//-----------------------------------------------------------------------------
 
 static bool ReadSystemLightTheme() {
   DWORD value = 0;
@@ -266,7 +255,7 @@ static void SetTooltip(TileLayout layout) {
       desktopId = g_wm.reconciledDesktop;
       haveDesktop = true;
     } else {
-      haveDesktop = GetCurrentDesktopId(&desktopId);
+      haveDesktop = Platform::VirtualDesktop::GetCurrentDesktopId(&desktopId);
     }
     if (!haveDesktop && g_haveDisplayedDesktopId) {
       desktopId = g_displayedDesktopId;
@@ -415,10 +404,6 @@ static void RebuildIcons() {
   DestroyIconSet(old);
 }
 
-//-----------------------------------------------------------------------------
-// Compact layout flyout
-//-----------------------------------------------------------------------------
-
 static int ScaleForDpi(int value, UINT dpi) {
   return MulDiv(value, static_cast<int>(dpi ? dpi : 96), 96);
 }
@@ -533,15 +518,15 @@ static FlyoutInstance* GetOrCreateFlyoutForMonitor(HMONITOR monitor) {
 
 static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
   if (!g_showToasts || !text || !*text) return;
-  if (!monitor) monitor = GetWorkspaceCommandMonitor();
+  if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
   RECT workArea{};
-  if (!monitor || !GetMonitorWorkArea(monitor, &workArea)) return;
+  if (!monitor || !Platform::Monitors::GetMonitorWorkArea(monitor, &workArea)) return;
 
   FlyoutInstance* instance = GetOrCreateFlyoutForMonitor(monitor);
   if (!instance || !instance->hwnd) return;
   instance->text = text;
 
-  UINT dpi = GetMonitorEffectiveDpi(monitor);
+  UINT dpi = Platform::Monitors::GetMonitorEffectiveDpi(monitor);
   HFONT font = CreateFlyoutFont(dpi);
   HDC dc = GetDC(instance->hwnd);
   HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
@@ -596,7 +581,7 @@ static void ShowCommandFailureFlyout(
 static void ShowManagementModeFlyout(bool automatic) {
   ShowStatusFlyout(
       automatic ? L"Automatic Mode" : L"Manual Mode",
-      GetWorkspaceCommandMonitor());
+      Platform::Monitors::GetWorkspaceCommandMonitor());
 }
 
 static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
@@ -615,18 +600,14 @@ static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
   }
 }
 
-//-----------------------------------------------------------------------------
-// Standard tray context menu
-//-----------------------------------------------------------------------------
-
 static HMONITOR GetContextMenuMonitor() {
   MONITORINFO info{sizeof(info)};
   if (g_displayedMonitor && GetMonitorInfoW(g_displayedMonitor, &info)) {
     return g_displayedMonitor;
   }
 
-  HMONITOR monitor = GetForegroundMonitor();
-  if (!monitor) monitor = GetCursorMonitor();
+  HMONITOR monitor = Platform::Monitors::GetForegroundMonitor();
+  if (!monitor) monitor = Platform::Monitors::GetCursorMonitor();
   return monitor;
 }
 
@@ -634,7 +615,7 @@ static TileLayout GetMonitorLayoutOrDefault(HMONITOR monitor) {
   TileLayout layout = g_settings.defaultLayout;
   DesktopMonitorKey key{};
   Workspace state;
-  if (monitor && GetCurrentWorkspaceKey(monitor, &key)) {
+  if (monitor && Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key)) {
     layout = g_workspaces.Load(key, &state)
         ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
   }
@@ -649,7 +630,7 @@ static LRESULT CALLBACK TrayMenuMessageFilterProc(
   if (code == MSGF_MENU && lParam) {
     const MSG& msg = *reinterpret_cast<const MSG*>(lParam);
     if (!msg.hwnd &&
-        HandleWmThreadMessage(msg) == WmMessageDisposition::Handled) {
+        RuntimeLifecycle::HandleWmThreadMessage(msg) == WmMessageDisposition::Handled) {
       return 1;
     }
   }
@@ -666,7 +647,7 @@ static void ShowContextMenu() {
   if (!menu) return;
 
   AppendMenuW(menu, MF_STRING, kContextTileWorkspace, L"Tile Workspace");
-  const ManagementMode targetMode = IsAutomaticMode()
+  const ManagementMode targetMode = RuntimeLifecycle::IsAutomaticMode()
                                         ? ManagementMode::Manual
                                         : ManagementMode::Automatic;
   AppendMenuW(
@@ -742,10 +723,6 @@ static void ShowContextMenu() {
   }
 }
 
-//-----------------------------------------------------------------------------
-// Lifecycle / shell integration
-//-----------------------------------------------------------------------------
-
 // Updates the single shell notification icon for one explicit monitor boundary.
 // The icon is intentionally a view onto one workspace, while the tooltip can
 // summarize all current monitor workspaces when multiple displays are connected.
@@ -755,7 +732,7 @@ static void RefreshForMonitor(HMONITOR monitor) {
   TileLayout layout = g_settings.defaultLayout;
   DesktopMonitorKey key{};
   Workspace state;
-  const bool haveKey = GetCurrentWorkspaceKey(monitor, &key);
+  const bool haveKey = Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key);
   if (haveKey) {
     layout = g_workspaces.Load(key, &state)
         ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
@@ -772,8 +749,8 @@ static void RefreshDisplayedMonitor() {
   HMONITOR monitor = g_displayedMonitor;
   MONITORINFO info{sizeof(info)};
   if (!monitor || !GetMonitorInfoW(monitor, &info)) {
-    monitor = GetForegroundMonitor();
-    if (!monitor) monitor = GetCursorMonitor();
+    monitor = Platform::Monitors::GetForegroundMonitor();
+    if (!monitor) monitor = Platform::Monitors::GetCursorMonitor();
   }
   if (monitor) RefreshForMonitor(monitor);
 }
@@ -782,8 +759,8 @@ static void RefreshDisplayedMonitor() {
 // workspace commands call RefreshForMonitor directly with their cursor-selected
 // monitor instead of going through this focus-driven path.
 static void RefreshForCurrentWorkspace() {
-  HMONITOR monitor = GetForegroundMonitor();
-  if (!monitor) monitor = GetCursorMonitor();
+  HMONITOR monitor = Platform::Monitors::GetForegroundMonitor();
+  if (!monitor) monitor = Platform::Monitors::GetCursorMonitor();
   if (monitor) RefreshForMonitor(monitor);
 }
 

@@ -24,6 +24,38 @@ instead of implementing a separate desktop system.
 - **Event-driven** - changes are signaled through native events rather than 
 continuous polling.
 
+## Source layout
+
+`src/multiwm.cpp` includes the implementation in dependency order and is the entry point for Windhawk amalgamation. The headers share one translation unit.
+
+The headers are dependency-ordered implementation/declaration fragments for this
+Windhawk build. They are read through the entry point, rather than compiled in
+isolation. Namespaces identify a few shared responsibilities across files.
+
+| Responsibility / namespace | Files under `src/includes` |
+| --- | --- |
+| Shared declarations and actor state | `multiwm_core.h`, `multiwm_workspace.h`, `multiwm_runtime_state.h`, `multiwm_interfaces.h` |
+| `Model`: membership, preferences, validation and snapshot storage | `multiwm_workspace_model.h`, `multiwm_workspace_repository.h` |
+| `Layout`: allocation, cached constraint planning and resize learning | `multiwm_layout.h`, `multiwm_workspace_planning.h` |
+| `Placement`: floating geometry, tiled arrangement and conformance leases | `multiwm_floating_placement.h`, `multiwm_workspace_arrangement.h`, `multiwm_conformance.h` |
+| `Reconcile`: observed ownership, discovery and routing | `multiwm_reconcile.h`, `multiwm_window_routing.h` |
+| `Platform`: native adapters | `multiwm_monitors.h`, `multiwm_windows.h`, `multiwm_window_events.h`, `multiwm_virtual_desktop.h` |
+| Settings and gestures | `multiwm_configuration.h`, `multiwm_gestures.h` |
+| Commands and runtime lifecycle | `multiwm_commands.h`, `multiwm_bootstrap.h`, `multiwm_runtime_lifecycle.h` |
+| Presentation and diagnostics | `multiwm_tray_ui.h`, `multiwm_diagnostics.h` |
+
+`multiwm_workspace.h` declares the model. Runtime instances and diagnostic state
+live in `multiwm_runtime_state.h`; the small interfaces fragment resolves calls
+that must precede their definitions. Model resize methods are defined explicitly
+inside `namespace Model` beside the planner they use. Native monitor conversion
+methods likewise stay beside the monitor adapter. Namespaces communicate
+ownership within the shared translation unit, rather than enforcing privacy.
+
+Keep layout preferences in the model and temporary constraint adjustments in the planner. Recovery searches produce local candidate workspaces; the caller commits them after retaining any required rollback state. Native queries can outlive a desktop transition, so retain the ownership checks at discovery and migration boundaries.
+
+See [Maintaining MultiWM](CONTRIBUTING.md) for readability rules, contracts, units,
+ownership, the project glossary, and review tooling.
+
 ## Layouts
 - Floating
 - Master + Stack (vertical or horizontal)

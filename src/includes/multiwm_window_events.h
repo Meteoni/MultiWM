@@ -1,6 +1,3 @@
-//=============================================================================
-// Windows platform adapter: WinEvent observation + queueing
-//=============================================================================
 namespace Platform::WindowEvents {
 
 void OnWindowMoveSizeEnd(HWND hwnd) {
@@ -22,7 +19,7 @@ static void QueueWindowEvent(DWORD event, HWND hwnd) {
 }
 
 static bool HasTrackedMonitorOwnershipMismatch(HWND hwnd) {
-  const HMONITOR observed = GetWindowPhysicalMonitor(hwnd);
+  const HMONITOR observed = Platform::Windows::GetWindowPhysicalMonitor(hwnd);
   Model::MonitorId observedId;
   if (!observed || !Model::MonitorId::FromHMonitor(observed, &observedId)) {
     return false;
@@ -39,7 +36,7 @@ static bool HasTrackedMonitorOwnershipMismatch(HWND hwnd) {
 // observation-only and post accepted work so reentrant delivery can't recursively
 // mutate workspace state.
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
-  AssertWmThread(L"WinEventProc");
+  RuntimeLifecycle::AssertWmThread(L"WinEventProc");
   switch (event) {
     case EVENT_SYSTEM_FOREGROUND:
     case EVENT_SYSTEM_MOVESIZESTART:
@@ -79,26 +76,20 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // owner for native move/size boundaries. Lifecycle events retain exact identity.
   if ((event == EVENT_SYSTEM_MOVESIZESTART ||
        event == EVENT_SYSTEM_MOVESIZEEND) &&
-      !IsWindowTrackedInAnyState(hwnd) &&
-      FindMatchingWindowRule(
+      !Platform::Windows::IsWindowTrackedInAnyState(hwnd) &&
+      Platform::Windows::FindMatchingWindowRule(
           hwnd, WindowRuleTreatment::TraceToOwner)) {
     HWND rootOwner = GetAncestor(hwnd, GA_ROOTOWNER);
-    if (rootOwner && IsWindowTrackedInAnyState(rootOwner)) {
+    if (rootOwner && Platform::Windows::IsWindowTrackedInAnyState(rootOwner)) {
       hwnd = rootOwner;
     }
   }
 
-  const bool tracked = IsWindowTrackedInAnyState(hwnd);
+  const bool tracked = Platform::Windows::IsWindowTrackedInAnyState(hwnd);
   if (event == EVENT_OBJECT_DESTROY) {
     // Retire lifetime metadata when destruction is observed, before a delayed
     // model message could mistake a reused HWND for the old routed window.
-    g_wm.overflowWindows.erase(hwnd);
-    g_wm.pendingWindowOverflow.erase(
-        std::remove_if(g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
-                       [hwnd](const PendingWindowOverflow& pending) { return pending.hwnd == hwnd; }),
-        g_wm.pendingWindowOverflow.end());
-    if (g_wm.pendingOverflowSwitch.hwnd == hwnd) g_wm.pendingOverflowSwitch = {};
-    if (g_wm.pendingInitialPlacementSwitch.hwnd == hwnd) g_wm.pendingInitialPlacementSwitch = {};
+    g_wm.CancelPendingWindowMoves(hwnd);
     const bool routingKnown = g_wm.windowRoutingEvaluated.erase(hwnd) != 0;
     const bool routingPending = g_wm.pendingWindowRoutes.erase(hwnd) != 0;
     if (tracked || routingKnown || routingPending) QueueWindowEvent(event, hwnd);
@@ -117,22 +108,19 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
       // A newly created window can already be minimized, maximized, or fullscreen
       // before the ordinary discovery snapshot sees it. Queue those states for the
       // inactive-admission path.
-      const SuspensionReason reason = GetPhysicalSuspensionReason(hwnd);
+      const SuspensionReason reason = Platform::Windows::GetPhysicalSuspensionReason(hwnd);
       if ((reason != SuspensionReason::Minimized &&
            reason != SuspensionReason::Maximized) ||
-          !WindowCanBeManaged(hwnd)) {
+          !Platform::Windows::WindowCanBeManaged(hwnd)) {
         return;
       }
       QueueWindowEvent(event, hwnd);
       return;
     }
 
-    const bool overflowPending = std::any_of(
-        g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
-        [hwnd](const PendingWindowOverflow& pending) { return pending.hwnd == hwnd; });
     const bool stateOrLeaseNeedsObservation =
-        overflowPending || g_workspaces.IsSuspendedMaximized(hwnd) ||
-        HasActiveConformanceLease(hwnd) ||
+        g_wm.HasPendingOverflow(hwnd) || g_workspaces.IsSuspendedMaximized(hwnd) ||
+        Placement::HasActiveConformanceLease(hwnd) ||
         g_workspaces.IsTiled(hwnd);
     if (!stateOrLeaseNeedsObservation &&
         !HasTrackedMonitorOwnershipMismatch(hwnd)) {
@@ -156,7 +144,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
         event == EVENT_SYSTEM_MINIMIZEEND ||
         ((event == EVENT_SYSTEM_MOVESIZESTART ||
           event == EVENT_SYSTEM_MOVESIZEEND) &&
-         (g_wm.windowRoutingReady || IsAutomaticMode()));
+         (g_wm.windowRoutingReady || RuntimeLifecycle::IsAutomaticMode()));
     if (!discoveryEvent || GetAncestor(hwnd, GA_ROOT) != hwnd) {
       return;
     }
@@ -166,18 +154,12 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // Lease cancellation is actor-local; workspace mutation remains deferred until
   // normal message dispatch.
   if (event == EVENT_SYSTEM_MOVESIZESTART) {
-    g_wm.overflowWindows.erase(hwnd);
-    g_wm.pendingWindowOverflow.erase(
-        std::remove_if(g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
-                       [hwnd](const PendingWindowOverflow& pending) { return pending.hwnd == hwnd; }),
-        g_wm.pendingWindowOverflow.end());
-    if (g_wm.pendingOverflowSwitch.hwnd == hwnd) g_wm.pendingOverflowSwitch = {};
-    if (g_wm.pendingInitialPlacementSwitch.hwnd == hwnd) g_wm.pendingInitialPlacementSwitch = {};
+    g_wm.CancelPendingWindowMoves(hwnd);
     if (g_wm.windowRoutingReady) {
       g_wm.windowRoutingEvaluated.insert(hwnd);
       g_wm.pendingWindowRoutes.erase(hwnd);
     }
-    CancelConformanceLease(hwnd);
+    Placement::CancelConformanceLease(hwnd);
   }
 
   // Untracked drags only cancel initial routing. They must not reach the
@@ -192,7 +174,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // mutation and layout work happen later on the WM thread.
   if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
     RECT r{};
-    if (GetWindowFrameRect(hwnd, &r)) {
+    if (Platform::Windows::GetWindowFrameRect(hwnd, &r)) {
       if (event == EVENT_SYSTEM_MOVESIZESTART) {
         g_moveSize.startRects[hwnd] = r;
       } else {
@@ -225,7 +207,7 @@ bool AllWinEventHooksInstalled() {
 }
 
 bool InstallWinEventHooks() {
-  AssertWmThread(L"Platform::WindowEvents::InstallWinEventHooks");
+  RuntimeLifecycle::AssertWmThread(L"Platform::WindowEvents::InstallWinEventHooks");
   auto noteFailure = [](const wchar_t* name) {
     ++Diagnostics::g_runtime.counters.winEventHookInstallFailures;
     Wh_Log(L"Failed to install %s WinEvent hook: %lu", name, GetLastError());

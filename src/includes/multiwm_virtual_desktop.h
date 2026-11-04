@@ -1,6 +1,3 @@
-//=============================================================================
-// Windows platform adapters: private virtual desktops
-//=============================================================================
 //
 // Everything below this point is shell/COM adaptation. The model, layout engine,
 // reconciliation policy, commands, and WinEvent adapter above depend only on the
@@ -12,11 +9,6 @@ template <typename T>
 T GetVTableFunction(void* pInterface, int index) {
   return reinterpret_cast<T>((*reinterpret_cast<void***>(pInterface))[index]);
 }
-
-
-//=============================================================================
-// COM CLSIDs and IIDs for Virtual Desktop API (undocumented)
-//=============================================================================
 
 static const CLSID CLSID_ImmersiveShell = {
     0xC2F03A33, 0x21F5, 0x47FA, {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
@@ -42,10 +34,6 @@ static const IID IID_IVirtualDesktopNotification_Intermediate = {
 static const IID IID_IVirtualDesktopNotification_Current = {
     0xB9E5E94D, 0x233E, 0x49AB, {0xAF, 0x5C, 0x2B, 0x45, 0x41, 0xC3, 0xAA, 0xDE}};
 
-//=============================================================================
-// Virtual Desktop private ABI identifiers
-//=============================================================================
-
 // Manager interface generations. Selection is automatic from explorer.exe's
 // build; there is no user-facing Windows-version override.
 static const IID IID_IVirtualDesktopManagerInternal_Win10Old = {
@@ -59,9 +47,6 @@ static const IID IID_IVirtualDesktopManagerInternal_Win11_22621 = {
 static const IID IID_IVirtualDesktopManagerInternal_Win11_26100 = {
     0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}};
 
-//=============================================================================
-// COM Interface Definitions (undocumented, reverse-engineered)
-//=============================================================================
 struct IVirtualDesktop : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE IsViewVisible(IUnknown*, BOOL*) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetId(GUID*) = 0;
@@ -82,11 +67,6 @@ struct VirtualDesktopNotificationObject {
 };
 
 bool UsesHMonitorParameter() { return g_vd.abi.usesHMonitor; }
-
-
-//=============================================================================
-// Virtual Desktop API + native change notifications
-//=============================================================================
 
 DesktopMetadata ReadDesktopMetadata(const GUID& desktopId) {
   // Read only at the initial-layout boundary. Missing shell metadata leaves the
@@ -665,8 +645,8 @@ bool InitializeVirtualDesktopAPI() {
 bool ReinitializeVirtualDesktopAPI() {
   ++Diagnostics::g_runtime.counters.vdApiReinitializations;
   Diagnostics::RecordEvent(L"virtual desktop core API reinitialization requested");
-  CleanupVirtualDesktopAPI();
-  const bool ready = InitializeVirtualDesktopAPI();
+  Platform::VirtualDesktop::CleanupVirtualDesktopAPI();
+  const bool ready = Platform::VirtualDesktop::InitializeVirtualDesktopAPI();
   // A previously-live COM path failed, so give the centralized recovery owner a
   // fresh retry burst. Notification registration remains owned there.
   RuntimeLifecycle::RequestMaintenance(true);
@@ -713,7 +693,7 @@ HRESULT CallManagerInternal(int vtableIndex, TResult* outResult, bool enumerateD
 bool GetDesktopIdsInOrder(std::vector<GUID>* desktopIds) {
   if (!desktopIds) return false;
   desktopIds->clear();
-  if (!InitializeVirtualDesktopAPI()) return false;
+  if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI()) return false;
   IObjectArray* desktops = nullptr;
   HRESULT hr = CallManagerInternal(g_vd.abi.getDesktopsIndex, &desktops, true);
   if (FAILED(hr) || !desktops) {
@@ -739,7 +719,7 @@ bool GetDesktopIdsInOrder(std::vector<GUID>* desktopIds) {
 // Resolve a GUID against a fresh shell array at each mutation boundary. Holding
 // an ordinal or a desktop pointer across a dynamic-desktop update is unsafe.
 static IVirtualDesktop* FindLiveDesktop(const GUID& desktopId) {
-  if (!InitializeVirtualDesktopAPI()) return nullptr;
+  if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI()) return nullptr;
   IObjectArray* desktops = nullptr;
   HRESULT hr = CallManagerInternal(g_vd.abi.getDesktopsIndex, &desktops, true);
   IUnknown* const manager = g_vd.managerInternal;
@@ -768,7 +748,7 @@ static IVirtualDesktop* FindLiveDesktop(const GUID& desktopId) {
 // Read shell views rather than guessing occupancy from cloaked top-level HWNDs.
 // An unregistered ApplicationFrameWindow is absent here and cannot block routing.
 bool IsDesktopEmptyExcept(const GUID& desktopId, HWND allowedWindow) {
-  if (!InitializeVirtualDesktopAPI()) return false;
+  if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI()) return false;
   IUnknown* const manager = g_vd.managerInternal;
   const IID collectionIid =
       {0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
@@ -817,16 +797,19 @@ bool IsDesktopEmptyExcept(const GUID& desktopId, HWND allowedWindow) {
   return empty && g_vd.managerInternal == manager;
 }
 
+static std::vector<GUID>::const_iterator FindDesktopInOrder(
+    const std::vector<GUID>& order, const GUID& desktopId) {
+  return std::find_if(order.begin(), order.end(),
+      [&](const GUID& id) { return IsEqualGUID(id, desktopId); });
+}
+
 bool CreateDesktopAfter(const GUID& sourceDesktop, GUID* desktopId, int* desktopNumber) {
   if (!desktopId || !desktopNumber) return false;
   *desktopId = {};
   *desktopNumber = 0;
   std::vector<GUID> order;
-  GUID current{};
-  if (!GetDesktopIdsInOrder(&order) || !GetCurrentDesktopId(&current) ||
-      !IsEqualGUID(current, sourceDesktop)) return false;
-  auto source = std::find_if(order.begin(), order.end(),
-      [&](const GUID& id) { return IsEqualGUID(id, sourceDesktop); });
+  if (!GetDesktopIdsInOrder(&order) || !IsCurrentDesktop(sourceDesktop)) return false;
+  auto source = FindDesktopInOrder(order, sourceDesktop);
   if (source == order.end() ||
       (g_vd.abi.moveDesktopIndex < 0 && source + 1 != order.end())) return false;
   IUnknown* const manager = g_vd.managerInternal;
@@ -843,16 +826,13 @@ bool CreateDesktopAfter(const GUID& sourceDesktop, GUID* desktopId, int* desktop
     return false;
   }
   if (!GetDesktopIdsInOrder(&order) || g_vd.managerInternal != manager ||
-      !GetCurrentDesktopId(&current) || !IsEqualGUID(current, sourceDesktop)) return false;
-  source = std::find_if(order.begin(), order.end(),
-      [&](const GUID& id) { return IsEqualGUID(id, sourceDesktop); });
-  auto target = std::find_if(order.begin(), order.end(),
-      [&](const GUID& id) { return IsEqualGUID(id, *desktopId); });
+      !IsCurrentDesktop(sourceDesktop)) return false;
+  source = FindDesktopInOrder(order, sourceDesktop);
+  auto target = FindDesktopInOrder(order, *desktopId);
   if (source == order.end() || target == order.end()) return false;
   if (target != source + 1) {
     if (g_vd.abi.moveDesktopIndex < 0 || !IsDesktopEmptyExcept(*desktopId) ||
-        g_vd.managerInternal != manager || !GetCurrentDesktopId(&current) ||
-        !IsEqualGUID(current, sourceDesktop)) return false;
+        g_vd.managerInternal != manager || !IsCurrentDesktop(sourceDesktop)) return false;
     const int index = static_cast<int>(source - order.begin()) + (target < source ? 0 : 1);
     created = FindLiveDesktop(*desktopId);
     if (!created || g_vd.managerInternal != manager) { SAFE_RELEASE(created); return false; }
@@ -862,10 +842,8 @@ bool CreateDesktopAfter(const GUID& sourceDesktop, GUID* desktopId, int* desktop
     created->Release();
   }
   if (!GetDesktopIdsInOrder(&order) || g_vd.managerInternal != manager) return false;
-  source = std::find_if(order.begin(), order.end(),
-      [&](const GUID& id) { return IsEqualGUID(id, sourceDesktop); });
-  target = std::find_if(order.begin(), order.end(),
-      [&](const GUID& id) { return IsEqualGUID(id, *desktopId); });
+  source = FindDesktopInOrder(order, sourceDesktop);
+  target = FindDesktopInOrder(order, *desktopId);
   const bool inserted = source != order.end() && target != order.end() && target == source + 1;
   if (inserted) *desktopNumber = static_cast<int>(target - order.begin()) + 1;
   Diagnostics::RecordEvent(L"overflow desktop creation target=%08X hr=%08X inserted=%d", desktopId->Data1, hr, inserted ? 1 : 0);
@@ -883,7 +861,7 @@ bool RemoveEmptyOverflowDesktop(const GUID& desktopId, const GUID& fallbackDeskt
   GUID current{};
   bool removed = false;
   if (desktop && fallback && IsDesktopEmptyExcept(desktopId) &&
-      GetCurrentDesktopId(&current) && !IsEqualGUID(current, desktopId) &&
+      Platform::VirtualDesktop::GetCurrentDesktopId(&current) && !IsEqualGUID(current, desktopId) &&
       g_vd.managerInternal == manager) {
     HRESULT hr = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop*, IVirtualDesktop*)>(
         manager, g_vd.abi.removeDesktopIndex)(manager, desktop, fallback);
@@ -903,7 +881,7 @@ bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, 
     const auto pending = g_wm.pendingWindowRoutes.find(hwnd);
     return pending != g_wm.pendingWindowRoutes.end() && pending->second.processId == processId &&
         IsEqualGUID(pending->second.sourceDesktop, sourceDesktop) &&
-        IsEqualGUID(pending->second.targetDesktop, desktopId) && !IsMoveSizeGestureInProgress(hwnd);
+        IsEqualGUID(pending->second.targetDesktop, desktopId) && !Gestures::IsMoveSizeGestureInProgress(hwnd);
   };
   if (!requestPending() || !g_vd.serviceProvider) return false;
   IVirtualDesktop* desktop = FindLiveDesktop(desktopId);
@@ -947,16 +925,13 @@ bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, 
     const auto canMoveView = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, BOOL*)>(g_vd.managerInternal, 5);
     hr = canMoveView(g_vd.managerInternal, view, &canMove);
   }
-  DWORD livePid = 0;
-  GUID owner{}, current{};
   const bool sourceObserved = SUCCEEDED(hr) && view && canMove &&
-      GetWindowDesktopIdSafe(hwnd, &owner) && IsEqualGUID(owner, sourceDesktop);
+      IsWindowOnDesktop(hwnd, sourceDesktop);
   const bool sourceActive = purpose == WindowMovePurpose::Overflow ||
-      (GetCurrentDesktopId(&current) && IsEqualGUID(current, sourceDesktop) &&
-       !IsWindowTrackedInAnyState(hwnd) && !IsWindowCloaked(hwnd) &&
-       GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None);
-  GetWindowThreadProcessId(hwnd, &livePid);
-  if (sourceObserved && sourceActive && IsWindow(hwnd) && livePid == processId &&
+      (IsCurrentDesktop(sourceDesktop) &&
+       !Platform::Windows::IsWindowTrackedInAnyState(hwnd) && !Platform::Windows::IsWindowCloaked(hwnd) &&
+       Platform::Windows::GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None);
+  if (sourceObserved && sourceActive && Platform::Windows::IsSameLiveWindow(hwnd, processId) &&
       requestPending() && manager && g_vd.managerInternal == manager) {
     const auto moveView = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, IVirtualDesktop*)>(g_vd.managerInternal, 4);
     hr = moveView(g_vd.managerInternal, view, desktop);
@@ -966,12 +941,10 @@ bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, 
   SAFE_RELEASE(view);
   SAFE_RELEASE(collection);
   desktop->Release();
-  GUID observed{};
   // A mutation can complete despite a lost COM response. Never blindly repeat it.
-  const bool ownerObserved = GetWindowDesktopIdSafe(hwnd, &observed);
-  GetWindowThreadProcessId(hwnd, &livePid);
-  const bool moved = IsWindow(hwnd) && livePid == processId && ownerObserved &&
-                     IsEqualGUID(observed, desktopId) && requestPending();
+  const bool ownerMatches = IsWindowOnDesktop(hwnd, desktopId);
+  const bool moved = Platform::Windows::IsSameLiveWindow(hwnd, processId) && ownerMatches &&
+                     requestPending();
   Diagnostics::RecordEvent(L"window desktop move hwnd=%p target=%08X hr=%08X observedSuccess=%d",
                            hwnd, desktopId.Data1, hr, moved ? 1 : 0);
   if (IsDeadVirtualDesktopProxy(hr)) RuntimeLifecycle::RequestMaintenance(true);
@@ -985,20 +958,16 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
   IUnknown* const manager = g_vd.managerInternal;
   auto canFollow = [&] {
     LASTINPUTINFO input{sizeof(input)};
-    GUID current{}, owner{};
-    if (!GetWindowDesktopIdSafe(hwnd, &owner) || !IsEqualGUID(owner, desktopId) ||
-        !GetCurrentDesktopId(&current) || !IsEqualGUID(current, sourceDesktop) ||
+    if (!IsWindowOnDesktop(hwnd, desktopId) || !IsCurrentDesktop(sourceDesktop) ||
         !manager || g_vd.managerInternal != manager) return false;
     // Owner queries can pump destroy/user-gesture events. Check intent last.
-    DWORD livePid = 0;
-    GetWindowThreadProcessId(hwnd, &livePid);
     const auto& initial = g_wm.pendingInitialPlacementSwitch;
     const bool requestPending = purpose == WindowMovePurpose::Overflow
         ? g_wm.overflowWindows.count(hwnd) != 0
         : initial.hwnd == hwnd && initial.processId == processId &&
           initial.inputTickMs == inputTickMs && IsEqualGUID(initial.sourceDesktop, sourceDesktop) &&
-          IsEqualGUID(initial.targetDesktop, desktopId) && !IsMoveSizeGestureInProgress(hwnd);
-    return IsWindow(hwnd) && livePid == processId && requestPending &&
+          IsEqualGUID(initial.targetDesktop, desktopId) && !Gestures::IsMoveSizeGestureInProgress(hwnd);
+    return Platform::Windows::IsSameLiveWindow(hwnd, processId) && requestPending &&
            GetLastInputInfo(&input) && input.dwTime == inputTickMs;
   };
   if (!canFollow()) {
@@ -1043,8 +1012,7 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
     }
   }
   desktop->Release();
-  GUID current{};
-  const bool accepted = SUCCEEDED(hr) || (GetCurrentDesktopId(&current) && IsEqualGUID(current, desktopId));
+  const bool accepted = SUCCEEDED(hr) || IsCurrentDesktop(desktopId);
   Diagnostics::RecordEvent(L"window desktop switch target=%08X hr=%08X accepted=%d animated=%d", desktopId.Data1, hr, accepted ? 1 : 0, animated ? 1 : 0);
   if (IsDeadVirtualDesktopProxy(hr)) RuntimeLifecycle::RequestMaintenance(true);
   return accepted;
@@ -1123,8 +1091,6 @@ bool IsWindowOnCurrentDesktopSafe(HWND hwnd, BOOL* onCurrent) {
   }
   return SUCCEEDED(hr);
 }
-
-
 
 }  // namespace Platform::VirtualDesktop
 

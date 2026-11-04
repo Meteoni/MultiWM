@@ -394,13 +394,22 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 // ==/WindhawkModSettings==
 
 #include "includes/multiwm_core.h"
-#include "includes/multiwm_gestures.h"
-#include "includes/multiwm_configuration_helpers.h"
+#include "includes/multiwm_workspace.h"
+#include "includes/multiwm_runtime_state.h"
+#include "includes/multiwm_interfaces.h"
 #include "includes/multiwm_layout.h"
-#include "includes/multiwm_window_observation.h"
+#include "includes/multiwm_gestures.h"
+#include "includes/multiwm_configuration.h"
+#include "includes/multiwm_monitors.h"
+#include "includes/multiwm_workspace_model.h"
+#include "includes/multiwm_windows.h"
+#include "includes/multiwm_floating_placement.h"
 #include "includes/multiwm_workspace_repository.h"
-#include "includes/multiwm_workspace_operations.h"
+#include "includes/multiwm_workspace_planning.h"
+#include "includes/multiwm_workspace_arrangement.h"
+#include "includes/multiwm_conformance.h"
 #include "includes/multiwm_reconcile.h"
+#include "includes/multiwm_window_routing.h"
 #include "includes/multiwm_commands.h"
 #include "includes/multiwm_window_events.h"
 #include "includes/multiwm_virtual_desktop.h"
@@ -416,8 +425,8 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 BOOL WhTool_ModInit() {
   Diagnostics::InitializeProcessRuntime();
   Wh_Log(L"MultiWM mod initializing...");
-  LoadSettings();
-  if (!StartHotkeyThread()) {
+  Configuration::LoadSettings();
+  if (!RuntimeLifecycle::StartHotkeyThread()) {
     Wh_Log(L"Failed to start hotkey thread");
     return FALSE;
   }
@@ -427,7 +436,7 @@ BOOL WhTool_ModInit() {
 
 void WhTool_ModUninit() {
   Wh_Log(L"MultiWM mod uninitializing...");
-  if (!StopHotkeyThread()) {
+  if (!RuntimeLifecycle::StopHotkeyThread()) {
     // The standard tool-mod wrapper exits this dedicated process immediately
     // after WhTool_ModUninit returns, so never create a second owner here.
     Wh_Log(L"WM worker did not join before tool-process shutdown");
@@ -441,7 +450,7 @@ void WhTool_ModSettingsChanged() {
   // Join the old diagnostics/model owner before touching lifetime telemetry.
   // If it cannot stop, keep the old worker/settings rather than allowing two WM
   // actors to overlap inside the dedicated tool-mod process.
-  if (!StopHotkeyThread()) {
+  if (!RuntimeLifecycle::StopHotkeyThread()) {
     Wh_Log(L"Settings reload aborted because the existing WM worker is still alive");
     return;
   }
@@ -451,8 +460,8 @@ void WhTool_ModSettingsChanged() {
 
   // Settings reload changes defaults/policies but does not destroy per-desktop
   // workspace identity, layout mode, ordering, or learned ratios.
-  LoadSettings();
-  if (!StartHotkeyThread()) {
+  Configuration::LoadSettings();
+  if (!RuntimeLifecycle::StartHotkeyThread()) {
     Wh_Log(L"Failed to restart WM worker after settings change");
   }
 }

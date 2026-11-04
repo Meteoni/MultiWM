@@ -1,495 +1,7 @@
-//=============================================================================
-// Settings parsing + serialized WM thread
-//=============================================================================
+// Hotkeys, WM dispatch and tool-thread lifecycle.
+// Implementation/interface fragment assembled by src/multiwm.cpp in dependency order.
 
-UINT ParseHotkeyKey(PCWSTR str) {
-  if (!str || !str[0]) return 0;
-
-  static const std::pair<PCWSTR, UINT> kNamedKeys[] = {
-      {L"Space", VK_SPACE},
-      {L"Tab", VK_TAB},
-      {L"Enter", VK_RETURN},
-      {L"Return", VK_RETURN},
-      {L"Esc", VK_ESCAPE},
-      {L"Escape", VK_ESCAPE},
-      {L"Backspace", VK_BACK},
-      {L"Insert", VK_INSERT},
-      {L"Ins", VK_INSERT},
-      {L"Delete", VK_DELETE},
-      {L"Del", VK_DELETE},
-      {L"Home", VK_HOME},
-      {L"End", VK_END},
-      {L"PageUp", VK_PRIOR},
-      {L"PgUp", VK_PRIOR},
-      {L"PageDown", VK_NEXT},
-      {L"PgDn", VK_NEXT},
-      {L"Left", VK_LEFT},
-      {L"Right", VK_RIGHT},
-      {L"Up", VK_UP},
-      {L"Down", VK_DOWN},
-  };
-  for (const auto& namedKey : kNamedKeys) {
-    if (_wcsicmp(str, namedKey.first) == 0) return namedKey.second;
-  }
-
-  if ((str[0] == L'F' || str[0] == L'f') && str[1]) {
-    wchar_t* end = nullptr;
-    long functionKey = std::wcstol(str + 1, &end, 10);
-    if (*end == L'\0' && functionKey >= 1 && functionKey <= 12) {
-      return VK_F1 + static_cast<UINT>(functionKey - 1);
-    }
-  }
-
-  if (str[1] != L'\0') return 0;
-  wchar_t c = str[0];
-
-  if (c >= L'A' && c <= L'Z') return c;
-  if (c >= L'a' && c <= L'z') return c - L'a' + L'A';
-  if (c >= L'0' && c <= L'9') return c;
-
-  if (c == L'!') return '1';
-  if (c == L'@') return '2';
-  if (c == L'#') return '3';
-  if (c == L'$') return '4';
-  if (c == L'%') return '5';
-  if (c == L'^') return '6';
-  if (c == L'&') return '7';
-  if (c == L'*') return '8';
-  if (c == L'(') return '9';
-  if (c == L')') return '0';
-
-  if (c == L'`' || c == L'~') return VK_OEM_3;
-  if (c == L'-' || c == L'_') return VK_OEM_MINUS;
-  if (c == L'=' || c == L'+') return VK_OEM_PLUS;
-  if (c == L'[' || c == L'{') return VK_OEM_4;
-  if (c == L']' || c == L'}') return VK_OEM_6;
-  if (c == L'\\' || c == L'|') return VK_OEM_5;
-  if (c == L';' || c == L':') return VK_OEM_1;
-  if (c == L'\'' || c == L'"') return VK_OEM_7;
-  if (c == L',' || c == L'<') return VK_OEM_COMMA;
-  if (c == L'.' || c == L'>') return VK_OEM_PERIOD;
-  if (c == L'/' || c == L'?') return VK_OEM_2;
-  if (c == L' ') return VK_SPACE;
-
-  return 0;
-}
-
-static bool ParseWorkspaceInsetsSetting(PCWSTR text, WorkspaceInsets* outInsets) {
-  if (!text || !outInsets) return false;
-
-  LONG values[4]{};
-  const wchar_t* cursor = text;
-
-  for (size_t i = 0; i < 4; ++i) {
-    while (*cursor && std::iswspace(*cursor)) ++cursor;
-
-    wchar_t* end = nullptr;
-    long value = std::wcstol(cursor, &end, 10);
-    if (end == cursor || value < 0 || value > 500) return false;
-    values[i] = static_cast<LONG>(value);
-    cursor = end;
-
-    while (*cursor && std::iswspace(*cursor)) ++cursor;
-    if (i < 3) {
-      if (*cursor != L',') return false;
-      ++cursor;
-    }
-  }
-
-  while (*cursor && std::iswspace(*cursor)) ++cursor;
-  if (*cursor != L'\0') return false;
-
-  *outInsets = {values[0], values[1], values[2], values[3]};
-  return true;
-}
-
-static bool ParseFloatingDefaultSizeSetting(
-    PCWSTR text, FloatingDefaultSize* outSize) {
-  if (!text || !outSize) return false;
-
-  LONG values[2]{};
-  const wchar_t* cursor = text;
-  for (size_t i = 0; i < 2; ++i) {
-    while (*cursor && std::iswspace(*cursor)) ++cursor;
-    wchar_t* end = nullptr;
-    long value = std::wcstol(cursor, &end, 10);
-    if (end == cursor || value < 100 || value > 4000) return false;
-    values[i] = static_cast<LONG>(value);
-    cursor = end;
-    while (*cursor && std::iswspace(*cursor)) ++cursor;
-    if (i == 0) {
-      if (*cursor != L',') return false;
-      ++cursor;
-    }
-  }
-  while (*cursor && std::iswspace(*cursor)) ++cursor;
-  if (*cursor != L'\0') return false;
-  *outSize = {values[0], values[1]};
-  return true;
-}
-
-void LoadSettings() {
-  using WindhawkUtils::StringSetting;
-
-  g_settings.tilingModifiers =
-      ReadModifierSetting(L"hotkeys.TilingModifier", MOD_ALT);
-
-  auto insets = StringSetting::make(L"workspace.WorkspaceInsets");
-  WorkspaceInsets parsedInsets{};
-  if (ParseWorkspaceInsetsSetting(insets.get(), &parsedInsets)) {
-    g_settings.insetsDip = parsedInsets;
-  } else {
-    g_settings.insetsDip = {};
-    Wh_Log(L"Invalid WorkspaceInsets setting; using 6, 6, 6, 6");
-  }
-  g_settings.gapDip = Wh_GetIntSetting(L"workspace.TileGap");
-  if (g_settings.gapDip < 0 || g_settings.gapDip > 100) g_settings.gapDip = 6;
-
-  auto floatingSize =
-      StringSetting::make(L"windowBehavior.FloatingDefaultSize");
-  FloatingDefaultSize parsedFloatingSize{};
-  if (ParseFloatingDefaultSizeSetting(floatingSize.get(), &parsedFloatingSize)) {
-    g_settings.floatingDefaultSizeDip = parsedFloatingSize;
-  } else {
-    g_settings.floatingDefaultSizeDip = {};
-    Wh_Log(L"Invalid FloatingDefaultSize setting; using 960, 640");
-  }
-  g_settings.masterPercent = Wh_GetIntSetting(L"workspace.MasterPercent");
-  if (g_settings.masterPercent < 1 || g_settings.masterPercent > 99) g_settings.masterPercent = 50;
-  g_settings.reverseDwindle =
-      Wh_GetIntSetting(L"workspace.ReverseDwindle") != 0;
-  const int adaptiveDwindleSlots =
-      Wh_GetIntSetting(L"workspace.AdaptiveDwindleSlots");
-  g_settings.adaptiveDwindleSlots = static_cast<size_t>(
-      std::clamp(adaptiveDwindleSlots, 0, 64));
-  const int adaptiveDwindlePercentage =
-      Wh_GetIntSetting(L"workspace.AdaptiveDwindlePercentage");
-  g_settings.adaptiveDwindlePercentage =
-      std::clamp(adaptiveDwindlePercentage, 0, 40);
-
-  auto layout = StringSetting::make(L"workspace.DefaultLayout");
-  g_settings.defaultLayout = ParseLayoutSetting(layout.get());
-
-  g_settings.layoutCycle.clear();
-  for (int i = 0; i < 32; ++i) {
-    auto cycleEntry =
-        StringSetting::make(L"workspace.LayoutCycle[%d]", i);
-    if (!*cycleEntry.get()) break;
-
-    TileLayout cycleLayout{};
-    if (!TryParseLayoutSetting(cycleEntry.get(), &cycleLayout)) {
-      Wh_Log(L"Ignoring invalid LayoutCycle[%d] entry: %s", i, cycleEntry.get());
-      continue;
-    }
-    if (std::find(g_settings.layoutCycle.begin(), g_settings.layoutCycle.end(),
-                  cycleLayout) == g_settings.layoutCycle.end()) {
-      g_settings.layoutCycle.push_back(cycleLayout);
-    }
-  }
-  if (g_settings.layoutCycle.empty()) {
-    g_settings.layoutCycle = MakeBuiltInLayoutCycle();
-    Wh_Log(L"LayoutCycle is empty or invalid; using the built-in layout sequence");
-  }
-
-  g_settings.automaticWindowLimit = static_cast<size_t>(
-      std::max(0, Wh_GetIntSetting(L"workspace.Overflow.WindowLimit")));
-  auto overflowAction = StringSetting::make(L"workspace.Overflow.Action");
-  g_settings.overflowCreateDesktop =
-      _wcsicmp(overflowAction.get(), L"new_desktop") == 0;
-  g_settings.overflowTryOtherMonitors =
-      Wh_GetIntSetting(L"workspace.Overflow.TryOtherMonitors") != 0;
-  g_settings.monitorWindowLimits.clear();
-  for (int i = 0;; ++i) {
-    auto monitor = StringSetting::make(L"workspace.Overflow.MonitorLimits[%d].Monitor", i);
-    auto monitorId = StringSetting::make(L"workspace.Overflow.MonitorLimits[%d].MonitorId", i);
-    const int limit = Wh_GetIntSetting(L"workspace.Overflow.MonitorLimits[%d].Limit", i);
-    if (!*monitor.get() && !*monitorId.get() && limit == 0) break;
-    // Disabled rows do not terminate the list or inspect their hidden fields.
-    if (!*monitor.get() || _wcsicmp(monitor.get(), L"disabled") == 0) continue;
-    if (limit < 0) {
-      Wh_Log(L"Ignoring negative per-monitor limit at rule %d", i + 1);
-      continue;
-    }
-    SettingsState::MonitorWindowLimit rule;
-    if (_wcsicmp(monitor.get(), L"primary") == 0) rule.monitor = RuleMonitor::Primary;
-    else if (_wcsicmp(monitor.get(), L"non_primary") == 0) rule.monitor = RuleMonitor::NonPrimary;
-    else if (_wcsicmp(monitor.get(), L"specific") != 0) {
-      Wh_Log(L"Ignoring invalid monitor selector at limit rule %d", i + 1);
-      continue;
-    }
-    if (rule.monitor == RuleMonitor::Specific) {
-      rule.monitorId = monitorId.get();
-      const size_t first = rule.monitorId.find_first_not_of(L" \t\r\n");
-      if (first == std::wstring::npos) continue;
-      rule.monitorId = rule.monitorId.substr(first, rule.monitorId.find_last_not_of(L" \t\r\n") - first + 1);
-      NormalizeMonitorIdentityToken(&rule.monitorId);
-      if (rule.monitorId.rfind(L"IFACE:", 0) != 0 && rule.monitorId.rfind(L"GDI:", 0) != 0) {
-        Wh_Log(L"Ignoring invalid monitor ID at limit rule %d", i + 1);
-        continue;
-      }
-    }
-    rule.limit = static_cast<size_t>(limit);
-    g_settings.monitorWindowLimits.push_back(std::move(rule));
-  }
-
-  g_settings.workspaceInitializationRules.clear();
-  for (int i = 0;; ++i) {
-    auto ruleLayout =
-        StringSetting::make(L"workspace.InitializationRules[%d].Layout", i);
-    auto desktopName = StringSetting::make(
-        L"workspace.InitializationRules[%d].DesktopNameContains", i);
-    auto monitor =
-        StringSetting::make(L"workspace.InitializationRules[%d].Monitor", i);
-    auto monitorId =
-        StringSetting::make(L"workspace.InitializationRules[%d].MonitorId", i);
-    const int desktopNumber = Wh_GetIntSetting(
-        L"workspace.InitializationRules[%d].DesktopNumber", i);
-    // Added rows can omit unchanged fields, including Monitor. Read the whole
-    // row before detecting the end, as blank Layout only disables that row.
-    if (!*ruleLayout.get() && !*desktopName.get() && !*monitor.get() &&
-        !*monitorId.get() && desktopNumber == 0) {
-      break;
-    }
-    if (!*ruleLayout.get()) continue;
-
-    WorkspaceInitializationRule rule;
-    rule.settingsIndex = i + 1;
-    rule.desktopNumber = desktopNumber;
-    if (rule.desktopNumber < 0 ||
-        !TryParseLayoutSetting(ruleLayout.get(), &rule.layout)) {
-      Wh_Log(L"Ignoring invalid workspace initialization rule %d", i + 1);
-      continue;
-    }
-    if (_wcsicmp(monitor.get(), L"primary") == 0) {
-      rule.monitor = RuleMonitor::Primary;
-    } else if (_wcsicmp(monitor.get(), L"non_primary") == 0) {
-      rule.monitor = RuleMonitor::NonPrimary;
-    } else if (_wcsicmp(monitor.get(), L"specific") == 0) {
-      rule.monitor = RuleMonitor::Specific;
-    } else if (*monitor.get() && _wcsicmp(monitor.get(), L"any") != 0) {
-      Wh_Log(L"Ignoring invalid monitor selector at workspace rule %d", i + 1);
-      continue;
-    }
-    auto trimmed = [](PCWSTR text) {
-      std::wstring value = text;
-      const size_t first = value.find_first_not_of(L" \t\r\n");
-      return first == std::wstring::npos ? std::wstring{}
-          : value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
-    };
-    rule.desktopNameContains = trimmed(desktopName.get());
-    std::transform(
-        rule.desktopNameContains.begin(), rule.desktopNameContains.end(),
-        rule.desktopNameContains.begin(),
-        [](wchar_t ch) { return std::towlower(ch); });
-    if (rule.monitor == RuleMonitor::Specific) {
-      rule.monitorId = trimmed(monitorId.get());
-      NormalizeMonitorIdentityToken(&rule.monitorId);
-      if (rule.monitorId.empty() || (rule.monitorId.rfind(L"IFACE:", 0) != 0 &&
-                                   rule.monitorId.rfind(L"GDI:", 0) != 0)) {
-        Wh_Log(L"Ignoring invalid monitor ID at workspace rule %d", i + 1);
-        continue;
-      }
-    }
-    if (rule.desktopNameContains.empty() && rule.desktopNumber == 0 &&
-        rule.monitor == RuleMonitor::Any && rule.monitorId.empty()) {
-      continue;
-    }
-    g_settings.workspaceInitializationRules.push_back(std::move(rule));
-  }
-
-  auto mouseBehavior =
-      StringSetting::make(L"windowBehavior.MouseMoveBehavior");
-  g_settings.mouseMoveBehavior =
-      _wcsicmp(mouseBehavior.get(), L"swap") == 0
-          ? MouseMoveBehavior::Swap
-          : MouseMoveBehavior::Float;
-
-  auto automaticNewWindowPosition =
-      StringSetting::make(L"general.AutomaticNewWindowPosition");
-  g_settings.automaticNewWindowPosition =
-      _wcsicmp(automaticNewWindowPosition.get(), L"after_focused") == 0
-          ? AutomaticNewWindowPosition::AfterFocused
-          : AutomaticNewWindowPosition::LastSlot;
-
-  auto managementMode =
-      StringSetting::make(L"general.DefaultWindowManagementMode");
-  g_wm.managementMode =
-      _wcsicmp(managementMode.get(), L"manual") == 0
-          ? ManagementMode::Manual
-          : ManagementMode::Automatic;
-
-  int conformanceLease = Wh_GetIntSetting(L"advanced.ConformanceLeaseMs");
-  if (conformanceLease < 0 || conformanceLease > 10000) conformanceLease = 3000;
-  g_settings.conformanceLeaseMs = static_cast<UINT>(conformanceLease);
-
-  int conformanceRepairInterval =
-      Wh_GetIntSetting(L"advanced.ConformanceRepairIntervalMs");
-  if (conformanceRepairInterval < 20 || conformanceRepairInterval > 2000) {
-    conformanceRepairInterval = 75;
-  }
-  g_settings.conformanceRepairIntervalMs =
-      static_cast<UINT>(conformanceRepairInterval);
-
-  int reconcileDelay = Wh_GetIntSetting(L"advanced.ReconcileDelayMs");
-  if (reconcileDelay < 20 || reconcileDelay > 2000) reconcileDelay = 50;
-  g_settings.reconcileDelayMs = static_cast<UINT>(reconcileDelay);
-
-  int slowApplicationDelay =
-      Wh_GetIntSetting(L"advanced.SlowApplicationDelayMs");
-  if (slowApplicationDelay < 0 || slowApplicationDelay > 2000) {
-    slowApplicationDelay = 250;
-  }
-  g_settings.slowApplicationDelayMs =
-      static_cast<UINT>(slowApplicationDelay);
-
-  auto parseWindowRuleList = [](const wchar_t* text) {
-    std::vector<std::wstring> values;
-    std::wstring value;
-    for (const wchar_t* cursor = text; ; ++cursor) {
-      if (*cursor == L'\\' && cursor[1] == L',') {
-        value.push_back(L',');
-        ++cursor;
-        continue;
-      }
-      if (*cursor != L',' && *cursor != L'\0') {
-        value.push_back(*cursor);
-        continue;
-      }
-
-      size_t first = 0;
-      while (first < value.size() && std::iswspace(value[first])) ++first;
-      size_t last = value.size();
-      while (last > first && std::iswspace(value[last - 1])) --last;
-      if (first < last) {
-        values.emplace_back(value.substr(first, last - first));
-      }
-
-      value.clear();
-      if (*cursor == L'\0') break;
-    }
-    return values;
-  };
-
-  g_settings.windowRules.clear();
-  for (int i = 0;; ++i) {
-    auto process =
-        StringSetting::make(L"windowRules.Rules[%d].Process", i);
-    auto className =
-        StringSetting::make(L"windowRules.Rules[%d].Class", i);
-    auto titleContains =
-        StringSetting::make(L"windowRules.Rules[%d].TitleContains", i);
-    auto treatment =
-        StringSetting::make(L"windowRules.Rules[%d].Treatment", i);
-    auto size = StringSetting::make(L"windowRules.Rules[%d].Size", i);
-    auto monitor = StringSetting::make(L"windowRules.Rules[%d].Monitor", i);
-    auto monitorId = StringSetting::make(L"windowRules.Rules[%d].MonitorId", i);
-    auto desktopName = StringSetting::make(L"windowRules.Rules[%d].DesktopNameContains", i);
-    const int desktopNumber = Wh_GetIntSetting(L"windowRules.Rules[%d].DesktopNumber", i);
-    if (!*process.get() && !*className.get() && !*titleContains.get()) {
-      Wh_Log(
-          L"Window rule %d is blank; later rules will not be loaded",
-          i + 1);
-      break;
-    }
-
-    WindowRule rule;
-    if (_wcsicmp(treatment.get(), L"default_to_floating") == 0) {
-      rule.treatment = WindowRuleTreatment::DefaultToFloating;
-    } else if (_wcsicmp(treatment.get(), L"always_floating") == 0) {
-      rule.treatment = WindowRuleTreatment::AlwaysFloating;
-    } else if (_wcsicmp(treatment.get(), L"trace_to_owner") == 0) {
-      rule.treatment = WindowRuleTreatment::TraceToOwner;
-    } else if (_wcsicmp(treatment.get(), L"open_on_monitor") == 0) {
-      rule.treatment = WindowRuleTreatment::InitialPlacement;
-      auto trimmed = [](PCWSTR text) {
-        std::wstring value = text;
-        const size_t first = value.find_first_not_of(L" \t\r\n");
-        return first == std::wstring::npos ? std::wstring{}
-            : value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
-      };
-      if (_wcsicmp(monitor.get(), L"primary") == 0) rule.monitor = RuleMonitor::Primary;
-      else if (_wcsicmp(monitor.get(), L"non_primary") == 0) rule.monitor = RuleMonitor::NonPrimary;
-      else if (_wcsicmp(monitor.get(), L"specific") == 0) rule.monitor = RuleMonitor::Specific;
-      else if (*monitor.get() && _wcsicmp(monitor.get(), L"any") != 0) {
-        Wh_Log(L"Ignoring invalid monitor selector at window rule %d", i + 1);
-        continue;
-      }
-      if (rule.monitor == RuleMonitor::Specific) {
-        rule.monitorId = trimmed(monitorId.get());
-        NormalizeMonitorIdentityToken(&rule.monitorId);
-        if (rule.monitorId.empty() || (rule.monitorId.rfind(L"IFACE:", 0) != 0 &&
-                                     rule.monitorId.rfind(L"GDI:", 0) != 0)) {
-          Wh_Log(L"Ignoring invalid monitor target at window rule %d", i + 1);
-          continue;
-        }
-      }
-      rule.desktopNumber = desktopNumber;
-      rule.desktopNameContains = trimmed(desktopName.get());
-      if (desktopNumber < 0) {
-        Wh_Log(L"Ignoring invalid desktop number at window rule %d", i + 1);
-        continue;
-      }
-      rule.followWindow = Wh_GetIntSetting(L"windowRules.Rules[%d].FollowWindow", i) != 0;
-      if (rule.monitor == RuleMonitor::Any && !desktopNumber && rule.desktopNameContains.empty()) continue;
-    } else if (_wcsicmp(
-                   treatment.get(), L"preserve_size_when_centering") == 0) {
-      rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
-      rule.preserveFloatingSize = true;
-    } else if (_wcsicmp(
-                   treatment.get(), L"override_size_when_centering") == 0) {
-      rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
-      if (_wcsicmp(size.get(), L"Workspace") == 0) {
-        rule.useWorkspaceSize = true;
-      } else if (!ParseFloatingDefaultSizeSetting(
-                     size.get(), &rule.floatingSizeDip)) {
-        Wh_Log(
-            L"Ignoring invalid centered size override at rule %d: %s",
-            i + 1, size.get());
-        continue;
-      }
-      rule.preserveFloatingSize = false;
-    } else {
-      rule.treatment = WindowRuleTreatment::Exclude;
-    }
-    rule.processNames = parseWindowRuleList(process.get());
-    rule.classNames = parseWindowRuleList(className.get());
-    rule.titleFragments = parseWindowRuleList(titleContains.get());
-    if (rule.processNames.empty() && rule.classNames.empty() &&
-        rule.titleFragments.empty()) {
-      Wh_Log(L"Ignoring window rule %d with no usable match values", i + 1);
-      continue;
-    }
-    g_settings.windowRules.push_back(std::move(rule));
-  }
-
-  g_settings.tileKey =
-      ReadHotkeySetting<UINT>(L"hotkeys.TileKey", ParseHotkeyKey);
-  g_settings.layoutKey =
-      ReadHotkeySetting<UINT>(L"hotkeys.LayoutKey", ParseHotkeyKey);
-  g_settings.swapMasterKey =
-      ReadHotkeySetting<UINT>(L"hotkeys.SwapMasterKey", ParseHotkeyKey);
-  g_settings.promoteWindowKey =
-      ReadHotkeySetting<UINT>(L"hotkeys.PromoteWindowKey", ParseHotkeyKey);
-  g_settings.demoteWindowKey =
-      ReadHotkeySetting<UINT>(L"hotkeys.DemoteWindowKey", ParseHotkeyKey);
-  g_settings.managementModeToggleKey =
-      ReadHotkeySetting<UINT>(L"hotkeys.ManagementModeToggleKey", ParseHotkeyKey);
-  g_settings.floatFocusedKey =
-      ReadHotkeySetting<UINT>(L"hotkeys.FloatFocusedKey", ParseHotkeyKey);
-  g_settings.diagnosticDumpKey =
-      ReadHotkeySetting<UINT>(L"hotkeys.DiagnosticDumpKey", ParseHotkeyKey);
-
-  auto diagnosticsPath =
-      StringSetting::make(L"diagnostics.DiagnosticsOutputPath");
-  if (*diagnosticsPath.get()) {
-    g_settings.diagnosticsOutputPath = diagnosticsPath.get();
-  } else {
-    g_settings.diagnosticsOutputPath =
-        L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";
-  }
-
-  TrayUi::LoadSettings();
-}
+namespace RuntimeLifecycle {
 
 static void RegisterConfiguredHotkeys() {
   auto registerOne = [](
@@ -600,20 +112,55 @@ static void HandleMoveSizeEndMessage(HWND hwnd) {
   std::vector<DesktopMonitorKey> changedKeys;
   Reconcile::ReconcileKnownWindows(Reconcile::ReconcileScope::Monitor, &changedKeys, hwnd);
   Commands::ApplyUserMoveSize(hwnd);
-  for (const auto& key : changedKeys) ArrangeWorkspace(key);
+  for (const auto& key : changedKeys) Placement::ArrangeWorkspace(key);
   Reconcile::ScheduleLifecycleReconcile(hwnd);
+}
+
+// True for messages that carry an explicit user command (hotkeys, tray menu).
+// Writing a diagnostic report is not a command: it must not change WM behavior.
+static bool IsUserCommandMessage(const MSG& msg) {
+  switch (msg.message) {
+    case WM_HOTKEY:
+      return msg.wParam != HK_DIAGNOSTIC_DUMP;
+    case WM_APP_LAYOUT_CYCLE:
+    case WM_APP_LAYOUT_SET:
+    case WM_APP_TILE_WORKSPACE:
+    case WM_APP_MANAGEMENT_MODE_SET:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Runs the handler for one of the WM actor's own timers. Returns false when
+// `timerId` is not one of ours (for example a COM or tray window timer).
+static bool DispatchActorTimer(UINT_PTR timerId) {
+  const struct {
+    UINT_PTR id;
+    void (*handler)();
+  } actorTimers[] = {
+      {g_wm.lifecycleTimer, Reconcile::ReconcileDeferredLifecycle},
+      {g_wm.discoveryRetryTimer, Reconcile::ProcessDiscoveryRetryTimer},
+      {g_wm.overflowTimer, Reconcile::ProcessWindowOverflow},
+      {g_wm.maintenanceTimer, RunMaintenanceNow},
+      {g_wm.conformanceTimer, Placement::ProcessConformanceTimer},
+  };
+  for (const auto& timer : actorTimers) {
+    if (timer.id && timer.id == timerId) {
+      timer.handler();
+      return true;
+    }
+  }
+  return false;
 }
 
 // Converts one serialized thread message into a domain command. Messages not
 // owned by the WM are explicitly returned to Windows so STA COM's hidden window
 // continues receiving cross-apartment calls.
 static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
-  if ((msg.message == WM_HOTKEY && msg.wParam != HK_DIAGNOSTIC_DUMP) ||
-      msg.message == WM_APP_LAYOUT_CYCLE ||
-      msg.message == WM_APP_LAYOUT_SET || msg.message == WM_APP_TILE_WORKSPACE ||
-      msg.message == WM_APP_MANAGEMENT_MODE_SET) {
-    g_wm.pendingOverflowSwitch = {};
-  }
+  // A new user command supersedes a pending "follow the overflowed window to its
+  // new desktop" switch; never yank the user away after they have acted.
+  if (IsUserCommandMessage(msg)) g_wm.pendingOverflowSwitch = {};
   switch (msg.message) {
     case WM_APP_MOVE_SIZE_END:
       HandleMoveSizeEndMessage(reinterpret_cast<HWND>(msg.wParam));
@@ -640,9 +187,8 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
           // message is consumed. Preserve the discovery prompt with one settled
           // global snapshot, which can observe its live replacement.
           Reconcile::ScheduleLifecycleReconcile(nullptr);
-        } else if (!IsWindowTrackedInAnyState(hwnd) ||
-                   std::any_of(g_wm.pendingWindowOverflow.begin(), g_wm.pendingWindowOverflow.end(),
-                               [hwnd](const PendingWindowOverflow& request) { return request.hwnd == hwnd; })) {
+        } else if (!Platform::Windows::IsWindowTrackedInAnyState(hwnd) ||
+                   g_wm.HasPendingOverflow(hwnd)) {
           Reconcile::ScheduleLifecycleReconcile(hwnd);
         }
       }
@@ -681,33 +227,9 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
       // Actor timers are created with SetTimer(nullptr, ...). A window timer can
       // use the same numeric ID and must still reach its WndProc.
       if (msg.hwnd) return WmMessageDisposition::DispatchToWindows;
-
-      if (g_wm.lifecycleTimer &&
-          static_cast<UINT_PTR>(msg.wParam) == g_wm.lifecycleTimer) {
-        Reconcile::ReconcileDeferredLifecycle();
-        return WmMessageDisposition::Handled;
-      }
-      if (g_wm.discoveryRetryTimer &&
-          static_cast<UINT_PTR>(msg.wParam) == g_wm.discoveryRetryTimer) {
-        Reconcile::ProcessDiscoveryRetryTimer();
-        return WmMessageDisposition::Handled;
-      }
-      if (g_wm.overflowTimer &&
-          static_cast<UINT_PTR>(msg.wParam) == g_wm.overflowTimer) {
-        Reconcile::ProcessWindowOverflow();
-        return WmMessageDisposition::Handled;
-      }
-      if (g_wm.maintenanceTimer &&
-          static_cast<UINT_PTR>(msg.wParam) == g_wm.maintenanceTimer) {
-        RuntimeLifecycle::RunMaintenanceNow();
-        return WmMessageDisposition::Handled;
-      }
-      if (g_wm.conformanceTimer &&
-          static_cast<UINT_PTR>(msg.wParam) == g_wm.conformanceTimer) {
-        ProcessConformanceTimer();
-        return WmMessageDisposition::Handled;
-      }
-      return WmMessageDisposition::DispatchToWindows;
+      return DispatchActorTimer(static_cast<UINT_PTR>(msg.wParam))
+          ? WmMessageDisposition::Handled
+          : WmMessageDisposition::DispatchToWindows;
 
     case WM_HOTKEY:
       switch (static_cast<UINT>(msg.wParam)) {
@@ -773,17 +295,16 @@ static void CleanupWmThread() {
   std::vector<PendingWindowOverflow> deferredOverflow;
   deferredOverflow.swap(g_wm.pendingWindowOverflow);
   for (const PendingWindowOverflow& pending : deferredOverflow) {
-    DWORD livePid = 0;
-    GetWindowThreadProcessId(pending.hwnd, &livePid);
-    if (livePid != pending.processId || !g_wm.overflowWindows.count(pending.hwnd)) continue;
+    if (!Platform::Windows::IsSameLiveWindow(pending.hwnd, pending.processId) ||
+        !g_wm.overflowWindows.count(pending.hwnd)) continue;
     for (const auto& key : g_workspaces.OwnersOf(pending.hwnd)) {
       Workspace workspace;
       if (!g_workspaces.Load(key, &workspace) || workspace.Layout() == TileLayout::Floating) continue;
       const WindowRecord* record = workspace.Find(pending.hwnd);
-      if (!record || record->pid != livePid || record->state != ManageState::Floating ||
+      if (!record || record->pid != pending.processId || record->state != ManageState::Floating ||
           record->alwaysFloating || record->tilingGeneration != pending.tilingGeneration) continue;
       workspace.ActivateTiled(pending.hwnd);
-      const SuspensionReason reason = GetPhysicalSuspensionReason(pending.hwnd);
+      const SuspensionReason reason = Platform::Windows::GetPhysicalSuspensionReason(pending.hwnd);
       if (reason != SuspensionReason::None) workspace.Suspend(pending.hwnd, reason);
       g_workspaces.Save(key, workspace);
     }
@@ -793,7 +314,7 @@ static void CleanupWmThread() {
   UnregisterConfiguredHotkeys();
   TrayUi::Shutdown();
   Platform::WindowEvents::RemoveWinEventHooks();
-  CleanupVirtualDesktopAPI();
+  Platform::VirtualDesktop::CleanupVirtualDesktopAPI();
 
   if (g_wm.lifecycleTimer) {
     KillTimer(nullptr, g_wm.lifecycleTimer);
@@ -830,9 +351,9 @@ static void CleanupWmThread() {
   g_wm.reconciledDesktop = {};
   g_wm.reconciledDesktopState = ReconciledDesktopState::Unknown;
   g_wm.pendingDesktopSwitchFlyouts = false;
-  ClearAllConformanceLeases();
-  ClearAllMoveSizeSamples();
-  ClearMonitorIdentityCache();
+  Placement::ClearAllConformanceLeases();
+  Gestures::ClearAllMoveSizeSamples();
+  Platform::Monitors::ClearMonitorIdentityCache();
   InterlockedExchange(&g_vd.changeQueued, 0);
 }
 
@@ -860,7 +381,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   Wh_Log(L"CoInitializeEx result: 0x%08X", coHr);
 
   if (g_wm.comInitialized) {
-    RuntimeLifecycle::RunMaintenanceNow();
+    RunMaintenanceNow();
   } else {
     Platform::WindowEvents::InstallWinEventHooks();
     Wh_Log(L"COM initialization failed; virtual desktop integration unavailable for this WM session");
@@ -969,3 +490,4 @@ bool StopHotkeyThread() {
   return true;
 }
 
+} // namespace RuntimeLifecycle

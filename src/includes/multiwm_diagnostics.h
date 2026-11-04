@@ -1,8 +1,5 @@
 namespace Diagnostics {
 
-//=============================================================================
-// On-demand diagnostic report
-//=============================================================================
 //
 // Diagnostics are intentionally snapshot-based. The WM accumulates only cheap
 // counters and a bounded in-memory event tail while running; disk I/O happens
@@ -411,12 +408,12 @@ static DiagnosticWindowIdentity DiagnosticReadWindowIdentity(
     identity.visible = IsWindowVisible(hwnd) != FALSE;
     identity.minimized = IsIconic(hwnd) != FALSE;
     identity.maximized = IsZoomed(hwnd) != FALSE;
-    identity.cloaked = IsWindowCloaked(hwnd);
-    identity.hasFrame = GetWindowFrameRect(hwnd, &identity.frame) &&
+    identity.cloaked = Platform::Windows::IsWindowCloaked(hwnd);
+    identity.hasFrame = Platform::Windows::GetWindowFrameRect(hwnd, &identity.frame) &&
                         identity.frame.right > identity.frame.left &&
                         identity.frame.bottom > identity.frame.top;
-    identity.monitor = GetWindowPhysicalMonitor(hwnd);
-    if (identity.monitor) identity.dpi = GetMonitorEffectiveDpi(identity.monitor);
+    identity.monitor = Platform::Windows::GetWindowPhysicalMonitor(hwnd);
+    if (identity.monitor) identity.dpi = Platform::Monitors::GetMonitorEffectiveDpi(identity.monitor);
 
     wchar_t className[256]{};
     if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) > 0) {
@@ -623,99 +620,119 @@ static void DumpDerivedPerformanceIndicators(
       placementProblemPercent);
 }
 
+// One row of the counter tables: display label and the Counters field it shows.
+struct DiagnosticCounterRowSpec {
+  const wchar_t* label;
+  uint64_t Counters::*field;
+};
+
+static constexpr DiagnosticCounterRowSpec kChurnCounterRows[] = {
+    {L"Lifecycle events processed", &Counters::lifecycleEventsProcessed},
+    {L"  destroy", &Counters::lifecycleDestroy},
+    {L"  minimize start", &Counters::lifecycleMinimizeStart},
+    {L"  minimize end", &Counters::lifecycleMinimizeEnd},
+    {L"  state change", &Counters::lifecycleStateChange},
+    {L"  location change", &Counters::lifecycleLocationChange},
+    {L"  hide", &Counters::lifecycleHide},
+    {L"  show", &Counters::lifecycleShow},
+    {L"  cloaked", &Counters::lifecycleCloaked},
+    {L"  uncloaked", &Counters::lifecycleUncloaked},
+    {L"Lifecycle schedule requests", &Counters::lifecycleScheduleRequests},
+    {L"Lifecycle timer resets", &Counters::lifecycleTimerResets},
+    {L"Settled lifecycle reconciles", &Counters::lifecycleReconciles},
+    {L"Dirty HWNDs processed", &Counters::lifecycleDirtyWindowsProcessed},
+    {L"Move/size end messages", &Counters::moveSizeEndMessages},
+    {L"Foreground/tray refreshes", &Counters::trayRefreshMessages},
+    {L"User move gestures", &Counters::userMoveGestures},
+    {L"User resize gestures", &Counters::userResizeGestures},
+    {L"Unclassified/no-op gestures", &Counters::userNoopGestures},
+    {L"Floating geometry user updates", &Counters::floatingGeometryUserUpdates},
+    {L"Tiled drag -> Floating actions", &Counters::tiledFloatActions},
+    {L"Tiled drag swap actions", &Counters::tiledSwapActions},
+    {L"Divider weight updates", &Counters::dividerUpdates},
+    {L"Rejected resize gestures", &Counters::rejectedResizeGestures},
+    {L"Reconcile calls", &Counters::reconcileCalls},
+    {L"Known HWNDs examined", &Counters::reconcileWindowsExamined},
+    {L"Workspace saves", &Counters::workspaceSaves},
+    {L"Workspace migrations", &Counters::workspaceMigrations},
+};
+
+static constexpr DiagnosticCounterRowSpec kPlacementCounterRows[] = {
+    {L"EnumWindows passes", &Counters::enumWindowsPasses},
+    {L"Top-level HWNDs visited", &Counters::enumWindowsVisited},
+    {L"Tile candidates collected", &Counters::tileCandidatesCollected},
+    {L"Arrange calls", &Counters::arrangeCalls},
+    {L"Arrange passes", &Counters::arrangePasses},
+    {L"Layout plans built", &Counters::layoutPlansBuilt},
+    {L"Placement checks", &Counters::placementChecks},
+    {L"Placement no-ops", &Counters::placementNoOps},
+    {L"Placement preflight stops", &Counters::placementPreflightStops},
+    {L"SetWindowPos calls", &Counters::setWindowPosCalls},
+    {L"Placement success", &Counters::placementSuccess},
+    {L"Suppressed by physical state", &Counters::placementSuppressedByPhysicalState},
+    {L"Adjusted by window", &Counters::placementAdjusted},
+    {L"Placement access denied", &Counters::placementAccessDenied},
+    {L"Placement refused", &Counters::placementRefused},
+    {L"Placement dead HWND", &Counters::placementDead},
+    {L"Floating geometry repairs", &Counters::floatingGeometryRepairs},
+    {L"Constraint probes", &Counters::constraintProbeAttempts},
+    {L"  constraint probe successes", &Counters::constraintProbeSuccesses},
+    {L"  constraint probe timeouts", &Counters::constraintProbeTimeouts},
+    {L"  constraint probe failures", &Counters::constraintProbeFailures},
+    {L"Constraint-unsatisfiable plans", &Counters::constraintUnsatisfiablePlans},
+    {L"Constraint-triggered floats", &Counters::constraintFloats},
+    {L"Conformance leases started", &Counters::conformanceLeasesStarted},
+    {L"Conformance lease reinforcement attempts", &Counters::conformanceLeaseRepairs},
+    {L"Conformance lease deferred burst repairs", &Counters::conformanceLeaseDeferredRepairs},
+    {L"Conformance deadlines completed compliant", &Counters::conformanceLeaseExpiredCompliant},
+    {L"Conformance deadlines floated window", &Counters::conformanceLeaseExpiredFloats},
+    {L"Conformance deadline stale/cancelled verdicts", &Counters::conformanceLeaseExpiredStale},
+};
+
+static constexpr DiagnosticCounterRowSpec kRuntimeCounterRows[] = {
+    {L"Native VD changes processed", &Counters::virtualDesktopChangesProcessed},
+    {L"Fallback VD changes detected", &Counters::virtualDesktopFallbackChanges},
+    {L"VD API init attempts", &Counters::vdApiInitAttempts},
+    {L"VD API init successes", &Counters::vdApiInitSuccesses},
+    {L"VD API init failures", &Counters::vdApiInitFailures},
+    {L"VD API reinitializations", &Counters::vdApiReinitializations},
+    {L"VD notification register attempts", &Counters::vdNotificationRegisterAttempts},
+    {L"VD notification register successes", &Counters::vdNotificationRegisterSuccesses},
+    {L"VD notification register failures", &Counters::vdNotificationRegisterFailures},
+    {L"Runtime maintenance runs", &Counters::runtimeMaintenanceRuns},
+    {L"Runtime maintenance retries", &Counters::runtimeMaintenanceRetries},
+    {L"Runtime maintenance exhausted", &Counters::runtimeMaintenanceExhausted},
+    {L"Explorer restart signals", &Counters::shellRestartSignals},
+    {L"Display/work-area signals", &Counters::displayTopologySignals},
+    {L"WinEvent hook install failures", &Counters::winEventHookInstallFailures},
+    {L"Tile commands", &Counters::tileCommands},
+    {L"Layout cycle commands", &Counters::layoutCycleCommands},
+    {L"Float focused commands", &Counters::floatFocusedCommands},
+    {L"Swap master commands", &Counters::swapMasterCommands},
+    {L"Promote window commands", &Counters::promoteWindowCommands},
+    {L"Demote window commands", &Counters::demoteWindowCommands},
+    {L"Rejected order commands", &Counters::rejectedOrderCommands},
+    {L"Rejected layout changes", &Counters::rejectedLayoutChanges},
+};
+
+static void DumpCounterSection(
+    ReportBuilder& report, const wchar_t* title, std::span<const DiagnosticCounterRowSpec> rows,
+    const Counters& c, const Counters& previous, ULONGLONG uptimeMs, ULONGLONG intervalMs) {
+  report.Line(title);
+  DiagnosticCounterHeader(report);
+  for (const DiagnosticCounterRowSpec& row : rows) {
+    DiagnosticCounterRow(report, row.label, c.*row.field, previous.*row.field, uptimeMs, intervalMs);
+  }
+}
+
 static void DumpCounters(
     ReportBuilder& report, const Counters& c, const Counters& previous,
     ULONGLONG uptimeMs, ULONGLONG intervalMs) {
-  report.Line(L"Event / reconciliation churn");
-  DiagnosticCounterHeader(report);
-  DiagnosticCounterRow(report, L"Lifecycle events processed", c.lifecycleEventsProcessed, previous.lifecycleEventsProcessed, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  destroy", c.lifecycleDestroy, previous.lifecycleDestroy, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  minimize start", c.lifecycleMinimizeStart, previous.lifecycleMinimizeStart, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  minimize end", c.lifecycleMinimizeEnd, previous.lifecycleMinimizeEnd, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  state change", c.lifecycleStateChange, previous.lifecycleStateChange, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  location change", c.lifecycleLocationChange, previous.lifecycleLocationChange, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  hide", c.lifecycleHide, previous.lifecycleHide, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  show", c.lifecycleShow, previous.lifecycleShow, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  cloaked", c.lifecycleCloaked, previous.lifecycleCloaked, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  uncloaked", c.lifecycleUncloaked, previous.lifecycleUncloaked, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Lifecycle schedule requests", c.lifecycleScheduleRequests, previous.lifecycleScheduleRequests, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Lifecycle timer resets", c.lifecycleTimerResets, previous.lifecycleTimerResets, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Settled lifecycle reconciles", c.lifecycleReconciles, previous.lifecycleReconciles, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Dirty HWNDs processed", c.lifecycleDirtyWindowsProcessed, previous.lifecycleDirtyWindowsProcessed, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Move/size end messages", c.moveSizeEndMessages, previous.moveSizeEndMessages, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Foreground/tray refreshes", c.trayRefreshMessages, previous.trayRefreshMessages, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"User move gestures", c.userMoveGestures, previous.userMoveGestures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"User resize gestures", c.userResizeGestures, previous.userResizeGestures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Unclassified/no-op gestures", c.userNoopGestures, previous.userNoopGestures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Floating geometry user updates", c.floatingGeometryUserUpdates, previous.floatingGeometryUserUpdates, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Tiled drag -> Floating actions", c.tiledFloatActions, previous.tiledFloatActions, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Tiled drag swap actions", c.tiledSwapActions, previous.tiledSwapActions, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Divider weight updates", c.dividerUpdates, previous.dividerUpdates, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Rejected resize gestures", c.rejectedResizeGestures, previous.rejectedResizeGestures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Reconcile calls", c.reconcileCalls, previous.reconcileCalls, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Known HWNDs examined", c.reconcileWindowsExamined, previous.reconcileWindowsExamined, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Workspace saves", c.workspaceSaves, previous.workspaceSaves, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Workspace migrations", c.workspaceMigrations, previous.workspaceMigrations, uptimeMs, intervalMs);
-
+  DumpCounterSection(report, L"Event / reconciliation churn", kChurnCounterRows, c, previous, uptimeMs, intervalMs);
   report.Line();
-  report.Line(L"Enumeration / layout / placement");
-  DiagnosticCounterHeader(report);
-  DiagnosticCounterRow(report, L"EnumWindows passes", c.enumWindowsPasses, previous.enumWindowsPasses, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Top-level HWNDs visited", c.enumWindowsVisited, previous.enumWindowsVisited, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Tile candidates collected", c.tileCandidatesCollected, previous.tileCandidatesCollected, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Arrange calls", c.arrangeCalls, previous.arrangeCalls, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Arrange passes", c.arrangePasses, previous.arrangePasses, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Layout plans built", c.layoutPlansBuilt, previous.layoutPlansBuilt, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Placement checks", c.placementChecks, previous.placementChecks, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Placement no-ops", c.placementNoOps, previous.placementNoOps, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Placement preflight stops", c.placementPreflightStops, previous.placementPreflightStops, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"SetWindowPos calls", c.setWindowPosCalls, previous.setWindowPosCalls, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Placement success", c.placementSuccess, previous.placementSuccess, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Suppressed by physical state", c.placementSuppressedByPhysicalState, previous.placementSuppressedByPhysicalState, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Adjusted by window", c.placementAdjusted, previous.placementAdjusted, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Placement access denied", c.placementAccessDenied, previous.placementAccessDenied, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Placement refused", c.placementRefused, previous.placementRefused, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Placement dead HWND", c.placementDead, previous.placementDead, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Floating geometry repairs", c.floatingGeometryRepairs, previous.floatingGeometryRepairs, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Constraint probes", c.constraintProbeAttempts, previous.constraintProbeAttempts, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  constraint probe successes", c.constraintProbeSuccesses, previous.constraintProbeSuccesses, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  constraint probe timeouts", c.constraintProbeTimeouts, previous.constraintProbeTimeouts, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"  constraint probe failures", c.constraintProbeFailures, previous.constraintProbeFailures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Constraint-unsatisfiable plans", c.constraintUnsatisfiablePlans, previous.constraintUnsatisfiablePlans, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Constraint-triggered floats", c.constraintFloats, previous.constraintFloats, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Conformance leases started", c.conformanceLeasesStarted, previous.conformanceLeasesStarted, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Conformance lease reinforcement attempts", c.conformanceLeaseRepairs, previous.conformanceLeaseRepairs, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Conformance lease deferred burst repairs", c.conformanceLeaseDeferredRepairs, previous.conformanceLeaseDeferredRepairs, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Conformance deadlines completed compliant", c.conformanceLeaseExpiredCompliant, previous.conformanceLeaseExpiredCompliant, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Conformance deadlines floated window", c.conformanceLeaseExpiredFloats, previous.conformanceLeaseExpiredFloats, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Conformance deadline stale/cancelled verdicts", c.conformanceLeaseExpiredStale, previous.conformanceLeaseExpiredStale, uptimeMs, intervalMs);
-
+  DumpCounterSection(report, L"Enumeration / layout / placement", kPlacementCounterRows, c, previous, uptimeMs, intervalMs);
   report.Line();
-  report.Line(L"Virtual desktop / runtime lifecycle / user commands");
-  DiagnosticCounterHeader(report);
-  DiagnosticCounterRow(report, L"Native VD changes processed", c.virtualDesktopChangesProcessed, previous.virtualDesktopChangesProcessed, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Fallback VD changes detected", c.virtualDesktopFallbackChanges, previous.virtualDesktopFallbackChanges, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"VD API init attempts", c.vdApiInitAttempts, previous.vdApiInitAttempts, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"VD API init successes", c.vdApiInitSuccesses, previous.vdApiInitSuccesses, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"VD API init failures", c.vdApiInitFailures, previous.vdApiInitFailures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"VD API reinitializations", c.vdApiReinitializations, previous.vdApiReinitializations, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"VD notification register attempts", c.vdNotificationRegisterAttempts, previous.vdNotificationRegisterAttempts, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"VD notification register successes", c.vdNotificationRegisterSuccesses, previous.vdNotificationRegisterSuccesses, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"VD notification register failures", c.vdNotificationRegisterFailures, previous.vdNotificationRegisterFailures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Runtime maintenance runs", c.runtimeMaintenanceRuns, previous.runtimeMaintenanceRuns, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Runtime maintenance retries", c.runtimeMaintenanceRetries, previous.runtimeMaintenanceRetries, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Runtime maintenance exhausted", c.runtimeMaintenanceExhausted, previous.runtimeMaintenanceExhausted, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Explorer restart signals", c.shellRestartSignals, previous.shellRestartSignals, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Display/work-area signals", c.displayTopologySignals, previous.displayTopologySignals, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"WinEvent hook install failures", c.winEventHookInstallFailures, previous.winEventHookInstallFailures, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Tile commands", c.tileCommands, previous.tileCommands, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Layout cycle commands", c.layoutCycleCommands, previous.layoutCycleCommands, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Float focused commands", c.floatFocusedCommands, previous.floatFocusedCommands, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Swap master commands", c.swapMasterCommands, previous.swapMasterCommands, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Promote window commands", c.promoteWindowCommands, previous.promoteWindowCommands, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Demote window commands", c.demoteWindowCommands, previous.demoteWindowCommands, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Rejected order commands", c.rejectedOrderCommands, previous.rejectedOrderCommands, uptimeMs, intervalMs);
-  DiagnosticCounterRow(report, L"Rejected layout changes", c.rejectedLayoutChanges, previous.rejectedLayoutChanges, uptimeMs, intervalMs);
+  DumpCounterSection(report, L"Virtual desktop / runtime lifecycle / user commands", kRuntimeCounterRows, c, previous, uptimeMs, intervalMs);
 }
 
 static uint64_t DiagnosticFileTime100ns(const FILETIME& value) {
@@ -1100,7 +1117,7 @@ static void WriteDiagnosticReport() {
   report.Line(L"Privacy note: this report contains window titles and executable paths.");
 
   report.Section(L"Current runtime summary");
-  report.Line(L"Management mode: %ls", IsAutomaticMode() ? L"Automatic" : L"Manual");
+  report.Line(L"Management mode: %ls", RuntimeLifecycle::IsAutomaticMode() ? L"Automatic" : L"Manual");
   report.Line(
       L"Workspaces=%zu records=%zu tiled=%zu suspended=%zu perWindowFloating=%zu ignored=%zu",
       workspaces.size(), totalRecords, tiledCount, suspendedCount, floatingCount,
@@ -1111,7 +1128,7 @@ static void WriteDiagnosticReport() {
       duplicateOwners);
   report.Line(
       L"Active conformance leases=%zu pending layout mutations=%zu runtime-maintenance timer=%d attempt=%u",
-      CountActiveConformanceLeases(), g_pendingLayoutMutations.size(),
+      Placement::CountActiveConformanceLeases(), g_pendingLayoutMutations.size(),
       g_wm.maintenanceTimer ? 1 : 0, g_wm.maintenanceAttempts);
   report.Line(
       L"Reverse ownership index: entries=%zu mismatches=%zu",
@@ -1143,8 +1160,8 @@ static void WriteDiagnosticReport() {
   report.Line(
       L"Adaptive Dwindle percentage: %ld (automatic envelope %.0f%%-%.0f%%)",
       g_settings.adaptiveDwindlePercentage,
-      GetAdaptiveDwindleRatioEnvelope().minimum * 100.0,
-      GetAdaptiveDwindleRatioEnvelope().maximum * 100.0);
+      Layout::GetAdaptiveDwindleRatioEnvelope().minimum * 100.0,
+      Layout::GetAdaptiveDwindleRatioEnvelope().maximum * 100.0);
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
   report.Line(
       L"Automatic insertion position: %ls",
@@ -1256,9 +1273,9 @@ static void WriteDiagnosticReport() {
       report.Line(L"device:    %ls", monitorInfo.szDevice);
       report.Line(L"monitorRect: %ls", DiagnosticRectString(monitorInfo.rcMonitor).c_str());
       report.Line(L"systemWork:  %ls", DiagnosticRectString(monitorInfo.rcWork).c_str());
-      report.Line(L"monitorDpi:  %u", GetMonitorEffectiveDpi(resolvedMonitor));
+      report.Line(L"monitorDpi:  %u", Platform::Monitors::GetMonitorEffectiveDpi(resolvedMonitor));
       RECT configuredWork{};
-      if (GetWorkspaceWorkArea(resolvedMonitor, &configuredWork)) {
+      if (Platform::Monitors::GetWorkspaceWorkArea(resolvedMonitor, &configuredWork)) {
         report.Line(L"configuredWork: %ls", DiagnosticRectString(configuredWork).c_str());
       }
     } else {
@@ -1275,7 +1292,7 @@ static void WriteDiagnosticReport() {
         workspaceSuspended, workspaceFloating, workspaceIgnored);
     report.Line(L"overflow: visibleTiled=%zu limit=%zu",
                 state.VisibleWindowCount(),
-                AutomaticWindowLimitForMonitor(key.monitor));
+                Placement::AutomaticWindowLimitForMonitor(key.monitor));
     report.Line(L"pendingReinforcement=%d invariants=%ls",
                 pendingReinforcement ? 1 : 0,
                 invariantsValid ? L"PASS" : L"FAIL");

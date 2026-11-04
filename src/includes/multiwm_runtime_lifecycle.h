@@ -1,6 +1,3 @@
-//=============================================================================
-// Runtime lifecycle maintenance
-//=============================================================================
 //
 // Keep recovery centralized. Callers may only request maintenance; this WM-STA
 // owner is the only place that retries WinEvent hooks, the private VD core, and
@@ -55,7 +52,7 @@ void RunMaintenanceNow() {
 
   const bool hooksReady = Platform::WindowEvents::InstallWinEventHooks();
   const bool vdCoreReady =
-      g_wm.comInitialized && InitializeVirtualDesktopAPI();
+      g_wm.comInitialized && Platform::VirtualDesktop::InitializeVirtualDesktopAPI();
   const bool notificationsReady =
       vdCoreReady && Platform::VirtualDesktop::RegisterVirtualDesktopNotifications();
 
@@ -123,8 +120,8 @@ void NotifyShellRestarted() {
 
   // A shell replacement can move/recreate windows asynchronously. Never let a
   // pre-restart conformance rectangle fight the replacement shell.
-  ClearAllConformanceLeases();
-  ScheduleNextConformanceTimer();
+  Placement::ClearAllConformanceLeases();
+  Placement::ScheduleNextConformanceTimer();
   g_wm.forceMonitorReconcile = true;
   const bool platformNeedsRecovery =
       !Platform::WindowEvents::AllWinEventHooksInstalled() ||
@@ -138,17 +135,17 @@ void NotifyDisplayTopologyChanged() {
   AssertWmThread(L"RuntimeLifecycle::NotifyDisplayTopologyChanged");
   ++Diagnostics::g_runtime.counters.displayTopologySignals;
   Diagnostics::RecordEvent(L"display/work-area topology changed");
-  ClearMonitorIdentityCache();
+  Platform::Monitors::ClearMonitorIdentityCache();
 
   // Every existing lease was computed against the old work-area/monitor topology.
   // Cancel it before Windows' own topology-induced LOCATIONCHANGE burst arrives.
-  ClearAllConformanceLeases();
-  ScheduleNextConformanceTimer();
+  Placement::ClearAllConformanceLeases();
+  Placement::ScheduleNextConformanceTimer();
   g_wm.pendingDesktopArranges.erase(
       std::remove_if(
           g_wm.pendingDesktopArranges.begin(), g_wm.pendingDesktopArranges.end(),
           [](const PendingWorkspaceArrange& pending) {
-            return !IsLiveMonitorHandle(pending.monitor);
+            return !Platform::Monitors::IsLiveMonitorHandle(pending.monitor);
           }),
       g_wm.pendingDesktopArranges.end());
   g_wm.forceMonitorReconcile = true;
