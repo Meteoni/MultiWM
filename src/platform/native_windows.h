@@ -177,9 +177,12 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
   if (IsIconic(hwnd)) return SuspensionReason::Minimized;
+  // IsWindowVisible reads user-mode state; check it before the DWM cloak query so
+  // the many invisible top-level HWNDs seen during EnumWindows skip that call.
+  if (!IsWindowVisible(hwnd)) return SuspensionReason::Hidden;
   DWORD cloaked = 0;
   DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-  if (!IsWindowVisible(hwnd) || (cloaked & DWM_CLOAKED_APP)) return SuspensionReason::Hidden;
+  if (cloaked & DWM_CLOAKED_APP) return SuspensionReason::Hidden;
   if (IsZoomed(hwnd)) return SuspensionReason::Maximized;
 
   // Chromium and similar apps can cover the full monitor while Windows still
