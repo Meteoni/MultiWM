@@ -859,9 +859,10 @@ static void RunDiagnosticReportShapeTest() {
     digest ^= static_cast<unsigned char>(ch);
     digest *= 1099511628211ull;
   }
-  // Recorded from the implementation as of 2026-11-04. Intentional report format
-  // changes must update this value.
-  if (digest != 0x1ab140825e70107full) {
+  // Recorded from the implementation as of 2026-11-17 (companion snapshot
+  // section/counters, maximum sizes, ABI and liveness-event state). Intentional
+  // report format changes must update this value.
+  if (digest != 0xb0ca6b0a8a727976ull) {
     std::fprintf(stderr, "FAILED: diagnostic report shape changed (%016llx)\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }
@@ -956,7 +957,231 @@ static void RunComRefOwnershipTests() {
   std::printf("Passed %u COM reference ownership checks.\n", checks);
 }
 
+// The probe reads both tracking limits from WM_GETMINMAXINFO in frame geometry.
+// A maximum is recorded only when the app lowered it below the system default.
+// Hidden, never-shown test windows: no window manager or mod reacts to them.
+static void RunConstraintProbeTests() {
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  static POINT reportedMinimum{};
+  static POINT reportedMaximum{};
+  static bool overrideLimits = false;
+  WNDCLASSW windowClass{};
+  windowClass.lpfnWndProc = [](HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) -> LRESULT {
+    if (message == WM_GETMINMAXINFO && overrideLimits) {
+      auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+      info->ptMinTrackSize = reportedMinimum;
+      info->ptMaxTrackSize = reportedMaximum;
+      return 0;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+  };
+  windowClass.hInstance = GetModuleHandleW(nullptr);
+  windowClass.lpszClassName = L"MultiWMConstraintProbeTest";
+  check(RegisterClassW(&windowClass) != 0, "register probe test class");
+  // Probe the way MultiWM's WM thread does: from a per-monitor-aware thread. A
+  // window created under that context is per-monitor aware too.
+  const DPI_AWARENESS_CONTEXT previousContext =
+      SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  const HWND hwnd = CreateWindowExW(0, windowClass.lpszClassName, L"MultiWM probe test", WS_OVERLAPPEDWINDOW,
+                                    100, 100, 800, 600, nullptr, nullptr, windowClass.hInstance, nullptr);
+  check(hwnd != nullptr, "create hidden probe test window");
+  LONG decorationWidth = 0;
+  LONG decorationHeight = 0;
+  Platform::Windows::GetFrameDecorationSpan(hwnd, &decorationWidth, &decorationHeight);
+
+  overrideLimits = false;
+  const WindowConstraints defaults = Platform::Windows::ProbeWindowConstraints(hwnd);
+  check(defaults.valid && defaults.maxWidth == 0 && defaults.maxHeight == 0,
+        "the system default maximum is recorded as no maximum");
+
+  overrideLimits = true;
+  reportedMinimum = {300, 200};
+  reportedMaximum = {500, 400};
+  const WindowConstraints capped = Platform::Windows::ProbeWindowConstraints(hwnd);
+  check(capped.valid && capped.maxWidth == 500 - decorationWidth && capped.maxHeight == 400 - decorationHeight,
+        "a lowered maximum is recorded in frame geometry");
+  check(capped.minWidth == std::max<LONG>(300, GetSystemMetricsForDpi(SM_CXMINTRACK, capped.dpi)) - decorationWidth,
+        "the minimum is read as before");
+
+  // A maximum below the minimum is not a real limit on the window's size.
+  reportedMaximum = {100, 100};
+  const WindowConstraints inverted = Platform::Windows::ProbeWindowConstraints(hwnd);
+  check(inverted.maxWidth == inverted.minWidth && inverted.maxHeight == inverted.minHeight,
+        "a maximum is never below the minimum");
+
+  // A DPI-unaware window answers in its own 96-DPI units, unconverted. The probe
+  // must scale them to the monitor's physical pixels, or MultiWM plans tiles the
+  // window refuses on a scaled display.
+  SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+  const HWND unaware = CreateWindowExW(0, windowClass.lpszClassName, L"MultiWM unaware probe test",
+                                       WS_OVERLAPPEDWINDOW, 100, 100, 800, 600, nullptr, nullptr,
+                                       windowClass.hInstance, nullptr);
+  SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  check(unaware != nullptr && GetDpiForWindow(unaware) == 96, "create hidden DPI-unaware test window");
+  LONG unawareDecorationWidth = 0;
+  LONG unawareDecorationHeight = 0;
+  Platform::Windows::GetFrameDecorationSpan(unaware, &unawareDecorationWidth, &unawareDecorationHeight);
+  overrideLimits = false;
+  const WindowConstraints unawareDefaults = Platform::Windows::ProbeWindowConstraints(unaware);
+  check(unawareDefaults.valid && unawareDefaults.maxWidth == 0 && unawareDefaults.maxHeight == 0,
+        "an unaware window's default maximum is still recorded as no maximum");
+  overrideLimits = true;
+  reportedMinimum = {300, 200};
+  reportedMaximum = {500, 400};
+  const WindowConstraints scaled = Platform::Windows::ProbeWindowConstraints(unaware);
+  const int monitorDpi = static_cast<int>(scaled.dpi);
+  check(scaled.minWidth == MulDiv(std::max<LONG>(300, GetSystemMetricsForDpi(SM_CXMINTRACK, 96)), monitorDpi, 96) -
+                               unawareDecorationWidth &&
+            scaled.minHeight == MulDiv(std::max<LONG>(200, GetSystemMetricsForDpi(SM_CYMINTRACK, 96)), monitorDpi, 96) -
+                                    unawareDecorationHeight,
+        "an unaware window's minimum is scaled to physical pixels");
+  check(scaled.maxWidth == MulDiv(500, monitorDpi, 96) - unawareDecorationWidth &&
+            scaled.maxHeight == MulDiv(400, monitorDpi, 96) - unawareDecorationHeight,
+        "an unaware window's maximum is scaled to physical pixels");
+
+  DestroyWindow(unaware);
+  DestroyWindow(hwnd);
+  SetThreadDpiAwarenessContext(previousContext);
+  UnregisterClassW(windowClass.lpszClassName, windowClass.hInstance);
+  std::printf("Passed %d constraint probe checks.\n", checks);
+}
+
+// The companion moves a new window to the centred floating frame when MultiWM
+// predicts that overflow floats it (newWindowFloats). Check the prediction
+// against what discovery's admission plus arrangement's real recovery do, over
+// random settled workspaces, with and without a preferred window, and with the
+// newcomer reporting a larger minimum than the prediction assumed.
+static void RunOverflowFloatPredictionTests() {
+  uint32_t seed = 9157;
+  auto random = [&](uint32_t bound) { seed = seed * 1664525u + 1013904223u; return (seed >> 8) % bound; };
+  const bool savedToasts = TrayUi::g_preferences.showToasts;
+  const ManagementMode savedMode = g_wm.managementMode;
+  TrayUi::g_preferences.showToasts = false;
+  g_wm.managementMode = ManagementMode::Automatic;
+  const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  Platform::Monitors::WorkspaceMetrics metrics;
+  metrics.workArea = {0, 0, 1920, 1040};
+  metrics.gap = 12;
+  metrics.dpi = 96;
+  DesktopMonitorKey key;
+  GUID desktop{};
+  desktop.Data1 = 0x0F10A7;
+  if (!DesktopMonitorKey::FromHMonitor(desktop, monitor, &key)) std::exit(1);
+  const TileLayout layouts[] = {TileLayout::MasterStack, TileLayout::MasterStackH, TileLayout::Columns,
+                                TileLayout::Rows, TileLayout::Dwindle, TileLayout::Monocle};
+  const HWND incoming = reinterpret_cast<HWND>(0x7FFF0000);
+
+  // missedFloats: the predicted minimal window floated without a prediction.
+  size_t predictedFloats = 0, predictedTiles = 0, unpredictedFloats = 0, missedFloats = 0;
+  for (int iteration = 0; iteration < 8000; ++iteration) {
+    Workspace workspace;
+    workspace.SetLayout(layouts[random(std::size(layouts))]);
+    const size_t count = 1 + random(6);
+    // Half the workspaces are crowded: each window needs 70-100% of an equal
+    // share on both axes, so the windows fit but often leave no room.
+    const bool crowded = random(2) == 0;
+    const LONG shareWidth = (1920 - metrics.gap * static_cast<LONG>(count - 1)) / static_cast<LONG>(count);
+    const LONG shareHeight = (1040 - metrics.gap * static_cast<LONG>(count - 1)) / static_cast<LONG>(count);
+    std::vector<HWND> hwnds;
+    for (size_t i = 0; i < count; ++i) {
+      const HWND hwnd = reinterpret_cast<HWND>(0x7400000 + i * 4);
+      hwnds.push_back(hwnd);
+      WindowRecord record;
+      record.hwnd = hwnd;
+      record.pid = 901;
+      record.canMove = false;
+      workspace.AdmitTiled(record);
+      WindowConstraints constraints;
+      constraints.valid = true;
+      constraints.dpi = metrics.dpi;
+      // Often wide or tall windows, so a newcomer often doesn't fit.
+      if (crowded) {
+        constraints.minWidth = shareWidth * static_cast<LONG>(70 + random(31)) / 100;
+        constraints.minHeight = shareHeight * static_cast<LONG>(70 + random(31)) / 100;
+      } else {
+        constraints.minWidth = 1 + static_cast<LONG>(random(random(2) ? 1900 : 600));
+        constraints.minHeight = 1 + static_cast<LONG>(random(random(2) ? 1030 : 400));
+      }
+      workspace.UpdateConstraints(hwnd, constraints);
+      workspace.ClearInsertionPlacement(hwnd);
+    }
+    std::vector<RECT> rects;
+    // Only settled workspaces that fit: arrangement keeps them that way.
+    if (Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects) !=
+        Layout::LayoutPlanStatus::Success) {
+      continue;
+    }
+    const auto prediction = Placement::PredictAutomaticAdmission(workspace, metrics, false, false);
+
+    Workspace admitted = workspace;
+    if (!Reconcile::AdmitUntrackedSnapshot(admitted, {incoming}, true, true)) std::exit(1);
+    const bool largerMinimum = random(2) == 0;
+    if (largerMinimum) {
+      admitted.UpdateConstraints(incoming, {1 + static_cast<LONG>(random(1000)), 1 + static_cast<LONG>(random(600)),
+                                            metrics.dpi, true});
+    }
+    const uint32_t preferredChoice = random(3);
+    const HWND preferred = preferredChoice == 0 ? nullptr : preferredChoice == 1 ? incoming : hwnds[random(count)];
+    g_workspaces.Save(key, admitted);
+    Placement::ArrangementContext context{key, monitor, metrics, preferred};
+    for (int pass = 0; pass < 8; ++pass) {
+      if (Layout::BuildWorkspaceLayoutPlan(admitted, metrics.workArea, metrics.gap, &rects) !=
+          Layout::LayoutPlanStatus::Unsatisfiable) {
+        break;
+      }
+      if (Placement::RecoverUnsatisfiableLayout(admitted, context, rects) != Placement::ArrangementStep::Replan) break;
+    }
+    const WindowRecord* newcomer = admitted.Find(incoming);
+    const bool floated = newcomer && newcomer->state == ManageState::Floating;
+    bool othersKept = true;
+    for (HWND hwnd : hwnds) othersKept &= admitted.IsTiled(hwnd);
+
+    if (prediction.newWindowFloats) {
+      ++predictedFloats;
+      if (!floated || !othersKept) {
+        std::fprintf(stderr, "FAILED: predicted overflow float, but floated=%d othersKept=%d (iteration %d)\n",
+                     floated, othersKept, iteration);
+        std::exit(1);
+      }
+    } else if (prediction.tiledFrame && !largerMinimum) {
+      ++predictedTiles;
+      if (floated) {
+        std::fprintf(stderr, "FAILED: predicted a tiled slot, but the window floated (iteration %d)\n", iteration);
+        std::exit(1);
+      }
+    } else if (floated) {
+      ++unpredictedFloats;  // Allowed: a larger real minimum, or no prediction.
+      missedFloats += !largerMinimum;
+    }
+
+    g_workspaces.Save(key, Workspace{});
+    TestAdmissionRecoveries().clear();
+    TestLeases().clear();
+    g_wm.overflow.queue.clear();
+    g_wm.overflow.windows.clear();
+  }
+  if (g_wm.timers.overflow) KillTimer(nullptr, g_wm.timers.overflow);
+  if (g_wm.timers.conformance) KillTimer(nullptr, g_wm.timers.conformance);
+  g_wm.timers.overflow = g_wm.timers.conformance = 0;
+  TrayUi::g_preferences.showToasts = savedToasts;
+  g_wm.managementMode = savedMode;
+  // Fixed seed: 98 predicted floats and 3016 predicted tiles as of 2026-11-17.
+  if (predictedFloats < 80 || predictedTiles < 1000) {
+    std::fprintf(stderr, "FAILED: overflow prediction inputs too narrow (%zu floats, %zu tiles)\n", predictedFloats,
+                 predictedTiles);
+    std::exit(1);
+  }
+  std::printf("Passed overflow float prediction parity: %zu predicted floats, %zu predicted tiles, "
+              "%zu other floats (%zu without a larger minimum).\n",
+              predictedFloats, predictedTiles, unpredictedFloats, missedFloats);
+}
+
 int main() {
+  RunConstraintProbeTests();
   RunComRefOwnershipTests();
   RunDesktopReconciliationTests();
   RunDiscoveryResultTests();
@@ -965,4 +1190,5 @@ int main() {
   RunDiagnosticReportShapeTest();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
+  RunOverflowFloatPredictionTests();
 }

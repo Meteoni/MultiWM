@@ -61,6 +61,24 @@ static bool WindowConstraintFitsSlot(
        RectHeight(slot) >= std::max<LONG>(1, constraint.minHeight));
 }
 
+// Shrinks each rectangle that is larger than its window's maximum tracking size
+// to that maximum, centred in the original cell. Windows can't grow past that
+// size: asked for the whole cell, a capped window kept its top-left corner and
+// stayed short, so placement reported AdjustedByWindow, the conformance lease
+// kept retrying, and the window was floated when the lease expired. The other
+// windows keep their cells; the spare space stays as an even gap rather than
+// being redistributed. A valid maximum is never below the minimum, so this
+// never breaks WindowConstraintFitsSlot. Pure; changes only `rects`.
+static void CenterWithinMaximumSizes(
+    std::vector<RECT>& rects, const std::vector<WindowConstraints>& constraints) {
+  const size_t count = std::min(rects.size(), constraints.size());
+  for (size_t i = 0; i < count; ++i) {
+    if (!constraints[i].valid) continue;
+    SharedGeometry::CenterWithinMaximumSize(rects[i].left, rects[i].right, constraints[i].maxWidth);
+    SharedGeometry::CenterWithinMaximumSize(rects[i].top, rects[i].bottom, constraints[i].maxHeight);
+  }
+}
+
 // True when every rectangle fits the window assigned to the same index.
 static bool RectsSatisfyWindowConstraints(
     const std::vector<RECT>& rects,
@@ -247,8 +265,11 @@ static LayoutPlanStatus BuildWorkspaceLayoutPlan(
     outRects->assign(count, workArea);
   }
 
+  // Every successful plan ends here: maximum sizes never change other windows'
+  // cells, only where a capped window sits inside its own.
   const std::vector<WindowConstraints> constraints = ActiveWindowConstraints(workspace);
   if (RectsSatisfyWindowConstraints(*outRects, constraints)) {
+    CenterWithinMaximumSizes(*outRects, constraints);
     return LayoutPlanStatus::Success;
   }
 
@@ -266,7 +287,9 @@ static LayoutPlanStatus BuildWorkspaceLayoutPlan(
   } else {  // Monocle
     fitted = LayoutMonocleConstrained(workArea, constraints, outRects);
   }
-  return fitted ? LayoutPlanStatus::Success : LayoutPlanStatus::Unsatisfiable;
+  if (!fitted) return LayoutPlanStatus::Unsatisfiable;
+  CenterWithinMaximumSizes(*outRects, constraints);
+  return LayoutPlanStatus::Success;
 }
 
 static HWND FindConstraintCulprit(

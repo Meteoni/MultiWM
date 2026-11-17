@@ -518,12 +518,13 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
       L"      capabilities: move=%d resize=%d topmost=%d",
       record.canMove ? 1 : 0, record.canResize ? 1 : 0, record.topmost ? 1 : 0);
   report.Line(
-      L"      constraints: generation=%llu pendingInsertion=%d pendingFloatCenter=%d valid=%d dpi=%u min=%ldx%ld timeout=%d error=%lu",
+      L"      constraints: generation=%llu pendingInsertion=%d pendingFloatCenter=%d valid=%d dpi=%u min=%ldx%ld max=%ldx%ld timeout=%d error=%lu",
       static_cast<unsigned long long>(record.tilingGeneration),
       record.pendingInsertionPlacement ? 1 : 0,
       record.pendingDefaultFloatingCenter ? 1 : 0,
       record.constraints.valid ? 1 : 0, record.constraints.dpi,
       record.constraints.minWidth, record.constraints.minHeight,
+      record.constraints.maxWidth, record.constraints.maxHeight,
       record.constraints.lastProbeError == ERROR_TIMEOUT ? 1 : 0,
       record.constraints.lastProbeError);
   report.Line(
@@ -715,6 +716,14 @@ static constexpr DiagnosticCounterRowSpec kRuntimeCounterRows[] = {
     {L"Rejected layout changes", &Counters::rejectedLayoutChanges},
 };
 
+static constexpr DiagnosticCounterRowSpec kCompanionCounterRows[] = {
+    {L"Companion snapshot rebuilds", &Counters::companionRebuilds},
+    {L"  within 16 ms of the previous", &Counters::companionBurstRebuilds},
+    {L"  unchanged, not written", &Counters::companionUnchangedRebuilds},
+    {L"Companion snapshot writes", &Counters::companionWrites},
+    {L"Companion rebuild time (us)", &Counters::companionRebuildMicroseconds},
+};
+
 static void DumpCounterSection(
     ReportBuilder& report, const wchar_t* title, std::span<const DiagnosticCounterRowSpec> rows,
     const Counters& c, const Counters& previous, ULONGLONG uptimeMs, ULONGLONG intervalMs) {
@@ -733,6 +742,39 @@ static void DumpCounters(
   DumpCounterSection(report, L"Enumeration / layout / placement", kPlacementCounterRows, c, previous, uptimeMs, intervalMs);
   report.Line();
   DumpCounterSection(report, L"Virtual desktop / runtime lifecycle / user commands", kRuntimeCounterRows, c, previous, uptimeMs, intervalMs);
+  report.Line();
+  DumpCounterSection(report, L"Companion snapshot", kCompanionCounterRows, c, previous, uptimeMs, intervalMs);
+}
+
+// What the companion snapshot last published (app/companion_snapshot.h).
+static void DumpCompanionSnapshot(ReportBuilder& report, const Counters& c) {
+  const CompanionPublishState& state = g_runtime.companion;
+  report.Line(L"Snapshot ABI: %u.%u", CompanionAbi::kAbiMajor, CompanionAbi::kAbiMinor);
+  report.Line(L"Section: open=%d aliveEvent=%d published=%d generation=%llu flags=0x%02X (running=%d automatic=%d rules=%d tracked=%d overflowCenters=%d)",
+              state.sectionOpen ? 1 : 0, state.aliveEventOpen ? 1 : 0, state.published ? 1 : 0,
+              static_cast<unsigned long long>(state.generation), state.flags,
+              (state.flags & CompanionAbi::kFlagRunning) ? 1 : 0,
+              (state.flags & CompanionAbi::kFlagAutomaticMode) ? 1 : 0,
+              (state.flags & CompanionAbi::kFlagRulesComplete) ? 1 : 0,
+              (state.flags & CompanionAbi::kFlagTrackedComplete) ? 1 : 0,
+              (state.flags & CompanionAbi::kFlagOverflowCentersFloat) ? 1 : 0);
+  report.Line(L"Contents: workspaces=%zu tracked=%u restoreHints=%u rulesBytes=%u measuredBorders=%zu",
+              state.workspaces.size(), state.trackedCount, state.restoreWindowCount, state.rulesBytes,
+              state.measuredMarginWindows);
+  const double average = c.companionRebuilds
+      ? static_cast<double>(c.companionRebuildMicroseconds) / static_cast<double>(c.companionRebuilds)
+      : 0.0;
+  report.Line(L"Rebuild cost: average=%.1f us slowest=%llu us",
+              average, static_cast<unsigned long long>(state.slowestRebuildMicroseconds));
+  for (size_t i = 0; i < state.workspaces.size(); ++i) {
+    const CompanionAbi::WorkspaceHint& hint = state.workspaces[i];
+    report.Line(L"  [%zu] monitor=%ls dpi=%u floatingLayout=%d newWindowFloats=%d", i,
+                DiagnosticRectString(hint.monitorRect).c_str(), hint.dpi, hint.floatingLayout,
+                hint.newWindowFloats);
+    report.Line(L"      tiledFrame=%ls floatingFrame=%ls",
+                hint.hasTiledFrame ? DiagnosticRectString(hint.tiledFrame).c_str() : L"none",
+                hint.hasFloatingFrame ? DiagnosticRectString(hint.floatingFrame).c_str() : L"none");
+  }
 }
 
 static uint64_t DiagnosticFileTime100ns(const FILETIME& value) {
@@ -1513,6 +1555,8 @@ static void WriteDiagnosticReport() {
   DumpConfigurationSnapshot(report);
   report.Section(L"Platform / hook health");
   DumpPlatformHealth(report);
+  report.Section(L"Companion snapshot");
+  DumpCompanionSnapshot(report, counters);
   DumpPerformanceSection(report, timing, reportStartCpu, counters, previous);
   DumpRecentHistory(report, timing.now);
 

@@ -1,0 +1,196 @@
+#include <windows.h>
+
+// An unnamed liveness event and a heap snapshot keep this test independent of
+// the installed MultiWM. Windows are app-cloaked on a private Win32 desktop;
+// the input desktop is never switched and live window managers ignore them.
+static HANDLE WINAPI OpenTestAliveEvent(DWORD, BOOL, LPCWSTR) {
+  return CreateEventW(nullptr, TRUE, FALSE, nullptr);
+}
+#define OpenEventW OpenTestAliveEvent
+#include "../src/companion/multiwm-companion.cpp"
+#undef OpenEventW
+#include <cstdio>
+
+static bool preparationPreservedState = true;
+static int preparations = 0;
+// The companion's restore preparation must change only the normal rectangle:
+// never the window's visibility, minimized/maximized state or activation.
+static BOOL WINAPI ObservePlacement(HWND hwnd, const WINDOWPLACEMENT* placement) {
+  const bool minimized = IsIconic(hwnd) != FALSE;
+  const bool maximized = IsZoomed(hwnd) != FALSE;
+  const bool visible = IsWindowVisible(hwnd) != FALSE;
+  const HWND active = GetActiveWindow();
+  const BOOL result = SetWindowPlacement(hwnd, placement);
+  const UINT command = placement->showCmd;
+  if (command == SW_SHOWMINNOACTIVE || command == SW_SHOWNA || command == SW_HIDE) {
+    ++preparations;
+    preparationPreservedState &= minimized == (IsIconic(hwnd) != FALSE) && maximized == (IsZoomed(hwnd) != FALSE) &&
+                                 visible == (IsWindowVisible(hwnd) != FALSE) && active == GetActiveWindow();
+  }
+  return result;
+}
+
+static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
+  if (!SetThreadDesktop(static_cast<HDESK>(parameter))) return 1;
+  Companion::PhysicalCoordinatesScope physical;
+  Companion::g_unhookedSetWindowPlacement = ObservePlacement;
+  Companion::g_unhookedShowWindow = ShowWindow;
+  Companion::g_unhookedShowWindowAsync = ShowWindowAsync;
+  Companion::g_unhookedDefWindowProcW = DefWindowProcW;
+  Companion::g_unhookedDefWindowProcA = DefWindowProcA;
+  auto section = std::make_unique<CompanionAbi::SnapshotSection>();
+  section->magic = CompanionAbi::kMagic;
+  section->abiMajor = CompanionAbi::kAbiMajor;
+  Companion::g_reader.view = section.get();
+  Companion::g_reader.body = std::make_unique<CompanionAbi::SnapshotBody>();
+  auto& body = section->body;
+  body.flags = CompanionAbi::kFlagRunning | CompanionAbi::kFlagAutomaticMode |
+               CompanionAbi::kFlagRulesComplete | CompanionAbi::kFlagTrackedComplete;
+  body.workspaceCount = body.trackedCount = body.restoreWindowCount = 1;
+  auto& workspace = body.workspaces[0];
+  RECT restoreTile{};
+  int checks = 0;
+
+  for (bool maximized : {false, true}) {
+    for (int path = 0; path < 5; ++path) {
+      HWND hwnd = CreateWindowExW(0, L"STATIC", L"MultiWM restore test", WS_OVERLAPPEDWINDOW,
+                                   100, 100, 600, 400, nullptr, nullptr, nullptr, nullptr);
+      if (!hwnd) return 2;
+      BOOL cloak = TRUE;
+      if (FAILED(DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak)))) return 3;
+      MONITORINFO info{sizeof(info)};
+      if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info)) return 4;
+      workspace.monitorRect = info.rcMonitor;
+      workspace.workArea = info.rcWork;
+      workspace.dpi = GetDpiForWindow(hwnd);
+      // The tile MultiWM publishes for this window's restore.
+      restoreTile = {info.rcWork.left + 110, info.rcWork.top + 110, info.rcWork.left + 610, info.rcWork.top + 460};
+      body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
+      // What MultiWM publishes: the borders measured while the window is restored.
+      RECT restoredWindow{}, restoredFrame{};
+      GetWindowRect(hwnd, &restoredWindow);
+      if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &restoredFrame, sizeof(restoredFrame)))) {
+        return 13;
+      }
+      const RECT margins{restoredFrame.left - restoredWindow.left, restoredFrame.top - restoredWindow.top,
+                         restoredWindow.right - restoredFrame.right, restoredWindow.bottom - restoredFrame.bottom};
+      body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, margins,
+                                workspace.dpi};
+      ++body.generation;  // A new publish; the reader reuses its copy otherwise.
+
+      ShowWindow(hwnd, maximized ? SW_SHOWMAXIMIZED : SW_SHOWMINNOACTIVE);
+      if (maximized ? !IsZoomed(hwnd) : !IsIconic(hwnd)) return 5;
+      WINDOWPLACEMENT requested{sizeof(requested)};
+      GetWindowPlacement(hwnd, &requested);
+      requested.showCmd = SW_RESTORE;
+      preparations = 0;
+      switch (path) {
+        case 0: Companion::ShowWindowHook(hwnd, SW_RESTORE); break;
+        case 1: Companion::ShowWindowAsyncHook(hwnd, SW_SHOWNORMAL); break;
+        case 2: Companion::SetWindowPlacementHook(hwnd, &requested); break;
+        case 3: Companion::DefWindowProcWHook(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0); break;
+        case 4: Companion::DefWindowProcAHook(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0); break;
+      }
+      MSG message;
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+      }
+      RECT expected = restoreTile;
+      expected.left -= margins.left;
+      expected.top -= margins.top;
+      expected.right += margins.right;
+      expected.bottom += margins.bottom;
+      RECT actual{}, actualFrame{};
+      GetWindowRect(hwnd, &actual);
+      DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &actualFrame, sizeof(actualFrame));
+      // The point of the measured borders: the visible frame lands exactly on the slot.
+      if (IsIconic(hwnd) || IsZoomed(hwnd) || !EqualRect(&actual, &expected) ||
+          !EqualRect(&actualFrame, &restoreTile) ||
+          !preparationPreservedState || preparations != (path == 2 ? 0 : 1)) {
+        std::fprintf(stderr, "FAILED: restore path=%d maximized=%d actual=(%ld,%ld,%ld,%ld) expected=(%ld,%ld,%ld,%ld)\n",
+                     path, maximized, actual.left, actual.top, actual.right, actual.bottom,
+                     expected.left, expected.top, expected.right, expected.bottom);
+        return 6;
+      }
+      ++checks;
+      DestroyWindow(hwnd);
+    }
+  }
+  // A hidden minimized or maximized member (hidden to the tray, say) being shown
+  // again: the preparation must keep it hidden, so it never flashes at full size,
+  // and the caller's show then restores it straight into the slot.
+  for (bool maximized : {false, true}) {
+    HWND hidden = CreateWindowExW(0, L"STATIC", L"Hidden restore test", WS_OVERLAPPEDWINDOW,
+                                   100, 100, 600, 400, nullptr, nullptr, nullptr, nullptr);
+    if (!hidden) return 14;
+    BOOL cloak = TRUE;
+    if (FAILED(DwmSetWindowAttribute(hidden, DWMWA_CLOAK, &cloak, sizeof(cloak)))) return 15;
+    RECT restoredWindow{}, restoredFrame{};
+    GetWindowRect(hidden, &restoredWindow);
+    if (FAILED(DwmGetWindowAttribute(hidden, DWMWA_EXTENDED_FRAME_BOUNDS, &restoredFrame, sizeof(restoredFrame)))) {
+      return 16;
+    }
+    const RECT margins{restoredFrame.left - restoredWindow.left, restoredFrame.top - restoredWindow.top,
+                       restoredWindow.right - restoredFrame.right, restoredWindow.bottom - restoredFrame.bottom};
+    body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hidden));
+    body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, margins,
+                              workspace.dpi};
+    ++body.generation;
+    ShowWindow(hidden, maximized ? SW_SHOWMAXIMIZED : SW_SHOWMINNOACTIVE);
+    ShowWindow(hidden, SW_HIDE);
+    if (IsWindowVisible(hidden) || (maximized ? !IsZoomed(hidden) : !IsIconic(hidden))) return 17;
+    preparations = 0;
+    preparationPreservedState = true;
+    Companion::ShowWindowHook(hidden, SW_SHOWNORMAL);
+    RECT frame{};
+    DwmGetWindowAttribute(hidden, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame));
+    if (preparations != 1 || !preparationPreservedState || !IsWindowVisible(hidden) || IsIconic(hidden) ||
+        IsZoomed(hidden) || !EqualRect(&frame, &restoreTile)) {
+      std::fprintf(stderr, "FAILED: hidden restore maximized=%d preparations=%d preserved=%d\n", maximized,
+                   preparations, preparationPreservedState);
+      return 18;
+    }
+    ++checks;
+    DestroyWindow(hidden);
+  }
+
+  // A minimized window that was maximized must return to maximized. Do not
+  // replace its normal rectangle with a tile on that transition.
+  HWND restoreMax = CreateWindowExW(0, L"STATIC", L"Restore to maximized", WS_OVERLAPPEDWINDOW,
+                                     100, 100, 600, 400, nullptr, nullptr, nullptr, nullptr);
+  if (!restoreMax) return 7;
+  BOOL cloak = TRUE;
+  if (FAILED(DwmSetWindowAttribute(restoreMax, DWMWA_CLOAK, &cloak, sizeof(cloak)))) return 8;
+  body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(restoreMax));
+  body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, RECT{7, 0, 7, 7},
+                            workspace.dpi};
+  ++body.generation;
+  ShowWindow(restoreMax, SW_SHOWMAXIMIZED);
+  ShowWindow(restoreMax, SW_SHOWMINNOACTIVE);
+  preparations = 0;
+  Companion::ShowWindowHook(restoreMax, SW_RESTORE);
+  if (!IsZoomed(restoreMax) || preparations != 0) return 9;
+  ++checks;
+  DestroyWindow(restoreMax);
+  Companion::g_reader.view = nullptr;
+  Companion::g_reader.body.reset();
+  std::printf("Passed %d native restoration checks.\n", checks);
+  return 0;
+}
+
+int main() {
+  wchar_t name[80];
+  swprintf(name, ARRAYSIZE(name), L"MultiWMRestoreTests_%lu", GetCurrentProcessId());
+  HDESK desktop = CreateDesktopW(name, nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+  if (!desktop) return 10;
+  HANDLE worker = CreateThread(nullptr, 0, RunNativeRestoreTests, desktop, 0, nullptr);
+  if (!worker) { CloseDesktop(desktop); return 11; }
+  const DWORD wait = WaitForSingleObject(worker, 15000);
+  if (wait != WAIT_OBJECT_0) return 12;
+  DWORD result = 0;
+  GetExitCodeThread(worker, &result);
+  CloseHandle(worker);
+  CloseDesktop(desktop);
+  return static_cast<int>(result);
+}

@@ -100,8 +100,36 @@ struct Counters {
   uint64_t rejectedOrderCommands = 0;
   uint64_t rejectedLayoutChanges = 0;
 
+  // Companion snapshot publisher (app/companion_snapshot.h).
+  uint64_t companionRebuilds = 0;
+  // Rebuilds within kCompanionBurstWindowMs of the previous one: what coalescing
+  // rebuilds until the message queue is idle could save at most.
+  uint64_t companionBurstRebuilds = 0;
+  uint64_t companionUnchangedRebuilds = 0;  // Built, compared equal, not written.
+  uint64_t companionWrites = 0;
+  uint64_t companionRebuildMicroseconds = 0;  // Build plus compare, summed.
+
   uint64_t reportsWritten = 0;
   uint64_t reportWriteFailures = 0;
+};
+
+inline constexpr ULONGLONG kCompanionBurstWindowMs = 16;
+
+// What the companion snapshot last published, for the diagnostic report. Kept
+// here because the report is compiled before the publisher.
+struct CompanionPublishState {
+  bool sectionOpen = false;
+  bool aliveEventOpen = false;
+  bool published = false;
+  uint64_t generation = 0;
+  uint32_t flags = 0;
+  uint32_t trackedCount = 0;
+  uint32_t restoreWindowCount = 0;
+  uint32_t rulesBytes = 0;
+  size_t measuredMarginWindows = 0;
+  uint64_t slowestRebuildMicroseconds = 0;
+  ULONGLONG lastRebuildTickMs = 0;
+  std::vector<CompanionAbi::WorkspaceHint> workspaces;
 };
 
 struct RecentEvent {
@@ -133,6 +161,7 @@ struct Runtime {
   DiagnosticCost wmSessionDiagnosticCost{};
   std::deque<RecentEvent> significantEvents;
   std::deque<LifecycleBurst> lifecycleBursts;
+  CompanionPublishState companion;
 };
 
 static Runtime g_runtime;

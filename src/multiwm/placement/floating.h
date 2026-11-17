@@ -3,37 +3,6 @@
 
 namespace Placement {
 
-static POINT RectCenter(const RECT& rect) {
-  return {
-      rect.left + (rect.right - rect.left) / 2,
-      rect.top + (rect.bottom - rect.top) / 2};
-}
-
-static RECT CenteredRect(POINT center, LONG width, LONG height) {
-  width = std::max<LONG>(1, width);
-  height = std::max<LONG>(1, height);
-  const LONG left = center.x - width / 2;
-  const LONG top = center.y - height / 2;
-  return {left, top, left + width, top + height};
-}
-
-static RECT ClampFloatingRectToWorkArea(RECT rect, const RECT& workArea) {
-  const LONG areaWidth = std::max<LONG>(1, workArea.right - workArea.left);
-  const LONG areaHeight = std::max<LONG>(1, workArea.bottom - workArea.top);
-  const LONG width = std::min<LONG>(
-      std::max<LONG>(1, rect.right - rect.left), areaWidth);
-  const LONG height = std::min<LONG>(
-      std::max<LONG>(1, rect.bottom - rect.top), areaHeight);
-
-  LONG left = rect.left;
-  LONG top = rect.top;
-  if (left < workArea.left) left = workArea.left;
-  if (top < workArea.top) top = workArea.top;
-  if (left + width > workArea.right) left = workArea.right - width;
-  if (top + height > workArea.bottom) top = workArea.bottom - height;
-  return {left, top, left + width, top + height};
-}
-
 static FloatingPlacementHint MakeFloatingPlacementHintFromGesture(
     const MoveSizeGesture& gesture) {
   FloatingPlacementHint hint;
@@ -44,7 +13,7 @@ static FloatingPlacementHint MakeFloatingPlacementHintFromGesture(
   // pointer is usually on the title bar, so centering a repaired window on it
   // would visibly jump away from the user's chosen placement.
   if (gesture.hasRects) {
-    hint.anchor = RectCenter(gesture.end);
+    hint.anchor = SharedGeometry::RectCenter(gesture.end);
   } else if (gesture.hasDropPoint) {
     hint.anchor = gesture.dropPoint;
   }
@@ -124,8 +93,8 @@ static bool RepairFloatingGeometry(
       width = workArea.right - workArea.left;
       height = workArea.bottom - workArea.top;
     } else {
-      width = Platform::Monitors::ScaleDip(placementOverride->floatingSizeDip.width, targetDpi);
-      height = Platform::Monitors::ScaleDip(placementOverride->floatingSizeDip.height, targetDpi);
+      width = SharedGeometry::ScaleDip(placementOverride->floatingSizeDip.width, targetDpi);
+      height = SharedGeometry::ScaleDip(placementOverride->floatingSizeDip.height, targetDpi);
     }
   } else if (!useNewWindowSize && record->hasFloatingRect) {
     const UINT sourceDpi = record->floatingDpi ? record->floatingDpi : 96;
@@ -136,8 +105,8 @@ static bool RepairFloatingGeometry(
         record->floatingRect.bottom - record->floatingRect.top,
         static_cast<int>(targetDpi), static_cast<int>(sourceDpi));
   } else {
-    width = Platform::Monitors::ScaleDip(g_settings.floatingDefaultSizeDip.width, targetDpi);
-    height = Platform::Monitors::ScaleDip(g_settings.floatingDefaultSizeDip.height, targetDpi);
+    width = SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.width, targetDpi);
+    height = SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.height, targetDpi);
   }
 
   if (!record->canResize && haveCurrent) {
@@ -150,14 +119,14 @@ static bool RepairFloatingGeometry(
     center = hint.anchor;
   } else if (!centerInWorkspace && record->hasFloatingRect &&
              ResolveRememberedFloatingMonitor(*record) == monitor) {
-    center = RectCenter(record->floatingRect);
+    center = SharedGeometry::RectCenter(record->floatingRect);
   } else {
-    center = RectCenter(workArea);
+    center = SharedGeometry::RectCenter(workArea);
   }
 
-  RECT target = CenteredRect(center, width, height);
+  RECT target = SharedGeometry::CenteredRect(center, width, height);
   if (!centerWithoutResize) {
-    target = ClampFloatingRectToWorkArea(target, workArea);
+    target = SharedGeometry::ClampToArea(target, workArea);
   }
   // The window can enter a non-participating physical state while the placement
   // target is being calculated. Never overwrite it.

@@ -473,8 +473,14 @@ static void RunAdmissionPredictionTests() {
             if (existing > 1) workspace.RememberFocusedWindow(workspace.TiledWindows()[1]);
 
             const Placement::AdmissionPrediction prediction = Placement::PredictAutomaticAdmission(
-                workspace, metrics, 0, position == AutomaticNewWindowPosition::AfterFocused);
-            check(!prediction.floatingFrame, "tiled layouts predict no floating frame");
+                workspace, metrics, false, position == AutomaticNewWindowPosition::AfterFocused);
+            // Default size 960x640 at 96 DPI, centred: where overflow would centre it.
+            const RECT expectedFloating{480, 200, 1440, 840};
+            check(prediction.floatingFrame && EqualRect(&*prediction.floatingFrame, &expectedFloating),
+                  "tiled layouts publish the centred default floating frame");
+            check(prediction.tiledFrame.has_value() != prediction.newWindowFloats ||
+                      (!prediction.tiledFrame && !prediction.newWindowFloats),
+                  "a tiled slot and an overflow float never coexist");
 
             Workspace admitted = workspace;
             check(Reconcile::AdmitUntrackedSnapshot(admitted, {incoming}, true, true),
@@ -495,30 +501,80 @@ static void RunAdmissionPredictionTests() {
     }
   }
 
-  // The automatic window limit: a full workspace gets no tiled hint.
+  // The automatic window limit, counted exactly as EnforceAutomaticWindowLimit
+  // counts: tiled members and maximized members keeping a slot count, minimized
+  // ones don't. A full workspace gets no tiled hint.
   g_settings = SettingsState{};
+  POINT origin{};
+  const HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+  DesktopMonitorKey limitKey{};
+  check(DesktopMonitorKey::FromHMonitor(GUID{0x11A17001}, primary, &limitKey), "resolve limit test monitor");
   Workspace full;
   full.SetLayout(TileLayout::Columns);
-  for (size_t i = 0; i < 3; ++i) {
+  for (size_t i = 0; i < 4; ++i) {
     WindowRecord record;
     record.hwnd = reinterpret_cast<HWND>(0x2000 + i * 4);
     check(full.AdmitTiled(record), "admit window for limit test");
   }
-  check(!Placement::PredictAutomaticAdmission(full, metrics, 3, false).tiledFrame, "limit reached: no hint");
-  check(Placement::PredictAutomaticAdmission(full, metrics, 4, false).tiledFrame.has_value(),
-        "below the limit: hint");
+  check(full.Suspend(reinterpret_cast<HWND>(0x2008), SuspensionReason::Maximized), "suspend a maximized member");
+  check(full.Suspend(reinterpret_cast<HWND>(0x200C), SuspensionReason::Minimized), "suspend a minimized member");
+  // Two tiled plus one maximized occupy slots; the minimized one doesn't.
+  check(Placement::CollectAutomaticLimitOccupants(limitKey, full, primary).size() == 3,
+        "occupants are the visible members that keep a slot");
+  g_settings.automaticWindowLimit = 3;
+  const auto limited = Placement::PredictAutomaticAdmission(full, metrics, true, false);
+  check(Placement::WouldExceedAutomaticWindowLimit(limitKey, full, primary) && !limited.tiledFrame &&
+            limited.newWindowFloats,
+        "limit reached: no tiled slot, overflow floats the window");
+  g_settings.automaticWindowLimit = 4;
+  const auto belowLimit = Placement::PredictAutomaticAdmission(full, metrics, false, false);
+  check(!Placement::WouldExceedAutomaticWindowLimit(limitKey, full, primary) && belowLimit.tiledFrame.has_value() &&
+            !belowLimit.newWindowFloats,
+        "below the limit: tiled slot");
+  g_settings.automaticWindowLimit = 0;
+  check(!Placement::WouldExceedAutomaticWindowLimit(limitKey, full, primary), "no limit configured: never reached");
 
   // The Floating layout centers the DPI-scaled default size, clamped to the work area.
   Workspace floating;
   floating.SetLayout(TileLayout::Floating);
-  const auto centered = Placement::PredictAutomaticAdmission(floating, metrics, 0, false);
+  const auto centered = Placement::PredictAutomaticAdmission(floating, metrics, false, false);
   const RECT expectedCentered{480, 200, 1440, 840};
   check(!centered.tiledFrame && centered.floatingFrame && EqualRect(&*centered.floatingFrame, &expectedCentered),
         "floating default size is centered");
   const Platform::Monitors::WorkspaceMetrics highDpi{{0, 0, 1920, 1040}, 192, 12};
-  const auto clamped = Placement::PredictAutomaticAdmission(floating, highDpi, 0, false);
+  const auto clamped = Placement::PredictAutomaticAdmission(floating, highDpi, false, false);
   check(clamped.floatingFrame && EqualRect(&*clamped.floatingFrame, &highDpi.workArea),
         "scaled default size is clamped to the work area");
+  check(!centered.newWindowFloats, "the Floating layout never reports an overflow float");
+
+  // No slot fits even a minimal new window: two settled columns whose minimums
+  // fill the width. Recovery can't help (every slot is too narrow), so MultiWM
+  // floats the newcomer, and the prediction says so.
+  Workspace crowded;
+  crowded.SetLayout(TileLayout::Columns);
+  for (size_t i = 0; i < 2; ++i) {
+    WindowRecord record;
+    record.hwnd = reinterpret_cast<HWND>(0x3000 + i * 4);
+    // 2 x 955 + one 6 px gap = 1916 fits; adding a 1 px newcomer and a second
+    // gap makes 1923 > 1920.
+    record.constraints = {955, 300, 96, true};
+    check(crowded.AdmitTiled(record), "admit crowded column");
+    crowded.ClearInsertionPlacement(record.hwnd);
+  }
+  const auto overfull = Placement::PredictAutomaticAdmission(crowded, metrics, false, false);
+  check(!overfull.tiledFrame && overfull.newWindowFloats, "no slot fits: overflow floats the window");
+  // The same columns with room to spare tile it.
+  Workspace roomy = crowded;
+  roomy.UpdateConstraints(reinterpret_cast<HWND>(0x3000), {300, 300, 96, true});
+  const auto fits = Placement::PredictAutomaticAdmission(roomy, metrics, false, false);
+  check(fits.tiledFrame && !fits.newWindowFloats, "room left: tiled slot");
+  // A conflict among the windows already here is not the newcomer's fault: they
+  // are reordered or one of them is floated, so no float is predicted.
+  Workspace conflicted = crowded;
+  conflicted.UpdateConstraints(reinterpret_cast<HWND>(0x3000), {1500, 300, 96, true});
+  const auto blamedElsewhere = Placement::PredictAutomaticAdmission(conflicted, metrics, false, false);
+  check(!blamedElsewhere.tiledFrame && !blamedElsewhere.newWindowFloats,
+        "an existing conflict predicts neither a slot nor a float");
 
   std::printf("Passed %d admission prediction checks.\n", checks);
 }
@@ -576,6 +632,120 @@ static void RunCompanionRuleEncodingTests() {
   std::printf("Passed %d companion rule encoding checks.\n", checks);
 }
 
+static void RunRestorePublicationTests() {
+  auto body = std::make_unique<CompanionAbi::SnapshotBody>();
+  const GUID desktop{0xAABBC001};
+  POINT origin{};
+  const HMONITOR monitor = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+  DesktopMonitorKey key{};
+  if (!DesktopMonitorKey::FromHMonitor(desktop, monitor, &key)) std::exit(1);
+  g_settings = SettingsState{};
+  g_settings.automaticWindowLimit = 0;
+  Workspace workspace;
+  workspace.SetLayout(TileLayout::Columns);
+  const HWND windows[] = {reinterpret_cast<HWND>(0x4000), reinterpret_cast<HWND>(0x4004),
+                           reinterpret_cast<HWND>(0x4008), reinterpret_cast<HWND>(0x400C)};
+  for (HWND hwnd : windows) {
+    WindowRecord record;
+    record.hwnd = hwnd;
+    record.pid = 7;
+    workspace.AdmitTiled(record);
+  }
+  workspace.Suspend(windows[0], SuspensionReason::Minimized);
+  workspace.Suspend(windows[3], SuspensionReason::Maximized);
+  g_workspaces.Save(key, workspace);
+  // Borders remembered from when the windows were restored. The second belongs to
+  // another process, as if its HWND value had been reused, so it must not be used.
+  const RECT measuredMargins{11, 0, 11, 11};
+  CompanionSnapshot::g_publisher.frameMargins[windows[0]] = {7, measuredMargins, 192};
+  CompanionSnapshot::g_publisher.frameMargins[windows[3]] = {8, measuredMargins, 192};
+  const auto probes = Diagnostics::g_runtime.counters.constraintProbeAttempts;
+  CompanionSnapshot::AppendWorkspaceHints(desktop, body.get());
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  Platform::Monitors::WorkspaceMetrics metrics;
+  check(Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics), "read the test monitor's metrics");
+  check(body->workspaceCount == 1 && body->restoreWindowCount == 2, "publish only the suspended members");
+  check(body->restoreWindows[0].hwnd == 0x4000 && body->restoreWindows[1].hwnd == 0x400C,
+        "restore hints are published in a stable order");
+  check(body->restoreWindows[0].processId == 7 && body->restoreWindows[0].workspaceIndex == 0,
+        "restore hints retain identity and workspace");
+  // Restoring either window gives three columns. The first window returns to the
+  // first column (at the work area's left edge), the last to the last column.
+  const auto& first = body->restoreWindows[0];
+  const auto& last = body->restoreWindows[1];
+  check(first.hasFrame && first.frame.left == metrics.workArea.left && first.frame.top == metrics.workArea.top &&
+            first.frame.bottom == metrics.workArea.bottom,
+        "a restored first window gets the first column");
+  check(last.hasFrame && last.frame.right == metrics.workArea.right && last.frame.left > first.frame.right,
+        "a restored last window gets the last column");
+  // The frames are exactly what MultiWM's own restore produces.
+  for (const auto& hint : {first, last}) {
+    Workspace restored = workspace;
+    const HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(hint.hwnd));
+    std::vector<RECT> rects;
+    check(restored.Restore(hwnd) &&
+              Layout::BuildWorkspaceLayoutPlan(restored, metrics.workArea, metrics.gap, &rects) ==
+                  Layout::LayoutPlanStatus::Success &&
+              EqualRect(&rects[restored.TiledIndex(hwnd)], &hint.frame),
+          "the restore hint equals the tile MultiWM's restore produces");
+  }
+  check(probes == Diagnostics::g_runtime.counters.constraintProbeAttempts,
+        "restore publication adds no native constraint probes");
+  check(body->restoreWindows[0].marginsDpi == 192 &&
+            EqualRect(&body->restoreWindows[0].frameMargins, &measuredMargins),
+        "restore hints carry the borders measured while the window was restored");
+  check(body->restoreWindows[1].marginsDpi == 0,
+        "borders measured for another process are not published");
+
+  // Borders measured at another window DPI (or with other frame styles) no
+  // longer describe the window. A suspended window can't be measured again, so
+  // nothing is published for it. These fake HWNDs read back DPI 0 and styles 0.
+  auto stale = std::make_unique<CompanionAbi::SnapshotBody>();
+  CompanionSnapshot::MeasuredFrameMargins otherDpi{7, measuredMargins, 192};
+  otherDpi.windowDpi = 96;
+  CompanionSnapshot::g_publisher.frameMargins[windows[0]] = otherDpi;
+  CompanionSnapshot::AppendWorkspaceHints(desktop, stale.get());
+  check(stale->restoreWindowCount == 2 && stale->restoreWindows[0].marginsDpi == 0,
+        "borders from another window DPI are not published");
+  CompanionSnapshot::g_publisher.frameMargins.clear();
+
+  // A minimized master returns as the master, which the old next-window plan
+  // (a newcomer appended to the stack) could never express.
+  Workspace masterStack;
+  masterStack.SetLayout(TileLayout::MasterStack);
+  for (HWND hwnd : windows) {
+    WindowRecord record;
+    record.hwnd = hwnd;
+    record.pid = 7;
+    masterStack.AdmitTiled(record);
+  }
+  masterStack.Suspend(windows[0], SuspensionReason::Minimized);
+  g_workspaces.Save(key, masterStack);
+  auto master = std::make_unique<CompanionAbi::SnapshotBody>();
+  CompanionSnapshot::AppendWorkspaceHints(desktop, master.get());
+  check(master->restoreWindowCount == 1 && master->restoreWindows[0].hasFrame &&
+            master->restoreWindows[0].frame.left == metrics.workArea.left &&
+            master->restoreWindows[0].frame.top == metrics.workArea.top &&
+            master->restoreWindows[0].frame.bottom == metrics.workArea.bottom &&
+            master->restoreWindows[0].frame.right < metrics.workArea.right,
+        "a restored master gets the full-height master column");
+
+  // A window whose minimum can't fit once restored has no exact tile: MultiWM
+  // would move or float it, so no frame is published.
+  WindowConstraints huge{100000, 100000, 96, true};
+  masterStack.UpdateConstraints(windows[0], huge);
+  g_workspaces.Save(key, masterStack);
+  auto unsatisfiable = std::make_unique<CompanionAbi::SnapshotBody>();
+  CompanionSnapshot::AppendWorkspaceHints(desktop, unsatisfiable.get());
+  check(unsatisfiable->restoreWindowCount == 1 && !unsatisfiable->restoreWindows[0].hasFrame,
+        "an unsatisfiable restore publishes no frame");
+  std::printf("Passed %d restore publication checks.\n", checks);
+}
+
 static void RunCompanionSnapshotRecoveryTests() {
   auto section = std::make_unique<CompanionAbi::SnapshotSection>();
   auto copy = std::make_unique<CompanionAbi::SnapshotBody>();
@@ -604,7 +774,77 @@ static void RunCompanionSnapshotRecoveryTests() {
   std::printf("Passed %d companion snapshot recovery checks.\n", checks);
 }
 
+// A window capped below its cell is shrunk to its maximum and centred in that
+// cell; every other window keeps the cell it would have had anyway. Covers each
+// layout family, the cross axis, the constrained (minimum) path and the case
+// where the maximum doesn't bind.
+static void RunMaximumSizeTests() {
+  g_settings = SettingsState{};
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  const RECT area{0, 0, 1200, 1000};
+  auto plan = [&](TileLayout layout, const std::vector<WindowConstraints>& constraints) {
+    Workspace workspace;
+    workspace.SetLayout(layout);
+    for (size_t i = 0; i < constraints.size(); ++i) {
+      WindowRecord record;
+      record.hwnd = reinterpret_cast<HWND>(0x5000 + i * 4);
+      record.pid = 1;
+      record.constraints = constraints[i];
+      check(workspace.AdmitTiled(record), "admit window for maximum test");
+    }
+    std::vector<RECT> rects;
+    check(Layout::BuildWorkspaceLayoutPlan(workspace, area, 0, &rects) == Layout::LayoutPlanStatus::Success,
+          "a capped window never makes the plan unsatisfiable");
+    return rects;
+  };
+  auto capped = [](LONG maxWidth, LONG maxHeight) {
+    WindowConstraints constraints{1, 1, 96, true};
+    constraints.maxWidth = maxWidth;
+    constraints.maxHeight = maxHeight;
+    return constraints;
+  };
+  auto same = [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; };
+  const WindowConstraints free{1, 1, 96, true};
+
+  auto columns = plan(TileLayout::Columns, {free, capped(200, 0), free});
+  check(same(columns[0], {0, 0, 400, 1000}) && same(columns[2], {800, 0, 1200, 1000}),
+        "neighbours keep their cells");
+  check(same(columns[1], {500, 0, 700, 1000}), "capped width is centred in its column");
+
+  auto crossAxis = plan(TileLayout::Columns, {capped(0, 400), free});
+  check(same(crossAxis[0], {0, 300, 600, 700}) && same(crossAxis[1], {600, 0, 1200, 1000}),
+        "capped height is centred on the cross axis");
+
+  auto masterStack = plan(TileLayout::MasterStack, {capped(300, 0), free, free});
+  check(same(masterStack[0], {150, 0, 450, 1000}) && same(masterStack[1], {600, 0, 1200, 500}),
+        "a capped master is centred while the stack keeps its column");
+
+  auto monocle = plan(TileLayout::Monocle, {capped(600, 400)});
+  check(same(monocle[0], {300, 300, 900, 700}), "Monocle centres a capped window in the work area");
+
+  auto dwindle = plan(TileLayout::Dwindle, {free, capped(200, 300)});
+  check(same(dwindle[0], {0, 0, 600, 1000}) && same(dwindle[1], {800, 350, 1000, 650}),
+        "Dwindle centres a capped window in its cell");
+
+  // The constrained step runs first, then centring: a large minimum widens one
+  // column and the capped window is centred in what remains for it.
+  WindowConstraints wide{900, 1, 96, true};
+  auto constrained = plan(TileLayout::Columns, {wide, capped(100, 0)});
+  check(same(constrained[0], {0, 0, 900, 1000}) && same(constrained[1], {1000, 0, 1100, 1000}),
+        "centring follows the constrained allocation");
+
+  auto loose = plan(TileLayout::Columns, {capped(800, 1200), free});
+  check(same(loose[0], {0, 0, 600, 1000}), "a maximum at least as large as the cell changes nothing");
+
+  std::printf("Passed %d maximum size checks.\n", checks);
+}
+
 int main() {
+  RunMaximumSizeTests();
   RunSettingsParserDigest();
   RunRuleFieldParserTests();
   RunAdaptiveDwindleTests();
@@ -612,5 +852,6 @@ int main() {
   RunDwindlePlannerDigest();
   RunAdmissionPredictionTests();
   RunCompanionRuleEncodingTests();
+  RunRestorePublicationTests();
   RunCompanionSnapshotRecoveryTests();
 }

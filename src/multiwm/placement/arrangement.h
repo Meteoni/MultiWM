@@ -377,6 +377,18 @@ static size_t AutomaticWindowLimitForMonitor(const Model::MonitorId& monitor) {
   return g_settings.automaticWindowLimit;
 }
 
+// True when Automatic overflow routes a window it releases to another monitor or
+// a new desktop (it floats in place meanwhile). False: it floats the window and
+// centres it (FloatWindowAfterFailure). The companion snapshot publishes this.
+static bool AutomaticOverflowRoutes() {
+  // With exactly one display, monitor-only routing has no destination. The
+  // inexpensive count query also keeps the publisher current after hot-plug.
+  // A zero/unknown count retains routing rather than promising a float hint.
+  return RuntimeLifecycle::IsAutomaticMode() && Platform::WindowEvents::g_hooks.hideDestroy &&
+         (g_settings.overflowCreateDesktop ||
+          (g_settings.overflowTryOtherMonitors && GetSystemMetrics(SM_CMONITORS) != 1));
+}
+
 // Arrangement releases the slot first; physical routing runs after every source
 // workspace in the burst has been saved, so discovery snapshots cannot go stale
 // midway through admission. A failed route therefore already has a safe fallback.
@@ -388,8 +400,7 @@ static bool FloatAutomaticOverflowWindow(
   const DWORD processId = record->pid;
   const bool monitorFixed = record->automaticOverflowMonitorFixed;
   const uint64_t generation = record->tilingGeneration;
-  const bool route = RuntimeLifecycle::IsAutomaticMode() && Platform::WindowEvents::g_hooks.hideDestroy &&
-      (g_settings.overflowCreateDesktop || g_settings.overflowTryOtherMonitors);
+  const bool route = AutomaticOverflowRoutes();
   CancelConformanceLease(hwnd);
   DiscardPendingAdmissionRecovery(hwnd);
   if (!(route ? workspace.Float(hwnd) : FloatWindowAfterFailure(key, workspace, hwnd))) return false;
@@ -403,22 +414,27 @@ static bool FloatAutomaticOverflowWindow(
   return true;
 }
 
-// Counts visible arrivals in generation order, including maximized members
-// awaiting initial placement, and releases excess slots through overflow policy.
-// WM thread only; the caller saves the resulting workspace before routing it.
-static void EnforceAutomaticWindowLimit(
-    const DesktopMonitorKey& key, Workspace& workspace, HMONITOR monitor) {
-  if (!RuntimeLifecycle::IsAutomaticMode() || workspace.Layout() == TileLayout::Floating) return;
-  const size_t limit = AutomaticWindowLimitForMonitor(key.monitor);
-  if (!limit) return;
-  struct VisibleMember {
-    HWND hwnd;
-    DWORD processId;
-    uint64_t generation;
-    bool awaitingInitialPlacement;
-  };
-  std::vector<VisibleMember> visibleMembers;
-  size_t retainedSlots = 0;
+// A window that holds one of a workspace's automatic-limit slots.
+struct LimitOccupant {
+  HWND hwnd;
+  DWORD processId;
+  uint64_t generation;  // Arrival order: older windows keep their slots first.
+  // Not a member yet: a maximized window awaiting initial placement on this
+  // monitor. It only reserves its place in arrival order.
+  bool reservedForInitialPlacement;
+};
+
+// Everything that counts against the automatic window limit, in arrival order:
+// visible tiled members, visible maximized members that keep a slot, and
+// maximized windows still awaiting initial placement here. Minimized, hidden and
+// cloaked members don't count. EnforceAutomaticWindowLimit floats the occupants
+// past the limit; the companion snapshot uses the same list to tell whether a
+// new window would overflow, so the two can never disagree.
+// Reads only; native queries, including one desktop COM call per pending
+// window, which can deliver lifecycle events. WM thread.
+static std::vector<LimitOccupant> CollectAutomaticLimitOccupants(
+    const DesktopMonitorKey& key, const Workspace& workspace, HMONITOR monitor) {
+  std::vector<LimitOccupant> occupants;
   for (const auto& member : workspace.Records()) {
     const WindowRecord& record = member.second;
     if (record.state == ManageState::Tiled ||
@@ -427,42 +443,70 @@ static void EnforceAutomaticWindowLimit(
       const SuspensionReason physicalReason = Platform::Windows::GetPhysicalSuspensionReason(record.hwnd);
       if (physicalReason == SuspensionReason::Minimized ||
           physicalReason == SuspensionReason::Hidden || Platform::Windows::IsWindowCloaked(record.hwnd)) continue;
-      visibleMembers.push_back({record.hwnd, record.pid, record.tilingGeneration, false});
+      occupants.push_back({record.hwnd, record.pid, record.tilingGeneration, false});
     }
   }
   // Copy pending identities before desktop queries, which can deliver lifecycle events.
+  std::vector<LimitOccupant> pendingWindows;
   for (const auto& pending : g_wm.routing.pending) {
     const auto& request = pending.second;
     if (request.visibleGeneration && IsEqualGUID(request.sourceDesktop, key.desktopId)) {
-      visibleMembers.push_back({pending.first, request.processId, request.visibleGeneration, true});
+      pendingWindows.push_back({pending.first, request.processId, request.visibleGeneration, true});
     }
   }
-  std::sort(visibleMembers.begin(), visibleMembers.end(),
-            [](const VisibleMember& first, const VisibleMember& second) {
+  for (const LimitOccupant& candidate : pendingWindows) {
+    if (!Platform::VirtualDesktop::IsWindowOnDesktop(candidate.hwnd, key.desktopId)) continue;
+    if (!Platform::Windows::IsSameLiveWindow(candidate.hwnd, candidate.processId) ||
+        Platform::Windows::IsWindowTrackedInAnyState(candidate.hwnd) || Platform::Windows::IsWindowCloaked(candidate.hwnd) ||
+        Platform::Windows::GetPhysicalSuspensionReason(candidate.hwnd) != SuspensionReason::Maximized ||
+        Platform::Windows::GetWindowPhysicalMonitor(candidate.hwnd) != monitor ||
+        Platform::Windows::ShouldWindowStartFloating(candidate.hwnd)) continue;
+    // Recheck after the queries above: the request may have been replaced meanwhile.
+    const auto pending = g_wm.routing.pending.find(candidate.hwnd);
+    if (pending == g_wm.routing.pending.end() || pending->second.processId != candidate.processId ||
+        pending->second.visibleGeneration != candidate.generation) continue;
+    occupants.push_back(candidate);
+  }
+  std::sort(occupants.begin(), occupants.end(),
+            [](const LimitOccupant& first, const LimitOccupant& second) {
               return first.generation < second.generation;
             });
-  for (const VisibleMember& member : visibleMembers) {
-    if (member.awaitingInitialPlacement) {
-      if (!Platform::VirtualDesktop::IsWindowOnDesktop(member.hwnd, key.desktopId)) continue;
-      if (!Platform::Windows::IsSameLiveWindow(member.hwnd, member.processId) ||
-          Platform::Windows::IsWindowTrackedInAnyState(member.hwnd) || Platform::Windows::IsWindowCloaked(member.hwnd) ||
-          Platform::Windows::GetPhysicalSuspensionReason(member.hwnd) != SuspensionReason::Maximized ||
-          Platform::Windows::GetWindowPhysicalMonitor(member.hwnd) != monitor || Platform::Windows::ShouldWindowStartFloating(member.hwnd)) continue;
-      const auto pending = g_wm.routing.pending.find(member.hwnd);
-      if (pending == g_wm.routing.pending.end() || pending->second.processId != member.processId ||
-          pending->second.visibleGeneration != member.generation) continue;
-      // Reserve its place in arrival order. Restoration still performs initial placement.
+  return occupants;
+}
+
+// Counts visible arrivals in generation order, including maximized members
+// awaiting initial placement, and releases excess slots through overflow policy.
+// WM thread only; the caller saves the resulting workspace before routing it.
+static void EnforceAutomaticWindowLimit(
+    const DesktopMonitorKey& key, Workspace& workspace, HMONITOR monitor) {
+  if (!RuntimeLifecycle::IsAutomaticMode() || workspace.Layout() == TileLayout::Floating) return;
+  const size_t limit = AutomaticWindowLimitForMonitor(key.monitor);
+  if (!limit) return;
+  size_t retainedSlots = 0;
+  for (const LimitOccupant& occupant : CollectAutomaticLimitOccupants(key, workspace, monitor)) {
+    // A reserved place counts; restoration still performs initial placement.
+    if (occupant.reservedForInitialPlacement) {
       ++retainedSlots;
       continue;
     }
     const bool exceedsLimit = retainedSlots >= limit;
     ++retainedSlots;
     // Visible maximized members count, but are not restored just to move them.
-    if (exceedsLimit && !Gestures::IsMoveSizeGestureInProgress(member.hwnd) &&
-        FloatAutomaticOverflowWindow(key, workspace, member.hwnd, L"count limit")) {
+    if (exceedsLimit && !Gestures::IsMoveSizeGestureInProgress(occupant.hwnd) &&
+        FloatAutomaticOverflowWindow(key, workspace, occupant.hwnd, L"count limit")) {
       --retainedSlots;
     }
   }
+}
+
+// True when Automatic admission of one more window into `workspace` would
+// overflow its limit: the newest arrival is the one released. Same counting as
+// EnforceAutomaticWindowLimit. Native queries; WM thread.
+static bool WouldExceedAutomaticWindowLimit(
+    const DesktopMonitorKey& key, const Workspace& workspace, HMONITOR monitor) {
+  if (workspace.Layout() == TileLayout::Floating) return false;
+  const size_t limit = AutomaticWindowLimitForMonitor(key.monitor);
+  return limit && CollectAutomaticLimitOccupants(key, workspace, monitor).size() >= limit;
 }
 
 // References stay valid for the enclosing ArrangeWorkspace call and are never

@@ -12,6 +12,13 @@ struct HintInputs {
   uint32_t flags = 0;
   bool tracked = false;  // MultiWM already has a record for the window.
   std::optional<CompanionAbi::WorkspaceHint> workspace;  // The workspace on the window's monitor.
+  // Where MultiWM will tile the window once restored (visible frame). Absent
+  // when MultiWM can't tell, or the window isn't a suspended member.
+  std::optional<RECT> restoreFrame;
+  // The window's resize borders as MultiWM measured them while it was restored,
+  // with the DPI they belong to. Absent when MultiWM never measured them.
+  std::optional<RECT> restoreFrameMargins;
+  uint32_t restoreMarginsDpi = 0;
   std::shared_ptr<const std::vector<CompanionAbi::SnapshotRule>> rules;
 };
 
@@ -25,8 +32,13 @@ struct SnapshotReader {
   // Opening is retried no sooner than this (GetTickCount64), so a process
   // showing many windows while MultiWM is off doesn't retry each time.
   ULONGLONG nextOpenAttempt = 0;
-  // A consistent copy of the body; reused to keep 40 KB off application stacks.
+  // A consistent copy of the body; reused to keep the snapshot off app stacks.
   std::unique_ptr<CompanionAbi::SnapshotBody> body;
+  // Which publish `body` holds. While MultiWM's generation and process ID still
+  // match, a check reuses the copy instead of copying the whole body again.
+  bool bodyCurrent = false;
+  uint64_t bodyGeneration = 0;
+  uint32_t bodyWriterPid = 0;
   // Decoded rules and the bytes they came from; decoded again only on change.
   std::vector<uint8_t> rulesBytes;
   std::shared_ptr<const std::vector<CompanionAbi::SnapshotRule>> rules;
@@ -81,6 +93,37 @@ static void RefreshRulesLocked(const CompanionAbi::SnapshotBody& body) {
   g_reader.rules = CompanionAbi::DeserializeRules(body.rules, size, decoded.get()) ? decoded : nullptr;
 }
 
+// Brings the cached body up to date with the published one. Most checks find it
+// current and skip both the body copy and the rules comparison; only a new
+// publish costs a full copy. Returns false, with no usable body, for an unknown
+// ABI or a writer that stayed busy. Caller holds the lock exclusively.
+static bool RefreshBodyLocked() {
+  const CompanionAbi::SnapshotSection* section = g_reader.view;
+  if (section->magic != CompanionAbi::kMagic || section->abiMajor != CompanionAbi::kAbiMajor) {
+    g_reader.bodyCurrent = false;
+    return false;
+  }
+  uint64_t generation = 0;
+  uint32_t writerPid = 0;
+  if (g_reader.bodyCurrent && CompanionAbi::ReadConsistentGeneration(section, &generation, &writerPid) &&
+      generation == g_reader.bodyGeneration && writerPid == g_reader.bodyWriterPid) {
+    return true;
+  }
+  if (!CompanionAbi::ReadConsistentBody(section, g_reader.body.get())) {
+    g_reader.bodyCurrent = false;
+    return false;
+  }
+  RefreshRulesLocked(*g_reader.body);
+  // Remember which publish this copy is. If another write landed in between,
+  // use the copy for this check but don't trust it for the next one.
+  const uint64_t copied = g_reader.body->generation;
+  g_reader.bodyCurrent = CompanionAbi::ReadConsistentGeneration(section, &generation, &writerPid) &&
+                         generation == copied;
+  g_reader.bodyGeneration = copied;
+  g_reader.bodyWriterPid = writerPid;
+  return true;
+}
+
 static bool IsTrackedIn(const CompanionAbi::SnapshotBody& body, HWND hwnd) {
   const uint32_t value = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
   const uint32_t count = std::min(body.trackedCount, CompanionAbi::kMaxTrackedWindows);
@@ -92,23 +135,35 @@ static bool IsTrackedIn(const CompanionAbi::SnapshotBody& body, HWND hwnd) {
 // running, an unknown ABI, or a writer that stayed busy.
 static bool ReadHintInputs(HWND hwnd, const RECT& monitorRect, HintInputs* out) {
   AcquireSRWLockExclusive(&g_reader.lock);
-  bool ok = !g_reader.unloading && EnsureMappedLocked() && IsMultiWmRunning();
-  if (ok) {
-    const CompanionAbi::SnapshotSection* section = g_reader.view;
-    ok = section->magic == CompanionAbi::kMagic && section->abiMajor == CompanionAbi::kAbiMajor &&
-         CompanionAbi::ReadConsistentBody(section, g_reader.body.get());
-  }
+  const bool ok = !g_reader.unloading && EnsureMappedLocked() && IsMultiWmRunning() && RefreshBodyLocked();
   if (ok) {
     const CompanionAbi::SnapshotBody& body = *g_reader.body;
-    RefreshRulesLocked(body);
     out->flags = body.flags;
     out->tracked = IsTrackedIn(body, hwnd);
     out->rules = g_reader.rules;
     out->workspace.reset();
+    out->restoreFrame.reset();
+    out->restoreFrameMargins.reset();
+    out->restoreMarginsDpi = 0;
     const uint32_t count = std::min(body.workspaceCount, CompanionAbi::kMaxWorkspaces);
     for (uint32_t i = 0; i < count; ++i) {
       if (EqualRect(&body.workspaces[i].monitorRect, &monitorRect)) {
         out->workspace = body.workspaces[i];
+        break;
+      }
+    }
+    const uint32_t restoreCount = std::min(body.restoreWindowCount, CompanionAbi::kMaxRestoreWindows);
+    const uint32_t windowValue = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
+    for (uint32_t i = 0; i < restoreCount; ++i) {
+      const auto& restore = body.restoreWindows[i];
+      if (restore.hwnd == windowValue && restore.processId == GetCurrentProcessId() &&
+          restore.workspaceIndex < count) {
+        out->workspace = body.workspaces[restore.workspaceIndex];
+        if (restore.hasFrame) out->restoreFrame = restore.frame;
+        if (restore.marginsDpi) {
+          out->restoreFrameMargins = restore.frameMargins;
+          out->restoreMarginsDpi = restore.marginsDpi;
+        }
         break;
       }
     }
@@ -126,6 +181,7 @@ static void CloseSnapshotReader() {
   if (g_reader.section) CloseHandle(g_reader.section);
   g_reader.section = nullptr;
   g_reader.body.reset();
+  g_reader.bodyCurrent = false;
   g_reader.rules.reset();
   ReleaseSRWLockExclusive(&g_reader.lock);
 }

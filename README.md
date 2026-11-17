@@ -45,7 +45,7 @@ src/
     app/          settings loading, tray UI, diagnostics, WM thread lifecycle
     windhawk/     Windhawk's standard tool-mod launcher
   companion/      MultiWM Companion entry point, snapshot reader and show hooks
-  shared/         code both mods compile: rule matching, companion snapshot layout
+  shared/         rule matching, companion snapshot layout, geometry and size limits
 tests/            regression suites (run with tests/run.ps1)
 ```
 
@@ -68,6 +68,29 @@ moving windows through the logical order (Alt+, / .), floating a window (Alt+F),
 and Manual management (Alt+R).
 
 A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
+
+## Optional MultiWM Companion
+
+[MultiWM Companion](src/companion/multiwm-companion.cpp) is a separate mod that
+reduces opening and restoration jumps in Automatic mode. It reads MultiWM's
+published rectangles, including your gap and insets, and prepares a window
+before supported show/restore operations. In Manual mode it passes calls through.
+
+Restore hints use the window's saved slot and weights, cached size limits, and
+measured resize borders. New windows also respect live minimum/maximum sizes
+and DPI scaling. Definite local overflow floats can be centred early; general
+geometry-based overflow and routing to another monitor can still need correction.
+Both mods must use snapshot ABI major 4; ABI 4.0 and 4.1 interoperate, with the new
+overflow hints available only when both sides support 4.1.
+
+Build the companion separately; WHAM produces
+`output/companion/multiwm-companion.wh.cpp`. The companion requires a running
+MultiWM and does not replace its membership, layout or conformance handling.
+
+For runtime measurements, configure **Write Diagnostic Report** in the hotkey
+settings and use the shortcut. Reports include companion ABI/liveness state and
+rebuild costs. See [the plan](docs/VFX_COMPANION_PLAN.md) for known limitations
+and the remaining live-check checklist.
 
 
 ## Also check out

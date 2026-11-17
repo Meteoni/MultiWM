@@ -1,6 +1,6 @@
 param(
   [string]$CompilerRoot,
-  [ValidateSet('all', 'layout', 'reconciliation', 'companion')][string]$Suite = 'all'
+  [ValidateSet('all', 'layout', 'reconciliation', 'companion', 'restore')][string]$Suite = 'all'
 )
 $ErrorActionPreference = 'Stop'
 
@@ -18,7 +18,11 @@ if (-not (Test-Path -LiteralPath $compilerPath) -or -not (Test-Path -LiteralPath
 $repository = Split-Path -Parent $PSScriptRoot
 $buildDirectory = Join-Path $repository 'output/tests'
 New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
-$suites = if ($Suite -eq 'all') { @('layout', 'reconciliation', 'companion') } else { @($Suite) }
+$isolatedRunner = Join-Path $buildDirectory 'isolated_runner.exe'
+& $compilerPath '-std=c++23' '-target' 'x86_64-w64-mingw32' '-D_WIN32_WINNT=0x0A00' `
+  '-municode' '-static' (Join-Path $PSScriptRoot 'isolated_runner.cpp') '-o' $isolatedRunner
+if ($LASTEXITCODE -ne 0) { throw 'Compilation failed: isolated test runner' }
+$suites = if ($Suite -eq 'all') { @('layout', 'reconciliation', 'companion', 'restore') } else { @($Suite) }
 foreach ($name in $suites) {
   $source = Join-Path $PSScriptRoot ($name + '_tests.cpp')
   $executable = Join-Path $buildDirectory ($name + '_tests.exe')
@@ -31,6 +35,6 @@ foreach ($name in $suites) {
   )
   & $compilerPath @compilerArguments
   if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $name" }
-  & $executable
+  & $isolatedRunner $executable
   if ($LASTEXITCODE -ne 0) { throw "Regression failed: $name" }
 }

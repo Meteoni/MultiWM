@@ -164,8 +164,8 @@ static RouteStep MoveToRouteMonitor(
       !Platform::Monitors::GetWorkspaceWorkArea(route.targetMonitor, &workArea)) {
     return RouteStep::Abandon;
   }
-  const RECT target = Placement::CenteredRect(
-      Placement::RectCenter(workArea), Layout::RectWidth(*sourceFrame), Layout::RectHeight(*sourceFrame));
+  const RECT target = SharedGeometry::CenteredIn(
+      workArea, Layout::RectWidth(*sourceFrame), Layout::RectHeight(*sourceFrame));
   const auto placed = Platform::Windows::PlaceWindowChecked(hwnd, true, target, true);
   if (placed.result == PlacementResult::SuppressedByPhysicalState) return RouteStep::Retry;
   AddUniqueMonitor(monitors, Platform::Windows::GetWindowPhysicalMonitor(hwnd));
@@ -537,6 +537,14 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
   if (record.constraints.dpi != metrics.dpi) {
     record.constraints.minWidth = std::max<LONG>(1, MulDiv(record.constraints.minWidth, metrics.dpi, record.constraints.dpi));
     record.constraints.minHeight = std::max<LONG>(1, MulDiv(record.constraints.minHeight, metrics.dpi, record.constraints.dpi));
+    if (record.constraints.maxWidth) {
+      record.constraints.maxWidth = std::max<LONG>(
+          record.constraints.minWidth, MulDiv(record.constraints.maxWidth, metrics.dpi, record.constraints.dpi));
+    }
+    if (record.constraints.maxHeight) {
+      record.constraints.maxHeight = std::max<LONG>(
+          record.constraints.minHeight, MulDiv(record.constraints.maxHeight, metrics.dpi, record.constraints.dpi));
+    }
     record.constraints.dpi = metrics.dpi;
   }
   const HWND anchor = g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused

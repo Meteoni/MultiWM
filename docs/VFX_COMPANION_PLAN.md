@@ -1,401 +1,231 @@
-# MultiWM VFX companion: plan
-
-Status: the move/size part (Parts A and B) is implemented as a first version;
-borders and animation are not. Decisions made while building it, which override
-the text below where they differ:
-
-- **File layout.** WHAM builds each `.cpp` under `src/` as its own mod: the
-  companion is `src/companion/multiwm-companion.cpp` with chapters in `src/companion/`.
-  Shared code is in `src/shared/`.
-- **No tool process yet.** Without borders, the companion is only the part
-  injected into apps. The change event and the border list are left for Part C.
-- **No polling.** MultiWM republishes when a workspace is saved, the mode or
-  desktop changes, or the tray window reports a display, DPI or work-area change.
-- **One-shot, no per-window state.** One decision when a window goes from hidden to
-  shown. Windows MultiWM already knows are skipped through the snapshot's tracked
-  list, so no window tagging is needed. The "re-apply" idea in B4 is dropped.
-- **Frame bounds before show (risk 1).** Use `DWMWA_EXTENDED_FRAME_BOUNDS` when
-  available, otherwise use the window rectangle. Live app testing is still needed
-  for hidden-window frame margins and mixed-DPI moves.
-- **Window size limits (B3 step 6).** Query `WM_GETMINMAXINFO` on the window's
-  owning thread and clamp the hinted size to its limits, preserving the predicted
-  origin. MultiWM may refine the layout afterward. Reentrant shows pass through;
-  if the query changes or destroys the window, abandon the hint.
-- **Show calls.** `SetWindowPos`, `DeferWindowPos` and `SetWindowPlacement` predict from the app's
-  proposed geometry, then adjust that original call. No preliminary move or hide
-  is performed, and an unavailable hint leaves the call unchanged.
-- **Additional paths.** Hook `NtUserShowWindowAsync` separately and adjust
-  `DeferWindowPos` arguments without committing its batch. Classify `SW_RESTORE`
-  and resolve explicit `SW_SHOWDEFAULT` from startup information. A process-local
-  import probe on Windows confirmed that asynchronous and deferred shows bypass
-  the original native show/position hooks, while `AnimateWindow` reaches the
-  position hook with `SWP_SHOWWINDOW` while still hidden. No animation hook is needed
-  on that build. Visible creation still cannot guarantee placement before app code
-  paints during creation.
-- **Same thread only.** The companion only moves a window when the calling thread
-  owns it.
-
-## Goals
-
-1. **No first jump.** A window that MultiWM will manage opens directly at the
-   rect MultiWM would give it: the next tiled slot, or the default floating rect.
-2. **Custom borders** on managed windows, drawn by a separate process.
-3. **Open animations** that land on the window's real destination, either through
-   [Mobile Open Animation](../output/mobile-open-animation.wh.cpp) (MOA) or the
-   companion's own implementation later.
-
-## Non-goals
-
-- Repairing other windows immediately. They reflow on MultiWM's normal schedule
-  (`ReconcileDelayMs` after the new window is admitted).
-- Any communication from the companion back to MultiWM.
-- Animating MultiWM's own tiling moves (swaps, layout changes).
-
-## Principles
-
-- **MultiWM stays the authority.** The companion only places a window *before*
-  MultiWM sees it. If the hint is wrong, MultiWM corrects the window exactly as it
-  does today, so a bad hint costs at most one jump, the same as having no companion.
-- **One-way data flow.** MultiWM writes a snapshot; the companion reads it. MultiWM
-  never reads anything the companion writes.
-- **MultiWM's cloak handling stays as it is.** "Cloaked means not visible yet, wait"
-  is correct. Because the window is already at its destination when it is revealed,
-  admitting it is a no-op placement
-  ([`PlaceWindowChecked`](../src/multiwm/platform/native_windows.h#L670-L673) finds it in
-  place).
-- **The code inside apps stays minimal.** It runs in every process and a crash takes
-  the app down.
-
-## Architecture
-
-```
-MultiWM (tool process, WM thread)
-  │  writes after each model change / arrange / focus / desktop / mode change
-  ▼
-Shared memory "Local\MultiWM.Vfx.v1"        (read-only for everyone else)
-Named event   "Local\MultiWM.Vfx.v1.Changed" (signalled after each write)
-  │                                   │
-  ▼                                   ▼
-Companion, injected part (@include *)   Companion, tool part (UI-access host)
-  reads at show time; places the window   waits on the event; draws borders
-  before it is shown; later, animation
-```
-
-Both halves of the companion are one Windhawk mod, split by command line the way
-[Window Centralizer](../example_mod.wh.cpp) splits its hooks from its host process,
-using the tool-mod launcher pattern.
-
----
-
-## Part A: MultiWM changes
-
-### A1. Shareable window-rule header
-
-Make the rule matcher pure so both mods compile the same code.
-
-- New chapter, e.g. `src/multiwm/core/window_rules.h`, with no `g_settings`, `g_wm`,
-  `Wh_*` or Win32 calls:
-  - `struct WindowFacts { std::wstring process, className, title; DWORD style, exStyle; bool hasOwner, isRoot; }`
-  - `struct RuleSet { std::vector<WindowRule> rules; }`
-  - `const WindowRule* MatchRule(const RuleSet&, const WindowFacts&, WindowRuleTreatment)`
-  - `bool IsStructurallyManageable(const WindowFacts&, ...)`: the pure part of
-    [`WindowCanBeManaged`](../src/multiwm/platform/native_windows.h#L540), including
-    `kIgnoredWindowClasses`.
-  - `SerializeRules(const RuleSet&, uint8_t* out, size_t cap)` / `DeserializeRules(...)`.
-- [`FindMatchingWindowRule`](../src/multiwm/platform/native_windows.h#L444) becomes a thin
-  wrapper: gather `WindowFacts` lazily (keep the current lazy process-name lookup),
-  then call `MatchRule`.
-- The companion fills `WindowFacts` cheaply inside the app (process name from
-  `GetModuleFileName`).
-- How both WHAM projects include one file: see Open questions.
-
-### A2. Next-slot prediction
-
-New function in `layout/` (pure, no Win32):
-
-```cpp
-struct NextSlotPrediction {
-  bool tiledValid = false;   RECT tiledFrame{};     // visible frame, physical px
-  bool floatingValid = false; RECT floatingFrame{}; // Floating-layout default
-};
-NextSlotPrediction PredictNextAdmission(const Workspace&, const RECT& workArea,
-                                        LONG gap, UINT dpi);
-```
-
-- **Tiled layouts:** take a copy of the workspace (`Load` already returns one),
-  admit a placeholder record the same way
-  [`AdmitUntrackedSnapshot`](../src/multiwm/reconcile/reconcile.h#L232) would (`AdmitTiled`,
-  or `AdmitTiledAfter(LastFocusedTiledWindow())` when `after_focused` is set), run
-  [`BuildWorkspaceLayoutPlan`](../src/multiwm/layout/planning.h#L221), and take the
-  placeholder's rect. The placeholder has no constraints (`valid = false`), so
-  adaptive Dwindle plans as if the new window fits. The companion checks that
-  (see B3).
-  - The placeholder needs a value that can never be a real HWND. Confirm `Workspace`
-    methods do nothing native with it.
-- **Floating layout:** `FloatingDefaultSize` scaled by `dpi` and centered in the
-  work area, clamped like
-  [`RepairFloatingGeometry`](../src/multiwm/placement/floating.h#L72) with
-  `NewWindowCenter`. Size-override rules are applied by the companion through A1.
-- **No prediction (both invalid)** when:
-  - Manual mode is on
-  - the workspace is at its overflow limit (the overflow action is not predicted in v1)
-  - the layout is Monocle with a constraint failure (Monocle is otherwise trivial:
-    the work area)
-- **Tests** (`tests/reconciliation_tests.cpp`): for each layout × {last_slot,
-  after_focused} × {0..5 existing windows}, the predicted rect equals the rect the
-  real admission and arrange produce for a fake window with no constraints. This
-  test is what keeps the prediction honest as the planner changes.
-
-### A3. Snapshot publisher
-
-New chapter, e.g. `src/multiwm/app/vfx_snapshot.h` (or `platform/`, since it is a native
-object).
-
-Layout: fixed size, plain data, little-endian, append-only:
-
-```cpp
-struct VfxHeader {
-  uint32_t magic;            // 'MWFX'
-  uint16_t abiMajor, abiMinor;
-  uint32_t totalSize;
-  uint32_t writerPid;        // lets readers detect a restarted MultiWM
-  volatile LONG seq;         // seqlock: odd while writing
-  uint32_t flags;            // Running | AutomaticMode
-  uint64_t generation;       // bumps on every publish
-  GUID     currentDesktop;
-  uint32_t workspaceCount;   VfxWorkspace workspaces[16];   // current desktop only
-  uint32_t borderCount;      VfxBorder    borders[512];
-  uint32_t rulesBytes;       uint8_t      rules[32768];     // A1 serialization
-};
-struct VfxWorkspace {
-  RECT monitorRect;          // readers match by rect, not HMONITOR
-  RECT workArea;             // what MultiWM plans in (insets applied)
-  uint32_t dpi;
-  uint8_t  layout;           // TileLayout
-  uint8_t  tiledValid, floatingValid, reserved;
-  RECT tiledFrame, floatingFrame;
-};
-struct VfxBorder {
-  uint64_t hwnd;
-  uint8_t  kind;             // Tiled | Floating
-  uint8_t  focused;
-  uint16_t reserved;
-};
-```
-
-- **Seqlock write:** `InterlockedIncrement(seq)` (odd), write, `InterlockedIncrement(seq)`
-  (even), then `SetEvent(changed)`. Writes happen on the WM thread only.
-- **When it publishes:** after `ArrangeWorkspace`, after the focus anchor changes,
-  after a desktop switch is reconciled, after a mode toggle and after a settings
-  load. Merge bursts into one write per message-loop turn.
-- **Lifetime:** create the section and the event once per process (next to
-  `Diagnostics::InitializeProcessRuntime`), not per WM thread.
-  `WhTool_ModSettingsChanged` restarts the WM thread, so clear `Running` while it
-  is stopped. On uninit, clear `Running`, publish once, then close.
-- **Security:** readable by every integrity level and by AppContainer apps; writable
-  by MultiWM only. Draft SDDL: `D:(A;;GA;;;OW)(A;;GR;;;WD)(A;;GR;;;AC)S:(ML;;NW;;;LW)`.
-  Verify AppContainer access (see Risks).
-- **Diagnostics:** add counters for publishes and torn-read-free generations, and
-  put the current generation in the diagnostic report.
-
-### A4. Optional: more accurate desktop-switch hint
-
-In [`OnLifecycleEvent`](../src/multiwm/platform/window_events.h#L171), set
-`TransitionPending` on `EVENT_OBJECT_CLOAKED` only when the window's cloak flags
-include `DWM_CLOAKED_SHELL`. This only cuts extra Explorer queries when apps or
-animation mods cloak windows. Uncloak events can't be classified, because the flags
-are already clear when they arrive, so leave those alone. Independent of the
-companion; do it whenever convenient.
-
----
-
-## Part B: companion, injected part (`@include *`)
-
-### B1. Hooks
-
-Use the show paths MOA and Window Centralizer both found necessary:
-
-- `ShowWindow` (or `NtUserShowWindow`), `ShowWindowAsync`
-- `SetWindowPos` with `SWP_SHOWWINDOW`
-- `SetWindowPlacement`
-- `CreateWindowExW` / `CreateWindowExA` with `WS_VISIBLE`
-
-Process exclusions: start from MOA's `@exclude` list (shell hosts,
-`msedgewebview2.exe`, ...).
-
-### B2. Reading the snapshot
-
-- Open the section lazily on the first candidate show, then cache it. Reopen if
-  `writerPid` changed or `magic` / `abiMajor` don't match. If it can't be opened,
-  do nothing.
-- Seqlock read: read `seq`; if odd, retry; copy the parts you need; read `seq`
-  again; if it changed, retry. After 4 attempts, skip the hint.
-- Never block, wait or call MultiWM.
-
-### B3. Deciding the hint
-
-All of the following must hold, otherwise do nothing:
-
-1. `Running` and `AutomaticMode` are set.
-2. The window passes `IsStructurallyManageable` (A1), is not shown maximized or
-   minimized, and has no Exclude rule.
-3. No Open-on-monitor/desktop rule matches. MultiWM will route the window
-   elsewhere anyway.
-4. Its proposed rect's monitor (`MonitorFromRect`, compared by `rcMonitor`) matches
-   a snapshot workspace.
-5. Target rect:
-   - Always-floating or Default-to-floating rule: the window's own size centered in
-     `workArea`, matching `CenterPreservingSize`.
-   - Workspace layout is Floating: `floatingFrame`, or the size-override rule's size
-     scaled by `dpi`.
-   - Otherwise `tiledFrame`, if valid.
-6. The target is at least the window's minimum track size (`WM_GETMINMAXINFO`).
-   Otherwise MultiWM's adaptive fitting would pick a different rect, so skip.
-
-### B4. Placing the window
-
-- The hint is a **visible frame** rect; `SetWindowPos` needs the window rect,
-  including invisible resize borders.
-  - **Before show:** estimate the borders. For `WS_THICKFRAME` windows, left, right
-    and bottom are `SM_CXSIZEFRAME + SM_CXPADDEDBORDER` at the window's DPI, and top
-    is 0. Custom-frame apps (Chromium, Electron) usually have none.
-  - **Right after the original show returns,** before the app pumps its first
-    paint: read `DWMWA_EXTENDED_FRAME_BOUNDS` and correct the position if the
-    estimate was off.
-- Call `SetWindowPos` with `SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER`,
-  with the thread's DPI awareness temporarily set to
-  `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`, because the snapshot is in physical
-  pixels.
-- Guard against recursion: a thread-local flag around the companion's own calls.
-- v2, optional: apps that restore a saved position right after showing override the
-  hint. Re-apply it for a short time, like Window Centralizer's `RecentCenter`
-  ([example_mod.wh.cpp:861-876](../example_mod.wh.cpp#L861-L876)).
-
-### B5. Working with MOA
-
-No extra work for the splash path. MOA reads the window's rect when it starts, and
-its in-process `SetWindowPos` hook retargets the panel if the window moves during
-the zoom
-([lines 3546-3571](../output/mobile-open-animation.wh.cpp#L3546-L3571)). Since the
-companion's move runs inside the same process, hook order doesn't matter.
-
----
-
-## Part C: companion, tool part (borders)
-
-### C1. v1: DWM border color
-
-- On each change event: diff the border list, then call
-  `DwmSetWindowAttribute(DWMWA_BORDER_COLOR)` with the color for each window's
-  kind and focus state.
-- Restore `DWMWA_COLOR_DEFAULT` when a window leaves the list and for every window
-  on unload.
-- Windows 11 only, 1 px, color only. No overlay windows, no position tracking.
-
-### C2. v2: overlay borders (PowerToys Always on Top style)
-
-- One click-through overlay per bordered window:
-  `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`, not
-  owned by the target.
-- Read the geometry from `DWMWA_EXTENDED_FRAME_BOUNDS` and respect
-  `DWMWA_WINDOW_CORNER_PREFERENCE` for rounding.
-- Track movement with an out-of-context `EVENT_OBJECT_LOCATIONCHANGE` hook, filtered
-  to the border set. Keep z-order with
-  `SetWindowPos(overlay, GetWindow(target, GW_HWNDPREV))` on foreground and
-  location changes.
-- Hide the overlay while its window is minimized, maximized or cloaked.
-- Expect slight lag during drags, as in PowerToys.
-
-Animations: a window being animated is cloaked, so MultiWM hasn't admitted it and
-it isn't in the border list yet. Its border appears after the reveal with no extra
-logic.
-
----
-
-## Part D: companion animation (optional, after B and C)
-
-Prefer recommending MOA (splash on) first. If the companion gets its own animation:
-
-- Follow MOA's splash path:
-  - cloak the window at show time (only if it isn't already cloaked)
-  - an opaque panel with the app icon zooms to the **hinted** rect
-  - wait until the window has painted (with a timeout)
-  - uncloak the window under the panel, then fade the panel out
-- Don't implement MOA's real-window fallback (`WS_EX_LAYERED` plus resizing the real
-  window every frame). MultiWM admits that window mid-animation and the conformance
-  lease fights it.
-- Rules for code running inside apps:
-  - a dedicated animation thread with its own message loop
-  - a panel not owned by the target window
-  - the thread's DPI awareness set to match the window's
-  - a guard against the companion's own hooks
-  - wall-clock limits on every wait
-  - on unload: uncloak, destroy, join, unregister
-- Set `DWMWA_TRANSITIONS_FORCEDISABLED` on the window during the animation so
-  Windows' own open animation doesn't play as well.
-
----
-
-## Phases
-
-| Phase | Scope | Done when |
-|---|---|---|
-| 1 | A1, A2, A3 in MultiWM | Prediction parity tests pass; a small reader tool dumps the snapshot correctly as layouts, focus and desktops change |
-| 2 | B1-B5 | A manual test pass (below) shows no first jump in tiled and Floating layouts, with and without MOA |
-| 3 | C1 | Borders follow focus and state; all colors restored on unload |
-| 4 | C2 (if C1 is not enough) | Overlay tracks moves, z-order and state without flicker |
-| 5 | D (optional) | Same test pass with the companion's own animation and MOA disabled |
-| any | A4 | Fewer `TransitionPending` entries in diagnostics during animated opens |
-
-## Manual test matrix
-
-- **Apps:**
-  - Notepad / classic Win32
-  - Explorer
-  - Chromium or Electron (custom frame, DirectComposition)
-  - a WPF app
-  - an elevated app (regedit)
-  - a DPI-unaware app (an old installer)
-  - an app that restores its saved position
-- **Layouts:** Master + Stack (V and H), Dwindle (normal and reversed), Columns,
-  Rows, Monocle, Floating.
-- **Insertion modes:** `last_slot` and `after_focused`.
-- **States:** Manual mode, overflow limit reached, Default-to-floating and
-  Always-floating rules, an Open-on-monitor rule.
-- **Monitors:** two monitors with different DPI and the taskbar on a non-bottom edge.
-- **Other mods:** MOA with splash on and with splash off (the conflict is known),
-  and Window Centralizer (expected to conflict; see Compatibility).
-
-## Compatibility
-
-| Mod | Status |
-|---|---|
-| Mobile Open Animation, splash on | Works (B5) |
-| Mobile Open Animation, splash off | Conflicts: it resizes the real window while MultiWM manages it. Document: keep its splash on |
-| Window Centralizer | Conflicts: both move windows before show. Document as incompatible |
-| FancyZones and similar | Conflicts with MultiWM already; no change |
-
-## Risks to verify early (spikes)
-
-1. **Frame bounds before show:** what `DWMWA_EXTENDED_FRAME_BOUNDS` returns for a
-   window that hasn't been shown yet, and whether the after-show correction in B4 is
-   invisible.
-2. **`DWMWA_BORDER_COLOR` from another process:** confirm it works on other
-   processes' windows, including elevated ones from the UI-access host.
-3. **AppContainer apps:** whether they can open a `Local\` section created by
-   MultiWM given the SDDL above. If not, they simply get no hints.
-4. **Placeholder admission:** that `Workspace` admission with a sentinel HWND stays
-   purely in the model.
-5. **Hook chaining:** with MOA and the companion both hooking `ShowWindow`, check
-   both orders on a real install.
-
-## Open questions for review
-
-1. **Where the shared header lives:** a third folder both WHAM configs include,
-   a git submodule, or a copy with a version constant checked at runtime (the
-   companion compares the serialized rules' version anyway).
-2. **Should Overflow → Float get a floating hint in v1,** or no hint (current plan)?
-3. **Should snapshot publishing be a MultiWM setting** (default on), or always on?
-   It's cheap and has no visible effect without the companion.
-4. **Borders v1:** is DWM color enough, or start straight with overlays?
-5. **Animation:** recommend MOA, or plan for the companion's own (Part D)?
+# MultiWM companion: implementation and remaining work
+
+Release preparation: MultiWM 1.14.0 and Companion 0.2.0, snapshot ABI 4.1.
+Placement hints and diagnostics are implemented. Borders and animations remain
+future work. Source versions are updated; installation and the live checks
+below are separate steps.
+
+## Current implementation
+
+- **Separate mods.** MultiWM runs in its tool process and owns membership,
+  layouts, routing and conformance. The companion runs inside applications,
+  including Explorer where permitted by Windhawk's process configuration.
+- **One-way snapshot.** MultiWM publishes current-desktop workspaces, admission
+  frames, known HWNDs, rules and per-window restore frames. Readers map the
+  section read-only and never send placement requests back to MultiWM.
+- **Event-driven publication.** Between messages, repository revisions, mode,
+  desktop, display and effective routing changes trigger a rebuild. Identical
+  contents skip the write. There is no background minimized-window seeding.
+- **ABI 4.1.** The section is `Local\MultiWM.Companion.Snapshot.v4`; the
+  liveness event is `Local\MultiWM.Companion.Alive.v4`. Event presence identifies
+  a running MultiWM; it is not a change-notification event. A seqlock protects
+  writes. Limits are 16 workspaces, 2048 tracked HWNDs, 128 restore hints and
+  32 KiB of serialized rules. Layout assertions cover x86 and x64.
+- **Reader cache.** The companion refreshes its body when generation or writer
+  PID changes, and decodes rules only when their bytes change. Major-version
+  mismatches and incomplete required data give no hint.
+- **Automatic mode only.** Opening and restore hints require Automatic mode.
+  Manual-mode calls pass through. MultiWM itself retains its existing Manual
+  group policy; the companion does not admit or restore group membership.
+- **Owning thread only.** Native preparation and size-limit queries occur on
+  the window's own thread. Cross-thread calls pass through without synchronous
+  foreign-window preparation. Nested shows during preparation also pass through.
+- **Admission frames.** MultiWM runs its real admission and layout planner on a
+  workspace copy. Frames include configured gap and insets, scaled to the
+  monitor's physical DPI. Windows known to MultiWM are skipped by admission hints.
+- **Live limits.** The companion asks `WM_GETMINMAXINFO`, then converts the reply
+  from the window's DPI units to physical visible-frame sizes. Both mods centre
+  capped windows within their cells. System-default maxima mean no explicit cap.
+  Window destruction or geometry/state changes during the query abandon the hint.
+- **Shared arithmetic.** `src/shared/geometry.h` owns conversion, centring,
+  clamping, DIP scaling, fullscreen bounds and maximum-size centring. Native
+  queries and callback safeguards stay in their respective mods. The layout
+  solver remains in MultiWM.
+- **Exact restore planning.** For each suspended member, MultiWM calls
+  `Restore(hwnd)` on a workspace copy and plans it with cached size limits.
+  The published frame accounts for saved position, weight, Dwindle ratio and
+  master status. An unsatisfiable plan has no frame. Constraints, DPI, membership
+  or overflow decisions can still change before the actual restore.
+- **Measured borders.** Resize borders are cached while a window is tiled and
+  restored. Window DPI and frame styles must still match that measurement, and
+  its measurement DPI must match the destination workspace. Missing/stale
+  measurements give no restore hint; minimized/maximized borders are not guessed.
+- **Hook coverage.** Native show and asynchronous-show entry points,
+  immediate/deferred show positioning, saved placements, visible creation and
+  default `SC_RESTORE` handling are covered. Commands, flags, results and deferred
+  batch timing survive. Restore preparation preserves visibility, min/max state
+  and activation until the original operation. Restore-to-maximized is skipped.
+- **Taskbar evidence.** Real tests reached `DefWindowProcW(SC_RESTORE)` on the
+  application's own thread while still minimized. This supplies an early hook
+  for the tested apps; it does not prove coverage of custom handlers or every
+  shell/dialog restore route. Explorer-specific preparation is not implemented.
+- **Best-effort visibility.** DWM frame bounds are used when available. Visible
+  creation may paint before the hook returns. Changed startup geometry or limits
+  can still require MultiWM to correct placement afterward.
+- **Diagnostics.** Reports include ABI, section and liveness-event state,
+  generation, contents, maximum sizes, rebuild/write counts, burst and unchanged
+  rebuilds, and average/slowest build-and-compare time.
+
+## Current overflow coverage and remaining jumps (ABI 4.1)
+
+The companion can hint a centred overflow float in two cases without an extra
+fit-envelope calculation: the workspace's window limit is reached (or admission
+and recovery establish that even a minimal newcomer will float), and the new
+window's live minimum width or height exceeds the whole work area. MultiWM
+publishes the default floating frame; a matching size override still applies.
+Overflow ignores a preserve-app-size rule, matching MultiWM's FailureCenter
+placement. Native minimum and maximum sizes still apply to the hinted frame.
+
+These floating hints apply only when overflow centres the window on its current
+workspace. With exactly one display and Create desktop disabled, Try other
+monitors first has no destination: MultiWM centres directly and publishes the
+floating hint. The shared routing decision uses a cheap monitor-count query,
+so connecting another display restores monitor routing automatically. A failed
+count query conservatively retains routing. With another monitor available or
+Create desktop enabled, overflow initially floats the window in place, then
+routes it. The companion does not yet predict that destination or a later
+centring fallback if routing fails.
+
+A minimum larger than the predicted tile but small enough for the work area is
+still a gap. The companion expands that tile towards its neighbours, but does
+not run MultiWM's complete admission and recovery solver against every member's
+limits. MultiWM can subsequently choose another slot or float the arrival, so a
+visible correction remains possible. No fit envelope is published. Predictions
+also do not model rollback of an explicit layout command that has not settled;
+such a rollback can change the destination after the hint was calculated.
+
+The overflow additions use ABI major 4, minor 1: a reserved workspace byte and a
+new flag, with no field offsets changed. A 4.0 companion ignores the additions;
+a 4.1 companion reading a 4.0 writer receives no overflow float hints. This minor
+update does not require reinstalling both mods together, provided both already
+use ABI major 4. Earlier major versions remain incompatible.
+
+General routed-overflow hints are deferred. Proving overflow and choosing the
+winning destination require the incoming window's live limits, the destination
+members' limits, candidate ordering and DPI handling. Moving a window early also
+changes its observed source monitor. A destination's next-slot rectangle alone
+does not establish the route MultiWM would commit. Keep the definite local-float
+cases above; revisit routing only with a bounded prediction that preserves the
+existing routing policy.
+
+The common geometry arithmetic is consolidated in `src/shared/geometry.h`:
+centres, work-area clamping, DIP scaling, fullscreen bounds, tracking-limit
+conversion and maximum-size centring. Native metric queries and message sending
+remain in their respective mods, including MultiWM's timeout and the companion's
+owning-thread/reentrancy checks. The companion's approximate minimum-size growth
+stays local; MultiWM continues using its constrained layout solver.
+
+## Measuring snapshot rebuilds before changing scheduling
+
+After installing the instrumented MultiWM, configure its Write Diagnostic Report
+hotkey (blank by default). Use that shortcut to write a report, use MultiWM
+normally for several minutes, then write a second report from the same running
+process. Include ordinary window opening/closing, minimization
+and restoration, and desktop or layout changes. Keep the two reports as the
+baseline and final sample; restarting MultiWM makes their counter differences
+incomparable. Reports use the configured Output Directory, or
+`%USERPROFILE%\Documents\MultiWMDiagnostics` when it is blank.
+
+In the performance counters' Companion snapshot group, use the difference
+between the two reports' total columns to calculate:
+
+- Burst share: rebuilds within 16 ms of the previous rebuild / all rebuilds.
+- Unchanged share: rebuilds whose result was unchanged / all rebuilds.
+- Average rebuild time: total rebuild time in microseconds / all rebuilds.
+- Rebuild frequency: all rebuilds / elapsed sample seconds.
+
+Only calculate ratios when the interval contains rebuilds. The burst counter
+uses a strict interval of less than 16 ms. Rebuild time is elapsed time for
+building and comparing the snapshot, including native queries; it excludes the
+shared-memory write. The separate Companion snapshot section shows the latest
+published contents and lifetime average/slowest rebuild, rather than an interval
+maximum. Writes and unchanged rebuilds are counted separately.
+
+Use both frequency and elapsed cost when deciding item 7b (rebuild after the
+message queue drains). A high burst share alone does not establish expensive
+or redundant work. Frequent unchanged rebuilds during bursts plus meaningful
+rebuild time would justify trying coalescing, followed by the same measurement
+and a check that new-window and restore hints remain timely. Until a live sample
+is collected, leave scheduling unchanged; synthetic parity tests and benchmarks
+do not substitute for that sample.
+
+Live sample, 2026-11-17 (first report, including startup): 539.547 seconds,
+191 rebuilds (21.24/min), 14 burst rebuilds (7.33%), 34 unchanged (17.80%),
+and 157 writes. Build-and-compare time totalled 24.893 ms: 130.3 us average,
+1.411 ms slowest, and 0.0046% of elapsed runtime (not a CPU measurement).
+The sample included eight desktop-change notifications and minimize/restore
+activity, but no layout commands or resize gestures. Decision: defer 7b for this
+workload and proceed to shared geometry helpers (item 8); revisit scheduling if
+a heavier sample shows meaningful cost. No scheduling change was made.
+
+## Verification completed
+
+All four maintained suites pass: layout, reconciliation, companion and native
+restoration. The overflow parity run uses 8000 generated workspaces: 98 predicted
+floats were actual floats, and none of 3016 predicted tiles floated. Three
+same-minimum floats received no hint; missing hints retain ordinary placement.
+
+Warning checks cover x64 MultiWM and x86/x64 companion. The repository's warning
+profile passes with warnings treated as errors. Unsuppressed checks still report
+SDK editor-stub unused parameters and the project's Windows-structure initializer
+idioms. These checks compile local source and do not install mods.
+
+The report-shape digest includes the new ABI/liveness fields. Other maintained
+digests are unchanged. `tests/run.ps1` launches statically linked tests with
+Windows' Microsoft-signed-DLL-only policy, verified before the child resumes.
+This prevents installed Windhawk mods from altering test behavior without
+changing the installed mods or Windhawk configuration. The native restore suite
+also uses app-cloaked windows on a private desktop and never switches the input
+desktop.
+
+## Remaining live checks
+
+Run these after installing the prepared builds; no installation is performed by
+the test runner. Enable the companion's `logDecisions` while investigating, and
+capture a diagnostic report after the scenario.
+
+| Scenario | Expected result |
+| --- | --- |
+| New tiled window, each insertion mode | It first appears near its final tile, with configured gap/insets; MultiWM makes no unnecessary correction. |
+| Real app with a maximum size | Its frame is centred in its cell at the cap and remains tiled. |
+| DPI-unaware app at 200% | Reported limits convert to physical pixels and the visible frame matches the intended placement. |
+| Taskbar restore of a weighted/master member | Installed companion logs restore-tile use before the original restore; final saved slot and weight remain correct. |
+| Minimize then restore in Manual mode | Companion passes calls through; ordinary MultiWM Manual membership policy applies. |
+| Restore Down in Manual mode | Companion gives no hint; MultiWM handles its retained group normally. |
+| One-monitor local overflow, Create desktop off | `overflowCenters=1`; definite overflow floats use the centred hint even with Try other monitors first on. |
+| Connect/disconnect another monitor | Effective routing and snapshot flags update without a settings change. |
+| Mixed DPI and non-bottom taskbar | Window/frame/workspace coordinates remain correct. |
+| App handles restore itself | Observe whether a supported hook is reached; no universal coverage claim. |
+| Compatible animation mod enabled | Check hook order and that its visual target follows the prepared geometry. |
+
+Taskbar dispatch and the nine-minute publisher-cost sample are verified, but
+they do not replace these installed-companion visual checks. The temporary
+restore probe can be disabled/removed after its investigation is complete.
+
+## Deferred work
+
+- **General routed-overflow hints:** require a bounded approach that preserves
+  destination selection; no copying the full solver into application processes.
+- **7b/7c scheduling changes:** the measured publisher cost does not justify them
+  for the sampled workload. Revisit with a heavier live sample if needed.
+- **Geometry-based float prediction:** no fit envelope is implemented.
+- **Other compatibility work:** proportional growth between neighbours, Mobile
+  Open Animation with DPI-unaware apps, AppContainer readers, and restore
+  preparation bypassing other mods' placement hooks.
+
+## Future visuals (not implemented)
+
+Custom borders should remain independent of admission hints. Start by evaluating
+DWM border colour for managed windows, restoring original attributes on unload;
+consider a separate UI-access overlay process only if DWM colour is insufficient.
+Focus/state changes and windows on other virtual desktops need explicit handling.
+
+Open animations should be evaluated against Mobile Open Animation before adding
+a second animation engine. Preserve MultiWM's cloak/visibility handling and
+avoid competing placement writers. Current compatibility needs live verification:
+Window Centralizer and Center New Windows conflict by moving the same windows;
+Mobile Open Animation's resize-real-window mode conflicts with tiling, and
+DPI-unaware targets remain a separate compatibility item.
+
+Any border/event transport or animation settings need their own design. They
+are not part of snapshot ABI 4.1 or this release's placement implementation.

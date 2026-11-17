@@ -98,6 +98,8 @@ int main() {
   check(hwnd != nullptr, "create test-owned hidden window");
   limits.probes = 0;
   Companion::g_unhookedSetWindowPos = RecordPosition;
+  // The companion's own moves use the public SetWindowPos; record them the same way.
+  Companion::g_setWindowPosForOwnMoves = RecordPosition;
   Companion::g_unhookedSetWindowPlacement = RecordPlacement;
   Companion::g_unhookedDeferWindowPos = RecordDeferred;
   Companion::g_unhookedShowWindow = RecordShow;
@@ -119,8 +121,10 @@ int main() {
   workspace.workArea = monitorInfo.rcWork;
   workspace.dpi = GetDpiForWindow(hwnd);
   workspace.hasTiledFrame = 1;
-  workspace.tiledFrame = {monitorInfo.rcWork.left + 100, monitorInfo.rcWork.top + 100,
-                           monitorInfo.rcWork.left + 600, monitorInfo.rcWork.top + 500};
+  // A slot in the work area's top-left corner: a window that must grow keeps
+  // that corner (it is on the boundary), one that is capped is centred.
+  workspace.tiledFrame = {monitorInfo.rcWork.left, monitorInfo.rcWork.top,
+                           monitorInfo.rcWork.left + 500, monitorInfo.rcWork.top + 400};
   Companion::g_reader.view = section.get();
   Companion::g_reader.body = std::make_unique<CompanionAbi::SnapshotBody>();
   constexpr UINT showFlags = SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE;
@@ -154,6 +158,9 @@ int main() {
     if (policy == 2) rules.emplace_back();  // An unrestricted Exclude rule.
     bool complete = false;
     body.rulesBytes = CompanionAbi::SerializeRules(rules, body.rules, CompanionAbi::kRulesCapacity, &complete);
+    // Each fixture change is a new publish, as MultiWM's would be; the reader
+    // reuses its copy while the generation is unchanged.
+    ++body.generation;
     positionCalls.clear();
     Companion::SetWindowPosHook(hwnd, nullptr, 210, 220, 710, 510, showFlags);
     check(positionCalls.size() == 1 && positionCalls[0].x == 210 && positionCalls[0].width == 710 &&
@@ -163,6 +170,7 @@ int main() {
   body.flags = completeFlags;
   body.trackedCount = 0;
   body.rulesBytes = 0;
+  ++body.generation;
 
   // Restoring a hidden, unknown window is an eligible show. Startup defaults
   // are classified without changing the command passed to the original API.
@@ -210,14 +218,17 @@ int main() {
   check(positionCalls.empty() && limits.probes == 0 && asyncCommands == std::vector<int>{SW_RESTORE},
         "cross-thread async show passes through without placement or probing");
 
-  // A real hint rewrites the original call. Minimums expand it and maximums
-  // shrink it, while its visible origin and the app's other flags survive.
+  // A real hint rewrites the original call. A minimum grows the window from the
+  // slot's corner on the work-area boundary; a maximum centres it in the slot,
+  // as MultiWM's planner will. The app's other arguments and flags survive.
   RECT current{}, currentFrame{};
   GetWindowRect(hwnd, &current);
   if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &currentFrame, sizeof(currentFrame))) ||
       currentFrame.right <= currentFrame.left || currentFrame.bottom <= currentFrame.top) currentFrame = current;
-  const LONG hintedLeft = workspace.tiledFrame.left - (currentFrame.left - current.left);
-  const LONG hintedTop = workspace.tiledFrame.top - (currentFrame.top - current.top);
+  const RECT testMargins{currentFrame.left - current.left, currentFrame.top - current.top,
+                         current.right - currentFrame.right, current.bottom - currentFrame.bottom};
+  const LONG hintedLeft = workspace.tiledFrame.left - testMargins.left;
+  const LONG hintedTop = workspace.tiledFrame.top - testMargins.top;
   for (bool enforceMinimum : {true, false}) {
     limits.minimum = enforceMinimum ? POINT{700, 600} : POINT{100, 100};
     limits.maximum = enforceMinimum ? POINT{2000, 2000} : POINT{400, 300};
@@ -226,10 +237,137 @@ int main() {
           "hint preserves the original native failure");
     check(positionCalls.size() == 1, "hint makes exactly one native positioning call");
     const auto& call = positionCalls[0];
-    check(call.x == hintedLeft && call.y == hintedTop &&
+    // Capped: the visible frame (window size minus borders) is centred in the 500x400 slot.
+    const LONG cappedFrameWidth = 400 - testMargins.left - testMargins.right;
+    const LONG cappedFrameHeight = 300 - testMargins.top - testMargins.bottom;
+    const LONG expectedX = enforceMinimum ? hintedLeft : hintedLeft + (500 - cappedFrameWidth) / 2;
+    const LONG expectedY = enforceMinimum ? hintedTop : hintedTop + (400 - cappedFrameHeight) / 2;
+    check(call.x == expectedX && call.y == expectedY &&
               call.width == (enforceMinimum ? 700 : 400) && call.height == (enforceMinimum ? 600 : 300) &&
               call.after == HWND_TOPMOST && call.flags == showFlags,
-          "hint clamps size limits at the predicted origin in one native call");
+          "hint applies size limits as MultiWM will, in one native call");
+  }
+
+  // Overflow floats: a window MultiWM won't tile goes where overflow centres it
+  // (the published floating frame), only while overflow centres rather than routes.
+  {
+    using Companion::Width;
+    using Companion::Height;
+    const RECT& work = monitorInfo.rcWork;
+    const RECT floatFrame{work.left + 300, work.top + 200, work.left + 900, work.top + 600};
+    workspace.floatingFrame = floatFrame;
+    workspace.hasFloatingFrame = 1;
+    limits.minimum = {100, 100};
+    limits.maximum = {2000, 2000};
+    auto hinted = [&](const char* description, bool expectHint, LONG expectedWidth, LONG expectedHeight) {
+      ++body.generation;
+      positionCalls.clear();
+      Companion::SetWindowPosHook(hwnd, nullptr, 210, 220, 710, 510, showFlags);
+      check(positionCalls.size() == 1, description);
+      const auto& call = positionCalls[0];
+      if (expectHint) {
+        check(call.x == floatFrame.left - testMargins.left && call.y == floatFrame.top - testMargins.top &&
+                  call.width == expectedWidth && call.height == expectedHeight && call.flags == showFlags,
+              description);
+      } else {
+        check(call.x == 210 && call.y == 220 && call.width == 710 && call.height == 510, description);
+      }
+    };
+    const LONG floatWidth = Width(floatFrame) + testMargins.left + testMargins.right;
+    const LONG floatHeight = Height(floatFrame) + testMargins.top + testMargins.bottom;
+
+    // The window limit is reached (or no slot fits a minimal window).
+    workspace.hasTiledFrame = 0;
+    workspace.newWindowFloats = 1;
+    body.flags = completeFlags | CompanionAbi::kFlagOverflowCentersFloat;
+    hinted("an overflow float goes to the centred floating frame", true, floatWidth, floatHeight);
+    body.flags = completeFlags;
+    hinted("overflow that routes the window gives no hint", false, 0, 0);
+    workspace.newWindowFloats = 0;
+    body.flags = completeFlags | CompanionAbi::kFlagOverflowCentersFloat;
+    hinted("no slot and no predicted float gives no hint", false, 0, 0);
+
+    // A minimum wider than the work area: MultiWM floats the window; Windows
+    // keeps the centred frame's top-left corner and applies the minimum.
+    workspace.hasTiledFrame = 1;
+    limits.minimum = {Width(work) + 200, 600};
+    hinted("a minimum wider than the work area is floated at the centred frame", true, Width(work) + 200,
+           std::max<LONG>(600, floatHeight));
+    body.flags = completeFlags;
+    hinted("a minimum wider than the work area gives no hint while overflow routes", false, 0, 0);
+
+    limits.minimum = {100, 100};
+    workspace.hasFloatingFrame = 0;
+    workspace.floatingFrame = {};
+    ++body.generation;
+  }
+
+  // Process rules match on the executable's file name, read without a path limit.
+  check(_wcsicmp(Companion::CurrentProcessName(nullptr).c_str(), L"companion_tests.exe") == 0,
+        "the process name is the executable's file name");
+
+  // The fitting rule itself, with literal numbers. A 1200x1000 work area.
+  {
+    const RECT area{0, 0, 1200, 1000};
+    auto fit = [&](RECT slot, SharedGeometry::FrameLimits frameLimits) {
+      return Companion::FitSlotToLimits(slot, area, frameLimits);
+    };
+    auto equals = [](const std::optional<RECT>& rect, RECT expected) {
+      return rect && EqualRect(&*rect, &expected);
+    };
+    check(equals(fit({0, 0, 400, 1000}, {600, 1, 0, 0}), {0, 0, 600, 1000}),
+          "growth keeps the edge on the work-area boundary (start)");
+    check(equals(fit({800, 0, 1200, 1000}, {600, 1, 0, 0}), {600, 0, 1200, 1000}),
+          "growth keeps the edge on the work-area boundary (end)");
+    check(equals(fit({400, 0, 800, 1000}, {600, 1, 0, 0}), {300, 0, 900, 1000}),
+          "growth between neighbours spreads from the centre");
+    check(equals(fit({100, 0, 500, 1000}, {900, 1, 0, 0}), {0, 0, 900, 1000}),
+          "growth never leaves the work area");
+    check(!fit({0, 0, 400, 1000}, {1300, 1, 0, 0}), "a minimum wider than the work area gives no hint");
+    check(equals(fit({400, 0, 800, 1000}, {1, 1, 200, 0}), {500, 0, 700, 1000}),
+          "a capped width is centred, as MultiWM's planner does");
+    check(equals(fit({0, 0, 600, 1000}, {1, 1, 0, 400}), {0, 300, 600, 700}),
+          "a capped height is centred on the cross axis");
+    check(equals(fit({0, 0, 600, 1000}, {1, 1, 600, 1000}), {0, 0, 600, 1000}),
+          "limits the slot already satisfies change nothing");
+    const RECT floating = Companion::ClampSizeKeepingOrigin({10, 10, 510, 410}, {1, 1, 300, 200});
+    const RECT expectedFloating{10, 10, 310, 210};
+    check(EqualRect(&floating, &expectedFloating), "floating frames keep their top-left corner");
+  }
+
+  // A DPI-unaware window reports its limits in its own 96-DPI units, unconverted
+  // even to this per-monitor-aware scope. They must come back in physical pixels,
+  // matching MultiWM's probe, or hints on a scaled display are too small.
+  {
+    WindowLimits unawareLimits;
+    unawareLimits.minimum = {400, 300};
+    unawareLimits.maximum = {800, 600};
+    const DPI_AWARENESS_CONTEXT scope = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+    const HWND unaware = CreateWindowExW(0, windowClass.lpszClassName, L"Companion unaware test", WS_OVERLAPPEDWINDOW,
+                                         100, 100, 800, 600, nullptr, nullptr, windowClass.hInstance, &unawareLimits);
+    SetThreadDpiAwarenessContext(scope);
+    check(unaware && GetDpiForWindow(unaware) == 96, "create hidden DPI-unaware window");
+    RECT window{}, frame{};
+    GetWindowRect(unaware, &window);
+    if (FAILED(DwmGetWindowAttribute(unaware, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) frame = window;
+    const RECT unawareMargins{frame.left - window.left, frame.top - window.top,
+                              window.right - frame.right, window.bottom - frame.bottom};
+    const UINT monitorDpi = workspace.dpi;
+    std::optional<SharedGeometry::FrameLimits> read;
+    {
+      Companion::PlacementScope placing;
+      read = Companion::QueryFrameLimits(unaware, monitorDpi, unawareMargins);
+    }
+    const LONG decorationWidth = unawareMargins.left + unawareMargins.right;
+    const LONG decorationHeight = unawareMargins.top + unawareMargins.bottom;
+    check(read && read->minWidth == MulDiv(std::max(400, GetSystemMetricsForDpi(SM_CXMINTRACK, 96)),
+                                           static_cast<int>(monitorDpi), 96) - decorationWidth &&
+              read->minHeight == MulDiv(std::max(300, GetSystemMetricsForDpi(SM_CYMINTRACK, 96)),
+                                        static_cast<int>(monitorDpi), 96) - decorationHeight &&
+              read->maxWidth == MulDiv(800, static_cast<int>(monitorDpi), 96) - decorationWidth &&
+              read->maxHeight == MulDiv(600, static_cast<int>(monitorDpi), 96) - decorationHeight,
+          "an unaware window's limits are scaled to physical pixels");
+    DestroyWindow(unaware);
   }
 
   limits.minimum = {700, 600};
@@ -269,6 +407,90 @@ int main() {
     }
   }
   testPublisherAlive = true;
+
+  // Restoring uses the tile MultiWM published for this window, not the stale
+  // normal rectangle. Changing only the hidden test window's style exercises the
+  // decision without showing or moving it; real native restoration is checked
+  // separately.
+  const LONG_PTR normalStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
+  SetWindowLongPtrW(hwnd, GWL_STYLE, normalStyle | WS_MINIMIZE);
+  check(IsIconic(hwnd), "hidden restore fixture reports minimized");
+  limits.minimum = {100, 100};
+  body.trackedCount = 1;
+  body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
+  body.restoreWindowCount = 1;
+  // Borders as MultiWM measured them while the window was restored. Deliberately
+  // unlike any system-metric estimate, so the test proves they are what is used.
+  const RECT measuredMargins{9, 0, 9, 9};
+  RECT restoreTile = workspace.tiledFrame;
+  OffsetRect(&restoreTile, 600, 0);
+  body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, measuredMargins,
+                            workspace.dpi};
+  ++body.generation;
+  WINDOWPLACEMENT restoreRequest = original;
+  restoreRequest.showCmd = SW_RESTORE;
+  const LONG workspaceOffset = monitorInfo.rcWork.left - monitorInfo.rcMonitor.left;
+  const LONG workspaceTopOffset = monitorInfo.rcWork.top - monitorInfo.rcMonitor.top;
+  {
+    Companion::PlacementScope placing;
+    check(Companion::AdjustRestorePlacement(hwnd, &restoreRequest, "test"), "known minimized member gets a restore hint");
+  }
+  const RECT& slot = restoreTile;
+  check(restoreRequest.rcNormalPosition.left == slot.left - measuredMargins.left - workspaceOffset &&
+            restoreRequest.rcNormalPosition.top == slot.top - measuredMargins.top - workspaceTopOffset &&
+            restoreRequest.rcNormalPosition.right == slot.right + measuredMargins.right - workspaceOffset &&
+            restoreRequest.rcNormalPosition.bottom == slot.bottom + measuredMargins.bottom - workspaceTopOffset &&
+            restoreRequest.showCmd == SW_RESTORE && restoreRequest.flags == original.flags,
+        "MultiWM's restore tile is used, inflated by its measured borders, while show state and flags survive");
+
+  // Without a measurement at this DPI the restored frame can't be exact, so no hint.
+  for (UINT marginsDpi : {0u, workspace.dpi + 24}) {
+    body.restoreWindows[0].marginsDpi = marginsDpi;
+    ++body.generation;
+    restoreRequest = original;
+    restoreRequest.showCmd = SW_RESTORE;
+    const auto unchanged = restoreRequest;
+    Companion::PlacementScope placing;
+    check(!Companion::AdjustRestorePlacement(hwnd, &restoreRequest, "test") &&
+              std::memcmp(&restoreRequest, &unchanged, sizeof(unchanged)) == 0,
+          "missing or other-DPI border measurement gives no restore hint");
+  }
+  body.restoreWindows[0].marginsDpi = workspace.dpi;
+  for (int missing = 0; missing < 3; ++missing) {
+    body.restoreWindows[0].processId = missing == 0 ? GetCurrentProcessId() + 1 : GetCurrentProcessId();
+    // MultiWM publishes no tile when the restored layout would be unsatisfiable.
+    body.restoreWindows[0].hasFrame = missing == 1 ? 0 : 1;
+    ++body.generation;
+    restoreRequest = original;
+    restoreRequest.showCmd = SW_RESTORE;
+    if (missing == 2) restoreRequest.flags |= WPF_RESTORETOMAXIMIZED;
+    const auto unchanged = restoreRequest;
+    Companion::PlacementScope placing;
+    check(!Companion::AdjustRestorePlacement(hwnd, &restoreRequest, "test") &&
+              std::memcmp(&restoreRequest, &unchanged, sizeof(unchanged)) == 0,
+          "wrong identity, no published tile and restore-to-maximized are left alone");
+  }
+  SetWindowLongPtrW(hwnd, GWL_STYLE, normalStyle);
+  body.trackedCount = 0;
+  body.restoreWindowCount = 0;
+  ++body.generation;
+
+  // The reader reuses its copy while MultiWM's generation and process ID are
+  // unchanged, and copies again when either changes. A restarted MultiWM counts
+  // generations from zero again, so the process ID must invalidate on its own.
+  {
+    Companion::HintInputs inputs;
+    check(Companion::ReadHintInputs(hwnd, workspace.monitorRect, &inputs) && inputs.flags == completeFlags,
+          "read the current snapshot");
+    body.flags = 0;  // Changed without a new generation: not a publish.
+    check(Companion::ReadHintInputs(hwnd, workspace.monitorRect, &inputs) && inputs.flags == completeFlags,
+          "an unchanged generation reuses the cached copy");
+    section->writerPid += 1;
+    check(Companion::ReadHintInputs(hwnd, workspace.monitorRect, &inputs) && inputs.flags == 0,
+          "a new writer process invalidates the cached copy");
+    body.flags = completeFlags;
+    ++body.generation;
+  }
 
   limits.destroyDuringProbe = true;
   positionCalls.clear();

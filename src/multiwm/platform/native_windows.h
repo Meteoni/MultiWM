@@ -117,16 +117,24 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
       MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
   constraints.dpi = Platform::Monitors::GetMonitorEffectiveDpi(monitor);
 
+  // The window answers in its own DPI units, and Windows does not convert the
+  // reply for a sender with different awareness (measured: a DPI-unaware window
+  // on a 200% monitor reports half its physical limits, to any sender). Offer
+  // the defaults in the window's units too, as Windows does when it sends this
+  // message, then scale everything to the monitor's physical pixels. For a
+  // per-monitor-aware window both DPIs are equal and nothing is scaled.
+  const UINT reportedWindowDpi = GetDpiForWindow(hwnd);
+  const UINT windowDpi = reportedWindowDpi ? reportedWindowDpi : constraints.dpi;
   const LONG defaultMinWidth = std::max<LONG>(
-      1, GetSystemMetricForDpiCompat(SM_CXMINTRACK, constraints.dpi));
+      1, GetSystemMetricForDpiCompat(SM_CXMINTRACK, windowDpi));
   const LONG defaultMinHeight = std::max<LONG>(
-      1, GetSystemMetricForDpiCompat(SM_CYMINTRACK, constraints.dpi));
+      1, GetSystemMetricForDpiCompat(SM_CYMINTRACK, windowDpi));
   const LONG defaultMaxWidth = std::max<LONG>(
       defaultMinWidth,
-      GetSystemMetricForDpiCompat(SM_CXMAXTRACK, constraints.dpi));
+      GetSystemMetricForDpiCompat(SM_CXMAXTRACK, windowDpi));
   const LONG defaultMaxHeight = std::max<LONG>(
       defaultMinHeight,
-      GetSystemMetricForDpiCompat(SM_CYMAXTRACK, constraints.dpi));
+      GetSystemMetricForDpiCompat(SM_CYMAXTRACK, windowDpi));
 
   MINMAXINFO mmi{};
   mmi.ptMinTrackSize = {defaultMinWidth, defaultMinHeight};
@@ -162,14 +170,13 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
   GetFrameDecorationSpan(
       hwnd, &decorationWidth, &decorationHeight);
 
-  constraints.minWidth = std::max<LONG>(
-      1,
-      std::max<LONG>(defaultMinWidth, mmi.ptMinTrackSize.x) -
-          decorationWidth);
-  constraints.minHeight = std::max<LONG>(
-      1,
-      std::max<LONG>(defaultMinHeight, mmi.ptMinTrackSize.y) -
-          decorationHeight);
+  const auto frame = SharedGeometry::TrackingLimitsToFrame(
+      mmi, {defaultMinWidth, defaultMinHeight}, {defaultMaxWidth, defaultMaxHeight},
+      windowDpi, constraints.dpi, decorationWidth, decorationHeight);
+  constraints.minWidth = frame.minWidth;
+  constraints.minHeight = frame.minHeight;
+  constraints.maxWidth = frame.maxWidth;
+  constraints.maxHeight = frame.maxHeight;
 
   return constraints;
 }
@@ -180,6 +187,13 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   // IsWindowVisible reads user-mode state; check it before the DWM cloak query so
   // the many invisible top-level HWNDs seen during EnumWindows skip that call.
   if (!IsWindowVisible(hwnd)) return SuspensionReason::Hidden;
+  // Fail open on purpose: a failed query (DWM restarting, or the window being
+  // destroyed right now) reads as "not app-cloaked". Treating failure as Hidden
+  // would suspend every tiled window while DWM is unavailable and collapse each
+  // layout, then rebuild it. A briefly app-cloaked window being tiled is the
+  // smaller harm, and the next settled pass corrects it. The overflow
+  // destination scan (window_routing.h) differs deliberately: it is a trial
+  // that can simply be retried, so there a failure means "incomplete".
   DWORD cloaked = 0;
   DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
   if (cloaked & DWM_CLOAKED_APP) return SuspensionReason::Hidden;
@@ -192,16 +206,8 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (GetWindowRect(hwnd, &windowRect)) {
     HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONULL);
     MONITORINFO monitorInfo{sizeof(monitorInfo)};
-    constexpr LONG kFullscreenTolerancePx = 2;
     if (monitor && GetMonitorInfoW(monitor, &monitorInfo) &&
-        !Layout::Differs(windowRect.left, monitorInfo.rcMonitor.left,
-                 kFullscreenTolerancePx) &&
-        !Layout::Differs(windowRect.top, monitorInfo.rcMonitor.top,
-                 kFullscreenTolerancePx) &&
-        !Layout::Differs(windowRect.right, monitorInfo.rcMonitor.right,
-                 kFullscreenTolerancePx) &&
-        !Layout::Differs(windowRect.bottom, monitorInfo.rcMonitor.bottom,
-                 kFullscreenTolerancePx)) {
+        SharedGeometry::CoversMonitor(windowRect, monitorInfo.rcMonitor)) {
       return SuspensionReason::Maximized;
     }
   }

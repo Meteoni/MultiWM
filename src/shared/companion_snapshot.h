@@ -27,18 +27,21 @@ namespace CompanionAbi {
 
 // The section exists while MultiWM or any reader holds a handle, so it outlives a
 // MultiWM restart; a restarted MultiWM reopens it and rewrites the header.
-inline constexpr wchar_t kSectionName[] = L"Local\\MultiWM.Companion.Snapshot.v1";
+inline constexpr wchar_t kSectionName[] = L"Local\\MultiWM.Companion.Snapshot.v4";
 // Held open by MultiWM only. Readers probe it to tell a live MultiWM from a
 // section that only their own handles keep alive.
-inline constexpr wchar_t kAliveEventName[] = L"Local\\MultiWM.Companion.Alive.v1";
+inline constexpr wchar_t kAliveEventName[] = L"Local\\MultiWM.Companion.Alive.v4";
 
 inline constexpr uint32_t kMagic = 0x5343574D;  // "MWCS"
-inline constexpr uint16_t kAbiMajor = 1;
-inline constexpr uint16_t kAbiMinor = 0;
+inline constexpr uint16_t kAbiMajor = 4;
+// 1: kFlagOverflowCentersFloat, WorkspaceHint::newWindowFloats, and
+//    floatingFrame for tiled layouts too.
+inline constexpr uint16_t kAbiMinor = 1;
 
 inline constexpr uint32_t kMaxWorkspaces = 16;
 inline constexpr uint32_t kMaxTrackedWindows = 2048;
 inline constexpr uint32_t kRulesCapacity = 32768;
+inline constexpr uint32_t kMaxRestoreWindows = 128;
 
 enum SnapshotFlags : uint32_t {
   // MultiWM's WM thread is running and the rest of the body is meaningful.
@@ -50,6 +53,11 @@ enum SnapshotFlags : uint32_t {
   kFlagRulesComplete = 1u << 2,
   // Every window MultiWM knows is listed in `trackedWindows`.
   kFlagTrackedComplete = 1u << 3,
+  // A window Automatic overflow floats is centred at its workspace's
+  // floatingFrame (FailureCenter). Clear when overflow routes such windows to
+  // another monitor or desktop instead; they then float where they are. With
+  // one display and desktop creation off, monitor-only routing centres directly.
+  kFlagOverflowCentersFloat = 1u << 4,
 };
 
 // The current desktop's workspace on one monitor. All rectangles are physical
@@ -58,12 +66,37 @@ struct WorkspaceHint {
   RECT monitorRect;    // Readers find the workspace by monitor rectangle.
   RECT workArea;       // What MultiWM plans in: monitor work area minus insets.
   RECT tiledFrame;     // Valid when hasTiledFrame: the next tiled slot.
-  RECT floatingFrame;  // Valid when hasFloatingFrame: a new window's default floating frame.
+  // Valid when hasFloatingFrame: the default floating size centred in the work
+  // area, before size rules. Where a new window goes in the Floating layout, and
+  // where overflow centres a window it floats (see kFlagOverflowCentersFloat).
+  RECT floatingFrame;
   uint32_t dpi;        // Effective DPI of the monitor.
   uint8_t floatingLayout;    // The workspace uses the Floating layout.
   uint8_t hasTiledFrame;
   uint8_t hasFloatingFrame;
-  uint8_t reserved0;
+  // Tiled layouts (ABI minor 1): Automatic overflow will float the next new
+  // window instead of tiling it, whatever its size: the window limit is reached,
+  // or no slot fits even a minimal window. 0 from older writers.
+  uint8_t newWindowFloats;
+};
+
+// A minimized or maximized member of a workspace, and where it goes when it is
+// restored.
+struct RestoreWindowHint {
+  uint32_t hwnd;
+  uint32_t processId;
+  uint32_t workspaceIndex;
+  uint32_t hasFrame;  // 1 when `frame` is valid.
+  // The window's tile once restored: MultiWM's own Restore on a copy of the
+  // workspace, planned with the window's cached size limits. Absent when that
+  // plan is unsatisfiable (MultiWM would then move or float the window).
+  RECT frame;
+  // The window's invisible resize borders (GetWindowRect minus the DWM frame on
+  // each side), measured by MultiWM while the window was last tiled and restored.
+  // A minimized or maximized window reports different values, so readers must not
+  // measure them now. Valid only at `marginsDpi`; 0 means never measured.
+  RECT frameMargins;
+  uint32_t marginsDpi;
 };
 
 struct SnapshotBody {
@@ -73,11 +106,14 @@ struct SnapshotBody {
   uint32_t workspaceCount;
   uint32_t trackedCount;
   uint32_t rulesBytes;
+  uint32_t restoreWindowCount;
+  uint32_t reserved0;
   WorkspaceHint workspaces[kMaxWorkspaces];
   // Every HWND MultiWM has a record for, in any state, truncated to 32 bits
   // (Windows keeps HWND values 32-bit significant) and sorted ascending.
   uint32_t trackedWindows[kMaxTrackedWindows];
   uint8_t rules[kRulesCapacity];  // See SerializeRules.
+  RestoreWindowHint restoreWindows[kMaxRestoreWindows];
 };
 
 struct SnapshotSection {
@@ -94,10 +130,12 @@ struct SnapshotSection {
 };
 
 static_assert(sizeof(WorkspaceHint) == 72, "WorkspaceHint layout");
+static_assert(sizeof(RestoreWindowHint) == 52, "RestoreWindowHint layout");
 static_assert(offsetof(SnapshotBody, desktopId) == 8, "SnapshotBody layout");
-static_assert(offsetof(SnapshotBody, workspaces) == 40, "SnapshotBody layout");
-static_assert(offsetof(SnapshotBody, trackedWindows) == 40 + 72 * kMaxWorkspaces, "SnapshotBody layout");
-static_assert(sizeof(SnapshotBody) == 40 + 72 * kMaxWorkspaces + 4 * kMaxTrackedWindows + kRulesCapacity,
+static_assert(offsetof(SnapshotBody, workspaces) == 48, "SnapshotBody layout");
+static_assert(offsetof(SnapshotBody, trackedWindows) == 48 + sizeof(WorkspaceHint) * kMaxWorkspaces, "SnapshotBody layout");
+static_assert(sizeof(SnapshotBody) == 48 + sizeof(WorkspaceHint) * kMaxWorkspaces + 4 * kMaxTrackedWindows +
+                                         kRulesCapacity + sizeof(RestoreWindowHint) * kMaxRestoreWindows,
               "SnapshotBody layout");
 static_assert(offsetof(SnapshotSection, sequence) == 16, "SnapshotSection layout");
 static_assert(offsetof(SnapshotSection, body) == 24, "SnapshotSection layout");
@@ -140,6 +178,25 @@ inline bool ReadConsistentBody(const SnapshotSection* section, SnapshotBody* out
     if (section->sequence == before) return true;
   }
   return false;
+}
+
+// Reads the body's generation and the writer's process ID as one consistent
+// pair, without copying the body. Every publish increases the generation, so a
+// reader holding a copy with the same pair can keep using it. The pair, not the
+// generation alone: a restarted MultiWM counts again from zero. Returns false
+// while a write is in progress; the caller then copies the body as usual.
+inline bool ReadConsistentGeneration(const SnapshotSection* section, uint64_t* generation, uint32_t* writerPid) {
+  const LONG before = section->sequence;
+  std::atomic_thread_fence(std::memory_order_acquire);
+  if (before & 1) return false;
+  // Plain copies: a 64-bit read isn't atomic on x86, which the recheck covers.
+  const uint64_t readGeneration = section->body.generation;
+  const uint32_t readPid = section->writerPid;
+  std::atomic_thread_fence(std::memory_order_acquire);
+  if (section->sequence != before) return false;
+  *generation = readGeneration;
+  *writerPid = readPid;
+  return true;
 }
 
 // --- Rules -----------------------------------------------------------------------

@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.13.59
+// @version         1.14.0
 // @author          meteoni
 // @github          https://github.com/Meteoni
 // @license         MIT
@@ -405,6 +405,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 // matching and the snapshot ABI. Self-contained; no MultiWM chapter needed.
 #include "../shared/window_rules.h"
 #include "../shared/companion_snapshot.h"
+#include "../shared/geometry.h"
 
 // Shared vocabulary: platform declarations, settings, messages, model types, actor state.
 #include "core/shared_types.h"

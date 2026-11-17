@@ -39,25 +39,34 @@ except the sibling `shared/` and `companion/` roots.
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |
 | `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot |
 | `windhawk/` | — | Windhawk's stock tool-mod launcher. Not MultiWM logic. |
-| `shared/` | `SharedRules`, `CompanionAbi` | Code compiled by both mods: window-rule matching and the companion snapshot layout. Windows and the standard library only. |
+| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry` | Code compiled by both mods: window-rule matching, the companion snapshot layout, and geometry/size-limit arithmetic. Windows and the standard library only. |
 | `companion/` | `Companion` | The separate MultiWM Companion mod (`src/companion/multiwm-companion.cpp`). Never included by MultiWM. |
 
 ## The companion mod
 
 WHAM builds every `.cpp` under `src/` as its own mod, so `src/companion/multiwm-companion.cpp`
 becomes `output/companion/multiwm-companion.wh.cpp`. That mod is loaded into every
-application and does one thing: just before a window is first shown, it moves the
-window to where MultiWM will put it.
+application and predicts placement before a new window is shown or a known tiled
+window is restored.
 
-Data flows one way. After each message, the WM thread
-(`CompanionSnapshot::PublishIfChanged`) checks whether a workspace was saved, the
-mode or desktop changed, or the display changed. If so, it rebuilds a snapshot and
-writes it to shared memory. The snapshot holds the next slot for each workspace
-(`Placement::PredictAutomaticAdmission`), the window rules and the known windows.
-The companion reads it and never writes. It predicts from the application's
-proposed geometry, clamps the hinted size to its reported limits, and rewrites
-the original positioning call. An unavailable hint leaves that call unchanged.
-MultiWM still corrects every window as usual, so a wrong hint costs one move.
+Data flows one way. Between messages, the WM thread
+(`CompanionSnapshot::PublishIfChanged`) checks repository revision, mode, desktop,
+display changes and effective overflow routing. Changed inputs rebuild a snapshot;
+changed contents are written with a seqlock. Unchanged contents skip the write.
+There is no polling or request back to MultiWM. A named liveness event distinguishes
+a running writer from a section kept alive only by readers.
+
+The snapshot holds each current-desktop workspace's next-admission tile and default
+floating frame, definite overflow-float predictions, known HWNDs, rules and per-window
+restore frames. Prediction uses MultiWM's layout planner with the monitor's physical
+work area, DPI-scaled insets and gap. The companion starts from the application's
+proposed geometry, queries its live size limits, and adjusts its original positioning
+call. The native call retains its command, flags, batching and return value. An
+unavailable hint passes through; MultiWM remains responsible for final placement.
+
+All companion placement hints, including restoration, require Automatic mode.
+In Manual mode the hooks pass placement and restore calls through unchanged;
+MultiWM itself continues managing its existing groups under Manual policy.
 
 The companion covers normal and asynchronous show calls, immediate and deferred
 positioning with `SWP_SHOWWINDOW`, saved placements, and visible creation.
@@ -67,6 +76,45 @@ asynchronous shows nonblocking. Deferred batches retain their original commit
 timing and returned handles. A local Windows probe found `AnimateWindow` reaches
 the existing native positioning hook while hidden, so no animation hook is added.
 Visible creation is best effort: the app may paint before creation returns.
+
+For restoration, the publisher calls `Workspace::Restore(hwnd)` on a copy and
+plans the result separately for each suspended member. This accounts for saved
+order, weights, Dwindle ratios, master status and cached minimum/maximum sizes.
+An unsatisfiable plan has no restore frame. The companion updates the normal
+restore rectangle just before a supported owning-thread restore, retaining
+visibility, min/max state and activation until the caller's original operation.
+This preparation is not performed while a minimized window waits for restoration.
+
+Resize borders come from measurements taken while each window was tiled and
+restored. Their cached window DPI and frame styles must still match; the hint
+must also match the workspace DPI. Missing measurements cause a skipped hint.
+The shared geometry header converts reported limits from window-DPI units to
+physical frame pixels. Both mods centre capped windows inside their tiles. The
+companion's growth for a minimum larger than its predicted tile remains approximate;
+MultiWM's constrained solver can subsequently choose another slot or float it.
+
+Explicit show/placement calls and default `SC_RESTORE` handling are covered.
+Real taskbar tests reached `DefWindowProcW(SC_RESTORE)` on the owning thread while
+still minimized. This establishes an interception point for those tested apps;
+it does not prove every application uses default handling. Restore-to-maximized,
+Floating workspaces, unsupported thread contexts and unavailable hints pass through.
+
+Local overflow-float hints cover definite capacity overflow and a minimum larger
+than the work area. The direct-centre policy applies when routing is disabled, or
+there is exactly one monitor with desktop creation off. General routed-overflow
+destinations and full geometry-based admission prediction remain deferred; see
+[the plan](VFX_COMPANION_PLAN.md).
+
+ABI 4.1 uses fixed-width structures with layout assertions for x86 and x64. Bounds
+are 16 workspaces, 2048 tracked HWNDs, 128 restore hints and 32 KiB of encoded rules.
+The reader caches the body by generation and writer PID and decodes rules only
+when their bytes change. A major-version mismatch gives no hint. The 4.1 overflow
+fields reuse reserved space, so 4.0/4.1 readers and writers interoperate, with no
+new float hints when either side lacks support.
+
+Diagnostics expose ABI, section/liveness state, published contents, rebuild/write
+counts, burst and unchanged rebuilds, and average/slowest rebuild time. The measured
+workload did not justify queue-drain coalescing; event-driven scheduling remains.
 
 Comparable projects use the same split. i3 has `handlers.c` (events),
 `commands.c`, `workspace.c` (model), `render.c` (layout) and `x.c` (pushing to
@@ -128,7 +176,13 @@ anything. When you see a check repeated after a native call, that is why.
 ## Tests
 
 `tests/run.ps1 -CompilerRoot <Windhawk Compiler>` builds layout, reconciliation,
-and companion suites. The first two include `src/multiwm/multiwm.cpp` directly;
-the third includes `src/companion/multiwm-companion.cpp`. They use real code with
+companion, and restore suites. The first two include `src/multiwm/multiwm.cpp` directly;
+the others include `src/companion/multiwm-companion.cpp`. They use real code with
 fake desktop COM objects, test-owned hidden windows, and recorded placement
 calls. They never move other applications' windows. Run them before every commit.
+The restore suite uses app-cloaked test windows on a private Win32 desktop and
+never switches the input desktop.
+The runner starts every test with Microsoft's signed-DLL-only process policy
+and verifies it before resuming execution. This blocks installed Windhawk mods
+without changing their configuration. Test executables must remain statically
+linked; run them through `tests/run.ps1` rather than directly.

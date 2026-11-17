@@ -62,10 +62,6 @@ static UINT GetMonitorEffectiveDpi(HMONITOR monitor) {
   return haveDpi ? dpiX : 96;
 }
 
-static LONG ScaleDip(LONG value, UINT dpi) {
-  return MulDiv(value, static_cast<int>(dpi ? dpi : 96), 96);
-}
-
 // Monitor targeting policy is intentionally explicit:
 // - workspace-level user commands follow the cursor, because this mod doesn't
 //   maintain a separate WM "focused monitor" state;
@@ -118,10 +114,10 @@ static bool GetWorkspaceMetrics(HMONITOR monitor, WorkspaceMetrics* out) {
 
   const UINT dpi = GetMonitorEffectiveDpi(monitor);
   const WorkspaceInsets insets{
-      ScaleDip(g_settings.insetsDip.left, dpi),
-      ScaleDip(g_settings.insetsDip.top, dpi),
-      ScaleDip(g_settings.insetsDip.right, dpi),
-      ScaleDip(g_settings.insetsDip.bottom, dpi)};
+        SharedGeometry::ScaleDip(g_settings.insetsDip.left, dpi),
+        SharedGeometry::ScaleDip(g_settings.insetsDip.top, dpi),
+        SharedGeometry::ScaleDip(g_settings.insetsDip.right, dpi),
+        SharedGeometry::ScaleDip(g_settings.insetsDip.bottom, dpi)};
   const RECT workArea{
       monitorWork.left + insets.left,
       monitorWork.top + insets.top,
@@ -133,7 +129,7 @@ static bool GetWorkspaceMetrics(HMONITOR monitor, WorkspaceMetrics* out) {
 
   out->workArea = workArea;
   out->dpi = dpi;
-  out->gap = ScaleDip(g_settings.gapDip, dpi);
+  out->gap = SharedGeometry::ScaleDip(g_settings.gapDip, dpi);
   return true;
 }
 

@@ -161,6 +161,8 @@ static bool SameConstraintGeometry(
     const WindowConstraints& a, const WindowConstraints& b) {
   return a.minWidth == b.minWidth &&
          a.minHeight == b.minHeight &&
+         a.maxWidth == b.maxWidth &&
+         a.maxHeight == b.maxHeight &&
          a.dpi == b.dpi &&
          a.valid == b.valid;
 }
@@ -269,6 +271,8 @@ bool Workspace::UpdateConstraints(
   const bool changed =
       old.minWidth != constraints.minWidth ||
       old.minHeight != constraints.minHeight ||
+      old.maxWidth != constraints.maxWidth ||
+      old.maxHeight != constraints.maxHeight ||
       old.dpi != constraints.dpi ||
       old.valid != constraints.valid ||
       old.lastProbeError != constraints.lastProbeError;

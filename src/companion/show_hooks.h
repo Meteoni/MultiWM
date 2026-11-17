@@ -12,50 +12,46 @@ using NtUserShowWindow_t = BOOL(WINAPI*)(HWND, int);
 static NtUserShowWindow_t g_unhookedShowWindow = nullptr;
 static NtUserShowWindow_t g_unhookedShowWindowAsync = nullptr;
 static decltype(&DeferWindowPos) g_unhookedDeferWindowPos = nullptr;
-static decltype(&SetWindowPlacement) g_unhookedSetWindowPlacement = nullptr;
 static decltype(&CreateWindowExW) g_unhookedCreateWindowExW = nullptr;
 static decltype(&CreateWindowExA) g_unhookedCreateWindowExA = nullptr;
-
-// Show commands that bring up a restored window. Maximized and minimized shows
-// are suspended by MultiWM rather than tiled, so they are left alone.
-static bool IsRestoredShowCommand(int command) {
-  if (command == SW_SHOWDEFAULT) {
-    STARTUPINFOW startup{sizeof(startup)};
-    GetStartupInfoW(&startup);
-    command = (startup.dwFlags & STARTF_USESHOWWINDOW) ? startup.wShowWindow : SW_SHOWNORMAL;
-  }
-  return command == SW_SHOWNORMAL || command == SW_SHOW || command == SW_SHOWNA ||
-         command == SW_SHOWNOACTIVATE || command == SW_RESTORE;
-}
+static decltype(&DefWindowProcW) g_unhookedDefWindowProcW = nullptr;
+static decltype(&DefWindowProcA) g_unhookedDefWindowProcA = nullptr;
 
 static BOOL WINAPI ShowWindowHook(HWND hwnd, int command) {
-  if (hwnd && IsRestoredShowCommand(command) && !IsWindowVisible(hwnd)) {
-    PlaceAtPredictedFrame(hwnd, "ShowWindow");
+  if (PrepareRestorePlacement(hwnd, command, "ShowWindow restore")) {
+    PlacementScope placing;
+    return g_unhookedShowWindow(hwnd, command);
   }
+  if (hwnd && IsRestoredShowCommand(command) && !IsWindowVisible(hwnd)) PlaceAtPredictedFrame(hwnd, "ShowWindow");
   return g_unhookedShowWindow(hwnd, command);
 }
 
 static BOOL WINAPI ShowWindowAsyncHook(HWND hwnd, int command) {
-  if (hwnd && IsRestoredShowCommand(command) && !IsWindowVisible(hwnd)) {
-    // PlaceAtPredictedFrame rejects other-thread windows. Never turn an async
-    // request into a synchronous cross-thread move or send it a minimum query.
-    PlaceAtPredictedFrame(hwnd, "ShowWindowAsync");
+  if (PrepareRestorePlacement(hwnd, command, "ShowWindowAsync restore")) {
+    PlacementScope placing;
+    return g_unhookedShowWindowAsync(hwnd, command);
   }
+  // Structural eligibility rejects cross-thread windows before any native probe.
+  if (hwnd && IsRestoredShowCommand(command) && !IsWindowVisible(hwnd)) PlaceAtPredictedFrame(hwnd, "ShowWindowAsync");
   return g_unhookedShowWindowAsync(hwnd, command);
 }
 
-// Geometry arguments use the caller's DPI coordinates. The conversion APIs use
-// the window's context, so skip unusual mixed-context calls rather than guess.
-// Per-monitor callers already use physical pixels, even for an unaware window.
-static std::optional<RECT> ConvertScreenRect(
-    HWND hwnd, const RECT& rect, BOOL(WINAPI* convert)(HWND, LPPOINT)) {
-  const auto context = GetThreadDpiAwarenessContext();
-  if (GetAwarenessFromDpiAwarenessContext(context) == DPI_AWARENESS_PER_MONITOR_AWARE) return rect;
-  if (!AreDpiAwarenessContextsEqual(context, GetWindowDpiAwarenessContext(hwnd))) return std::nullopt;
-  POINT topLeft{rect.left, rect.top};
-  POINT bottomRight{rect.right, rect.bottom};
-  if (!convert(hwnd, &topLeft) || !convert(hwnd, &bottomRight)) return std::nullopt;
-  return RECT{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
+static LRESULT WINAPI DefWindowProcWHook(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (message == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_RESTORE &&
+      PrepareRestorePlacement(hwnd, SW_RESTORE, "SC_RESTORE")) {
+    PlacementScope placing;
+    return g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
+  }
+  return g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static LRESULT WINAPI DefWindowProcAHook(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (message == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_RESTORE &&
+      PrepareRestorePlacement(hwnd, SW_RESTORE, "SC_RESTORE")) {
+    PlacementScope placing;
+    return g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
+  }
+  return g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
 }
 
 // Both immediate and deferred placement take the same geometry. Rewrite it
@@ -114,6 +110,15 @@ static HDWP WINAPI DeferWindowPosHook(
 // Programs that restore a saved position (7-Zip's file manager, for one) show
 // their window this way, with no show call to hook.
 static BOOL WINAPI SetWindowPlacementHook(HWND hwnd, const WINDOWPLACEMENT* placement) {
+  if (!g_placing && hwnd && placement && placement->length == sizeof(*placement) &&
+      (IsIconic(hwnd) || IsZoomed(hwnd))) {
+    PlacementScope placing;
+    WINDOWPLACEMENT adjusted = *placement;
+    if (AdjustRestorePlacement(hwnd, &adjusted, "SetWindowPlacement restore")) {
+      return g_unhookedSetWindowPlacement(hwnd, &adjusted);
+    }
+    return g_unhookedSetWindowPlacement(hwnd, placement);
+  }
   if (g_placing || !hwnd || !placement || placement->length != sizeof(*placement) ||
       !IsRestoredShowCommand(static_cast<int>(placement->showCmd)) ||
       IsWindowVisible(hwnd) || RejectStructurally(hwnd)) {
@@ -184,6 +189,8 @@ static bool InstallShowHooks() {
     }
   }
   ok &= WindhawkUtils::SetFunctionHook(DeferWindowPos, DeferWindowPosHook, &g_unhookedDeferWindowPos);
+  ok &= WindhawkUtils::SetFunctionHook(DefWindowProcW, DefWindowProcWHook, &g_unhookedDefWindowProcW);
+  ok &= WindhawkUtils::SetFunctionHook(DefWindowProcA, DefWindowProcAHook, &g_unhookedDefWindowProcA);
   ok &= WindhawkUtils::SetFunctionHook(SetWindowPlacement, SetWindowPlacementHook, &g_unhookedSetWindowPlacement);
   ok &= WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExWHook, &g_unhookedCreateWindowExW);
   ok &= WindhawkUtils::SetFunctionHook(CreateWindowExA, CreateWindowExAHook, &g_unhookedCreateWindowExA);

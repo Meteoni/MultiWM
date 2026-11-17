@@ -99,12 +99,24 @@ Run the maintained regression suites with the Windhawk compiler:
 ./tests/run.ps1 -CompilerRoot 'C:/path/to/Windhawk/Compiler'
 ```
 
-Use `-Suite layout`, `-Suite reconciliation`, or `-Suite companion` to run one suite.
+Use `-Suite layout`, `-Suite reconciliation`, `-Suite companion`, or `-Suite restore` to run one suite.
 The layout suite uses the real model/planner without native placement. The
 reconciliation suite uses fake desktop COM responses and test-owned hidden
 windows. The companion suite checks show-call preservation and size limits with
-test-owned hidden windows and recorded native calls. None of the suites switches
-real virtual desktops or moves other apps. Executables go under `output/tests/`.
+test-owned hidden windows and recorded native calls. The restore suite exercises
+native min/max restores using app-cloaked windows on a private Win32 desktop.
+None of the suites switches the input desktop or real virtual desktops, or moves
+other apps. Executables go under `output/tests/`.
+
+`run.ps1` builds a small isolated launcher and starts each test with
+`PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON`.
+The launcher verifies the child's Microsoft-signed-only policy while it is
+suspended and stops if isolation cannot be established. Windhawk's injector
+skips processes with this policy, and Windows prevents its DLLs from loading.
+No global exclusions, mod disabling or Windhawk restart is needed. Keep tests
+statically linked and run them through this script; direct `.exe` launches do
+not receive the policy. See the [Windows policy documentation](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-process_mitigation_binary_signature_policy)
+and [Windhawk's injector](https://github.com/ramensoftware/windhawk/blob/main/src/windhawk/engine/new_process_injector.cpp).
 
 Build with the Windhawk/WHAM compiler configuration. For changes to layout,
 ownership, or native sequencing, exercise the affected behavior and compare the

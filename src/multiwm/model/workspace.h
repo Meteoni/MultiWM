@@ -126,6 +126,13 @@ struct WindowConstraints {
   UINT dpi = 96;
   bool valid = false;
   DWORD lastProbeError = ERROR_SUCCESS;
+  // The app's maximum tracking size, in the same frame geometry as the
+  // minimums. 0 means the app left the system default (no practical maximum).
+  // A window can't grow past it, so the planner centres it inside a larger cell
+  // instead of asking for a size Windows will refuse (see CenterWithinMaximumSizes).
+  // Last, so positional initializers of the fields above keep their meaning.
+  LONG maxWidth = 0;
+  LONG maxHeight = 0;
 };
 
 static uint64_t NextTilingGeneration() {
