@@ -10,6 +10,47 @@ T GetVTableFunction(void* pInterface, int index) {
   return reinterpret_cast<T>((*reinterpret_cast<void***>(pInterface))[index]);
 }
 
+// Owns one reference to a COM interface obtained inside a function, releasing it
+// on every return path. Only for short-lived local pointers on the WM thread.
+// The long-lived g_vd proxies are released explicitly instead: after an Explorer
+// restart they must be abandoned without Release (see CleanupVirtualDesktopAPI).
+// Where a later native call must not overlap the reference, Reset() releases it
+// early so the existing release order is kept.
+template <typename T>
+class ComRef {
+ public:
+  ComRef() = default;
+  ComRef(const ComRef&) = delete;
+  ComRef& operator=(const ComRef&) = delete;
+  ComRef(ComRef&& other) noexcept : ptr_(std::exchange(other.ptr_, nullptr)) {}
+  ComRef& operator=(ComRef&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      ptr_ = std::exchange(other.ptr_, nullptr);
+    }
+    return *this;
+  }
+  ~ComRef() { Reset(); }
+
+  T* Get() const noexcept { return ptr_; }
+  T* operator->() const noexcept { return ptr_; }
+  explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+  // Releases any held reference and returns the slot for an out-parameter.
+  T** Put() noexcept {
+    Reset();
+    return &ptr_;
+  }
+  void** PutVoid() noexcept { return reinterpret_cast<void**>(Put()); }
+
+  void Reset() noexcept {
+    if (T* released = std::exchange(ptr_, nullptr)) released->Release();
+  }
+
+ private:
+  T* ptr_ = nullptr;
+};
+
 static const CLSID CLSID_ImmersiveShell = {
     0xC2F03A33, 0x21F5, 0x47FA, {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
 
@@ -430,13 +471,12 @@ bool RegisterVirtualDesktopNotifications() {
   // Taskbar Desktop Indicator pattern. Notification-service readiness can lag the
   // core VD manager during logon, so don't pin registration to the provider that
   // happened to initialize the manager first.
-  IServiceProvider* notificationProvider = nullptr;
+  ComRef<IServiceProvider> notificationProvider;
   HRESULT hr = CoCreateInstance(
       CLSID_ImmersiveShell, nullptr,
       CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
-      reinterpret_cast<void**>(&notificationProvider));
+      notificationProvider.PutVoid());
   if (FAILED(hr) || !notificationProvider) {
-    if (notificationProvider) notificationProvider->Release();
     g_vd.notificationLastHr = FAILED(hr) ? hr : E_NOINTERFACE;
     ++Diagnostics::g_runtime.counters.vdNotificationRegisterFailures;
     Wh_Log(L"VD notification registration: ImmersiveShell unavailable: 0x%08X", hr);
@@ -451,7 +491,7 @@ bool RegisterVirtualDesktopNotifications() {
   hr = notificationProvider->QueryService(
       SID_VirtualDesktopNotificationService, IID_IVirtualDesktopNotificationService,
       reinterpret_cast<void**>(&g_vd.notificationService));
-  notificationProvider->Release();
+  notificationProvider.Reset();
   if (FAILED(hr) || !g_vd.notificationService) {
     SAFE_RELEASE(g_vd.notificationService);
     g_vd.notificationLastHr = FAILED(hr) ? hr : E_NOINTERFACE;
@@ -694,54 +734,46 @@ bool GetDesktopIdsInOrder(std::vector<GUID>* desktopIds) {
   if (!desktopIds) return false;
   desktopIds->clear();
   if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI()) return false;
-  IObjectArray* desktops = nullptr;
-  HRESULT hr = CallManagerInternal(g_vd.abi.getDesktopsIndex, &desktops, true);
-  if (FAILED(hr) || !desktops) {
-    SAFE_RELEASE(desktops);
-    return false;
-  }
+  ComRef<IObjectArray> desktops;
+  HRESULT hr = CallManagerInternal(g_vd.abi.getDesktopsIndex, desktops.Put(), true);
+  if (FAILED(hr) || !desktops) return false;
   UINT count = 0;
   hr = desktops->GetCount(&count);
   for (UINT index = 0; SUCCEEDED(hr) && index < count; ++index) {
-    IVirtualDesktop* desktop = nullptr;
-    hr = desktops->GetAt(index, g_vd.abi.virtualDesktop, reinterpret_cast<void**>(&desktop));
+    ComRef<IVirtualDesktop> desktop;
+    hr = desktops->GetAt(index, g_vd.abi.virtualDesktop, desktop.PutVoid());
     GUID id{};
     if (SUCCEEDED(hr) && desktop) hr = desktop->GetId(&id);
     else if (SUCCEEDED(hr)) hr = E_NOINTERFACE;
-    SAFE_RELEASE(desktop);
     if (SUCCEEDED(hr)) desktopIds->push_back(id);
   }
-  desktops->Release();
   if (FAILED(hr)) desktopIds->clear();
   return SUCCEEDED(hr);
 }
 
 // Resolve a GUID against a fresh shell array at each mutation boundary. Holding
 // an ordinal or a desktop pointer across a dynamic-desktop update is unsafe.
-static IVirtualDesktop* FindLiveDesktop(const GUID& desktopId) {
-  if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI()) return nullptr;
-  IObjectArray* desktops = nullptr;
-  HRESULT hr = CallManagerInternal(g_vd.abi.getDesktopsIndex, &desktops, true);
+static ComRef<IVirtualDesktop> FindLiveDesktop(const GUID& desktopId) {
+  ComRef<IVirtualDesktop> found;
+  if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI()) return found;
+  ComRef<IObjectArray> desktops;
+  HRESULT hr = CallManagerInternal(g_vd.abi.getDesktopsIndex, desktops.Put(), true);
   IUnknown* const manager = g_vd.managerInternal;
-  if (FAILED(hr) || !desktops) {
-    SAFE_RELEASE(desktops);
-    return nullptr;
-  }
+  if (FAILED(hr) || !desktops) return found;
   UINT count = 0;
   if (FAILED(desktops->GetCount(&count))) count = 0;
-  IVirtualDesktop* found = nullptr;
   for (UINT index = 0; index < count; ++index) {
-    IVirtualDesktop* desktop = nullptr;
+    ComRef<IVirtualDesktop> desktop;
     GUID id{};
-    if (SUCCEEDED(desktops->GetAt(index, g_vd.abi.virtualDesktop, reinterpret_cast<void**>(&desktop))) &&
+    if (SUCCEEDED(desktops->GetAt(index, g_vd.abi.virtualDesktop, desktop.PutVoid())) &&
         desktop && SUCCEEDED(desktop->GetId(&id)) && IsEqualGUID(id, desktopId)) {
-      found = desktop;
+      found = std::move(desktop);
       break;
     }
-    SAFE_RELEASE(desktop);
   }
-  desktops->Release();
-  if (g_vd.managerInternal != manager) SAFE_RELEASE(found);
+  desktops.Reset();
+  // A reinitialization during enumeration means `found` belongs to the old shell.
+  if (g_vd.managerInternal != manager) found.Reset();
   return found;
 }
 
@@ -754,46 +786,43 @@ bool IsDesktopEmptyExcept(const GUID& desktopId, HWND allowedWindow) {
       {0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
   const IID viewIid =
       {0x372E1D3B, 0x38D3, 0x42E4, {0xA1, 0x5B, 0x8A, 0xB2, 0xB1, 0x78, 0xF5, 0x13}};
-  IUnknown* collection = nullptr;
-  IObjectArray* views = nullptr;
-  IUnknown* allowedIdentity = nullptr;
+  // Declared in reverse release order: allowedIdentity, views, then collection.
+  ComRef<IUnknown> collection;
+  ComRef<IObjectArray> views;
+  ComRef<IUnknown> allowedIdentity;
   HRESULT hr = g_vd.serviceProvider->QueryService(
-      collectionIid, collectionIid, reinterpret_cast<void**>(&collection));
+      collectionIid, collectionIid, collection.PutVoid());
   if (SUCCEEDED(hr) && collection && allowedWindow) {
-    IUnknown* view = nullptr;
-    hr = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HWND, IUnknown**)>(collection, 6)(
-        collection, allowedWindow, &view);
-    if (SUCCEEDED(hr) && view) hr = view->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&allowedIdentity));
+    ComRef<IUnknown> view;
+    hr = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HWND, IUnknown**)>(collection.Get(), 6)(
+        collection.Get(), allowedWindow, view.Put());
+    if (SUCCEEDED(hr) && view) hr = view->QueryInterface(IID_IUnknown, allowedIdentity.PutVoid());
     else if (SUCCEEDED(hr)) hr = E_NOINTERFACE;
-    SAFE_RELEASE(view);
   }
   if (SUCCEEDED(hr) && collection) {
-    hr = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IObjectArray**)>(collection, 3)(collection, &views);
+    hr = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IObjectArray**)>(collection.Get(), 3)(
+        collection.Get(), views.Put());
   } else if (SUCCEEDED(hr)) hr = E_NOINTERFACE;
   UINT count = 0;
   if (SUCCEEDED(hr) && views) hr = views->GetCount(&count);
   else if (SUCCEEDED(hr)) hr = E_NOINTERFACE;
   bool empty = SUCCEEDED(hr);
   for (UINT index = 0; empty && index < count; ++index) {
-    IUnknown* view = nullptr;
-    IUnknown* identity = nullptr;
+    // Declared so identity is released before view, as before.
+    ComRef<IUnknown> view;
+    ComRef<IUnknown> identity;
     GUID owner{};
-    hr = views->GetAt(index, viewIid, reinterpret_cast<void**>(&view));
+    hr = views->GetAt(index, viewIid, view.PutVoid());
     if (SUCCEEDED(hr) && view) {
       // IApplicationView derives from IInspectable; GetVirtualDesktopId is slot 25.
-      hr = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, GUID*)>(view, 25)(view, &owner);
+      hr = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, GUID*)>(view.Get(), 25)(view.Get(), &owner);
       if (SUCCEEDED(hr) && IsEqualGUID(owner, desktopId)) {
-        hr = view->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&identity));
-        empty = SUCCEEDED(hr) && allowedIdentity && identity == allowedIdentity;
+        hr = view->QueryInterface(IID_IUnknown, identity.PutVoid());
+        empty = SUCCEEDED(hr) && allowedIdentity && identity.Get() == allowedIdentity.Get();
       }
     } else if (SUCCEEDED(hr)) hr = E_NOINTERFACE;
     if (FAILED(hr)) empty = false;
-    SAFE_RELEASE(identity);
-    SAFE_RELEASE(view);
   }
-  SAFE_RELEASE(allowedIdentity);
-  SAFE_RELEASE(views);
-  SAFE_RELEASE(collection);
   return empty && g_vd.managerInternal == manager;
 }
 
@@ -813,13 +842,15 @@ bool CreateDesktopAfter(const GUID& sourceDesktop, GUID* desktopId, int* desktop
   if (source == order.end() ||
       (g_vd.abi.moveDesktopIndex < 0 && source + 1 != order.end())) return false;
   IUnknown* const manager = g_vd.managerInternal;
-  IVirtualDesktop* created = nullptr;
-  // Creation is a mutation: never retry it after a lost COM response.
-  HRESULT hr = UsesHMonitorParameter()
-      ? GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, IVirtualDesktop**)>(manager, g_vd.abi.createDesktopIndex)(manager, nullptr, &created)
-      : GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop**)>(manager, g_vd.abi.createDesktopIndex)(manager, &created);
-  if (created) created->GetId(desktopId);
-  SAFE_RELEASE(created);
+  HRESULT hr = E_FAIL;
+  {
+    ComRef<IVirtualDesktop> created;
+    // Creation is a mutation: never retry it after a lost COM response.
+    hr = UsesHMonitorParameter()
+        ? GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, IVirtualDesktop**)>(manager, g_vd.abi.createDesktopIndex)(manager, nullptr, created.Put())
+        : GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop**)>(manager, g_vd.abi.createDesktopIndex)(manager, created.Put());
+    if (created) created->GetId(desktopId);
+  }
   if (IsEqualGUID(*desktopId, GUID_NULL)) {
     Diagnostics::RecordEvent(L"overflow desktop creation returned no identity hr=%08X", hr);
     if (IsDeadVirtualDesktopProxy(hr)) RuntimeLifecycle::RequestMaintenance(true);
@@ -834,12 +865,11 @@ bool CreateDesktopAfter(const GUID& sourceDesktop, GUID* desktopId, int* desktop
     if (g_vd.abi.moveDesktopIndex < 0 || !IsDesktopEmptyExcept(*desktopId) ||
         g_vd.managerInternal != manager || !IsCurrentDesktop(sourceDesktop)) return false;
     const int index = static_cast<int>(source - order.begin()) + (target < source ? 0 : 1);
-    created = FindLiveDesktop(*desktopId);
-    if (!created || g_vd.managerInternal != manager) { SAFE_RELEASE(created); return false; }
+    const ComRef<IVirtualDesktop> created = FindLiveDesktop(*desktopId);
+    if (!created || g_vd.managerInternal != manager) return false;
     hr = UsesHMonitorParameter()
-        ? GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop*, HMONITOR, int)>(manager, g_vd.abi.moveDesktopIndex)(manager, created, nullptr, index)
-        : GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop*, int)>(manager, g_vd.abi.moveDesktopIndex)(manager, created, index);
-    created->Release();
+        ? GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop*, HMONITOR, int)>(manager, g_vd.abi.moveDesktopIndex)(manager, created.Get(), nullptr, index)
+        : GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop*, int)>(manager, g_vd.abi.moveDesktopIndex)(manager, created.Get(), index);
   }
   if (!GetDesktopIdsInOrder(&order) || g_vd.managerInternal != manager) return false;
   source = FindDesktopInOrder(order, sourceDesktop);
@@ -855,22 +885,21 @@ bool CreateDesktopAfter(const GUID& sourceDesktop, GUID* desktopId, int* desktop
 // Never delete a selected desktop or one containing any shell application view.
 bool RemoveEmptyOverflowDesktop(const GUID& desktopId, const GUID& fallbackDesktop) {
   if (IsEqualGUID(desktopId, GUID_NULL) || IsEqualGUID(desktopId, fallbackDesktop)) return false;
-  IVirtualDesktop* desktop = FindLiveDesktop(desktopId);
+  ComRef<IVirtualDesktop> desktop = FindLiveDesktop(desktopId);
   IUnknown* const manager = g_vd.managerInternal;
-  IVirtualDesktop* fallback = FindLiveDesktop(fallbackDesktop);
+  ComRef<IVirtualDesktop> fallback = FindLiveDesktop(fallbackDesktop);
   GUID current{};
   bool removed = false;
   if (desktop && fallback && IsDesktopEmptyExcept(desktopId) &&
       Platform::VirtualDesktop::GetCurrentDesktopId(&current) && !IsEqualGUID(current, desktopId) &&
       g_vd.managerInternal == manager) {
     HRESULT hr = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop*, IVirtualDesktop*)>(
-        manager, g_vd.abi.removeDesktopIndex)(manager, desktop, fallback);
+        manager, g_vd.abi.removeDesktopIndex)(manager, desktop.Get(), fallback.Get());
     removed = SUCCEEDED(hr);
     Diagnostics::RecordEvent(L"overflow empty desktop cleanup target=%08X hr=%08X", desktopId.Data1, hr);
     if (IsDeadVirtualDesktopProxy(hr)) RuntimeLifecycle::RequestMaintenance(true);
   }
-  SAFE_RELEASE(desktop);
-  SAFE_RELEASE(fallback);
+  desktop.Reset();  // Keep the original release order: target, then fallback.
   return removed;
 }
 
@@ -884,46 +913,42 @@ bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, 
         IsEqualGUID(pending->second.targetDesktop, desktopId) && !Gestures::IsMoveSizeGestureInProgress(hwnd);
   };
   if (!requestPending() || !g_vd.serviceProvider) return false;
-  IVirtualDesktop* desktop = FindLiveDesktop(desktopId);
+  ComRef<IVirtualDesktop> desktop = FindLiveDesktop(desktopId);
   if (!desktop) return false;
   IUnknown* const manager = g_vd.managerInternal;
-  if (!manager || !g_vd.serviceProvider || !requestPending()) {
-    desktop->Release();
-    return false;
-  }
+  if (!manager || !g_vd.serviceProvider || !requestPending()) return false;
   const IID viewCollectionIid =
       {0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
-  IUnknown* collection = nullptr;
-  IUnknown* view = nullptr;
+  ComRef<IUnknown> collection;
+  ComRef<IUnknown> view;
   HRESULT hr = g_vd.serviceProvider->QueryService(
-      viewCollectionIid, viewCollectionIid, reinterpret_cast<void**>(&collection));
+      viewCollectionIid, viewCollectionIid, collection.PutVoid());
   if (SUCCEEDED(hr) && collection) {
-    const auto getView = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HWND, IUnknown**)>(collection, 6);
-    hr = getView(collection, hwnd, &view);
+    const auto getView = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HWND, IUnknown**)>(collection.Get(), 6);
+    hr = getView(collection.Get(), hwnd, view.Put());
   } else if (SUCCEEDED(hr)) {
     hr = E_NOINTERFACE;
   }
-  IUnknown* pinnedApps = nullptr;
   const CLSID pinnedAppsService =
       {0xB5A399E7, 0x1C87, 0x46B8, {0x88, 0xE9, 0xFC, 0x57, 0x47, 0xB1, 0x71, 0xBD}};
   const IID pinnedAppsIid =
       {0x4CE81583, 0x1E4C, 0x4632, {0xA6, 0x21, 0x07, 0xA5, 0x35, 0x43, 0x14, 0x8F}};
   BOOL pinned = TRUE;
   if (SUCCEEDED(hr) && view) {
+    ComRef<IUnknown> pinnedApps;  // Released at the end of this check.
     hr = g_vd.managerInternal == manager && g_vd.serviceProvider
-        ? g_vd.serviceProvider->QueryService(pinnedAppsService, pinnedAppsIid, reinterpret_cast<void**>(&pinnedApps))
+        ? g_vd.serviceProvider->QueryService(pinnedAppsService, pinnedAppsIid, pinnedApps.PutVoid())
         : E_ABORT;
     if (SUCCEEDED(hr) && pinnedApps) {
-      const auto isPinned = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, BOOL*)>(pinnedApps, 6);
-      hr = isPinned(pinnedApps, view, &pinned);
+      const auto isPinned = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, BOOL*)>(pinnedApps.Get(), 6);
+      hr = isPinned(pinnedApps.Get(), view.Get(), &pinned);
     }
     if (SUCCEEDED(hr) && pinned) hr = E_ACCESSDENIED;
   }
-  SAFE_RELEASE(pinnedApps);
   BOOL canMove = FALSE;
   if (SUCCEEDED(hr) && view && g_vd.managerInternal == manager) {
     const auto canMoveView = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, BOOL*)>(g_vd.managerInternal, 5);
-    hr = canMoveView(g_vd.managerInternal, view, &canMove);
+    hr = canMoveView(g_vd.managerInternal, view.Get(), &canMove);
   }
   const bool sourceObserved = SUCCEEDED(hr) && view && canMove &&
       IsWindowOnDesktop(hwnd, sourceDesktop);
@@ -934,13 +959,14 @@ bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, 
   if (sourceObserved && sourceActive && Platform::Windows::IsSameLiveWindow(hwnd, processId) &&
       requestPending() && manager && g_vd.managerInternal == manager) {
     const auto moveView = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, IVirtualDesktop*)>(g_vd.managerInternal, 4);
-    hr = moveView(g_vd.managerInternal, view, desktop);
+    hr = moveView(g_vd.managerInternal, view.Get(), desktop.Get());
   } else if (SUCCEEDED(hr)) {
     hr = E_ACCESSDENIED;
   }
-  SAFE_RELEASE(view);
-  SAFE_RELEASE(collection);
-  desktop->Release();
+  // Release before the follow-up ownership query, as before.
+  view.Reset();
+  collection.Reset();
+  desktop.Reset();
   // A mutation can complete despite a lost COM response. Never blindly repeat it.
   const bool ownerMatches = IsWindowOnDesktop(hwnd, desktopId);
   const bool moved = Platform::Windows::IsSameLiveWindow(hwnd, processId) && ownerMatches &&
@@ -953,7 +979,7 @@ bool MoveWindowToDesktop(HWND hwnd, DWORD processId, const GUID& sourceDesktop, 
 
 bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GUID& sourceDesktop, DWORD inputTickMs,
                      WindowMovePurpose purpose) {
-  IVirtualDesktop* desktop = FindLiveDesktop(desktopId);
+  ComRef<IVirtualDesktop> desktop = FindLiveDesktop(desktopId);
   if (!desktop) return false;
   IUnknown* const manager = g_vd.managerInternal;
   auto canFollow = [&] {
@@ -970,10 +996,7 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
     return Platform::Windows::IsSameLiveWindow(hwnd, processId) && requestPending &&
            GetLastInputInfo(&input) && input.dwTime == inputTickMs;
   };
-  if (!canFollow()) {
-    desktop->Release();
-    return false;
-  }
+  if (!canFollow()) return false;
   HRESULT hr = E_NOINTERFACE;
   bool animated = false;
   if (g_vd.abi.animatedSwitchIndex >= 0) {
@@ -984,14 +1007,11 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
         g_vd.managerInternal, g_vd.abi.animationWaitIndex);
     hr = waitForAnimation(g_vd.managerInternal);
     // An existing animation can outlast the user's decision to stay elsewhere.
-    if (!canFollow()) {
-      desktop->Release();
-      return false;
-    }
+    if (!canFollow()) return false;
     if (SUCCEEDED(hr)) {
       const auto switchAnimated = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop*)>(
           g_vd.managerInternal, g_vd.abi.animatedSwitchIndex);
-      hr = switchAnimated(g_vd.managerInternal, desktop);
+      hr = switchAnimated(g_vd.managerInternal, desktop.Get());
       animated = SUCCEEDED(hr);
       if (animated && g_vd.managerInternal == manager) {
         const HRESULT waitHr = waitForAnimation(g_vd.managerInternal);
@@ -1004,14 +1024,14 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
     if (g_vd.abi.usesHMonitor) {
       const auto switchDesktop = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, IVirtualDesktop*)>(
           g_vd.managerInternal, g_vd.abi.switchDesktopIndex);
-      hr = switchDesktop(g_vd.managerInternal, nullptr, desktop);
+      hr = switchDesktop(g_vd.managerInternal, nullptr, desktop.Get());
     } else {
       const auto switchDesktop = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IVirtualDesktop*)>(
           g_vd.managerInternal, g_vd.abi.switchDesktopIndex);
-      hr = switchDesktop(g_vd.managerInternal, desktop);
+      hr = switchDesktop(g_vd.managerInternal, desktop.Get());
     }
   }
-  desktop->Release();
+  desktop.Reset();  // Release before the current-desktop check, as before.
   const bool accepted = SUCCEEDED(hr) || IsCurrentDesktop(desktopId);
   Diagnostics::RecordEvent(L"window desktop switch target=%08X hr=%08X accepted=%d animated=%d", desktopId.Data1, hr, accepted ? 1 : 0, animated ? 1 : 0);
   if (IsDeadVirtualDesktopProxy(hr)) RuntimeLifecycle::RequestMaintenance(true);
@@ -1030,8 +1050,8 @@ bool GetCurrentDesktopId(GUID* outGuid) {
   // stale IVirtualDesktop can still fail at GetId after Explorer replacement, so
   // allow one full core reacquisition for that distinct failure boundary too.
   for (int attempt = 0; attempt < 2; ++attempt) {
-    IVirtualDesktop* desktop = nullptr;
-    HRESULT hr = CallManagerInternal(VTABLE_GET_CURRENT_DESKTOP, &desktop);
+    ComRef<IVirtualDesktop> desktop;
+    HRESULT hr = CallManagerInternal(VTABLE_GET_CURRENT_DESKTOP, desktop.Put());
     if (FAILED(hr) || !desktop) {
       g_vd.lastKnownDesktopValid = false;
       RuntimeLifecycle::RequestMaintenance(false);
@@ -1040,7 +1060,7 @@ bool GetCurrentDesktopId(GUID* outGuid) {
     }
 
     hr = desktop->GetId(outGuid);
-    desktop->Release();
+    desktop.Reset();  // Release before any reinitialization below.
     if (SUCCEEDED(hr)) {
       g_vd.lastKnownDesktop = *outGuid;
       g_vd.lastKnownDesktopValid = true;

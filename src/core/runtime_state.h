@@ -382,10 +382,22 @@ static WorkspaceRepository g_workspaces;
 namespace Gestures {
 // Frame rectangles captured by the WinEvent callback at the start and end of a
 // user move/resize, consumed later on the WM thread to classify the gesture.
+// The three maps describe one gesture per window and are always dropped together.
 struct MoveSizeTracker {
   std::unordered_map<HWND, RECT> startRects;
   std::unordered_map<HWND, RECT> endRects;
   std::unordered_map<HWND, POINT> endPoints;
+
+  void Forget(HWND hwnd) {
+    startRects.erase(hwnd);
+    endRects.erase(hwnd);
+    endPoints.erase(hwnd);
+  }
+  void Clear() noexcept {
+    startRects.clear();
+    endRects.clear();
+    endPoints.clear();
+  }
 };
 
 static MoveSizeTracker g_moveSize;
@@ -424,11 +436,6 @@ struct PendingLayoutMutation {
   const wchar_t* action = L"Layout mutation";
 };
 
-static std::unordered_map<
-    DesktopMonitorKey, PendingLayoutMutation,
-    Model::DesktopMonitorKeyHash, Model::DesktopMonitorKeyEqual>
-    g_pendingLayoutMutations;
-
 // Admission recovery can move the pending member and reassign siblings before
 // conformance has proved the resulting arrangement. Keep the pre-recovery order
 // until that member settles so a suspend/restore race cannot strand established
@@ -438,9 +445,6 @@ struct PendingAdmissionRecovery {
   Workspace baseline;
   uint64_t generation = 0;
 };
-
-static std::unordered_map<HWND, PendingAdmissionRecovery>
-    g_pendingAdmissionRecoveries;
 
 // A bounded period after placement during which a window is pushed back onto its
 // tile if it drifts (see the glossary in CONTRIBUTING.md).
@@ -460,17 +464,102 @@ struct ConformanceLease {
   uint64_t generation = 0;
 };
 
-struct ConformanceLeaseTracker {
-  std::unordered_map<HWND, ConformanceLease> leases;
-  uint64_t nextGeneration = 1;
-};
-
-static ConformanceLeaseTracker g_conformanceLeases;
-
 enum class ConformanceLeaseReadResult {
   Missing,
   Active,
   Expired,
 };
+
+// Durations copied from settings when a lease starts, so the store itself never
+// reads g_settings.
+struct ConformanceLeaseTiming {
+  ULONGLONG durationMs = 0;
+  ULONGLONG repairIntervalMs = 0;
+};
+
+// Expired leases and due repairs found by one timer pass. Collecting them first
+// lets the caller finalize/repair without iterating the store it changes.
+struct DueConformanceWork {
+  struct ExpiredLease {
+    HWND hwnd = nullptr;
+    uint64_t generation = 0;
+  };
+  std::vector<ExpiredLease> expired;
+  std::vector<HWND> repairs;
+};
+
+// Placement changes that have been applied but not yet proven: conformance
+// leases, user layout mutations awaiting settlement, and admission-recovery
+// baselines. All three describe the same unproven arrangement, so they share one
+// owner and one reset (Clear). The store keeps generations and expiry rules;
+// repair, rollback and float policy stay in placement/arrangement.h and
+// placement/conformance.h, which define these members. WM thread only. Callers
+// pass `nowMs` so every decision in one operation uses the same tick.
+class PendingProofs {
+ public:
+  // --- Conformance leases ---
+  // Copies the lease into outLease (when non-null) without consuming expiry.
+  ConformanceLeaseReadResult ReadLease(
+      HWND hwnd, ULONGLONG nowMs, ConformanceLease* outLease) const;
+  // Re-observing an active lease's target keeps its original deadline and only
+  // updates the preferred window/repair time. Otherwise starts a replacement with
+  // a new generation. Returns true only when a new lease was started.
+  bool BeginLease(HWND hwnd, const RECT& expectedRect, HWND preferredTiledWindow,
+                  bool scheduleRepair, ULONGLONG nowMs,
+                  const ConformanceLeaseTiming& timing);
+  // generation==0 cancels unconditionally; otherwise only that generation.
+  bool CancelLease(HWND hwnd, uint64_t generation);
+  // Moves an active lease's next repair earlier (never later).
+  bool DeferLeaseRepair(HWND hwnd, uint64_t generation, ULONGLONG dueTickMs,
+                        ULONGLONG nowMs);
+  // Counts a repair attempt on an active lease and clears its due time.
+  bool RecordLeaseAttempt(HWND hwnd, uint64_t generation, ULONGLONG nowMs,
+                          unsigned* outAttemptNumber);
+  // Removes and returns one expired generation; a replacement or cancellation
+  // that happened first wins.
+  std::optional<ConformanceLease> TakeExpiredLease(
+      HWND hwnd, uint64_t generation, ULONGLONG nowMs);
+  // Lists expired leases and clears the due time of each repair it returns.
+  DueConformanceWork TakeDueLeaseWork(ULONGLONG nowMs);
+  size_t CountActiveLeases(ULONGLONG nowMs) const;
+  // Earliest expiry or repair time over all leases; 0 when there are none.
+  ULONGLONG NextLeaseDeadline() const;
+
+  // --- User layout mutations (one per workspace) ---
+  void RememberLayoutMutation(const DesktopMonitorKey& key,
+                              PendingLayoutMutation mutation);
+  // The pointer is valid until the next change to this store.
+  const PendingLayoutMutation* FindLayoutMutation(
+      const DesktopMonitorKey& key) const;
+  void DiscardLayoutMutation(const DesktopMonitorKey& key);
+  size_t LayoutMutationCount() const { return mutations_.size(); }
+
+  // --- Admission-recovery baselines (one per window) ---
+  // The pointer is valid until the next change to this store.
+  const PendingAdmissionRecovery* FindAdmissionRecovery(HWND hwnd) const;
+  void RememberAdmissionRecovery(HWND hwnd, PendingAdmissionRecovery recovery);
+  std::optional<PendingAdmissionRecovery> TakeAdmissionRecovery(HWND hwnd);
+  void DiscardAdmissionRecovery(HWND hwnd);
+  size_t AdmissionRecoveryCount() const { return recoveries_.size(); }
+
+  // Forgets every unproven change. Lease generations keep increasing, so an
+  // observation copied before Clear can never match a later lease.
+  void Clear() noexcept;
+
+ private:
+  // Defined only by the regression tests, which drive lease timing directly.
+  friend struct PendingProofsTestAccess;
+
+  uint64_t AllocateGeneration();
+
+  std::unordered_map<HWND, ConformanceLease> leases_;
+  uint64_t nextGeneration_ = 1;
+  std::unordered_map<DesktopMonitorKey, PendingLayoutMutation,
+                     Model::DesktopMonitorKeyHash, Model::DesktopMonitorKeyEqual>
+      mutations_;
+  std::unordered_map<HWND, PendingAdmissionRecovery> recoveries_;
+};
+
+static PendingProofs g_pendingProofs;
 
 }  // namespace Placement

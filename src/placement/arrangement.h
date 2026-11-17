@@ -99,11 +99,11 @@ static void RememberPendingLayoutMutation(
   mutation.subject = subject;
   mutation.kind = kind;
   mutation.action = action ? action : L"Layout mutation";
-  g_pendingLayoutMutations[key] = std::move(mutation);
+  g_pendingProofs.RememberLayoutMutation(key, std::move(mutation));
 }
 
 static void DiscardPendingAdmissionRecovery(HWND hwnd) {
-  if (hwnd) g_pendingAdmissionRecoveries.erase(hwnd);
+  if (hwnd) g_pendingProofs.DiscardAdmissionRecovery(hwnd);
 }
 
 static void RememberPendingAdmissionRecovery(
@@ -115,10 +115,10 @@ static void RememberPendingAdmissionRecovery(
     return;
   }
 
-  auto existing = g_pendingAdmissionRecoveries.find(hwnd);
-  if (existing != g_pendingAdmissionRecoveries.end() &&
-      existing->second.generation == record->tilingGeneration &&
-      Model::DesktopMonitorKeyEqual{}(existing->second.key, key)) {
+  const PendingAdmissionRecovery* existing =
+      g_pendingProofs.FindAdmissionRecovery(hwnd);
+  if (existing && existing->generation == record->tilingGeneration &&
+      Model::DesktopMonitorKeyEqual{}(existing->key, key)) {
     // Keep the earliest pre-recovery snapshot for this unsettled admission.
     return;
   }
@@ -127,7 +127,7 @@ static void RememberPendingAdmissionRecovery(
   recovery.key = key;
   recovery.baseline = baseline;
   recovery.generation = record->tilingGeneration;
-  g_pendingAdmissionRecoveries[hwnd] = std::move(recovery);
+  g_pendingProofs.RememberAdmissionRecovery(hwnd, std::move(recovery));
 }
 
 // If an admission/restore leaves active participation before its recovery has
@@ -138,11 +138,11 @@ static void RememberPendingAdmissionRecovery(
 static bool RestorePendingAdmissionRecoveryAfterSuspension(
     const DesktopMonitorKey& key, HWND hwnd, Workspace* workspace) {
   if (!workspace || !hwnd) return false;
-  auto recoveryIt = g_pendingAdmissionRecoveries.find(hwnd);
-  if (recoveryIt == g_pendingAdmissionRecoveries.end()) return false;
+  std::optional<PendingAdmissionRecovery> taken =
+      g_pendingProofs.TakeAdmissionRecovery(hwnd);
+  if (!taken) return false;
 
-  PendingAdmissionRecovery recovery = recoveryIt->second;
-  g_pendingAdmissionRecoveries.erase(recoveryIt);
+  const PendingAdmissionRecovery recovery = std::move(*taken);
   if (!Model::DesktopMonitorKeyEqual{}(recovery.key, key)) return false;
 
   const WindowRecord* currentRecord = workspace->Find(hwnd);
@@ -272,31 +272,32 @@ static bool TryRollbackPendingLayoutMutation(
     const DesktopMonitorKey& key, HMONITOR monitor, Workspace* workspace,
     const std::vector<RECT>& rejectedRects, HWND culpritHint = nullptr) {
   if (!workspace) return false;
-  auto mutationIt = g_pendingLayoutMutations.find(key);
-  if (mutationIt == g_pendingLayoutMutations.end()) return false;
+  const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
+  if (!pending) return false;
   // Constraint learning and admission recovery are allowed to adjust ratios or
   // reorder pending admissions downstream of the user's command. Those are part
   // of the same delayed transaction, not evidence that the transaction is stale.
   // Only a membership/participation change makes the saved rollback snapshot
   // unsafe to apply.
-  if (!workspace->HasSameWindowMembershipAs(mutationIt->second.candidate)) {
+  if (!workspace->HasSameWindowMembershipAs(pending->candidate)) {
     Diagnostics::RecordEvent(
         L"discarded stale layout mutation rollback after membership change action=%ls desktop=%08X",
-        mutationIt->second.action, key.desktopId.Data1);
-    g_pendingLayoutMutations.erase(mutationIt);
+        pending->action, key.desktopId.Data1);
+    g_pendingProofs.DiscardLayoutMutation(key);
     return false;
   }
 
-  PendingLayoutMutation mutation = mutationIt->second;
+  // Work from a copy: every exit below discards the stored mutation.
+  const PendingLayoutMutation mutation = *pending;
   Workspace restored = *workspace;
   if (!restored.RestoreLayoutStateFrom(mutation.previous)) {
-    g_pendingLayoutMutations.erase(mutationIt);
+    g_pendingProofs.DiscardLayoutMutation(key);
     return false;
   }
 
   Platform::Monitors::WorkspaceMetrics rollbackMetrics;
   if (!Platform::Monitors::GetWorkspaceMetrics(monitor, &rollbackMetrics)) {
-    g_pendingLayoutMutations.erase(mutationIt);
+    g_pendingProofs.DiscardLayoutMutation(key);
     return false;
   }
   std::vector<RECT> restoredRects;
@@ -308,7 +309,7 @@ static bool TryRollbackPendingLayoutMutation(
     Diagnostics::RecordEvent(
         L"layout mutation rollback no longer feasible action=%ls desktop=%08X",
         mutation.action, key.desktopId.Data1);
-    g_pendingLayoutMutations.erase(mutationIt);
+    g_pendingProofs.DiscardLayoutMutation(key);
     return false;
   }
 
@@ -321,27 +322,27 @@ static bool TryRollbackPendingLayoutMutation(
       *workspace, rejectedRects, culpritHint);
   g_workspaces.Save(key, restored);
   *workspace = std::move(restored);
-  g_pendingLayoutMutations.erase(mutationIt);
+  g_pendingProofs.DiscardLayoutMutation(key);
   TrayUi::UpdateIcon(workspace->Layout(), monitor);
   return true;
 }
 
 static void ClearSettledLayoutMutation(
     const DesktopMonitorKey& key, const Workspace& workspace) {
-  auto mutationIt = g_pendingLayoutMutations.find(key);
-  if (mutationIt == g_pendingLayoutMutations.end()) return;
-  if (!workspace.HasSameWindowMembershipAs(mutationIt->second.candidate)) {
+  const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
+  if (!pending) return;
+  if (!workspace.HasSameWindowMembershipAs(pending->candidate)) {
     Diagnostics::RecordEvent(
         L"discarded stale layout mutation settle after membership change action=%ls desktop=%08X",
-        mutationIt->second.action, key.desktopId.Data1);
-    g_pendingLayoutMutations.erase(mutationIt);
+        pending->action, key.desktopId.Data1);
+    g_pendingProofs.DiscardLayoutMutation(key);
     return;
   }
   if (HasOutstandingConformanceLease(workspace)) return;
   Diagnostics::RecordEvent(
       L"layout mutation settled action=%ls desktop=%08X",
-      mutationIt->second.action, key.desktopId.Data1);
-  g_pendingLayoutMutations.erase(mutationIt);
+      pending->action, key.desktopId.Data1);
+  g_pendingProofs.DiscardLayoutMutation(key);
 }
 
 static bool FloatWindowAfterFailure(
@@ -475,7 +476,9 @@ struct ArrangementContext {
 };
 
 enum class ArrangementStep { Replan, Finished };
-enum class ConstraintRemovalReason { IntrinsicMinimum, PendingAdmission, SingleRemoval, AggregateConflict };
+enum class ConstraintRemovalReason {
+  IntrinsicMinimum, PendingAdmission, MinimumGrowth, SingleRemoval, AggregateConflict
+};
 
 // WM thread only. The snapshot contains victim and its matching record. Records
 // diagnostic values without changing membership or retaining input references.
@@ -499,6 +502,11 @@ static void RecordConstraintRemoval(
     Diagnostics::RecordEvent(
         L"pending admission rejected hwnd=%p generation=%llu",
         victim, static_cast<unsigned long long>(generation));
+  } else if (reason == ConstraintRemovalReason::MinimumGrowth) {
+    Wh_Log(
+        L"Constraint conflict after raised native minimum; floating HWND %p (generation=%llu)",
+        static_cast<void*>(victim),
+        static_cast<unsigned long long>(generation));
   } else if (reason == ConstraintRemovalReason::SingleRemoval) {
     Wh_Log(
         L"Current-order constraint conflict; floating single-removal candidate HWND %p (generation=%llu)",
@@ -511,10 +519,12 @@ static void RecordConstraintRemoval(
         static_cast<unsigned long long>(generation));
   }
   Diagnostics::RecordEvent(
-      L"native constraints floated hwnd=%p generation=%llu intrinsic=%d singleRemovalCurrentOrder=%d preferred=%d min=%ldx%ld",
+      L"native constraints floated hwnd=%p generation=%llu intrinsic=%d singleRemovalCurrentOrder=%d minimumGrowth=%d preferred=%d min=%ldx%ld",
       victim, static_cast<unsigned long long>(generation),
       reason == ConstraintRemovalReason::IntrinsicMinimum ? 1 : 0,
-      reason == ConstraintRemovalReason::SingleRemoval ? 1 : 0,
+      reason == ConstraintRemovalReason::SingleRemoval ||
+          reason == ConstraintRemovalReason::MinimumGrowth ? 1 : 0,
+      reason == ConstraintRemovalReason::MinimumGrowth ? 1 : 0,
       victim == preferredTiledWindow ? 1 : 0,
       constraints.minWidth, constraints.minHeight);
 
@@ -577,8 +587,9 @@ static HWND FindWindowLargerThanWorkArea(
   return victim;
 }
 
-// Tiled windows that may be removed, newest admission first, with the window
-// the user just acted on (`preferredTiledWindow`) last.
+// Tiled windows that may be removed, newest layout demand (admission,
+// restoration or raised minimum) first, with the window the user just acted on
+// (`preferredTiledWindow`) last.
 static std::vector<Layout::ConstraintCandidate> OrderRemovalCandidates(
     const Workspace& workspace, HWND preferredTiledWindow) {
   std::vector<Layout::ConstraintCandidate> candidates;
@@ -586,33 +597,67 @@ static std::vector<Layout::ConstraintCandidate> OrderRemovalCandidates(
   for (HWND candidate : workspace.TiledWindows()) {
     if (IsExemptFromRemoval(candidate)) continue;
     const WindowRecord* candidateRecord = workspace.Find(candidate);
-    candidates.push_back({candidate, candidateRecord ? candidateRecord->tilingGeneration : 0});
+    candidates.push_back({candidate, candidateRecord ? Model::LayoutDemandRecency(*candidateRecord) : 0});
   }
   std::stable_sort(candidates.begin(), candidates.end(),
                    [&](const Layout::ConstraintCandidate& first, const Layout::ConstraintCandidate& second) {
                      const bool firstPreferred = first.hwnd == preferredTiledWindow;
                      const bool secondPreferred = second.hwnd == preferredTiledWindow;
                      if (firstPreferred != secondPreferred) return !firstPreferred;
-                     return first.generation > second.generation;
+                     return first.demandGeneration > second.demandGeneration;
                    });
   return candidates;
 }
 
-// Picks the window to float after admission recovery failed, in this order:
-//  1. A still-settling (pending) window: it introduced the failure, so it goes,
-//     never an already-settled sibling.
-//  2. The first candidate whose removal alone makes the current order fit.
+// Returns the still-settling admission that introduced this conflict, or null.
+// That is the newest pending admission, unless a settled sibling raised its
+// minimum after it (the likelier cause), and only if the established windows
+// fit once every removable pending admission is gone. Otherwise the conflict is
+// among settled windows (a sibling left, or a minimum grew), and an unrelated
+// pending window that merely has not settled yet is not blamed.
+static HWND FindIntroducingPendingAdmission(
+    const Workspace& workspace, const std::vector<Layout::ConstraintCandidate>& candidates,
+    const RECT& workArea, LONG gap) {
+  const Layout::ConstraintCandidate* newest = nullptr;
+  uint64_t newestSettledGrowth = 0;
+  for (const Layout::ConstraintCandidate& candidate : candidates) {
+    const WindowRecord* record = workspace.Find(candidate.hwnd);
+    if (!record) continue;
+    if (record->pendingInsertionPlacement) {
+      if (!newest || candidate.demandGeneration > newest->demandGeneration) newest = &candidate;
+    } else if (Model::MinimumGrewSinceAdmission(*record)) {
+      newestSettledGrowth = std::max(newestSettledGrowth, record->minimumGrowthGeneration);
+    }
+  }
+  if (!newest || newestSettledGrowth > newest->demandGeneration) return nullptr;
+
+  Workspace established = workspace;
+  for (const Layout::ConstraintCandidate& candidate : candidates) {
+    const WindowRecord* record = workspace.Find(candidate.hwnd);
+    if (record && record->pendingInsertionPlacement) established.Float(candidate.hwnd);
+  }
+  std::vector<RECT> rects;
+  ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+  return Layout::BuildWorkspaceLayoutPlan(established, workArea, gap, &rects) ==
+          Layout::LayoutPlanStatus::Unsatisfiable
+      ? nullptr
+      : newest->hwnd;
+}
+
+// Picks the window to float once no recovery keeps everyone, in this order:
+//  1. `introducingAdmission` (see FindIntroducingPendingAdmission): it caused
+//     the failure, so it goes, never an already-settled sibling.
+//  2. The newest-demand candidate whose removal alone makes the current order
+//     fit, so a window that just raised its minimum goes before the siblings
+//     it crowded out.
 //  3. Automatic mode only: the first candidate, even if more removals will be
 //     needed (each pass removes one and replans).
 // No value of `hwnd` means: leave membership unchanged.
 static ConstraintVictim ChooseConstraintVictim(
     const Workspace& workspace, const std::vector<Layout::ConstraintCandidate>& candidates,
-    const RECT& workArea, LONG gap) {
-  for (const Layout::ConstraintCandidate& candidate : candidates) {
-    const WindowRecord* candidateRecord = workspace.Find(candidate.hwnd);
-    if (candidateRecord && candidateRecord->pendingInsertionPlacement) {
-      return {candidate.hwnd, ConstraintRemovalReason::PendingAdmission};
-    }
+    HWND introducingAdmission, const RECT& workArea, LONG gap) {
+  if (introducingAdmission) {
+    return {introducingAdmission, ConstraintRemovalReason::PendingAdmission};
   }
   for (const Layout::ConstraintCandidate& candidate : candidates) {
     Workspace trial = workspace;
@@ -620,7 +665,13 @@ static ConstraintVictim ChooseConstraintVictim(
     std::vector<RECT> trialRects;
     ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
     if (Layout::BuildWorkspaceLayoutPlan(trial, workArea, gap, &trialRects) == Layout::LayoutPlanStatus::Success) {
-      return {candidate.hwnd, ConstraintRemovalReason::SingleRemoval};
+      const WindowRecord* record = workspace.Find(candidate.hwnd);
+      const bool grew = record && !record->pendingInsertionPlacement &&
+          Model::MinimumGrewSinceAdmission(*record);
+      return {candidate.hwnd, record && record->pendingInsertionPlacement
+                                  ? ConstraintRemovalReason::PendingAdmission
+                                  : grew ? ConstraintRemovalReason::MinimumGrowth
+                                         : ConstraintRemovalReason::SingleRemoval};
     }
   }
   if (RuntimeLifecycle::IsAutomaticMode() && !candidates.empty()) {
@@ -683,7 +734,8 @@ static ArrangementStep ReleaseConstraintVictim(
 
 // Handles one failed plan, trying in order: roll back a provisional user change;
 // float a window that can never fit; move a pending admission to a slot it fits;
-// float one window chosen by ChooseConstraintVictim. Saves are explicit; Replan
+// unless a pending admission introduced the conflict, reorder the existing
+// windows so all of them fit; float one window chosen by ChooseConstraintVictim. Saves are explicit; Replan
 // means the next arrangement pass must plan again from the resulting workspace.
 // WM thread only; rects are physical screen pixels from the rejected plan.
 static ArrangementStep RecoverUnsatisfiableLayout(
@@ -717,7 +769,23 @@ static ArrangementStep RecoverUnsatisfiableLayout(
       ApplyAdmissionRecovery(key, workspace, pendingAdmissionRecoveryBaseline, recovery);
       return ArrangementStep::Replan;
     }
-    victim = ChooseConstraintVictim(workspace, candidates, workArea, gap);
+    const HWND introducingAdmission =
+        FindIntroducingPendingAdmission(workspace, candidates, workArea, gap);
+    // Not a newcomer's fault: reorder the windows already here rather than float
+    // one that fitted. A newcomer that cannot fit is still rejected instead.
+    Workspace reordered;
+    size_t movedWindowCount = 0;
+    if (!introducingAdmission &&
+        Layout::TryReorderForConstraints(
+            workspace, workArea, gap, context.preferredTiledWindow, &reordered, &movedWindowCount)) {
+      Wh_Log(L"Constraint conflict resolved by reordering %zu windows", movedWindowCount);
+      Diagnostics::RecordEvent(L"constraint conflict reordered windows moved=%zu desktop=%08X",
+                               movedWindowCount, key.desktopId.Data1);
+      workspace = std::move(reordered);
+      g_workspaces.Save(key, workspace);
+      return ArrangementStep::Replan;
+    }
+    victim = ChooseConstraintVictim(workspace, candidates, introducingAdmission, workArea, gap);
   }
 
   const WindowRecord* victimRecord = victim.hwnd ? workspace.Find(victim.hwnd) : nullptr;
@@ -897,14 +965,12 @@ static void ArrangeWorkspace(
 
   ObserveAndRepairWorkspaceForArrangement(workspace);
   EnforceAutomaticWindowLimit(key, workspace, monitor);
-  auto pendingMutationIt = g_pendingLayoutMutations.find(key);
-  if (pendingMutationIt != g_pendingLayoutMutations.end() &&
-      !workspace.HasSameWindowMembershipAs(
-          pendingMutationIt->second.candidate)) {
+  if (const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
+      pending && !workspace.HasSameWindowMembershipAs(pending->candidate)) {
     Diagnostics::RecordEvent(
         L"discarded stale layout mutation before arrangement after membership change action=%ls desktop=%08X",
-        pendingMutationIt->second.action, key.desktopId.Data1);
-    g_pendingLayoutMutations.erase(pendingMutationIt);
+        pending->action, key.desktopId.Data1);
+    g_pendingProofs.DiscardLayoutMutation(key);
   }
   // Native reports are cached between arrangements. The first pass below probes
   // missing/stale reports and pending admissions/restores before geometry is solved.

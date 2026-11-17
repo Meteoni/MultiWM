@@ -149,6 +149,10 @@ struct WindowRecord {
   // Monotonic admission generation provides stable ordering for constraint
   // recovery candidates. Reordering never changes this value.
   uint64_t tilingGeneration = 0;
+  // Generation (same counter as tilingGeneration) of the last time this window
+  // raised its native minimum at the same DPI. Constraint recovery treats the
+  // newest demand, admission or growth, as the likeliest cause of a conflict.
+  uint64_t minimumGrowthGeneration = 0;
   // True for a newly admitted or restored window that has not yet settled in its
   // slot. While true, arrangement may move it to a nearby slot that fits its
   // minimum size instead of floating it. Cleared once its placement holds.
@@ -181,6 +185,25 @@ struct WindowRecord {
   SuspendedSlot savedSlot{};
   bool hasSavedSlot = false;
 };
+
+// Most recent event that added this window's demands to the layout: admission
+// or a raised minimum. Larger is newer.
+static uint64_t LayoutDemandRecency(const WindowRecord& record) {
+  return std::max(record.tilingGeneration, record.minimumGrowthGeneration);
+}
+
+// True when the window's newest demand is a raised minimum, not its admission.
+static bool MinimumGrewSinceAdmission(const WindowRecord& record) {
+  return record.minimumGrowthGeneration > record.tilingGeneration;
+}
+
+// A valid same-DPI report that raises either minimum. DPI rescaling and a first
+// valid report are not growth: they describe the same application contract.
+static bool IsSameDpiMinimumGrowth(
+    const WindowConstraints& before, const WindowConstraints& after) {
+  return before.valid && after.valid && before.dpi == after.dpi &&
+         (after.minWidth > before.minWidth || after.minHeight > before.minHeight);
+}
 
 struct PlacementObservation {
   PlacementResult result = PlacementResult::Success;

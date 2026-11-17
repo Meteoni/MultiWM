@@ -10,6 +10,192 @@ struct ConformanceWorkspace {
 
 enum class ConformanceConstraintRefresh { Stale, Unchanged, Changed };
 
+//-----------------------------------------------------------------------------
+// PendingProofs members (declared in core/runtime_state.h)
+//-----------------------------------------------------------------------------
+
+ConformanceLeaseReadResult PendingProofs::ReadLease(
+    HWND hwnd, ULONGLONG nowMs, ConformanceLease* outLease) const {
+  const auto it = leases_.find(hwnd);
+  if (it == leases_.end()) return ConformanceLeaseReadResult::Missing;
+  if (outLease) *outLease = it->second;
+  return nowMs < it->second.expiresAtTickMs ? ConformanceLeaseReadResult::Active
+                                            : ConformanceLeaseReadResult::Expired;
+}
+
+uint64_t PendingProofs::AllocateGeneration() {
+  uint64_t generation = nextGeneration_++;
+  if (generation == 0) generation = nextGeneration_++;  // 0 means "any generation".
+  return generation;
+}
+
+bool PendingProofs::BeginLease(
+    HWND hwnd, const RECT& expectedRect, HWND preferredTiledWindow,
+    bool scheduleRepair, ULONGLONG nowMs, const ConformanceLeaseTiming& timing) {
+  const auto it = leases_.find(hwnd);
+
+  // Re-observing the same authoritative target while its lease is still active
+  // must not extend the original deadline or replenish any implicit budget.
+  if (it != leases_.end() && nowMs < it->second.expiresAtTickMs &&
+      EqualRect(&it->second.expectedRect, &expectedRect)) {
+    ConformanceLease& lease = it->second;
+    if (preferredTiledWindow) lease.preferredTiledWindow = preferredTiledWindow;
+    if (scheduleRepair && !lease.repairDueTickMs) {
+      lease.repairDueTickMs =
+          std::min(lease.expiresAtTickMs, nowMs + timing.repairIntervalMs);
+    }
+    return false;
+  }
+
+  ConformanceLease lease;
+  lease.expectedRect = expectedRect;
+  lease.preferredTiledWindow = preferredTiledWindow;
+  lease.expiresAtTickMs = nowMs + timing.durationMs;
+  if (scheduleRepair) {
+    lease.repairDueTickMs =
+        std::min(lease.expiresAtTickMs, nowMs + timing.repairIntervalMs);
+  }
+  lease.generation = AllocateGeneration();
+  leases_[hwnd] = lease;
+  return true;
+}
+
+bool PendingProofs::CancelLease(HWND hwnd, uint64_t generation) {
+  const auto it = leases_.find(hwnd);
+  if (it == leases_.end() ||
+      (generation != 0 && it->second.generation != generation)) {
+    return false;
+  }
+  leases_.erase(it);
+  return true;
+}
+
+bool PendingProofs::DeferLeaseRepair(
+    HWND hwnd, uint64_t generation, ULONGLONG dueTickMs, ULONGLONG nowMs) {
+  if (generation == 0 || !dueTickMs) return false;
+  const auto it = leases_.find(hwnd);
+  if (it == leases_.end() || nowMs >= it->second.expiresAtTickMs ||
+      it->second.generation != generation) {
+    return false;
+  }
+  ConformanceLease& lease = it->second;
+  if (!lease.repairDueTickMs || dueTickMs < lease.repairDueTickMs) {
+    lease.repairDueTickMs = dueTickMs;
+  }
+  return true;
+}
+
+bool PendingProofs::RecordLeaseAttempt(
+    HWND hwnd, uint64_t generation, ULONGLONG nowMs, unsigned* outAttemptNumber) {
+  if (generation == 0) return false;
+  const auto it = leases_.find(hwnd);
+  if (it == leases_.end() || nowMs >= it->second.expiresAtTickMs ||
+      it->second.generation != generation) {
+    return false;
+  }
+  ConformanceLease& lease = it->second;
+  ++lease.attempts;
+  lease.lastRepairTickMs = nowMs;
+  lease.repairDueTickMs = 0;
+  if (outAttemptNumber) *outAttemptNumber = lease.attempts;
+  return true;
+}
+
+std::optional<ConformanceLease> PendingProofs::TakeExpiredLease(
+    HWND hwnd, uint64_t generation, ULONGLONG nowMs) {
+  if (generation == 0) return std::nullopt;
+  const auto it = leases_.find(hwnd);
+  if (it == leases_.end() || it->second.generation != generation ||
+      nowMs < it->second.expiresAtTickMs) {
+    return std::nullopt;
+  }
+  ConformanceLease lease = it->second;
+  leases_.erase(it);
+  return lease;
+}
+
+DueConformanceWork PendingProofs::TakeDueLeaseWork(ULONGLONG nowMs) {
+  DueConformanceWork work;
+  for (auto& [hwnd, lease] : leases_) {
+    if (nowMs >= lease.expiresAtTickMs) {
+      work.expired.push_back({hwnd, lease.generation});
+      continue;
+    }
+    if (lease.repairDueTickMs && lease.repairDueTickMs <= nowMs) {
+      work.repairs.push_back(hwnd);
+      lease.repairDueTickMs = 0;
+    }
+  }
+  return work;
+}
+
+size_t PendingProofs::CountActiveLeases(ULONGLONG nowMs) const {
+  return static_cast<size_t>(std::count_if(
+      leases_.begin(), leases_.end(),
+      [nowMs](const auto& entry) { return nowMs < entry.second.expiresAtTickMs; }));
+}
+
+ULONGLONG PendingProofs::NextLeaseDeadline() const {
+  ULONGLONG earliestDue = 0;
+  for (const auto& [hwnd, lease] : leases_) {
+    ULONGLONG due = lease.expiresAtTickMs;
+    if (lease.repairDueTickMs && lease.repairDueTickMs < due) {
+      due = lease.repairDueTickMs;
+    }
+    if (!earliestDue || due < earliestDue) earliestDue = due;
+  }
+  return earliestDue;
+}
+
+void PendingProofs::RememberLayoutMutation(
+    const DesktopMonitorKey& key, PendingLayoutMutation mutation) {
+  mutations_[key] = std::move(mutation);
+}
+
+const PendingLayoutMutation* PendingProofs::FindLayoutMutation(
+    const DesktopMonitorKey& key) const {
+  const auto it = mutations_.find(key);
+  return it == mutations_.end() ? nullptr : &it->second;
+}
+
+void PendingProofs::DiscardLayoutMutation(const DesktopMonitorKey& key) {
+  mutations_.erase(key);
+}
+
+const PendingAdmissionRecovery* PendingProofs::FindAdmissionRecovery(
+    HWND hwnd) const {
+  const auto it = recoveries_.find(hwnd);
+  return it == recoveries_.end() ? nullptr : &it->second;
+}
+
+void PendingProofs::RememberAdmissionRecovery(
+    HWND hwnd, PendingAdmissionRecovery recovery) {
+  recoveries_[hwnd] = std::move(recovery);
+}
+
+std::optional<PendingAdmissionRecovery> PendingProofs::TakeAdmissionRecovery(
+    HWND hwnd) {
+  const auto it = recoveries_.find(hwnd);
+  if (it == recoveries_.end()) return std::nullopt;
+  PendingAdmissionRecovery recovery = std::move(it->second);
+  recoveries_.erase(it);
+  return recovery;
+}
+
+void PendingProofs::DiscardAdmissionRecovery(HWND hwnd) {
+  recoveries_.erase(hwnd);
+}
+
+void PendingProofs::Clear() noexcept {
+  leases_.clear();
+  mutations_.clear();
+  recoveries_.clear();
+}
+
+//-----------------------------------------------------------------------------
+// Lease operations used by placement, reconciliation and commands
+//-----------------------------------------------------------------------------
+
 // Reads lease state without consuming expiry. Expired leases stay present until
 // the WM actor performs the final passive conformance verdict; WinEvent
 // observations must never silently erase the evidence needed for that action.
@@ -17,17 +203,7 @@ static ConformanceLeaseReadResult ReadConformanceLease(
     HWND hwnd, ConformanceLease* outLease) {
   RuntimeLifecycle::AssertWmThread(L"ReadConformanceLease");
   if (!hwnd) return ConformanceLeaseReadResult::Missing;
-
-  const ULONGLONG now = GetTickCount64();
-  ConformanceLeaseReadResult result = ConformanceLeaseReadResult::Missing;
-  auto it = g_conformanceLeases.leases.find(hwnd);
-  if (it != g_conformanceLeases.leases.end()) {
-    if (outLease) *outLease = it->second;
-    result = now < it->second.expiresAtTickMs
-                 ? ConformanceLeaseReadResult::Active
-                 : ConformanceLeaseReadResult::Expired;
-  }
-  return result;
+  return g_pendingProofs.ReadLease(hwnd, GetTickCount64(), outLease);
 }
 
 static bool ReadActiveConformanceLease(HWND hwnd, ConformanceLease* outLease) {
@@ -47,31 +223,19 @@ static bool HasActiveConformanceLease(HWND hwnd) {
 static bool CancelConformanceLease(HWND hwnd, uint64_t generation) {
   RuntimeLifecycle::AssertWmThread(L"CancelConformanceLease");
   if (!hwnd) return false;
-  bool erased = false;
-  auto it = g_conformanceLeases.leases.find(hwnd);
-  if (it != g_conformanceLeases.leases.end() &&
-      (generation == 0 || it->second.generation == generation)) {
-    g_conformanceLeases.leases.erase(it);
-    erased = true;
-  }
-  return erased;
+  return g_pendingProofs.CancelLease(hwnd, generation);
 }
 
+// Forgets every unproven placement change: leases, pending layout mutations and
+// admission-recovery baselines.
 static void ClearAllConformanceLeases() {
   RuntimeLifecycle::AssertWmThread(L"ClearAllConformanceLeases");
-  g_conformanceLeases.leases.clear();
-  g_pendingLayoutMutations.clear();
-  g_pendingAdmissionRecoveries.clear();
+  g_pendingProofs.Clear();
 }
 
 static size_t CountActiveConformanceLeases() {
   RuntimeLifecycle::AssertWmThread(L"CountActiveConformanceLeases");
-  const ULONGLONG now = GetTickCount64();
-  size_t count = 0;
-  for (const auto& kv : g_conformanceLeases.leases) {
-    if (now < kv.second.expiresAtTickMs) ++count;
-  }
-  return count;
+  return g_pendingProofs.CountActiveLeases(GetTickCount64());
 }
 
 static void ScheduleNextConformanceTimer() {
@@ -82,15 +246,7 @@ static void ScheduleNextConformanceTimer() {
   }
 
   const ULONGLONG now = GetTickCount64();
-  ULONGLONG earliestDue = 0;
-  for (const auto& kv : g_conformanceLeases.leases) {
-    const ConformanceLease& lease = kv.second;
-    ULONGLONG due = lease.expiresAtTickMs;
-    if (lease.repairDueTickMs && lease.repairDueTickMs < due) {
-      due = lease.repairDueTickMs;
-    }
-    if (!earliestDue || due < earliestDue) earliestDue = due;
-  }
+  const ULONGLONG earliestDue = g_pendingProofs.NextLeaseDeadline();
   if (!earliestDue) return;
   const ULONGLONG remaining = earliestDue > now ? earliestDue - now : 1;
   const UINT delayMs = static_cast<UINT>(std::min<ULONGLONG>(remaining, 0x7FFFFFFFULL));
@@ -103,30 +259,11 @@ static void ScheduleNextConformanceTimer() {
 static bool DeferConformanceLeaseRepair(
     HWND hwnd, uint64_t generation, ULONGLONG dueTickMs) {
   RuntimeLifecycle::AssertWmThread(L"DeferConformanceLeaseRepair");
-  if (!hwnd || generation == 0 || !dueTickMs) return false;
-
-  const ULONGLONG now = GetTickCount64();
-  bool retained = false;
-  auto it = g_conformanceLeases.leases.find(hwnd);
-  if (it != g_conformanceLeases.leases.end() &&
-      now < it->second.expiresAtTickMs &&
-      it->second.generation == generation) {
-    if (!it->second.repairDueTickMs || dueTickMs < it->second.repairDueTickMs) {
-      it->second.repairDueTickMs = dueTickMs;
-    }
-    retained = true;
-  }
+  if (!hwnd) return false;
+  const bool retained = g_pendingProofs.DeferLeaseRepair(
+      hwnd, generation, dueTickMs, GetTickCount64());
   if (retained) ScheduleNextConformanceTimer();
   return retained;
-}
-
-static uint64_t AllocateConformanceLeaseGeneration() {
-  RuntimeLifecycle::AssertWmThread(L"AllocateConformanceLeaseGeneration");
-  uint64_t generation = g_conformanceLeases.nextGeneration++;
-  if (generation == 0) {
-    generation = g_conformanceLeases.nextGeneration++;
-  }
-  return generation;
 }
 
 static void BeginConformanceLease(
@@ -140,39 +277,12 @@ static void BeginConformanceLease(
     return;
   }
 
-  const ULONGLONG now = GetTickCount64();
-  auto it = g_conformanceLeases.leases.find(hwnd);
-
-  // Re-observing the same authoritative target while its lease is still active
-  // must not extend the original deadline or replenish any implicit budget.
-  if (it != g_conformanceLeases.leases.end() &&
-      now < it->second.expiresAtTickMs &&
-      EqualRect(&it->second.expectedRect, &expectedRect)) {
-    if (preferredTiledWindow) {
-      it->second.preferredTiledWindow = preferredTiledWindow;
-    }
-    if (scheduleRepair && !it->second.repairDueTickMs) {
-      it->second.repairDueTickMs = std::min(
-          it->second.expiresAtTickMs,
-          now + g_settings.conformanceRepairIntervalMs);
-    }
-    ScheduleNextConformanceTimer();
-    return;
+  const ConformanceLeaseTiming timing{g_settings.conformanceLeaseMs,
+                                      g_settings.conformanceRepairIntervalMs};
+  if (g_pendingProofs.BeginLease(hwnd, expectedRect, preferredTiledWindow,
+                                 scheduleRepair, GetTickCount64(), timing)) {
+    ++Diagnostics::g_runtime.counters.conformanceLeasesStarted;
   }
-
-  ConformanceLease lease;
-  lease.expectedRect = expectedRect;
-  lease.preferredTiledWindow = preferredTiledWindow;
-  lease.expiresAtTickMs = now + g_settings.conformanceLeaseMs;
-  if (scheduleRepair) {
-    lease.repairDueTickMs = std::min(
-        lease.expiresAtTickMs,
-        now + g_settings.conformanceRepairIntervalMs);
-  }
-  lease.generation = AllocateConformanceLeaseGeneration();
-  g_conformanceLeases.leases[hwnd] = lease;
-
-  ++Diagnostics::g_runtime.counters.conformanceLeasesStarted;
   ScheduleNextConformanceTimer();
 }
 
@@ -186,21 +296,9 @@ static bool IsCurrentConformanceLease(HWND hwnd, uint64_t generation) {
 static bool RecordConformanceLeaseAttempt(
     HWND hwnd, uint64_t generation, unsigned* outAttemptNumber = nullptr) {
   RuntimeLifecycle::AssertWmThread(L"RecordConformanceLeaseAttempt");
-  if (!hwnd || generation == 0) return false;
-
-  const ULONGLONG now = GetTickCount64();
-  bool retained = false;
-  auto it = g_conformanceLeases.leases.find(hwnd);
-  if (it != g_conformanceLeases.leases.end() &&
-      now < it->second.expiresAtTickMs &&
-      it->second.generation == generation) {
-    ++it->second.attempts;
-    it->second.lastRepairTickMs = now;
-    it->second.repairDueTickMs = 0;
-    if (outAttemptNumber) *outAttemptNumber = it->second.attempts;
-    retained = true;
-  }
-  return retained;
+  if (!hwnd) return false;
+  return g_pendingProofs.RecordLeaseAttempt(
+      hwnd, generation, GetTickCount64(), outAttemptNumber);
 }
 
 static bool HasOutstandingConformanceLease(const Workspace& workspace) {
@@ -218,19 +316,12 @@ static bool HasOutstandingConformanceLease(const Workspace& workspace) {
 static bool TakeExpiredConformanceLease(
     HWND hwnd, uint64_t generation, ConformanceLease* outLease) {
   RuntimeLifecycle::AssertWmThread(L"TakeExpiredConformanceLease");
-  if (!hwnd || generation == 0 || !outLease) return false;
-
-  const ULONGLONG now = GetTickCount64();
-  bool taken = false;
-  auto it = g_conformanceLeases.leases.find(hwnd);
-  if (it != g_conformanceLeases.leases.end() &&
-      it->second.generation == generation &&
-      now >= it->second.expiresAtTickMs) {
-    *outLease = it->second;
-    g_conformanceLeases.leases.erase(it);
-    taken = true;
-  }
-  return taken;
+  if (!hwnd || !outLease) return false;
+  std::optional<ConformanceLease> taken =
+      g_pendingProofs.TakeExpiredLease(hwnd, generation, GetTickCount64());
+  if (!taken) return false;
+  *outLease = *taken;
+  return true;
 }
 
 // Recomputes the target from the current workspace rather than trusting a copied
@@ -649,33 +740,15 @@ static void ProcessConformanceTimer() {
     g_wm.timers.conformance = 0;
   }
 
-  struct ExpiredCandidate {
-    HWND hwnd = nullptr;
-    uint64_t generation = 0;
-  };
-
-  const ULONGLONG now = GetTickCount64();
-  std::vector<ExpiredCandidate> expired;
-  std::vector<HWND> dueWindows;
-  for (auto& kv : g_conformanceLeases.leases) {
-    ConformanceLease& lease = kv.second;
-    if (now >= lease.expiresAtTickMs) {
-      expired.push_back({kv.first, lease.generation});
-      continue;
-    }
-    if (lease.repairDueTickMs && lease.repairDueTickMs <= now) {
-      dueWindows.push_back(kv.first);
-      lease.repairDueTickMs = 0;
-    }
-  }
-  for (const ExpiredCandidate& candidate : expired) {
+  const DueConformanceWork work = g_pendingProofs.TakeDueLeaseWork(GetTickCount64());
+  for (const DueConformanceWork::ExpiredLease& candidate : work.expired) {
     ConformanceLease lease;
     if (TakeExpiredConformanceLease(
             candidate.hwnd, candidate.generation, &lease)) {
       FinalizeExpiredConformanceLease(candidate.hwnd, lease);
     }
   }
-  for (HWND hwnd : dueWindows) {
+  for (HWND hwnd : work.repairs) {
     HandleTiledWindowLocationChange(hwnd);
   }
   ScheduleNextConformanceTimer();

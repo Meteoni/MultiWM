@@ -1,6 +1,18 @@
 #include "../src/multiwm.cpp"
 #include <cstdio>
 
+// Conformance tests drive lease timing directly (friend of PendingProofs).
+namespace Placement {
+struct PendingProofsTestAccess {
+  static auto& Leases() { return g_pendingProofs.leases_; }
+  static auto& AdmissionRecoveries() { return g_pendingProofs.recoveries_; }
+};
+}  // namespace Placement
+static auto& TestLeases() { return Placement::PendingProofsTestAccess::Leases(); }
+static auto& TestAdmissionRecoveries() {
+  return Placement::PendingProofsTestAccess::AdmissionRecoveries();
+}
+
 struct TestDesktop final : Platform::VirtualDesktop::IVirtualDesktop {
   GUID id{};
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
@@ -180,9 +192,9 @@ static void RunDesktopReconciliationTests() {
   Placement::FinalizeExpiredConformanceLease(hiddenWindows.front(), hiddenLease);
   check(g_workspaces.Load(liveKey, &retried) && retried.HasSameLayoutStateAs(expectedHidden),
         "lease expiry preserves hidden members and saved slots");
-  Placement::g_conformanceLeases.leases[hiddenWindows.front()] = hiddenLease;
+  TestLeases()[hiddenWindows.front()] = hiddenLease;
   check(!Placement::HandleTiledWindowLocationChange(hiddenWindows.front()), "hidden location event is ineligible for repair");
-  check(!Placement::g_conformanceLeases.leases.count(hiddenWindows.front()), "hidden location event cancels stale placement work");
+  check(!TestLeases().count(hiddenWindows.front()), "hidden location event cancels stale placement work");
   check(g_workspaces.Load(liveKey, &retried) && retried.HasSameLayoutStateAs(expectedHidden),
         "late location event preserves hidden members and saved slots");
   for (HWND hwnd : hiddenWindows) {
@@ -312,12 +324,12 @@ static void RunWinEventRoutingTests() {
   // Tracked windows.
   send(EVENT_OBJECT_LOCATIONCHANGE, tracked);
   check(windowEvent(EVENT_OBJECT_LOCATIONCHANGE, tracked), "tiled window location change is forwarded");
-  Placement::g_conformanceLeases.leases[tracked] = Placement::ConformanceLease{};
+  TestLeases()[tracked] = Placement::ConformanceLease{};
   g_wm.overflow.windows.insert(tracked);
   g_wm.overflow.queue.push_back({tracked});
   send(EVENT_SYSTEM_MOVESIZESTART, tracked);
   check(drain().empty(), "tracked drag start posts nothing");
-  check(!Placement::g_conformanceLeases.leases.count(tracked), "drag start cancels the conformance lease");
+  check(!TestLeases().count(tracked), "drag start cancels the conformance lease");
   check(!g_wm.HasPendingOverflow(tracked) && !g_wm.overflow.windows.count(tracked), "drag start cancels queued overflow");
   check(Gestures::g_moveSize.startRects.count(tracked) == 1, "drag start records the start frame");
   send(EVENT_SYSTEM_MOVESIZEEND, tracked);
@@ -424,8 +436,8 @@ static void RunConformanceLocationTests() {
   };
   auto offset = [](RECT r, LONG dx) { r.left += dx; r.right += dx; return r; };
   auto leaseOf = [&]() -> const Placement::ConformanceLease* {
-    auto it = Placement::g_conformanceLeases.leases.find(hwnd);
-    return it == Placement::g_conformanceLeases.leases.end() ? nullptr : &it->second;
+    auto it = TestLeases().find(hwnd);
+    return it == TestLeases().end() ? nullptr : &it->second;
   };
   // One step: optional setup, call the handler, record the observable outcome.
   auto step = [&](const char* name) {
@@ -451,7 +463,7 @@ static void RunConformanceLocationTests() {
     return handled;
   };
   auto resetLease = [&] {
-    Placement::g_conformanceLeases.leases.clear();
+    TestLeases().clear();
     if (g_wm.timers.conformance) KillTimer(nullptr, g_wm.timers.conformance);
     g_wm.timers.conformance = 0;
   };
@@ -474,27 +486,27 @@ static void RunConformanceLocationTests() {
   check(step("repair scheduled"), "scheduled repair defers");
 
   // 4. Repair due now: reinforce the tile.
-  Placement::g_conformanceLeases.leases[hwnd].repairDueTickMs = 0;
-  Placement::g_conformanceLeases.leases[hwnd].lastRepairTickMs = 0;
+  TestLeases()[hwnd].repairDueTickMs = 0;
+  TestLeases()[hwnd].lastRepairTickMs = 0;
   check(step("repair due"), "due repair is handled");
 
   // 5. Recently repaired: rate-limited into one deferred re-check.
   moveTo(offset(tile, 51));
-  if (Placement::g_conformanceLeases.leases.count(hwnd)) {
-    Placement::g_conformanceLeases.leases[hwnd].repairDueTickMs = 0;
-    Placement::g_conformanceLeases.leases[hwnd].lastRepairTickMs = GetTickCount64();
+  if (TestLeases().count(hwnd)) {
+    TestLeases()[hwnd].repairDueTickMs = 0;
+    TestLeases()[hwnd].lastRepairTickMs = GetTickCount64();
   }
   step("rate limited");
 
   // 6. Lease aimed at an old tile: replaced by one for the current tile.
-  if (Placement::g_conformanceLeases.leases.count(hwnd)) {
-    Placement::g_conformanceLeases.leases[hwnd].expectedRect = offset(tile, 400);
+  if (TestLeases().count(hwnd)) {
+    TestLeases()[hwnd].expectedRect = offset(tile, 400);
   }
   step("stale target replaced");
 
   // 7. Lease already past its deadline: leave it to the expiry timer.
-  if (Placement::g_conformanceLeases.leases.count(hwnd)) {
-    Placement::g_conformanceLeases.leases[hwnd].expiresAtTickMs = 1;
+  if (TestLeases().count(hwnd)) {
+    TestLeases()[hwnd].expiresAtTickMs = 1;
   }
   check(step("expired lease"), "expired lease is left to the timer");
   resetLease();
@@ -530,6 +542,143 @@ static void RunConformanceLocationTests() {
               checks, static_cast<unsigned long long>(digest));
 }
 
+// Sequences in which a window that fitted must not be floated later: a sibling
+// leaving changes the remaining slots' shape, or another window raises its
+// minimum. Fake HWNDs only; toasts disabled; no native window is moved.
+static void RunSettledWindowRecoveryTests() {
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  const SettingsState savedSettings = g_settings;
+  const bool savedToasts = TrayUi::g_preferences.showToasts;
+  const ManagementMode savedMode = g_wm.managementMode;
+  g_settings.adaptiveDwindleSlots = 0;  // Fixed Dwindle geometry: only order can help.
+  g_settings.reverseDwindle = false;
+  TrayUi::g_preferences.showToasts = false;
+  g_wm.managementMode = ManagementMode::Manual;
+
+  const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  Platform::Monitors::WorkspaceMetrics metrics;
+  metrics.workArea = {0, 0, 1000, 1000};
+  metrics.gap = 0;
+  metrics.dpi = 96;
+  DesktopMonitorKey key;
+  GUID desktop{};
+  desktop.Data1 = 0x5E77ED;
+  check(DesktopMonitorKey::FromHMonitor(desktop, monitor, &key), "resolve test monitor");
+  const HWND a = reinterpret_cast<HWND>(0x7400000);
+  const HWND b = reinterpret_cast<HWND>(0x7400004);
+  const HWND c = reinterpret_cast<HWND>(0x7400008);
+  const HWND d = reinterpret_cast<HWND>(0x740000C);
+
+  auto makeWorkspace = [&](TileLayout layout, std::initializer_list<std::pair<HWND, LONG>> members) {
+    Workspace workspace;
+    workspace.SetLayout(layout);
+    for (const auto& [hwnd, minWidth] : members) {
+      WindowRecord record;
+      record.hwnd = hwnd;
+      record.pid = 901;
+      record.canMove = false;
+      workspace.AdmitTiled(record);
+      if (minWidth > 1) workspace.UpdateConstraints(hwnd, {minWidth, 150, 96, true});
+      workspace.ClearInsertionPlacement(hwnd);
+    }
+    return workspace;
+  };
+  auto plan = [&](const Workspace& workspace) {
+    std::vector<RECT> rects;
+    return Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects);
+  };
+  auto recover = [&](Workspace& workspace) {
+    std::vector<RECT> rects;
+    Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects);
+    g_workspaces.Save(key, workspace);
+    Placement::ArrangementContext context{key, monitor, metrics, nullptr};
+    return Placement::RecoverUnsatisfiableLayout(workspace, context, rects);
+  };
+  auto tiled = [](const Workspace& workspace, HWND hwnd) { return workspace.IsTiled(hwnd); };
+
+  {
+    // Dwindle: a user-made 0.2 divider on slot 1 suits b (300 wide, 150 tall)
+    // there. Closing a moves b to slot 0, whose split runs the other way: 200 wide.
+    Workspace workspace = makeWorkspace(TileLayout::Dwindle, {{a, 1}, {b, 300}, {c, 1}});
+    std::vector<RECT> rects;
+    check(Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, 0, &rects) ==
+              Layout::LayoutPlanStatus::Success, "Dwindle siblings fit");
+    MoveSizeGesture gesture;
+    gesture.hasRects = true;
+    gesture.intent = MoveSizeIntent::Resize;
+    gesture.start = gesture.end = rects[1];
+    gesture.end.bottom -= 300;
+    check(workspace.LearnDwindleResize(metrics.workArea, 0, 1, gesture) &&
+              std::abs(workspace.DwindleRatios()[1] - 0.2) < 1e-9, "learn slot 1 divider");
+    check(plan(workspace) == Layout::LayoutPlanStatus::Success, "b fits its short slot");
+    check(workspace.Forget(a), "close first window");
+    check(plan(workspace) == Layout::LayoutPlanStatus::Unsatisfiable, "shifted slots no longer fit b");
+    check(recover(workspace) == Placement::ArrangementStep::Replan, "recovery replans");
+    check(tiled(workspace, b) && tiled(workspace, c), "closing a sibling floats nobody");
+    check(workspace.TiledWindows() == std::vector<HWND>({c, b}), "settled windows trade slots instead");
+    check(plan(workspace) == Layout::LayoutPlanStatus::Success, "reordered Dwindle fits");
+  }
+  {
+    // Master + Stack: b and d each need 600 of 1000 pixels and both fit in the
+    // stack. Closing master a would promote b beside d; promoting c fits instead.
+    Workspace workspace = makeWorkspace(TileLayout::MasterStack, {{a, 1}, {b, 600}, {c, 1}, {d, 600}});
+    check(plan(workspace) == Layout::LayoutPlanStatus::Success, "wide stack members fit");
+    check(workspace.Forget(a), "close master");
+    check(plan(workspace) == Layout::LayoutPlanStatus::Unsatisfiable, "promoted master no longer fits");
+    check(recover(workspace) == Placement::ArrangementStep::Replan, "recovery replans");
+    check(tiled(workspace, b) && tiled(workspace, c) && tiled(workspace, d), "closing master floats nobody");
+    check(workspace.TiledWindows() == std::vector<HWND>({c, b, d}), "a narrow window becomes master");
+  }
+  {
+    // A settled window raising its own minimum floats itself, not the newest sibling.
+    Workspace workspace = makeWorkspace(TileLayout::Columns, {{a, 300}, {b, 300}, {c, 300}});
+    check(plan(workspace) == Layout::LayoutPlanStatus::Success, "three columns fit");
+    workspace.UpdateConstraints(a, {500, 150, 96, true});
+    check(plan(workspace) == Layout::LayoutPlanStatus::Unsatisfiable, "raised minimum overflows");
+    check(recover(workspace) == Placement::ArrangementStep::Replan, "recovery floats one window");
+    check(!tiled(workspace, a) && tiled(workspace, b) && tiled(workspace, c), "the window that grew is floated");
+  }
+  {
+    // An unsettled admission that fitted is not blamed for a later raised minimum.
+    Workspace workspace = makeWorkspace(TileLayout::Columns, {{a, 300}, {b, 300}});
+    WindowRecord record;
+    record.hwnd = c;
+    record.pid = 901;
+    record.canMove = false;
+    workspace.AdmitTiled(record);
+    workspace.UpdateConstraints(c, {300, 150, 96, true});
+    check(plan(workspace) == Layout::LayoutPlanStatus::Success, "pending admission fits");
+    workspace.UpdateConstraints(b, {500, 150, 96, true});
+    check(recover(workspace) == Placement::ArrangementStep::Replan, "recovery floats one window");
+    check(!tiled(workspace, b) && tiled(workspace, a) && tiled(workspace, c), "growth, not pending admission, is floated");
+    check(workspace.Find(c)->pendingInsertionPlacement, "admission keeps settling");
+  }
+  {
+    // A newcomer that does not fit is still rejected rather than reordering or
+    // floating settled windows.
+    Workspace workspace = makeWorkspace(TileLayout::Columns, {{a, 400}, {b, 400}});
+    WindowRecord record;
+    record.hwnd = c;
+    record.pid = 901;
+    record.canMove = false;
+    workspace.AdmitTiled(record);
+    workspace.UpdateConstraints(c, {400, 150, 96, true});
+    check(plan(workspace) == Layout::LayoutPlanStatus::Unsatisfiable, "newcomer conflicts");
+    check(recover(workspace) == Placement::ArrangementStep::Replan, "recovery floats one window");
+    check(!tiled(workspace, c) && tiled(workspace, a) && tiled(workspace, b), "newcomer is rejected");
+  }
+
+  g_workspaces.Save(key, Workspace{});
+  g_settings = savedSettings;
+  TrayUi::g_preferences.showToasts = savedToasts;
+  g_wm.managementMode = savedMode;
+  std::printf("Passed %d settled window recovery checks.\n", checks);
+}
+
 // Characterizes Placement::RecoverUnsatisfiableLayout: given a workspace whose
 // windows cannot all fit, which window is floated, or how is it reordered?
 // Fake HWNDs only; toasts disabled; no native window is moved.
@@ -539,9 +688,9 @@ static void RunConstraintRecoveryDigest() {
   uint32_t seed = 4111;
   auto random = [&](uint32_t bound) { seed = seed * 1664525u + 1013904223u; return (seed >> 8) % bound; };
 
-  const bool savedToasts = TrayUi::g_showToasts;
+  const bool savedToasts = TrayUi::g_preferences.showToasts;
   const ManagementMode savedMode = g_wm.managementMode;
-  TrayUi::g_showToasts = false;
+  TrayUi::g_preferences.showToasts = false;
   const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
   // Fixed geometry so the digest does not depend on this machine's displays.
   Platform::Monitors::WorkspaceMetrics metrics;
@@ -613,25 +762,27 @@ static void RunConstraintRecoveryDigest() {
     mix(g_workspaces.Load(key, &saved));
     mixWorkspace(saved);
     mix(g_wm.overflow.queue.size());
-    mix(Placement::g_pendingAdmissionRecoveries.size());
+    mix(Placement::g_pendingProofs.AdmissionRecoveryCount());
 
     g_workspaces.Save(key, Workspace{});
-    Placement::g_pendingAdmissionRecoveries.clear();
-    Placement::g_conformanceLeases.leases.clear();
+    TestAdmissionRecoveries().clear();
+    TestLeases().clear();
     g_wm.overflow.queue.clear();
     g_wm.overflow.windows.clear();
   }
   if (g_wm.timers.overflow) KillTimer(nullptr, g_wm.timers.overflow);
   if (g_wm.timers.conformance) KillTimer(nullptr, g_wm.timers.conformance);
   g_wm.timers.overflow = g_wm.timers.conformance = 0;
-  TrayUi::g_showToasts = savedToasts;
+  TrayUi::g_preferences.showToasts = savedToasts;
   g_wm.managementMode = savedMode;
   if (exercised < 500 || replans == 0 || replans == exercised) {
     std::fprintf(stderr, "FAILED: recovery digest inputs do not exercise all outcomes (%zu/%zu)\n", replans, exercised);
     std::exit(1);
   }
-  // Recorded from the implementation as of 2026-11-04.
-  if (digest != 0xba09f692dab18be1ull) {
+  // Recorded from the implementation as of 2026-11-16: settled-window conflicts
+  // reorder or float a window from the conflict instead of an uninvolved
+  // pending admission (168 of 2467 outcomes changed vs. 2026-11-04).
+  if (digest != 0x59ab62281bd3f20cull) {
     std::fprintf(stderr, "FAILED: constraint recovery digest %016llx changed\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }
@@ -770,11 +921,48 @@ static void RunDiscoveryResultTests() {
   std::printf("Passed %u discovery result contract checks.\n", checks);
 }
 
+// Local COM references must be released exactly once on every path, and an
+// out-parameter slot must not leak a reference it already holds.
+static void RunComRefOwnershipTests() {
+  unsigned checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  struct CountingObject final : IUnknown {
+    unsigned releases = 0;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { ++releases; return 0; }
+  };
+  using Platform::VirtualDesktop::ComRef;
+  CountingObject first, second;
+  {
+    ComRef<IUnknown> ref;
+    *ref.Put() = &first;
+    *ref.Put() = &second;
+    check(first.releases == 1, "Put releases the previously held reference");
+    ComRef<IUnknown> moved = std::move(ref);
+    check(!ref && moved.Get() == &second, "move transfers ownership");
+  }
+  check(second.releases == 1, "scope exit releases the moved reference once");
+  {
+    ComRef<IUnknown> ref;
+    *ref.Put() = &first;
+    ref.Reset();
+    ref.Reset();
+  }
+  check(first.releases == 2, "Reset releases once and leaves nothing for scope exit");
+  std::printf("Passed %u COM reference ownership checks.\n", checks);
+}
+
 int main() {
+  RunComRefOwnershipTests();
   RunDesktopReconciliationTests();
   RunDiscoveryResultTests();
   RunWinEventRoutingTests();
   RunConformanceLocationTests();
   RunDiagnosticReportShapeTest();
+  RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
 }

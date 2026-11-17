@@ -87,16 +87,12 @@ static bool IsMoveSizeGestureInProgress(HWND hwnd) {
 
 static void ClearMoveSizeSamples(HWND hwnd) {
   RuntimeLifecycle::AssertWmThread(L"ClearMoveSizeSamples");
-  g_moveSize.startRects.erase(hwnd);
-  g_moveSize.endRects.erase(hwnd);
-  g_moveSize.endPoints.erase(hwnd);
+  g_moveSize.Forget(hwnd);
 }
 
 static void ClearAllMoveSizeSamples() {
   RuntimeLifecycle::AssertWmThread(L"ClearAllMoveSizeSamples");
-  g_moveSize.startRects.clear();
-  g_moveSize.endRects.clear();
-  g_moveSize.endPoints.clear();
+  g_moveSize.Clear();
 }
 
 // Consumes and clears the WinEvent samples for one completed gesture.
@@ -119,9 +115,7 @@ static MoveSizeGesture ConsumeMoveSizeGesture(HWND hwnd) {
     gesture.hasDropPoint = true;
   }
 
-  g_moveSize.startRects.erase(hwnd);
-  g_moveSize.endRects.erase(hwnd);
-  g_moveSize.endPoints.erase(hwnd);
+  g_moveSize.Forget(hwnd);
   if (gesture.hasRects) {
     gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
   }

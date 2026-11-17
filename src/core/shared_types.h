@@ -17,6 +17,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <deque>
+#include <memory>
 #include <cstdint>
 #include <cstdlib>
 #include <cwchar>

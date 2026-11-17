@@ -272,6 +272,9 @@ bool Workspace::UpdateConstraints(
       old.dpi != constraints.dpi ||
       old.valid != constraints.valid ||
       old.lastProbeError != constraints.lastProbeError;
+  if (IsSameDpiMinimumGrowth(old, constraints)) {
+    record->minimumGrowthGeneration = NextTilingGeneration();
+  }
   record->constraints = constraints;
   return changed;
 }
@@ -306,6 +309,9 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
   existing.topmost = record.topmost;
   existing.automaticOverflowMonitorFixed = record.automaticOverflowMonitorFixed;
   if (record.constraints.valid || !existing.constraints.valid) {
+    if (IsSameDpiMinimumGrowth(existing.constraints, record.constraints)) {
+      existing.minimumGrowthGeneration = NextTilingGeneration();
+    }
     existing.constraints = record.constraints;
   }
   if (!existing.hasFloatingRect) {

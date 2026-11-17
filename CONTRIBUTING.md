@@ -19,9 +19,17 @@ deliberately usable unqualified; do not add global aliases for functions,
 because they hide which owner has side effects.
 
 Shared state that belongs to one owner lives in that owner's namespace in
-`src/core/runtime_state.h` (for example `Placement::g_conformanceLeases`). If a
+`src/core/runtime_state.h` (for example `Placement::g_pendingProofs`). If a
 function from a later chapter is needed earlier, declare it in
 `src/core/forward_declarations.h`.
+
+Make shared state a class only when several containers must change together,
+for example a reset that must not miss one. Declare it in `runtime_state.h` and
+define its members in the owner's chapter, as `model/workspace.h` and
+`model/workspace_impl.h` do. Keep policy that observes or changes Windows in free
+functions. Hold function-local COM pointers in `Platform::VirtualDesktop::ComRef`;
+release the long-lived `g_vd` proxies explicitly, because after an Explorer
+restart they must be dropped without `Release`.
 
 ## Readability rules
 

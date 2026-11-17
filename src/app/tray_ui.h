@@ -19,22 +19,10 @@ constexpr UINT_PTR kFlyoutTimerId = 1;
 constexpr DWORD kFlyoutHoldMs = 850;
 constexpr DWORD kFlyoutFadeMs = 180;
 
-static HWND g_trayWindow = nullptr;
-static ATOM g_trayWindowClass = 0;
-static ATOM g_flyoutWindowClass = 0;
-static UINT g_taskbarCreatedMessage = 0;
-static bool g_iconAdded = false;
-static bool g_systemLightTheme = false;
-static bool g_flyoutTop = false;
-static bool g_showToasts = true;
-static bool g_trayClickOpensMenu = false;
-static int g_flyoutOffsetX = 0;
-static int g_flyoutOffsetY = 0;
-static TileLayout g_displayedLayout = TileLayout::COUNT;
-static GUID g_displayedDesktopId{};
-static bool g_haveDisplayedDesktopId = false;
-static HMONITOR g_displayedMonitor = nullptr;
+using LayoutIconSet = std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>;
 
+// One status card per monitor. GWLP_USERDATA of `hwnd` points at this object, so
+// it must outlive its window: Shutdown destroys the window before the object.
 struct FlyoutInstance {
   HWND hwnd = nullptr;
   HMONITOR monitor = nullptr;
@@ -43,11 +31,39 @@ struct FlyoutInstance {
   DWORD holdMs = kFlyoutHoldMs;
 };
 
-static std::vector<FlyoutInstance*> g_flyouts;
-static NOTIFYICONDATAW g_notifyData{};
-static std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> g_icons{};
-static std::array<std::wstring, static_cast<size_t>(TileLayout::COUNT)>
-    g_customIconPaths{};
+// User choices read by LoadSettings. They survive Shutdown so a settings reload
+// applies them to the next session.
+struct TrayPreferences {
+  bool showToasts = true;
+  bool flyoutAtTop = false;
+  bool clickOpensMenu = false;
+  int flyoutOffsetXDip = 0;
+  int flyoutOffsetYDip = 0;
+  std::array<std::wstring, static_cast<size_t>(TileLayout::COUNT)> customIconPaths{};
+};
+
+// Windows, shell registration and display state owned between Initialize and
+// Shutdown. Shutdown releases the native resources, then resets the whole
+// session at once, so a later Initialize never inherits stale state.
+struct TraySession {
+  HWND trayWindow = nullptr;
+  ATOM trayWindowClass = 0;
+  ATOM flyoutWindowClass = 0;
+  UINT taskbarCreatedMessage = 0;
+  bool iconAdded = false;
+  bool systemLightTheme = false;
+  TileLayout displayedLayout = TileLayout::COUNT;
+  GUID displayedDesktopId{};
+  bool haveDisplayedDesktopId = false;
+  HMONITOR displayedMonitor = nullptr;
+  NOTIFYICONDATAW notifyData{};
+  LayoutIconSet icons{};
+  // unique_ptr keeps each instance at a stable address for GWLP_USERDATA.
+  std::vector<std::unique_ptr<FlyoutInstance>> flyouts;
+};
+
+static TrayPreferences g_preferences;
+static TraySession g_session;
 
 static const wchar_t* LayoutDisplayName(TileLayout layout) {
   switch (layout) {
@@ -91,23 +107,23 @@ static const wchar_t* LayoutFlyoutText(TileLayout layout) {
 static void LoadSettings() {
   using WindhawkUtils::StringSetting;
   auto trayClickAction = StringSetting::make(L"general.TrayClickAction");
-  g_trayClickOpensMenu = _wcsicmp(trayClickAction.get(), L"context_menu") == 0;
-  g_showToasts = Wh_GetIntSetting(L"appearance.ShowToasts") != 0;
+  g_preferences.clickOpensMenu = _wcsicmp(trayClickAction.get(), L"context_menu") == 0;
+  g_preferences.showToasts = Wh_GetIntSetting(L"appearance.ShowToasts") != 0;
   auto position = StringSetting::make(L"appearance.FlyoutPosition");
-  g_flyoutTop = _wcsicmp(position.get(), L"top") == 0;
-  g_flyoutOffsetX = Wh_GetIntSetting(L"appearance.FlyoutOffsetX");
-  g_flyoutOffsetY = Wh_GetIntSetting(L"appearance.FlyoutOffsetY");
+  g_preferences.flyoutAtTop = _wcsicmp(position.get(), L"top") == 0;
+  g_preferences.flyoutOffsetXDip = Wh_GetIntSetting(L"appearance.FlyoutOffsetX");
+  g_preferences.flyoutOffsetYDip = Wh_GetIntSetting(L"appearance.FlyoutOffsetY");
 
-  for (auto& path : g_customIconPaths) path.clear();
+  for (auto& path : g_preferences.customIconPaths) path.clear();
   for (int i = 0; i < 32; ++i) {
     auto layoutName =
         StringSetting::make(L"appearance.CustomIcons[%d].Layout", i);
     if (!*layoutName.get()) break;
     auto path = StringSetting::make(L"appearance.CustomIcons[%d].Path", i);
     size_t index = static_cast<size_t>(Configuration::ParseLayoutSetting(layoutName.get()));
-    if (*path.get() && index < g_customIconPaths.size() &&
-        g_customIconPaths[index].empty()) {
-      g_customIconPaths[index] = path.get();
+    if (*path.get() && index < g_preferences.customIconPaths.size() &&
+        g_preferences.customIconPaths[index].empty()) {
+      g_preferences.customIconPaths[index] = path.get();
     }
   }
 }
@@ -127,11 +143,11 @@ static bool ReadSystemLightTheme() {
 }
 
 static COLORREF ForegroundColor() {
-  return g_systemLightTheme ? RGB(24, 24, 24) : RGB(255, 255, 255);
+  return g_session.systemLightTheme ? RGB(24, 24, 24) : RGB(255, 255, 255);
 }
 
 static COLORREF FlyoutBackgroundColor() {
-  return g_systemLightTheme ? RGB(243, 243, 243) : RGB(36, 36, 36);
+  return g_session.systemLightTheme ? RGB(243, 243, 243) : RGB(36, 36, 36);
 }
 
 static HICON CreateTextIcon(TileLayout layout) {
@@ -197,19 +213,19 @@ static HICON CreateTextIcon(TileLayout layout) {
 // generated text. The icon must eventually be released with DestroyIcon.
 static HICON CreateLayoutIcon(TileLayout layout) {
   size_t index = static_cast<size_t>(layout);
-  if (index < g_customIconPaths.size() && !g_customIconPaths[index].empty()) {
+  const auto& customIconPaths = g_preferences.customIconPaths;
+  if (index < customIconPaths.size() && !customIconPaths[index].empty()) {
     HICON icon = static_cast<HICON>(LoadImageW(
-        nullptr, g_customIconPaths[index].c_str(), IMAGE_ICON,
+        nullptr, customIconPaths[index].c_str(), IMAGE_ICON,
         kIconCanvasSize, kIconCanvasSize, LR_LOADFROMFILE));
     if (icon) return icon;
     Wh_Log(L"Failed to load custom tray icon, using text fallback: %s",
-           g_customIconPaths[index].c_str());
+           customIconPaths[index].c_str());
   }
   return CreateTextIcon(layout);
 }
 
-static void DestroyIconSet(
-    std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>& icons) {
+static void DestroyIconSet(LayoutIconSet& icons) {
   for (HICON& icon : icons) {
     if (icon) DestroyIcon(icon);
     icon = nullptr;
@@ -218,7 +234,7 @@ static void DestroyIconSet(
 
 static HICON GetLayoutIcon(TileLayout layout) {
   size_t index = static_cast<size_t>(layout);
-  if (index < g_icons.size() && g_icons[index]) return g_icons[index];
+  if (index < g_session.icons.size() && g_session.icons[index]) return g_session.icons[index];
   return LoadIconW(nullptr, IDI_APPLICATION);
 }
 
@@ -257,8 +273,8 @@ static void SetTooltip(TileLayout layout) {
     } else {
       haveDesktop = Platform::VirtualDesktop::GetCurrentDesktopId(&desktopId);
     }
-    if (!haveDesktop && g_haveDisplayedDesktopId) {
-      desktopId = g_displayedDesktopId;
+    if (!haveDesktop && g_session.haveDisplayedDesktopId) {
+      desktopId = g_session.displayedDesktopId;
       haveDesktop = true;
     }
 
@@ -280,7 +296,7 @@ static void SetTooltip(TileLayout layout) {
         tooltip += L"\n";
         // Reserve the same visual marker column for every row. A figure space
         // is much closer to the triangle glyph width than two proportional spaces.
-        tooltip += monitor == g_displayedMonitor ? L"\x25B8 " : L"\u2007 ";
+        tooltip += monitor == g_session.displayedMonitor ? L"\x25B8 " : L"\u2007 ";
         tooltip += MonitorTooltipLabel(monitor, i);
         tooltip += L": ";
         tooltip += LayoutFlyoutText(monitorLayout);
@@ -288,60 +304,62 @@ static void SetTooltip(TileLayout layout) {
     }
   }
 
-  wcsncpy(g_notifyData.szTip, tooltip.c_str(), ARRAYSIZE(g_notifyData.szTip) - 1);
-  g_notifyData.szTip[ARRAYSIZE(g_notifyData.szTip) - 1] = L'\0';
+  wcsncpy(g_session.notifyData.szTip, tooltip.c_str(), ARRAYSIZE(g_session.notifyData.szTip) - 1);
+  g_session.notifyData.szTip[ARRAYSIZE(g_session.notifyData.szTip) - 1] = L'\0';
 }
 
 static bool AddIconToShell() {
-  if (!g_trayWindow) return false;
-  if (g_displayedLayout == TileLayout::COUNT) g_displayedLayout = g_settings.defaultLayout;
+  if (!g_session.trayWindow) return false;
+  if (g_session.displayedLayout == TileLayout::COUNT) {
+    g_session.displayedLayout = g_settings.defaultLayout;
+  }
 
-  g_notifyData = {};
-  g_notifyData.cbSize = sizeof(g_notifyData);
-  g_notifyData.hWnd = g_trayWindow;
-  g_notifyData.uID = kIconId;
-  g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
-  g_notifyData.uCallbackMessage = kTrayCallbackMessage;
-  g_notifyData.hIcon = GetLayoutIcon(g_displayedLayout);
-  SetTooltip(g_displayedLayout);
-  if (!Shell_NotifyIconW(NIM_ADD, &g_notifyData)) {
-    g_iconAdded = false;
+  g_session.notifyData = {};
+  g_session.notifyData.cbSize = sizeof(g_session.notifyData);
+  g_session.notifyData.hWnd = g_session.trayWindow;
+  g_session.notifyData.uID = kIconId;
+  g_session.notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
+  g_session.notifyData.uCallbackMessage = kTrayCallbackMessage;
+  g_session.notifyData.hIcon = GetLayoutIcon(g_session.displayedLayout);
+  SetTooltip(g_session.displayedLayout);
+  if (!Shell_NotifyIconW(NIM_ADD, &g_session.notifyData)) {
+    g_session.iconAdded = false;
     Wh_Log(L"Tray icon NIM_ADD failed");
     return false;
   }
 
-  g_iconAdded = true;
-  g_notifyData.uVersion = NOTIFYICON_VERSION_4;
-  if (!Shell_NotifyIconW(NIM_SETVERSION, &g_notifyData)) {
+  g_session.iconAdded = true;
+  g_session.notifyData.uVersion = NOTIFYICON_VERSION_4;
+  if (!Shell_NotifyIconW(NIM_SETVERSION, &g_session.notifyData)) {
     Wh_Log(L"Tray icon NIM_SETVERSION failed after NIM_ADD");
   }
   return true;
 }
 
 static void UpdateIcon(TileLayout layout, HMONITOR monitor) {
-  if (!g_trayWindow || layout == TileLayout::COUNT) return;
+  if (!g_session.trayWindow || layout == TileLayout::COUNT) return;
 
-  const TileLayout previousLayout = g_displayedLayout;
-  const HMONITOR previousMonitor = g_displayedMonitor;
-  const HICON previousIcon = g_notifyData.hIcon;
-  const std::wstring previousTooltip = g_notifyData.szTip;
+  const TileLayout previousLayout = g_session.displayedLayout;
+  const HMONITOR previousMonitor = g_session.displayedMonitor;
+  const HICON previousIcon = g_session.notifyData.hIcon;
+  const std::wstring previousTooltip = g_session.notifyData.szTip;
 
-  g_displayedLayout = layout;
-  if (monitor) g_displayedMonitor = monitor;
+  g_session.displayedLayout = layout;
+  if (monitor) g_session.displayedMonitor = monitor;
 
-  if (!g_iconAdded) {
+  if (!g_session.iconAdded) {
     if (AddIconToShell()) return;
 
     // TaskbarCreated can be broadcast even when Explorer kept the existing tray
     // entry. In that state NIM_ADD fails because the icon already exists, so try
     // updating that surviving entry instead of permanently wedging on NIM_ADD.
-    g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    g_notifyData.hIcon = GetLayoutIcon(layout);
+    g_session.notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    g_session.notifyData.hIcon = GetLayoutIcon(layout);
     SetTooltip(layout);
-    if (Shell_NotifyIconW(NIM_MODIFY, &g_notifyData)) {
-      g_iconAdded = true;
-      g_notifyData.uVersion = NOTIFYICON_VERSION_4;
-      if (!Shell_NotifyIconW(NIM_SETVERSION, &g_notifyData)) {
+    if (Shell_NotifyIconW(NIM_MODIFY, &g_session.notifyData)) {
+      g_session.iconAdded = true;
+      g_session.notifyData.uVersion = NOTIFYICON_VERSION_4;
+      if (!Shell_NotifyIconW(NIM_SETVERSION, &g_session.notifyData)) {
         Wh_Log(L"Tray icon NIM_SETVERSION failed after NIM_MODIFY recovery");
       }
       Wh_Log(L"Tray icon recovered by NIM_MODIFY after NIM_ADD failed");
@@ -352,20 +370,20 @@ static void UpdateIcon(TileLayout layout, HMONITOR monitor) {
     return;
   }
 
-  g_notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-  g_notifyData.hIcon = GetLayoutIcon(layout);
+  g_session.notifyData.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+  g_session.notifyData.hIcon = GetLayoutIcon(layout);
   SetTooltip(layout);
-  if (previousLayout == g_displayedLayout &&
-      previousMonitor == g_displayedMonitor &&
-      previousIcon == g_notifyData.hIcon &&
-      previousTooltip == g_notifyData.szTip) {
+  if (previousLayout == g_session.displayedLayout &&
+      previousMonitor == g_session.displayedMonitor &&
+      previousIcon == g_session.notifyData.hIcon &&
+      previousTooltip == g_session.notifyData.szTip) {
     return;
   }
-  if (!Shell_NotifyIconW(NIM_MODIFY, &g_notifyData)) {
+  if (!Shell_NotifyIconW(NIM_MODIFY, &g_session.notifyData)) {
     // The shell may have discarded the entry while our local state still says it
     // exists. Reverse the recovery direction and recreate it with NIM_ADD.
     Wh_Log(L"Tray icon NIM_MODIFY failed; trying NIM_ADD");
-    g_iconAdded = false;
+    g_session.iconAdded = false;
     if (!AddIconToShell()) {
       Wh_Log(L"Tray icon recovery failed after NIM_MODIFY");
     }
@@ -376,31 +394,33 @@ static void UpdateIcon(TileLayout layout, HMONITOR monitor) {
 // entry vanished. Remove any surviving entry first, then rebuild from current
 // model state. UpdateIcon still has ADD/MODIFY recovery for shell-state races.
 static void RecreateIconInShell() {
-  if (!g_trayWindow) return;
+  if (!g_session.trayWindow) return;
 
   NOTIFYICONDATAW identity{};
   identity.cbSize = sizeof(identity);
-  identity.hWnd = g_trayWindow;
+  identity.hWnd = g_session.trayWindow;
   identity.uID = kIconId;
   Shell_NotifyIconW(NIM_DELETE, &identity);
 
-  g_iconAdded = false;
-  if (g_displayedLayout == TileLayout::COUNT) {
-    g_displayedLayout = g_settings.defaultLayout;
+  g_session.iconAdded = false;
+  if (g_session.displayedLayout == TileLayout::COUNT) {
+    g_session.displayedLayout = g_settings.defaultLayout;
   }
-  UpdateIcon(g_displayedLayout, g_displayedMonitor);
+  UpdateIcon(g_session.displayedLayout, g_session.displayedMonitor);
 }
 
 // Repoints the live tray entry to a complete new icon set before destroying the
 // old handles, so the shell never observes an HICON after it has been released.
 static void RebuildIcons() {
-  std::array<HICON, static_cast<size_t>(TileLayout::COUNT)> icons{};
+  LayoutIconSet icons{};
   for (size_t i = 0; i < icons.size(); ++i) {
     icons[i] = CreateLayoutIcon(static_cast<TileLayout>(i));
   }
-  auto old = g_icons;
-  g_icons = icons;
-  if (g_displayedLayout != TileLayout::COUNT) UpdateIcon(g_displayedLayout, g_displayedMonitor);
+  auto old = g_session.icons;
+  g_session.icons = icons;
+  if (g_session.displayedLayout != TileLayout::COUNT) {
+    UpdateIcon(g_session.displayedLayout, g_session.displayedMonitor);
+  }
   DestroyIconSet(old);
 }
 
@@ -486,10 +506,8 @@ static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
 }
 
 static FlyoutInstance* FindFlyoutForMonitor(HMONITOR monitor) {
-  for (FlyoutInstance* instance : g_flyouts) {
-    if (instance && instance->monitor == monitor && instance->hwnd) {
-      return instance;
-    }
+  for (const auto& instance : g_session.flyouts) {
+    if (instance->monitor == monitor && instance->hwnd) return instance.get();
   }
   return nullptr;
 }
@@ -498,7 +516,7 @@ static FlyoutInstance* GetOrCreateFlyoutForMonitor(HMONITOR monitor) {
   if (!monitor) return nullptr;
   if (FlyoutInstance* existing = FindFlyoutForMonitor(monitor)) return existing;
 
-  auto* instance = new (std::nothrow) FlyoutInstance;
+  auto instance = std::unique_ptr<FlyoutInstance>(new (std::nothrow) FlyoutInstance);
   if (!instance) return nullptr;
   instance->monitor = monitor;
 
@@ -506,18 +524,15 @@ static FlyoutInstance* GetOrCreateFlyoutForMonitor(HMONITOR monitor) {
   instance->hwnd = CreateWindowExW(
       WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
       kFlyoutWindowClassName, L"", WS_POPUP, 0, 0, 0, 0,
-      nullptr, nullptr, module, instance);
-  if (!instance->hwnd) {
-    delete instance;
-    return nullptr;
-  }
+      nullptr, nullptr, module, instance.get());
+  if (!instance->hwnd) return nullptr;
 
-  g_flyouts.push_back(instance);
-  return instance;
+  g_session.flyouts.push_back(std::move(instance));
+  return g_session.flyouts.back().get();
 }
 
 static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
-  if (!g_showToasts || !text || !*text) return;
+  if (!g_preferences.showToasts || !text || !*text) return;
   if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
   RECT workArea{};
   if (!monitor || !Platform::Monitors::GetMonitorWorkArea(monitor, &workArea)) return;
@@ -541,11 +556,11 @@ static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
                        static_cast<int>(textSize.cx) + ScaleForDpi(48, dpi));
   int height = ScaleForDpi(48, dpi);
   int x = workArea.left + ((workArea.right - workArea.left) - width) / 2 +
-          ScaleForDpi(g_flyoutOffsetX, dpi);
+          ScaleForDpi(g_preferences.flyoutOffsetXDip, dpi);
   int edgeGap = ScaleForDpi(16, dpi);
-  int y = g_flyoutTop ? workArea.top + edgeGap
+  int y = g_preferences.flyoutAtTop ? workArea.top + edgeGap
                       : workArea.bottom - height - edgeGap;
-  y += ScaleForDpi(g_flyoutOffsetY, dpi);
+  y += ScaleForDpi(g_preferences.flyoutOffsetYDip, dpi);
 
   int radius = ScaleForDpi(8, dpi);
   HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
@@ -585,7 +600,7 @@ static void ShowManagementModeFlyout(bool automatic) {
 }
 
 static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
-  if (!g_showToasts) return;
+  if (!g_preferences.showToasts) return;
   std::vector<HMONITOR> monitors;
   Reconcile::EnumerateCurrentMonitors(monitors);
   for (HMONITOR monitor : monitors) {
@@ -602,8 +617,8 @@ static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
 
 static HMONITOR GetContextMenuMonitor() {
   MONITORINFO info{sizeof(info)};
-  if (g_displayedMonitor && GetMonitorInfoW(g_displayedMonitor, &info)) {
-    return g_displayedMonitor;
+  if (g_session.displayedMonitor && GetMonitorInfoW(g_session.displayedMonitor, &info)) {
+    return g_session.displayedMonitor;
   }
 
   HMONITOR monitor = Platform::Monitors::GetForegroundMonitor();
@@ -638,7 +653,7 @@ static LRESULT CALLBACK TrayMenuMessageFilterProc(
 }
 
 static void ShowContextMenu() {
-  if (!g_trayWindow) return;
+  if (!g_session.trayWindow) return;
 
   const HMONITOR monitor = GetContextMenuMonitor();
   if (!monitor) return;
@@ -685,14 +700,14 @@ static void ShowContextMenu() {
   }
 
   // Required for reliable dismissal of notification-area popup menus.
-  SetForegroundWindow(g_trayWindow);
+  SetForegroundWindow(g_session.trayWindow);
   const UINT command = TrackPopupMenuEx(
       menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-      point.x, point.y, g_trayWindow, nullptr);
+      point.x, point.y, g_session.trayWindow, nullptr);
   if (!UnhookWindowsHookEx(menuMessageHook)) {
     Wh_Log(L"Failed to remove tray menu message filter: %lu", GetLastError());
   }
-  PostMessageW(g_trayWindow, WM_NULL, 0, 0);
+  PostMessageW(g_session.trayWindow, WM_NULL, 0, 0);
   DestroyMenu(menu);
 
   const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire);
@@ -739,14 +754,14 @@ static void RefreshForMonitor(HMONITOR monitor) {
   }
 
   if (haveKey) {
-    g_displayedDesktopId = key.desktopId;
-    g_haveDisplayedDesktopId = true;
+    g_session.displayedDesktopId = key.desktopId;
+    g_session.haveDisplayedDesktopId = true;
   }
   UpdateIcon(layout, monitor);
 }
 
 static void RefreshDisplayedMonitor() {
-  HMONITOR monitor = g_displayedMonitor;
+  HMONITOR monitor = g_session.displayedMonitor;
   MONITORINFO info{sizeof(info)};
   if (!monitor || !GetMonitorInfoW(monitor, &info)) {
     monitor = Platform::Monitors::GetForegroundMonitor();
@@ -766,11 +781,11 @@ static void RefreshForCurrentWorkspace() {
 
 static void HandleThemeChanged() {
   bool light = ReadSystemLightTheme();
-  if (light == g_systemLightTheme) return;
-  g_systemLightTheme = light;
+  if (light == g_session.systemLightTheme) return;
+  g_session.systemLightTheme = light;
   RebuildIcons();
-  for (FlyoutInstance* instance : g_flyouts) {
-    if (instance && instance->hwnd && IsWindowVisible(instance->hwnd)) {
+  for (const auto& instance : g_session.flyouts) {
+    if (instance->hwnd && IsWindowVisible(instance->hwnd)) {
       InvalidateRect(instance->hwnd, nullptr, TRUE);
     }
   }
@@ -778,7 +793,7 @@ static void HandleThemeChanged() {
 
 static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
                                        LPARAM lParam) {
-  if (g_taskbarCreatedMessage && message == g_taskbarCreatedMessage) {
+  if (g_session.taskbarCreatedMessage && message == g_session.taskbarCreatedMessage) {
     RecreateIconInShell();
     RuntimeLifecycle::NotifyShellRestarted();
     return 0;
@@ -798,7 +813,7 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
     }
     if (iconId == kIconId &&
         (event == NIN_SELECT || event == NIN_KEYSELECT)) {
-      if (g_trayClickOpensMenu) {
+      if (g_preferences.clickOpensMenu) {
         ShowContextMenu();
         return 0;
       }
@@ -811,7 +826,7 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
         // instead of letting the cursor's primary-monitor location retarget it.
         PostThreadMessageW(
             threadId, WM_APP_LAYOUT_CYCLE,
-            reinterpret_cast<WPARAM>(g_displayedMonitor), 0);
+            reinterpret_cast<WPARAM>(g_session.displayedMonitor), 0);
       }
     }
     return 0;
@@ -839,7 +854,7 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
 }
 
 static bool Initialize() {
-  g_systemLightTheme = ReadSystemLightTheme();
+  g_session.systemLightTheme = ReadSystemLightTheme();
   RebuildIcons();
 
   HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -847,66 +862,59 @@ static bool Initialize() {
   trayClass.lpfnWndProc = TrayWindowProc;
   trayClass.hInstance = instance;
   trayClass.lpszClassName = kTrayWindowClassName;
-  g_trayWindowClass = RegisterClassW(&trayClass);
-  if (!g_trayWindowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+  g_session.trayWindowClass = RegisterClassW(&trayClass);
+  if (!g_session.trayWindowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
   WNDCLASSW flyoutClass{};
   flyoutClass.lpfnWndProc = FlyoutWindowProc;
   flyoutClass.hInstance = instance;
   flyoutClass.lpszClassName = kFlyoutWindowClassName;
-  g_flyoutWindowClass = RegisterClassW(&flyoutClass);
-  const bool haveFlyoutClass = g_flyoutWindowClass != 0 ||
+  g_session.flyoutWindowClass = RegisterClassW(&flyoutClass);
+  const bool haveFlyoutClass = g_session.flyoutWindowClass != 0 ||
                                GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 
-  g_trayWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayWindowClassName, L"",
+  g_session.trayWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayWindowClassName, L"",
                                  WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
                                  instance, nullptr);
-  if (!g_trayWindow) return false;
+  if (!g_session.trayWindow) return false;
 
   if (!haveFlyoutClass) {
     Wh_Log(L"Status flyout window class unavailable; tray indicator remains active");
   }
 
-  g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
-  g_displayedLayout = g_settings.defaultLayout;
+  g_session.taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+  g_session.displayedLayout = g_settings.defaultLayout;
   RefreshForCurrentWorkspace();
-  return g_iconAdded;
+  return g_session.iconAdded;
 }
 
 static void Shutdown() {
-  if (g_iconAdded && g_trayWindow) {
-    g_notifyData.uFlags = 0;
-    Shell_NotifyIconW(NIM_DELETE, &g_notifyData);
+  if (g_session.iconAdded && g_session.trayWindow) {
+    g_session.notifyData.uFlags = 0;
+    Shell_NotifyIconW(NIM_DELETE, &g_session.notifyData);
   }
-  g_iconAdded = false;
-  for (FlyoutInstance* instance : g_flyouts) {
-    if (!instance) continue;
+  g_session.iconAdded = false;
+  // Destroy each window before its instance: WM_NCDESTROY clears GWLP_USERDATA.
+  for (const auto& instance : g_session.flyouts) {
     if (instance->hwnd) {
       KillTimer(instance->hwnd, kFlyoutTimerId);
       DestroyWindow(instance->hwnd);
       instance->hwnd = nullptr;
     }
-    delete instance;
   }
-  g_flyouts.clear();
-  if (g_trayWindow) {
-    DestroyWindow(g_trayWindow);
-    g_trayWindow = nullptr;
+  g_session.flyouts.clear();
+  if (g_session.trayWindow) {
+    DestroyWindow(g_session.trayWindow);
+    g_session.trayWindow = nullptr;
   }
-  DestroyIconSet(g_icons);
+  DestroyIconSet(g_session.icons);
 
   HINSTANCE instance = GetModuleHandleW(nullptr);
   // Unregister by name even after recovering from ERROR_CLASS_ALREADY_EXISTS,
   // where RegisterClassW didn't return an ATOM for us to remember.
   UnregisterClassW(kFlyoutWindowClassName, instance);
   UnregisterClassW(kTrayWindowClassName, instance);
-  g_flyoutWindowClass = g_trayWindowClass = 0;
-  g_taskbarCreatedMessage = 0;
-  g_displayedLayout = TileLayout::COUNT;
-  g_displayedDesktopId = {};
-  g_haveDisplayedDesktopId = false;
-  g_displayedMonitor = nullptr;
-  g_notifyData = {};
+  g_session = {};
 }
 
 }  // namespace TrayUi

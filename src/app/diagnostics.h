@@ -1127,7 +1127,7 @@ static void DumpRuntimeSummary(
       summary.duplicateOwners);
   report.Line(
       L"Active conformance leases=%zu pending layout mutations=%zu runtime-maintenance timer=%d attempt=%u",
-      Placement::CountActiveConformanceLeases(), Placement::g_pendingLayoutMutations.size(),
+      Placement::CountActiveConformanceLeases(), Placement::g_pendingProofs.LayoutMutationCount(),
       g_wm.timers.maintenance ? 1 : 0, g_wm.maintenance.attempts);
   report.Line(
       L"Reverse ownership index: entries=%zu mismatches=%zu",
@@ -1146,8 +1146,8 @@ static void DumpConfigurationSnapshot(ReportBuilder& report) {
   report.TextLine(L"Layout cycle: ", DiagnosticLayoutCycleString(g_settings.layoutCycle));
   report.Line(L"Workspace initialization rules: %zu", g_settings.workspaceInitializationRules.size());
   report.Line(L"Tray click: %ls; toasts: %ls",
-              TrayUi::g_trayClickOpensMenu ? L"context menu" : L"switch layout",
-              TrayUi::g_showToasts ? L"enabled" : L"disabled");
+              TrayUi::g_preferences.clickOpensMenu ? L"context menu" : L"switch layout",
+              TrayUi::g_preferences.showToasts ? L"enabled" : L"disabled");
   report.Line(
       L"Workspace geometry (96-DPI logical px): gap=%ld insets=[%ld,%ld,%ld,%ld] floatingDefault=%ldx%ld",
       g_settings.gapDip, g_settings.insetsDip.left, g_settings.insetsDip.top,

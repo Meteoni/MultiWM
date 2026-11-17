@@ -13,7 +13,7 @@ struct AdmissionRecoveryPlan {
 
 struct ConstraintCandidate {
   HWND hwnd;
-  uint64_t generation;
+  uint64_t demandGeneration;  // Model::LayoutDemandRecency of the window.
 };
 
 struct ConstraintSlotCompatibility {
@@ -485,6 +485,7 @@ static bool MatchDwindleTail(
 // Layout conversion has different semantics from an explicit order mutation.
 // Preserve the existing order first (the caller already tried that), but if the
 // new Dwindle geometry cannot host that order, find a compatible permutation.
+// TryReorderForConstraints reuses this search after a sibling leaves.
 //
 // Adaptive prefix splits are searched jointly with assignment: for a candidate
 // occupant we allocate the smallest legal span that satisfies that window, which
@@ -632,6 +633,58 @@ static bool ReassignDwindleLayoutConversionForConstraints(
   if (outMovedWindowCount) *outMovedWindowCount = movedWindowCount;
   workspace = std::move(trial);
   return true;
+}
+
+// Membership-preserving recovery for a layout that stopped fitting without a
+// new admission to blame: a sibling left (shifting every later Dwindle slot's
+// split axis, or promoting a new master) or a settled window raised its minimum.
+// Finds a window order that fits so no settled window has to float.
+//
+// Only Dwindle and Master + Stack feasibility depends on order. Master + Stack
+// depends only on which window is master, so each stack member is tried there,
+// nearest first, by swapping it with the current master. Dwindle uses the same
+// joint ratio/assignment search as a layout conversion. `pinnedWindow`, the
+// window the user just acted on, keeps its slot. On success writes the trial to
+// *outWorkspace; on failure leaves it untouched. Pure planning.
+static bool TryReorderForConstraints(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    HWND pinnedWindow, Workspace* outWorkspace, size_t* outMovedWindowCount) {
+  if (!outWorkspace || workspace.ActiveCount() < 2) return false;
+  const TileLayout layout = workspace.Layout();
+  const std::vector<HWND> windows = workspace.TiledWindows();
+  const size_t pinnedIndex = workspace.TiledIndex(pinnedWindow);
+
+  if (IsMasterStackLayout(layout)) {
+    if (pinnedIndex == 0) return false;
+    for (size_t index = 1; index < windows.size(); ++index) {
+      if (index == pinnedIndex) continue;
+      Workspace trial = workspace;
+      if (!trial.MakeMaster(windows[index])) continue;
+      std::vector<RECT> rects;
+      ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
+      if (BuildWorkspaceLayoutPlan(trial, workArea, gap, &rects) ==
+          LayoutPlanStatus::Success) {
+        if (outMovedWindowCount) *outMovedWindowCount = 2;
+        *outWorkspace = std::move(trial);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (layout == TileLayout::Dwindle) {
+    Workspace trial = workspace;
+    size_t moved = 0;
+    if (!ReassignDwindleLayoutConversionForConstraints(trial, workArea, gap, &moved) ||
+        moved == 0 ||
+        (pinnedIndex < windows.size() && trial.TiledIndex(pinnedWindow) != pinnedIndex)) {
+      return false;
+    }
+    if (outMovedWindowCount) *outMovedWindowCount = moved;
+    *outWorkspace = std::move(trial);
+    return true;
+  }
+  return false;  // Grid and Monocle feasibility does not depend on order.
 }
 
 // Dwindle geometry belongs to slots, not applications. During admission only,
