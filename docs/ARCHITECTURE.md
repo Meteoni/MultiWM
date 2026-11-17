@@ -7,22 +7,26 @@ minutes. For coding rules, units, and the glossary, see
 ## One source file, many chapters
 
 Windhawk compiles a mod from a single `.cpp` file. MultiWM keeps that single
-file readable by splitting it into headers under `src/`, which
-[`src/multiwm.cpp`](../src/multiwm.cpp) includes in a fixed order. WHAM pastes them
-together into `output/multiwm.wh.cpp` for publishing.
+file readable by splitting it into headers under `src/multiwm/`, which
+[`src/multiwm/multiwm.cpp`](../src/multiwm/multiwm.cpp) includes in a fixed order. WHAM pastes them
+together into `output/multiwm/multiwm.wh.cpp` for publishing.
 
 Consequences you will run into:
 
 - **A header is a chapter, not a standalone header.** It can use anything
   defined in an earlier chapter, and it will not compile on its own. Build
-  `src/multiwm.cpp` (or run the tests) instead.
+  `src/multiwm/multiwm.cpp` (or run the tests) instead.
 - **Order matters.** If you need a function from a later chapter, declare it in
-  [`core/forward_declarations.h`](../src/core/forward_declarations.h).
+  [`core/forward_declarations.h`](../src/multiwm/core/forward_declarations.h).
 - **Namespaces show ownership, not privacy.** Everything can see everything.
   Call across owners with the full name (`Platform::Windows::…`) so native
   effects stay visible; inside an owner, short names are fine.
 
 ## Folders and owners
+
+The roots `src/multiwm/`, `src/companion/`, and `src/shared/` separate the two
+mods from their shared code. Chapter paths below are relative to `src/multiwm/`,
+except the sibling `shared/` and `companion/` roots.
 
 | Folder | Namespace | Owns |
 | --- | --- | --- |
@@ -33,8 +37,36 @@ Consequences you will run into:
 | `reconcile/` | `Reconcile` | Turning observed OS state into model changes: discovery, ownership repair, initial-placement rules, overflow |
 | `commands/` | `Commands`, `Gestures` | Hotkey/tray commands and interpreting user drags and resizes |
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |
-| `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop |
+| `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot |
 | `windhawk/` | — | Windhawk's stock tool-mod launcher. Not MultiWM logic. |
+| `shared/` | `SharedRules`, `CompanionAbi` | Code compiled by both mods: window-rule matching and the companion snapshot layout. Windows and the standard library only. |
+| `companion/` | `Companion` | The separate MultiWM Companion mod (`src/companion/multiwm-companion.cpp`). Never included by MultiWM. |
+
+## The companion mod
+
+WHAM builds every `.cpp` under `src/` as its own mod, so `src/companion/multiwm-companion.cpp`
+becomes `output/companion/multiwm-companion.wh.cpp`. That mod is loaded into every
+application and does one thing: just before a window is first shown, it moves the
+window to where MultiWM will put it.
+
+Data flows one way. After each message, the WM thread
+(`CompanionSnapshot::PublishIfChanged`) checks whether a workspace was saved, the
+mode or desktop changed, or the display changed. If so, it rebuilds a snapshot and
+writes it to shared memory. The snapshot holds the next slot for each workspace
+(`Placement::PredictAutomaticAdmission`), the window rules and the known windows.
+The companion reads it and never writes. It predicts from the application's
+proposed geometry, clamps the hinted size to its reported limits, and rewrites
+the original positioning call. An unavailable hint leaves that call unchanged.
+MultiWM still corrects every window as usual, so a wrong hint costs one move.
+
+The companion covers normal and asynchronous show calls, immediate and deferred
+positioning with `SWP_SHOWWINDOW`, saved placements, and visible creation.
+`SW_RESTORE` is eligible for unknown hidden windows; `SW_SHOWDEFAULT` uses the
+startup show command. Cross-thread requests pass through without a hint, keeping
+asynchronous shows nonblocking. Deferred batches retain their original commit
+timing and returned handles. A local Windows probe found `AnimateWindow` reaches
+the existing native positioning hook while hidden, so no animation hook is added.
+Visible creation is best effort: the app may paint before creation returns.
 
 Comparable projects use the same split. i3 has `handlers.c` (events),
 `commands.c`, `workspace.c` (model), `render.c` (layout) and `x.c` (pushing to
@@ -80,7 +112,7 @@ anything. When you see a check repeated after a native call, that is why.
 - A workspace is keyed by `DesktopMonitorKey` (virtual desktop GUID + monitor ID).
 - Change membership only through `Workspace` methods (`AdmitTiled`, `Float`,
   `Suspend`, `Restore`, `Forget`, …). They maintain the invariants listed at the
-  top of [`core/shared_types.h`](../src/core/shared_types.h). If a change can't
+  top of [`core/shared_types.h`](../src/multiwm/core/shared_types.h). If a change can't
   be explained by those invariants, it probably belongs in `reconcile/`.
 
 ## Where to start for common changes
@@ -95,7 +127,8 @@ anything. When you see a check repeated after a native call, that is why.
 
 ## Tests
 
-`tests/run.ps1 -CompilerRoot <Windhawk Compiler>` builds two suites that
-include `src/multiwm.cpp` directly. They use the real model and planner with
-fake desktop COM objects, and never move other applications' windows. Run them
-before every commit.
+`tests/run.ps1 -CompilerRoot <Windhawk Compiler>` builds layout, reconciliation,
+and companion suites. The first two include `src/multiwm/multiwm.cpp` directly;
+the third includes `src/companion/multiwm-companion.cpp`. They use real code with
+fake desktop COM objects, test-owned hidden windows, and recorded placement
+calls. They never move other applications' windows. Run them before every commit.

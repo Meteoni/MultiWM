@@ -1,12 +1,13 @@
 # Maintaining MultiWM
 
 Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the invariants at the
-top of `src/core/shared_types.h`. The headers are chapters of one source file;
-compile `src/multiwm.cpp` (or run the tests) rather than a header on its own.
+top of `src/multiwm/core/shared_types.h`. The headers are chapters of one source file;
+compile `src/multiwm/multiwm.cpp` (or run the tests) rather than a header on its own.
 
 ## File and namespace ownership
 
-Each `src/` folder has one owner namespace (see the table in ARCHITECTURE.md).
+The source roots are `src/multiwm/`, `src/companion/`, and `src/shared/`. Each
+chapter folder under `src/multiwm/` has one owner namespace (see ARCHITECTURE.md).
 Put new code in the folder whose owner it belongs to. A new file does not need a
 new namespace or manager class; split a file when its responsibilities differ,
 and keep an algorithm together with its local helpers.
@@ -19,9 +20,9 @@ deliberately usable unqualified; do not add global aliases for functions,
 because they hide which owner has side effects.
 
 Shared state that belongs to one owner lives in that owner's namespace in
-`src/core/runtime_state.h` (for example `Placement::g_pendingProofs`). If a
+`src/multiwm/core/runtime_state.h` (for example `Placement::g_pendingProofs`). If a
 function from a later chapter is needed earlier, declare it in
-`src/core/forward_declarations.h`.
+`src/multiwm/core/forward_declarations.h`.
 
 Make shared state a class only when several containers must change together,
 for example a reset that must not miss one. Declare it in `runtime_state.h` and
@@ -92,17 +93,18 @@ These practices draw on the [C++ Core Guidelines](https://isocpp.github.io/CppCo
 
 ## Verification and review tools
 
-Run the two maintained regression suites with the Windhawk compiler:
+Run the maintained regression suites with the Windhawk compiler:
 
 ```powershell
 ./tests/run.ps1 -CompilerRoot 'C:/path/to/Windhawk/Compiler'
 ```
 
-Use `-Suite layout` or `-Suite reconciliation` to run the affected suite alone.
+Use `-Suite layout`, `-Suite reconciliation`, or `-Suite companion` to run one suite.
 The layout suite uses the real model/planner without native placement. The
 reconciliation suite uses fake desktop COM responses and test-owned hidden
-windows. Neither suite switches real virtual desktops or moves other apps.
-The runner writes only two reusable executables under `output/tests/`.
+windows. The companion suite checks show-call preservation and size limits with
+test-owned hidden windows and recorded native calls. None of the suites switches
+real virtual desktops or moves other apps. Executables go under `output/tests/`.
 
 Build with the Windhawk/WHAM compiler configuration. For changes to layout,
 ownership, or native sequencing, exercise the affected behavior and compare the
@@ -120,7 +122,7 @@ past 4 is a review prompt. Existing routines can exceed these values while a
 focused refactor is in progress. The checks introduce no naming or ABI rewrites.
 
 Enable clang-tidy diagnostics in clangd, or run `clang-tidy -p <build-directory>
-src/multiwm.cpp` with a compilation database containing the Windhawk flags.
+src/multiwm/multiwm.cpp` with a compilation database containing the Windhawk flags.
 WHAM's generated `.clangd` supplies the editor's compiler configuration.
 See the [clang-tidy check documentation](https://clang.llvm.org/extra/clang-tidy/checks/readability/function-cognitive-complexity.html)
 for how branching and nesting contribute to the score.

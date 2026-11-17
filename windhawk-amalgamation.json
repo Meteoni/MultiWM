@@ -11,6 +11,6 @@
   ],
   "externalIncludes": [],
   "inlineAngleIncludes": false,
-  "generate": "onSave",
+  "generate": "manual",
   "debounceMs": 250
 }

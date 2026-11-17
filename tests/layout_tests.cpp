@@ -1,4 +1,4 @@
-#include "../src/multiwm.cpp"
+#include "../src/multiwm/multiwm.cpp"
 #include <cstdio>
 
 // Exercise real model/planner behavior without creating or moving native windows.
@@ -434,10 +434,183 @@ static void RunRuleFieldParserTests() {
   std::printf("Passed %d rule field parser checks.\n", checks);
 }
 
+// The companion's next-slot hint is only useful if it is exactly where MultiWM
+// puts the window. Compare the prediction with what discovery's own admission
+// (Reconcile::AdmitUntrackedSnapshot) plus the planner produce for the same
+// workspace, across layouts, insertion positions and constrained neighbours.
+static void RunAdmissionPredictionTests() {
+  g_settings = SettingsState{};
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  const Platform::Monitors::WorkspaceMetrics metrics{{0, 0, 1920, 1040}, 96, 6};
+  // Never a test-owned or real window here: admission only reads its (absent) properties.
+  const HWND incoming = reinterpret_cast<HWND>(0x7FFF0000);
+  const TileLayout layouts[] = {TileLayout::MasterStack, TileLayout::MasterStackH, TileLayout::Dwindle,
+                                TileLayout::Columns, TileLayout::Rows, TileLayout::Monocle};
+  const AutomaticNewWindowPosition positions[] = {AutomaticNewWindowPosition::LastSlot,
+                                                  AutomaticNewWindowPosition::AfterFocused};
+
+  for (bool reverse : {false, true}) {
+    for (AutomaticNewWindowPosition position : positions) {
+      for (TileLayout layout : layouts) {
+        for (size_t existing = 0; existing <= 5; ++existing) {
+          for (bool constrained : {false, true}) {
+            g_settings.reverseDwindle = reverse;
+            g_settings.automaticNewWindowPosition = position;
+            Workspace workspace;
+            workspace.SetLayout(layout);
+            for (size_t i = 0; i < existing; ++i) {
+              WindowRecord record;
+              record.hwnd = reinterpret_cast<HWND>(0x1000 + i * 4);
+              record.pid = 1;
+              // A wide first window forces the constrained planner path.
+              if (constrained && i == 0) record.constraints = {1100, 300, 96, true};
+              check(workspace.AdmitTiled(record), "admit existing window");
+            }
+            if (existing > 1) workspace.RememberFocusedWindow(workspace.TiledWindows()[1]);
+
+            const Placement::AdmissionPrediction prediction = Placement::PredictAutomaticAdmission(
+                workspace, metrics, 0, position == AutomaticNewWindowPosition::AfterFocused);
+            check(!prediction.floatingFrame, "tiled layouts predict no floating frame");
+
+            Workspace admitted = workspace;
+            check(Reconcile::AdmitUntrackedSnapshot(admitted, {incoming}, true, true),
+                  "discovery admits the incoming window");
+            std::vector<RECT> rects;
+            const bool planned = Layout::BuildWorkspaceLayoutPlan(admitted, metrics.workArea, metrics.gap,
+                                                                  &rects) == Layout::LayoutPlanStatus::Success;
+            check(planned == prediction.tiledFrame.has_value(), "prediction exists exactly when the plan succeeds");
+            if (planned) {
+              const RECT& actual = rects[admitted.TiledIndex(incoming)];
+              check(EqualRect(&actual, &*prediction.tiledFrame), "predicted slot matches real admission");
+            }
+            check(workspace.ActiveCount() == existing && !workspace.HasRecord(Placement::kPredictedWindow),
+                  "prediction leaves the workspace unchanged");
+          }
+        }
+      }
+    }
+  }
+
+  // The automatic window limit: a full workspace gets no tiled hint.
+  g_settings = SettingsState{};
+  Workspace full;
+  full.SetLayout(TileLayout::Columns);
+  for (size_t i = 0; i < 3; ++i) {
+    WindowRecord record;
+    record.hwnd = reinterpret_cast<HWND>(0x2000 + i * 4);
+    check(full.AdmitTiled(record), "admit window for limit test");
+  }
+  check(!Placement::PredictAutomaticAdmission(full, metrics, 3, false).tiledFrame, "limit reached: no hint");
+  check(Placement::PredictAutomaticAdmission(full, metrics, 4, false).tiledFrame.has_value(),
+        "below the limit: hint");
+
+  // The Floating layout centers the DPI-scaled default size, clamped to the work area.
+  Workspace floating;
+  floating.SetLayout(TileLayout::Floating);
+  const auto centered = Placement::PredictAutomaticAdmission(floating, metrics, 0, false);
+  const RECT expectedCentered{480, 200, 1440, 840};
+  check(!centered.tiledFrame && centered.floatingFrame && EqualRect(&*centered.floatingFrame, &expectedCentered),
+        "floating default size is centered");
+  const Platform::Monitors::WorkspaceMetrics highDpi{{0, 0, 1920, 1040}, 192, 12};
+  const auto clamped = Placement::PredictAutomaticAdmission(floating, highDpi, 0, false);
+  check(clamped.floatingFrame && EqualRect(&*clamped.floatingFrame, &highDpi.workArea),
+        "scaled default size is clamped to the work area");
+
+  std::printf("Passed %d admission prediction checks.\n", checks);
+}
+
+// Rules travel to the companion in the snapshot; what it decodes must match
+// what MultiWM matches against.
+static void RunCompanionRuleEncodingTests() {
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  std::vector<WindowRule> rules(4);
+  rules[0].treatment = WindowRuleTreatment::Exclude;
+  rules[0].processNames = {L"Steam.exe"};
+  rules[1].treatment = WindowRuleTreatment::TraceToOwner;
+  rules[1].classNames = {L"OwnerHelper"};
+  rules[2].treatment = WindowRuleTreatment::FloatingPlacementOverride;
+  rules[2].preserveFloatingSize = false;
+  rules[2].floatingSizeDip = {720, 480};
+  rules[2].classNames = {L"Chrome_WidgetWin_1"};
+  rules[2].titleFragments = {L"Préférences, avancées", L"设置"};
+  rules[3].treatment = WindowRuleTreatment::DefaultToFloating;
+  rules[3].processNames = {L"a.exe", L"b.exe"};
+
+  std::vector<uint8_t> buffer(CompanionAbi::kRulesCapacity);
+  bool complete = false;
+  const uint32_t size =
+      CompanionAbi::SerializeRules(rules, buffer.data(), CompanionAbi::kRulesCapacity, &complete);
+  std::vector<CompanionAbi::SnapshotRule> decoded;
+  check(complete && CompanionAbi::DeserializeRules(buffer.data(), size, &decoded), "rules round-trip");
+  check(decoded.size() == 3, "trace-to-owner rules are left out");
+  auto same = [](const WindowRule& original, const CompanionAbi::SnapshotRule& copy) {
+    return original.treatment == copy.treatment && original.processNames == copy.processNames &&
+           original.classNames == copy.classNames && original.titleFragments == copy.titleFragments &&
+           original.preserveFloatingSize == copy.preserveFloatingSize &&
+           original.useWorkspaceSize == copy.useWorkspaceSize &&
+           original.floatingSizeDip.width == copy.floatingSizeDip.width &&
+           original.floatingSizeDip.height == copy.floatingSizeDip.height;
+  };
+  check(same(rules[0], decoded[0]) && same(rules[2], decoded[1]) && same(rules[3], decoded[2]),
+        "decoded rules keep every field");
+
+  // A full buffer keeps whole rules only and reports itself incomplete.
+  const uint32_t firstRuleSize =
+      CompanionAbi::SerializeRules(std::vector<WindowRule>{rules[0]}, buffer.data(), CompanionAbi::kRulesCapacity,
+                                   &complete);
+  const uint32_t truncated =
+      CompanionAbi::SerializeRules(rules, buffer.data(), firstRuleSize + 3, &complete);
+  check(!complete && truncated == firstRuleSize, "overflow stops at a rule boundary");
+  check(CompanionAbi::DeserializeRules(buffer.data(), truncated, &decoded) && decoded.size() == 1,
+        "the kept prefix decodes");
+  check(!CompanionAbi::DeserializeRules(buffer.data(), truncated - 1, &decoded) && decoded.empty(),
+        "cut data is rejected");
+  std::printf("Passed %d companion rule encoding checks.\n", checks);
+}
+
+static void RunCompanionSnapshotRecoveryTests() {
+  auto section = std::make_unique<CompanionAbi::SnapshotSection>();
+  auto copy = std::make_unique<CompanionAbi::SnapshotBody>();
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  // A new writer can inherit either a completed snapshot or an interrupted
+  // write. Readers must reject the body throughout takeover, then recover.
+  for (LONG previous : {0L, 2L, 1L, 3L, LONG_MAX}) {
+    section->sequence = previous;
+    CompanionAbi::BeginWrite(section.get());
+    check((section->sequence & 1) && section->sequence != previous, "takeover advances to a new odd sequence");
+    check(!CompanionAbi::ReadConsistentBody(section.get(), copy.get()), "takeover hides unfinished data");
+    section->body.flags = CompanionAbi::kFlagRunning;
+    CompanionAbi::EndWrite(section.get());
+    check(CompanionAbi::ReadConsistentBody(section.get(), copy.get()) &&
+              copy->flags == CompanionAbi::kFlagRunning, "completed takeover is readable");
+    CompanionAbi::BeginWrite(section.get());
+    section->body.flags = 0;
+    CompanionAbi::EndWrite(section.get());
+    check(CompanionAbi::ReadConsistentBody(section.get(), copy.get()) && copy->flags == 0,
+          "publishing continues after takeover");
+  }
+  std::printf("Passed %d companion snapshot recovery checks.\n", checks);
+}
+
 int main() {
   RunSettingsParserDigest();
   RunRuleFieldParserTests();
   RunAdaptiveDwindleTests();
   RunWeightedResizeTests();
   RunDwindlePlannerDigest();
+  RunAdmissionPredictionTests();
+  RunCompanionRuleEncodingTests();
+  RunCompanionSnapshotRecoveryTests();
 }

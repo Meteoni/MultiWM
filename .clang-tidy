@@ -1,0 +1,10 @@
+# Advisory review prompts. Keep meaningful operations together when splitting
+# would make the flow harder to follow; these checks are not build failures.
+Checks: '-*,readability-function-cognitive-complexity,readability-function-size'
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*[/\\]src[/\\].*\.h'
+CheckOptions:
+  readability-function-cognitive-complexity.Threshold: '25'
+  readability-function-cognitive-complexity.DescribeBasicIncrements: 'false'
+  readability-function-size.LineThreshold: '120'
+  readability-function-size.NestingThreshold: '4'

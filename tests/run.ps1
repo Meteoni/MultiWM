@@ -1,6 +1,6 @@
 param(
   [string]$CompilerRoot,
-  [ValidateSet('all', 'layout', 'reconciliation')][string]$Suite = 'all'
+  [ValidateSet('all', 'layout', 'reconciliation', 'companion')][string]$Suite = 'all'
 )
 $ErrorActionPreference = 'Stop'
 
@@ -18,7 +18,7 @@ if (-not (Test-Path -LiteralPath $compilerPath) -or -not (Test-Path -LiteralPath
 $repository = Split-Path -Parent $PSScriptRoot
 $buildDirectory = Join-Path $repository 'output/tests'
 New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
-$suites = if ($Suite -eq 'all') { @('layout', 'reconciliation') } else { @($Suite) }
+$suites = if ($Suite -eq 'all') { @('layout', 'reconciliation', 'companion') } else { @($Suite) }
 foreach ($name in $suites) {
   $source = Join-Path $PSScriptRoot ($name + '_tests.cpp')
   $executable = Join-Path $buildDirectory ($name + '_tests.exe')

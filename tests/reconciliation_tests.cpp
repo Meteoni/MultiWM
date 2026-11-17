@@ -1,4 +1,4 @@
-#include "../src/multiwm.cpp"
+#include "../src/multiwm/multiwm.cpp"
 #include <cstdio>
 
 // Conformance tests drive lease timing directly (friend of PendingProofs).

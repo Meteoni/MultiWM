@@ -26,23 +26,26 @@ continuous polling.
 
 ## Source layout
 
-Windhawk builds a mod from one source file. `src/multiwm.cpp` holds the mod's
+Windhawk builds a mod from one source file. `src/multiwm/multiwm.cpp` holds the mod's
 metadata and settings, and includes the headers below in a fixed order; WHAM
-combines them into `output/multiwm.wh.cpp`. Each header is a chapter of that one
-file, so build `src/multiwm.cpp` rather than a header on its own.
+combines them into `output/multiwm/multiwm.wh.cpp`. Each header is a chapter of that one
+file, so build `src/multiwm/multiwm.cpp` rather than a header on its own.
 
 ```
 src/
-  multiwm.cpp     Windhawk metadata, settings schema, entry points, include order
-  core/           shared types, settings, messages, WM thread state
-  model/          Workspace and WorkspaceRepository
-  layout/         rectangle math, constraint planning, resize learning
-  placement/      floating geometry, applying layouts, conformance leases
-  reconcile/      discovery, ownership repair, window routing and overflow
-  commands/       hotkey/tray commands and drag/resize gestures
-  platform/       Windows APIs: windows, monitors, WinEvents, virtual desktops
-  app/            settings loading, tray UI, diagnostics, WM thread lifecycle
-  windhawk/       Windhawk's standard tool-mod launcher
+  multiwm/
+    multiwm.cpp   Windhawk metadata, settings schema, entry points, include order
+    core/         shared types, settings, messages, WM thread state
+    model/        Workspace and WorkspaceRepository
+    layout/       rectangle math, constraint planning, resize learning
+    placement/    floating geometry, applying layouts, conformance leases
+    reconcile/    discovery, ownership repair, window routing and overflow
+    commands/     hotkey/tray commands and drag/resize gestures
+    platform/     Windows APIs: windows, monitors, WinEvents, virtual desktops
+    app/          settings loading, tray UI, diagnostics, WM thread lifecycle
+    windhawk/     Windhawk's standard tool-mod launcher
+  companion/      MultiWM Companion entry point, snapshot reader and show hooks
+  shared/         code both mods compile: rule matching, companion snapshot layout
 tests/            regression suites (run with tests/run.ps1)
 ```
 
