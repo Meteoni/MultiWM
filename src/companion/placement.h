@@ -1,12 +1,12 @@
-// Decides whether a window about to be shown for the first time will be managed
-// by MultiWM, and if so moves it to the frame MultiWM will give it.
+// Places a hidden window at the frame MultiWM will give it: the admission frame
+// for an unknown window, or its published restore frame for a suspended member.
 // Part of the MultiWM Companion mod; see the include order in src/companion/multiwm-companion.cpp.
 //
 // One-shot: one decision when a window goes from hidden to shown, nothing after.
 // No per-window state is kept. A window MultiWM already knows (say, hidden to the
-// tray) is in the snapshot's tracked list and is left alone by admission hints.
-// restoration.h handles known suspended members separately. Unknown windows
-// will be admitted as new, so the next slot is right for them on any show.
+// tray) uses its own restore frame rather than a new-window slot. restoration.h
+// separately prepares the normal rectangle for minimized/maximized restores.
+// Unknown windows will be admitted as new, so the next slot is right on any show.
 // MultiWM stays the authority: a wrong guess costs one move by MultiWM afterwards,
 // the same as without the companion.
 
@@ -247,13 +247,13 @@ static std::optional<RECT> CenteredFloatingFrame(const CompanionAbi::WorkspaceHi
   return SharedGeometry::ClampToArea(SharedGeometry::CenteredIn(workspace.workArea, width, height), workspace.workArea);
 }
 
-// The frame MultiWM will give `hwnd` (currently at `frame`), mirroring
-// Automatic discovery for an unknown window, and how MultiWM applies the
+// The frame MultiWM will give `hwnd` (currently at `frame`), using its restore
+// hint when known or Automatic discovery otherwise, and how MultiWM applies the
 // window's size limits to it (`*kind`). For a tiled slot, `*overflowFrame` is
 // where overflow would centre the window if its minimum turns out larger than
 // the work area (MultiWM then floats it); nothing when overflow routes such a
 // window instead. Returns nothing, with `*reason` set, when MultiWM won't
-// manage it as a new window or the snapshot can't say where it goes.
+// manage it or the snapshot can't say where it goes.
 static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const HintInputs& inputs, TargetKind* kind,
                                         std::optional<RECT>* overflowFrame, const char** reason) {
   using namespace CompanionAbi;
@@ -266,7 +266,6 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
   constexpr uint32_t kComplete = kFlagRunning | kFlagRulesComplete | kFlagTrackedComplete;
   if ((inputs.flags & kComplete) != kComplete || !inputs.rules) return reject("no complete snapshot");
   if (!(inputs.flags & kFlagAutomaticMode)) return reject("Manual mode");
-  if (inputs.tracked) return reject("MultiWM already knows this window");
   if (!inputs.workspace) return reject("no workspace on this monitor");
 
   const std::vector<SnapshotRule>& rules = *inputs.rules;
@@ -275,13 +274,26 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
     return SharedRules::FindFirstMatchingRule(rules, treatment, facts);
   };
   if (matches(WindowRuleTreatment::Exclude)) return reject("excluded by a rule");
+  const WorkspaceHint& workspace = *inputs.workspace;
+  if (inputs.tracked) {
+    // Hide-to-tray need not minimize the window. Its next show uses the saved
+    // slot, while a known window with no usable restore hint stays untouched.
+    if (IsWindowVisible(hwnd) || workspace.floatingLayout || !inputs.restoreFrame ||
+        Width(*inputs.restoreFrame) <= 0 || Height(*inputs.restoreFrame) <= 0) {
+      return reject("no restore tile for this known window");
+    }
+    if (!inputs.restoreFrameMargins || inputs.restoreMarginsDpi != workspace.dpi) {
+      return reject("no current restore border measurement");
+    }
+    *reason = "using MultiWM's restore tile";
+    return inputs.restoreFrame;
+  }
   if (matches(WindowRuleTreatment::InitialPlacement)) return reject("routed by an Open-on-monitor rule");
   const bool floatingRule =
       matches(WindowRuleTreatment::AlwaysFloating) || matches(WindowRuleTreatment::DefaultToFloating);
   const bool resizable = (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_SIZEBOX) != 0;
   if (!resizable && !floatingRule) return reject("fixed-size window");
 
-  const WorkspaceHint& workspace = *inputs.workspace;
   // Rule-floated windows keep the app's size and are centered without clamping
   // (CenterPreservingSize), in every layout.
   if (floatingRule) {
@@ -326,8 +338,9 @@ struct PredictedPlacement {
 };
 
 // Calculates without placing. `proposed` is the app's intended window rectangle
-// in physical screen pixels, including resize borders. The current DWM margins
-// translate it to a visible frame. Caller holds PlacementScope on the window's
+// in physical screen pixels, including resize borders. DWM margins translate
+// new windows; known members use the published measured borders and restore tile.
+// Caller holds PlacementScope on the window's
 // own thread, so application callbacks cannot recursively predict another show.
 static std::optional<PredictedPlacement> PredictWindowPlacement(
     HWND hwnd, const RECT& proposed, const char* path) {
@@ -335,8 +348,8 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   RECT windowRect{};
   if (!GetWindowRect(hwnd, &windowRect)) return std::nullopt;
   const RECT currentFrame = FrameOf(hwnd, windowRect);
-  const RECT margins{currentFrame.left - windowRect.left, currentFrame.top - windowRect.top,
-                     windowRect.right - currentFrame.right, windowRect.bottom - currentFrame.bottom};
+  RECT margins{currentFrame.left - windowRect.left, currentFrame.top - windowRect.top,
+                windowRect.right - currentFrame.right, windowRect.bottom - currentFrame.bottom};
   const RECT frame{proposed.left + margins.left, proposed.top + margins.top,
                    proposed.right - margins.right, proposed.bottom - margins.bottom};
 
@@ -358,6 +371,9 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
     LogDecision(hwnd, path, "no snapshot (MultiWM not running?)");
     return std::nullopt;
   }
+  // Known hidden members use the same measured borders as minimized restores;
+  // a hidden window's current DWM bounds can be missing or stale.
+  if (inputs.tracked && inputs.restoreFrameMargins) margins = *inputs.restoreFrameMargins;
   TargetKind kind = TargetKind::Tile;
   std::optional<RECT> overflowFrame;
   const char* reason = nullptr;
@@ -412,7 +428,7 @@ static bool PlaceAtPredictedFrame(HWND hwnd, const char* path) {
   if (prediction->keepSize) flags |= SWP_NOSIZE;
   const BOOL moved = g_setWindowPosForOwnMoves(hwnd, nullptr, placement.left, placement.top,
                                                Width(placement), Height(placement), flags);
-  LogDecision(hwnd, path, moved ? "placed at MultiWM's next frame" : "SetWindowPos failed");
+  LogDecision(hwnd, path, moved ? "placed at MultiWM's frame" : "SetWindowPos failed");
   return moved != FALSE;
 }
 

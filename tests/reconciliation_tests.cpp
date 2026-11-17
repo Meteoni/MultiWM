@@ -957,6 +957,103 @@ static void RunComRefOwnershipTests() {
   std::printf("Passed %u COM reference ownership checks.\n", checks);
 }
 
+// Exercise the publisher's real border cache across native state transitions.
+// A private desktop keeps the shown test window away from live window managers.
+static void RunFrameMarginCacheTests() {
+  wchar_t desktopName[80];
+  swprintf(desktopName, ARRAYSIZE(desktopName), L"MultiWMFrameCacheTests_%lu", GetCurrentProcessId());
+  HDESK desktop = CreateDesktopW(desktopName, nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+  if (!desktop) std::exit(1);
+  HANDLE worker = CreateThread(nullptr, 0, [](void* parameter) -> DWORD {
+    int checks = 0;
+    auto check = [&](bool passed, const char* message) {
+      if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+      ++checks;
+    };
+    check(SetThreadDesktop(static_cast<HDESK>(parameter)), "select border-cache test desktop");
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"MultiWM border cache test", WS_OVERLAPPEDWINDOW,
+                                  100, 100, 600, 400, nullptr, nullptr, nullptr, nullptr);
+    check(hwnd != nullptr, "create border-cache test window");
+    BOOL cloak = TRUE;
+    check(SUCCEEDED(DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak))), "cloak border-cache test window");
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    WindowRecord record;
+    record.hwnd = hwnd;
+    record.pid = GetCurrentProcessId();
+    Workspace workspace;
+    check(workspace.AdmitTiled(record), "admit border-cache test window");
+    const UINT dpi = GetDpiForWindow(hwnd);
+    CompanionSnapshot::RememberFrameMargins(workspace, dpi);
+    check(CompanionSnapshot::g_publisher.frameMargins.contains(hwnd), "measure visible restored borders");
+    const auto measured = CompanionSnapshot::g_publisher.frameMargins.at(hwnd);
+
+    for (int command : {SW_HIDE, SW_SHOWMINNOACTIVE, SW_HIDE, SW_SHOWMAXIMIZED, SW_HIDE, SW_SHOWNOACTIVATE}) {
+      ShowWindow(hwnd, command);
+      CompanionSnapshot::RememberFrameMargins(workspace, dpi);
+      const auto hint = CompanionSnapshot::MakeRestoreWindowHint(record, 0, RECT{10, 10, 500, 400});
+      const auto cached = CompanionSnapshot::g_publisher.frameMargins.find(hwnd);
+      check(cached != CompanionSnapshot::g_publisher.frameMargins.end() &&
+                cached->second.style == measured.style && EqualRect(&cached->second.margins, &measured.margins),
+            "show-state transitions retain the restored measurement without remeasuring");
+      check(hint.marginsDpi == dpi && EqualRect(&hint.frameMargins, &measured.margins),
+            "hidden, minimized and maximized windows publish restored borders");
+    }
+    for (bool topmost : {true, false}) {
+      check(SetWindowPos(hwnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE), "change stacking order");
+      EnableWindow(hwnd, !topmost);
+      RECT windowRect{}, frame{};
+      GetWindowRect(hwnd, &windowRect);
+      check(SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))),
+            "read borders after stacking and enabled-state changes");
+      const RECT margins{frame.left - windowRect.left, frame.top - windowRect.top,
+                         windowRect.right - frame.right, windowRect.bottom - frame.bottom};
+      check(EqualRect(&margins, &measured.margins) && CompanionSnapshot::FrameInputsUnchanged(hwnd, measured),
+            "stacking and enabled state preserve actual borders and cache validity");
+    }
+
+    ShowWindow(hwnd, SW_HIDE);
+    // Actual frame-style changes still invalidate the cache while hidden, when
+    // it cannot be safely replaced with a fresh measurement.
+    for (int change = 0; change < 3; ++change) {
+      SetWindowLongPtrW(hwnd, GWL_STYLE, measured.style & ~WS_VISIBLE);
+      SetWindowLongPtrW(hwnd, GWL_EXSTYLE, measured.exStyle);
+      if (change < 2) {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (measured.style & ~WS_VISIBLE) ^
+                                         (change == 0 ? WS_THICKFRAME : WS_CAPTION));
+      } else {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, measured.exStyle ^ WS_EX_CLIENTEDGE);
+      }
+      CompanionSnapshot::g_publisher.frameMargins[hwnd] = measured;
+      const auto hint = CompanionSnapshot::MakeRestoreWindowHint(record, 0, RECT{10, 10, 500, 400});
+      check(hint.marginsDpi == 0, "changed frame styles suppress stale published borders");
+      CompanionSnapshot::RememberFrameMargins(workspace, dpi);
+      check(!CompanionSnapshot::g_publisher.frameMargins.contains(hwnd), "unmeasurable stale borders are discarded");
+    }
+    SetWindowLongPtrW(hwnd, GWL_STYLE, measured.style & ~WS_VISIBLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, measured.exStyle);
+    auto stale = measured;
+    ++stale.windowDpi;
+    check(!CompanionSnapshot::FrameInputsUnchanged(hwnd, stale), "window-DPI changes invalidate cached borders");
+    stale = measured;
+    ++stale.processId;
+    CompanionSnapshot::g_publisher.frameMargins[hwnd] = stale;
+    check(CompanionSnapshot::MakeRestoreWindowHint(record, 0, RECT{10, 10, 500, 400}).marginsDpi == 0,
+          "another process cannot inherit cached borders");
+    CompanionSnapshot::g_publisher.frameMargins.clear();
+    DestroyWindow(hwnd);
+    std::printf("Passed %d border-cache checks.\n", checks);
+    return 0;
+  }, desktop, 0, nullptr);
+  if (!worker || WaitForSingleObject(worker, 30000) != WAIT_OBJECT_0) std::exit(1);
+  DWORD result = 0;
+  GetExitCodeThread(worker, &result);
+  CloseHandle(worker);
+  CloseDesktop(desktop);
+  if (result) std::exit(1);
+}
+
 // The probe reads both tracking limits from WM_GETMINMAXINFO in frame geometry.
 // A maximum is recorded only when the app lowered it below the system default.
 // Hidden, never-shown test windows: no window manager or mod reacts to them.
@@ -1181,6 +1278,7 @@ static void RunOverflowFloatPredictionTests() {
 }
 
 int main() {
+  RunFrameMarginCacheTests();
   RunConstraintProbeTests();
   RunComRefOwnershipTests();
   RunDesktopReconciliationTests();

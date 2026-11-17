@@ -53,6 +53,9 @@ destination, reducing the visible jump when MultiWM arranges them afterward.
   The companion uses measured resize borders to prepare Windows' restore rectangle
   just before explicit show/placement calls or default `SC_RESTORE` handling on
   the owning thread. Taskbar restores in the tested apps reached this path.
+- Known windows hidden to the tray without minimizing also use their own restore
+  tile when shown again, including saved and deferred placements. Missing restore
+  hints leave them untouched rather than giving them a new-window slot.
 - Definite overflow floats can open at the centred floating position when MultiWM
   will keep them on the current monitor. With one monitor and desktop creation off,
   Try other monitors first also uses this path. Routed destinations are not hinted.

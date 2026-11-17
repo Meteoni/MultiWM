@@ -20,12 +20,14 @@ struct MeasuredFrameMargins {
   LONG_PTR exStyle = 0;
 };
 
-// The window properties a measurement depends on, read now. Cheap user-mode
+// Saved restored borders survive show-state, enabled-state and stacking changes.
+// Keep checking all other style bits and DPI conservatively. Cheap user-mode
 // reads; no message is sent to the window.
 static bool FrameInputsUnchanged(HWND hwnd, const MeasuredFrameMargins& measured) {
+  constexpr LONG_PTR transientStyle = WS_VISIBLE | WS_MINIMIZE | WS_MAXIMIZE | WS_DISABLED;
   return GetDpiForWindow(hwnd) == measured.windowDpi &&
-         GetWindowLongPtrW(hwnd, GWL_STYLE) == measured.style &&
-         GetWindowLongPtrW(hwnd, GWL_EXSTYLE) == measured.exStyle;
+         ((GetWindowLongPtrW(hwnd, GWL_STYLE) ^ measured.style) & ~transientStyle) == 0 &&
+         ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) ^ measured.exStyle) & ~static_cast<LONG_PTR>(WS_EX_TOPMOST)) == 0;
 }
 
 struct Publisher {
@@ -70,7 +72,7 @@ static Publisher g_publisher;
 // A window is measured again when its own DPI or frame styles change, not only
 // when the monitor's DPI does: after a move to another monitor, the window's DPI
 // (and with it the borders) changes only when the app handles WM_DPICHANGED.
-// A measurement taken while the window's DPI changed is discarded.
+// A measurement taken while DPI or any style/state bit changed is discarded.
 // Three cheap reads per cached window per rebuild; two native queries per new
 // measurement.
 static void RememberFrameMargins(const Workspace& workspace, UINT dpi) {
@@ -93,7 +95,12 @@ static void RememberFrameMargins(const Workspace& workspace, UINT dpi) {
     if (!measured.windowDpi || !IsWindowVisible(hwnd) || IsIconic(hwnd) || IsZoomed(hwnd) ||
         !GetWindowRect(hwnd, &windowRect) ||
         FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) ||
-        frame.right <= frame.left || frame.bottom <= frame.top || !FrameInputsUnchanged(hwnd, measured)) {
+        frame.right <= frame.left || frame.bottom <= frame.top ||
+        // Unlike reusing restored borders, taking a fresh measurement requires
+        // the window to stay in the same visible, restored state throughout.
+        GetDpiForWindow(hwnd) != measured.windowDpi ||
+        GetWindowLongPtrW(hwnd, GWL_STYLE) != measured.style ||
+        GetWindowLongPtrW(hwnd, GWL_EXSTYLE) != measured.exStyle) {
       // Unmeasurable now (or changing under us): drop a stale entry rather than
       // keep borders that no longer belong to this window.
       if (cached != g_publisher.frameMargins.end()) g_publisher.frameMargins.erase(cached);

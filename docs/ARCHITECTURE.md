@@ -85,9 +85,18 @@ restore rectangle just before a supported owning-thread restore, retaining
 visibility, min/max state and activation until the caller's original operation.
 This preparation is not performed while a minimized window waits for restoration.
 
+A known window hidden without minimizing uses the same published restore frame
+and measured borders when it is shown again. Show calls position it while hidden;
+immediate/deferred positioning and saved-placement calls have their geometry
+rewritten. Deferred batches still wait for the application's commit. Known
+windows without a usable restore hint are left untouched rather than assigned
+the new-window slot.
+
 Resize borders come from measurements taken while each window was tiled and
 restored. Their cached window DPI and frame styles must still match; the hint
 must also match the workspace DPI. Missing measurements cause a skipped hint.
+Visibility, min/max, enabled and topmost state do not invalidate saved restored
+borders. Fresh measurements still require unchanged DPI and full styles throughout.
 The shared geometry header converts reported limits from window-DPI units to
 physical frame pixels. Both mods centre capped windows inside their tiles. The
 companion's growth for a minimum larger than its predicted tile remains approximate;

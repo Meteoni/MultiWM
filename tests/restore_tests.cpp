@@ -22,10 +22,39 @@ static BOOL WINAPI ObservePlacement(HWND hwnd, const WINDOWPLACEMENT* placement)
   const HWND active = GetActiveWindow();
   const BOOL result = SetWindowPlacement(hwnd, placement);
   const UINT command = placement->showCmd;
-  if (command == SW_SHOWMINNOACTIVE || command == SW_SHOWNA || command == SW_HIDE) {
+  if (command == SW_SHOWMINNOACTIVE || (command == SW_SHOWNA && visible) || command == SW_HIDE) {
     ++preparations;
     preparationPreservedState &= minimized == (IsIconic(hwnd) != FALSE) && maximized == (IsZoomed(hwnd) != FALSE) &&
                                  visible == (IsWindowVisible(hwnd) != FALSE) && active == GetActiveWindow();
+  }
+  return result;
+}
+
+static BOOL WINAPI ObservePosition(HWND hwnd, HWND after, int x, int y, int width, int height, UINT flags) {
+  const bool visible = IsWindowVisible(hwnd) != FALSE;
+  const HWND active = GetActiveWindow();
+  const BOOL result = SetWindowPos(hwnd, after, x, y, width, height, flags);
+  ++preparations;
+  preparationPreservedState &= !visible && !IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsZoomed(hwnd) &&
+                               active == GetActiveWindow();
+  return result;
+}
+
+struct HiddenRestoreObservation {
+  bool sawVisible = false;
+  RECT firstVisibleRect{};
+};
+
+static LRESULT CALLBACK HiddenRestoreProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (message == WM_NCCREATE) {
+    const auto* creation = reinterpret_cast<const CREATESTRUCTW*>(lparam);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(creation->lpCreateParams));
+  }
+  const LRESULT result = DefWindowProcW(hwnd, message, wparam, lparam);
+  auto* observation = reinterpret_cast<HiddenRestoreObservation*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  if (message == WM_WINDOWPOSCHANGED && observation && !observation->sawVisible && IsWindowVisible(hwnd)) {
+    observation->sawVisible = true;
+    GetWindowRect(hwnd, &observation->firstVisibleRect);
   }
   return result;
 }
@@ -36,6 +65,9 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
   Companion::g_unhookedSetWindowPlacement = ObservePlacement;
   Companion::g_unhookedShowWindow = ShowWindow;
   Companion::g_unhookedShowWindowAsync = ShowWindowAsync;
+  Companion::g_unhookedSetWindowPos = SetWindowPos;
+  Companion::g_setWindowPosForOwnMoves = ObservePosition;
+  Companion::g_unhookedDeferWindowPos = DeferWindowPos;
   Companion::g_unhookedDefWindowProcW = DefWindowProcW;
   Companion::g_unhookedDefWindowProcA = DefWindowProcA;
   auto section = std::make_unique<CompanionAbi::SnapshotSection>();
@@ -155,6 +187,86 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
     DestroyWindow(hidden);
   }
 
+  // Tray apps can hide a normal window without minimizing it. Every supported
+  // show path must use its own restore tile before the first visible position,
+  // including commands that preserve the window's current normal state.
+  WNDCLASSW hiddenClass{};
+  hiddenClass.lpfnWndProc = HiddenRestoreProcedure;
+  hiddenClass.hInstance = GetModuleHandleW(nullptr);
+  hiddenClass.lpszClassName = L"MultiWMHiddenRestoreTest";
+  if (!RegisterClassW(&hiddenClass)) return 19;
+  for (int path = 0; path < 5; ++path) {
+    for (int command : {SW_SHOWNORMAL, SW_SHOWNOACTIVATE, SW_SHOW, SW_SHOWNA, SW_RESTORE}) {
+      // Immediate/deferred positioning have flags rather than show commands.
+      if (path >= 3 && command != SW_SHOWNORMAL) continue;
+      HiddenRestoreObservation observation;
+      HWND hidden = CreateWindowExW(0, hiddenClass.lpszClassName, L"Hidden normal restore", WS_OVERLAPPEDWINDOW,
+                                      100, 100, 600, 400, nullptr, nullptr, hiddenClass.hInstance, &observation);
+      if (!hidden) return 20;
+      BOOL cloak = TRUE;
+      if (FAILED(DwmSetWindowAttribute(hidden, DWMWA_CLOAK, &cloak, sizeof(cloak)))) return 21;
+      RECT oldRect{}, oldFrame{};
+      GetWindowRect(hidden, &oldRect);
+      if (FAILED(DwmGetWindowAttribute(hidden, DWMWA_EXTENDED_FRAME_BOUNDS, &oldFrame, sizeof(oldFrame)))) return 22;
+      const RECT margins{oldFrame.left - oldRect.left, oldFrame.top - oldRect.top,
+                         oldRect.right - oldFrame.right, oldRect.bottom - oldFrame.bottom};
+      body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hidden));
+      body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, margins,
+                                workspace.dpi};
+      ++body.generation;
+      preparations = 0;
+      preparationPreservedState = true;
+      const HWND active = GetActiveWindow();
+      constexpr UINT flags = SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE;
+      switch (path) {
+        case 0: Companion::ShowWindowHook(hidden, command); break;
+        case 1: Companion::ShowWindowAsyncHook(hidden, command); break;
+        case 2: {
+          WINDOWPLACEMENT requested{sizeof(requested)};
+          GetWindowPlacement(hidden, &requested);
+          requested.showCmd = command;
+          Companion::SetWindowPlacementHook(hidden, &requested);
+          break;
+        }
+        case 3: Companion::SetWindowPosHook(hidden, nullptr, 0, 0, 0, 0, flags); break;
+        case 4: {
+          HDWP batch = BeginDeferWindowPos(1);
+          batch = Companion::DeferWindowPosHook(batch, hidden, nullptr, 0, 0, 0, 0, flags);
+          RECT beforeCommit{};
+          GetWindowRect(hidden, &beforeCommit);
+          if (!batch || IsWindowVisible(hidden) || observation.sawVisible ||
+              !EqualRect(&beforeCommit, &oldRect) || GetActiveWindow() != active) return 23;
+          if (!EndDeferWindowPos(batch)) return 24;
+          break;
+        }
+      }
+      MSG message;
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+      }
+      RECT expected = restoreTile;
+      expected.left -= margins.left;
+      expected.top -= margins.top;
+      expected.right += margins.right;
+      expected.bottom += margins.bottom;
+      RECT actual{}, frame{};
+      GetWindowRect(hidden, &actual);
+      DwmGetWindowAttribute(hidden, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame));
+      if (!IsWindowVisible(hidden) || IsIconic(hidden) || IsZoomed(hidden) || !observation.sawVisible ||
+          !EqualRect(&observation.firstVisibleRect, &expected) || !EqualRect(&actual, &expected) ||
+          !EqualRect(&frame, &restoreTile) || !preparationPreservedState || preparations != (path < 2 ? 1 : 0)) {
+        std::fprintf(stderr, "FAILED: hidden normal path=%d command=%d first=(%ld,%ld,%ld,%ld) expected=(%ld,%ld,%ld,%ld)\n",
+                     path, command, observation.firstVisibleRect.left, observation.firstVisibleRect.top,
+                     observation.firstVisibleRect.right, observation.firstVisibleRect.bottom,
+                     expected.left, expected.top, expected.right, expected.bottom);
+        return 25;
+      }
+      ++checks;
+      DestroyWindow(hidden);
+    }
+  }
+
   // A minimized window that was maximized must return to maximized. Do not
   // replace its normal rectangle with a tile on that transition.
   HWND restoreMax = CreateWindowExW(0, L"STATIC", L"Restore to maximized", WS_OVERLAPPEDWINDOW,
@@ -186,7 +298,7 @@ int main() {
   if (!desktop) return 10;
   HANDLE worker = CreateThread(nullptr, 0, RunNativeRestoreTests, desktop, 0, nullptr);
   if (!worker) { CloseDesktop(desktop); return 11; }
-  const DWORD wait = WaitForSingleObject(worker, 15000);
+  const DWORD wait = WaitForSingleObject(worker, 45000);
   if (wait != WAIT_OBJECT_0) return 12;
   DWORD result = 0;
   GetExitCodeThread(worker, &result);

@@ -32,7 +32,8 @@ below are separate steps.
   foreign-window preparation. Nested shows during preparation also pass through.
 - **Admission frames.** MultiWM runs its real admission and layout planner on a
   workspace copy. Frames include configured gap and insets, scaled to the
-  monitor's physical DPI. Windows known to MultiWM are skipped by admission hints.
+  monitor's physical DPI. Windows known to MultiWM use their own restore hints
+  rather than admission frames.
 - **Live limits.** The companion asks `WM_GETMINMAXINFO`, then converts the reply
   from the window's DPI units to physical visible-frame sizes. Both mods centre
   capped windows within their cells. System-default maxima mean no explicit cap.
@@ -46,10 +47,17 @@ below are separate steps.
   The published frame accounts for saved position, weight, Dwindle ratio and
   master status. An unsatisfiable plan has no frame. Constraints, DPI, membership
   or overflow decisions can still change before the actual restore.
+- **Hidden normal members.** Hide-to-tray does not have to minimize a window.
+  Known hidden normal members use their published restore frame and measured
+  borders on show, asynchronous show, saved placement and immediate/deferred
+  show positioning. Deferred placement waits for the application's commit;
+  unavailable hints leave the window untouched.
 - **Measured borders.** Resize borders are cached while a window is tiled and
   restored. Window DPI and frame styles must still match that measurement, and
   its measurement DPI must match the destination workspace. Missing/stale
   measurements give no restore hint; minimized/maximized borders are not guessed.
+  Cached restored borders survive visibility, min/max, enabled and topmost
+  changes; fresh measurements reject any DPI or style/state change while sampled.
 - **Hook coverage.** Native show and asynchronous-show entry points,
   immediate/deferred show positioning, saved placements, visible creation and
   default `SC_RESTORE` handling are covered. Commands, flags, results and deferred
@@ -190,6 +198,7 @@ capture a diagnostic report after the scenario.
 | Real app with a maximum size | Its frame is centred in its cell at the cap and remains tiled. |
 | DPI-unaware app at 200% | Reported limits convert to physical pixels and the visible frame matches the intended placement. |
 | Taskbar restore of a weighted/master member | Installed companion logs restore-tile use before the original restore; final saved slot and weight remain correct. |
+| Hide a normal window to the tray, change the layout, then show it | Installed companion uses the window's restore tile before it appears; test both hide-only and minimize-to-tray behavior. |
 | Minimize then restore in Manual mode | Companion passes calls through; ordinary MultiWM Manual membership policy applies. |
 | Restore Down in Manual mode | Companion gives no hint; MultiWM handles its retained group normally. |
 | One-monitor local overflow, Create desktop off | `overflowCenters=1`; definite overflow floats use the centred hint even with Try other monitors first on. |
