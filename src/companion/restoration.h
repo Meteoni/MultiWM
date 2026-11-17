@@ -56,22 +56,19 @@ static bool AdjustRestorePlacement(HWND hwnd, WINDOWPLACEMENT* placement, const 
     monitorRect = monitorInfo.rcMonitor;
   }
   HintInputs inputs;
-  constexpr uint32_t complete = CompanionAbi::kFlagRunning | CompanionAbi::kFlagRulesComplete |
-                                CompanionAbi::kFlagTrackedComplete;
-  if (!ReadHintInputs(hwnd, monitorRect, &inputs) || (inputs.flags & complete) != complete ||
-      !inputs.tracked || !inputs.restoreFrame || !inputs.workspace || !inputs.rules) return false;
-  // All companion placement is Automatic-only. MultiWM itself still manages
-  // existing Manual groups according to its normal membership and layout rules.
-  if (!(inputs.flags & CompanionAbi::kFlagAutomaticMode)) {
-    LogDecision(hwnd, path, "Manual mode");
+  if (!ReadHintInputs(hwnd, monitorRect, &inputs) || !inputs.tracked) return false;
+  TargetKind kind;
+  std::optional<RECT> overflowFrame;
+  const char* reason = nullptr;
+  // Known transitions ignore the proposed rectangle. Both hidden-normal shows
+  // and min/max restores select the same model-owned restore or arrival intent.
+  const auto frame = PredictFrame(hwnd, placement->rcNormalPosition, inputs, &kind, &overflowFrame, &reason);
+  if (!frame) {
+    LogDecision(hwnd, path, reason);
     return false;
   }
-  SharedRules::LazyWindowFacts facts(hwnd, CurrentProcessName);
-  if (SharedRules::FindFirstMatchingRule(*inputs.rules, WindowRuleTreatment::Exclude, facts)) return false;
   const auto& workspace = *inputs.workspace;
-  if (workspace.floatingLayout) return false;
-  RECT target = *inputs.restoreFrame;
-  if (Width(target) <= 0 || Height(target) <= 0) return false;
+  RECT target = *frame;
   // The tile is a visible frame; the restored window rectangle adds the
   // invisible resize borders. A minimized or maximized window can't report them
   // (see RememberFrameMargins in MultiWM), and system metrics overestimate them by
@@ -102,7 +99,7 @@ static bool AdjustRestorePlacement(HWND hwnd, WINDOWPLACEMENT* placement, const 
   placement->rcNormalPosition = *logicalTarget;
   OffsetRect(&placement->rcNormalPosition, monitorInfo.rcMonitor.left - monitorInfo.rcWork.left,
               monitorInfo.rcMonitor.top - monitorInfo.rcWork.top);
-  LogDecision(hwnd, path, "using MultiWM's restore tile");
+  LogDecision(hwnd, path, reason);
   return true;
 }
 

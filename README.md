@@ -80,8 +80,11 @@ Restore hints use the window's saved slot and weights, cached size limits, and
 measured resize borders. New windows also respect live minimum/maximum sizes
 and DPI scaling. Definite local overflow floats can be centred early; general
 geometry-based overflow and routing to another monitor can still need correction.
-Both mods must use snapshot ABI major 4; ABI 4.0 and 4.1 interoperate, with the new
-overflow hints available only when both sides support 4.1.
+Known tiled windows shown on another desktop or monitor can use that workspace's
+insertion tile; explicitly floated windows retain their treatment. Hidden arrivals
+follow the configured destination insertion position, including after focus.
+Both mods must use snapshot ABI major 5: update MultiWM to 1.15.0 and Companion to
+0.3.0 together. Older major versions give no companion hints.
 
 Build the companion separately; WHAM produces
 `output/companion/multiwm-companion.wh.cpp`. The companion requires a running

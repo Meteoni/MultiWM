@@ -109,6 +109,7 @@ int main() {
   section->magic = CompanionAbi::kMagic;
   section->abiMajor = CompanionAbi::kAbiMajor;
   auto& body = section->body;
+  body.desktopId = GUID{0xC001};
   constexpr uint32_t completeFlags = CompanionAbi::kFlagRunning | CompanionAbi::kFlagAutomaticMode |
                                       CompanionAbi::kFlagRulesComplete | CompanionAbi::kFlagTrackedComplete;
   body.flags = completeFlags;
@@ -153,7 +154,7 @@ int main() {
   for (int policy = 0; policy < 3; ++policy) {
     body.flags = policy == 0 ? completeFlags & ~CompanionAbi::kFlagAutomaticMode : completeFlags;
     body.trackedCount = policy == 1 ? 1 : 0;
-    body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
+    body.trackedWindows[0] = {.hwnd = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd))};
     std::vector<CompanionAbi::SnapshotRule> rules;
     if (policy == 2) rules.emplace_back();  // An unrestricted Exclude rule.
     bool complete = false;
@@ -408,6 +409,79 @@ int main() {
   }
   testPublisherAlive = true;
 
+  // Ownership chooses the operation. A missing local restore tile never turns
+  // into admission; a tiled owner elsewhere uses the destination insertion tile.
+  {
+    const RECT borders{9, 0, 9, 9};
+    RECT saved = workspace.tiledFrame;
+    OffsetRect(&saved, 600, 0);
+    limits.minimum = {100, 100};
+    limits.maximum = {2000, 2000};
+    body.trackedCount = 1;
+    for (int scenario = 0; scenario < 12; ++scenario) {
+      auto& owner = body.trackedWindows[0];
+      owner = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd)), GetCurrentProcessId(),
+               body.desktopId, workspace.monitorRect, CompanionAbi::WindowTreatment::Tiled, borders, workspace.dpi};
+      body.restoreWindowCount = 1;
+      body.restoreWindows[0] = {owner.hwnd, GetCurrentProcessId(), 0, 1, saved};
+      body.rulesBytes = 0;
+      workspace.floatingLayout = 0;
+      workspace.hasTiledFrame = 1;
+      workspace.newWindowFloats = 0;
+      Companion::PlacementIntent intent = Companion::PlacementIntent::Restore;
+      bool hintExpected = scenario < 4;
+      const RECT* target = &saved;
+      if (scenario != 0 && scenario != 4) {
+        owner.desktopId = GUID{0xC002};
+        intent = Companion::PlacementIntent::Arrival;
+        target = &workspace.tiledFrame;
+        body.restoreWindowCount = 0;
+      }
+      if (scenario == 2) { owner.desktopId = body.desktopId; OffsetRect(&owner.monitorRect, 4000, 0); }
+      if (scenario == 3) {
+        // Opening rules do not reclassify a retained tiled member on arrival.
+        std::vector<CompanionAbi::SnapshotRule> rules(2);
+        rules[0].treatment = WindowRuleTreatment::DefaultToFloating;
+        rules[1].treatment = WindowRuleTreatment::InitialPlacement;
+        bool complete = false;
+        body.rulesBytes = CompanionAbi::SerializeRules(rules, body.rules, CompanionAbi::kRulesCapacity, &complete);
+        check(complete, "encode arrival rule fixture");
+      }
+      if (scenario == 4) body.restoreWindowCount = 0;
+      if (scenario == 5) { owner.treatment = CompanionAbi::WindowTreatment::Floating; intent = Companion::PlacementIntent::KeepFloating; }
+      if (scenario == 6) { ++owner.processId; intent = Companion::PlacementIntent::Unavailable; }
+      if (scenario == 7) { owner.desktopId = {}; intent = Companion::PlacementIntent::Unavailable; }
+      if (scenario == 8) { owner.treatment = CompanionAbi::WindowTreatment::Ignored; intent = Companion::PlacementIntent::Unavailable; }
+      if (scenario == 9) owner.marginsDpi = 0;
+      if (scenario == 10) workspace.floatingLayout = 1;
+      if (scenario == 11) { workspace.hasTiledFrame = 0; workspace.newWindowFloats = 1; }
+      ++body.generation;
+      Companion::HintInputs inputs;
+      check(Companion::ReadHintInputs(hwnd, workspace.monitorRect, &inputs) && inputs.tracked && inputs.intent == intent,
+            "reader identifies restore, arrival, retained floating and unusable ownership");
+      positionCalls.clear();
+      limits.probes = 0;
+      Companion::SetWindowPosHook(hwnd, nullptr, 210, 220, 710, 510, showFlags);
+      check(positionCalls.size() == 1, "known transition preserves one positioning call");
+      const auto& call = positionCalls[0];
+      check(hintExpected ? call.x == target->left - borders.left && call.y == target->top - borders.top &&
+                             call.width == Companion::Width(*target) + borders.left + borders.right
+                         : call.x == 210 && call.y == 220 && call.width == 710 && limits.probes == 0,
+            "only an applicable restore or tiled arrival rewrites the geometry");
+    }
+    workspace.floatingLayout = workspace.newWindowFloats = 0;
+    workspace.hasTiledFrame = 1;
+    body.trackedCount = body.restoreWindowCount = body.rulesBytes = 0;
+    ++body.generation;
+    section->abiMajor = CompanionAbi::kAbiMajor - 1;
+    positionCalls.clear();
+    limits.probes = 0;
+    Companion::SetWindowPosHook(hwnd, nullptr, 210, 220, 710, 510, showFlags);
+    check(positionCalls.size() == 1 && positionCalls[0].x == 210 && positionCalls[0].width == 710 && limits.probes == 0,
+          "an incompatible snapshot major passes through without probing or placing");
+    section->abiMajor = CompanionAbi::kAbiMajor;
+  }
+
   // Restoring uses the tile MultiWM published for this window, not the stale
   // normal rectangle. Changing only the hidden test window's style exercises the
   // decision without showing or moving it; real native restoration is checked
@@ -417,15 +491,16 @@ int main() {
   check(IsIconic(hwnd), "hidden restore fixture reports minimized");
   limits.minimum = {100, 100};
   body.trackedCount = 1;
-  body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
   body.restoreWindowCount = 1;
   // Borders as MultiWM measured them while the window was restored. Deliberately
   // unlike any system-metric estimate, so the test proves they are what is used.
   const RECT measuredMargins{9, 0, 9, 9};
   RECT restoreTile = workspace.tiledFrame;
   OffsetRect(&restoreTile, 600, 0);
-  body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, measuredMargins,
-                            workspace.dpi};
+  body.trackedWindows[0] = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd)), GetCurrentProcessId(),
+                            body.desktopId, workspace.monitorRect, CompanionAbi::WindowTreatment::Tiled,
+                            measuredMargins, workspace.dpi};
+  body.restoreWindows[0] = {body.trackedWindows[0].hwnd, GetCurrentProcessId(), 0, 1, restoreTile};
   ++body.generation;
   WINDOWPLACEMENT restoreRequest = original;
   restoreRequest.showCmd = SW_RESTORE;
@@ -445,7 +520,7 @@ int main() {
 
   // Without a measurement at this DPI the restored frame can't be exact, so no hint.
   for (UINT marginsDpi : {0u, workspace.dpi + 24}) {
-    body.restoreWindows[0].marginsDpi = marginsDpi;
+    body.trackedWindows[0].marginsDpi = marginsDpi;
     ++body.generation;
     restoreRequest = original;
     restoreRequest.showCmd = SW_RESTORE;
@@ -455,7 +530,7 @@ int main() {
               std::memcmp(&restoreRequest, &unchanged, sizeof(unchanged)) == 0,
           "missing or other-DPI border measurement gives no restore hint");
   }
-  body.restoreWindows[0].marginsDpi = workspace.dpi;
+  body.trackedWindows[0].marginsDpi = workspace.dpi;
   for (int missing = 0; missing < 3; ++missing) {
     body.restoreWindows[0].processId = missing == 0 ? GetCurrentProcessId() + 1 : GetCurrentProcessId();
     // MultiWM publishes no tile when the restored layout would be unsatisfiable.

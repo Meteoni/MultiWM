@@ -117,20 +117,20 @@ static void RememberFrameMargins(const Workspace& workspace, UINT dpi) {
   }
 }
 
-// Builds the restore hint for one suspended member, with its measured borders
-// when MultiWM has them for this process and the window's DPI and frame styles
-// still match the measurement. A suspended window can't be measured again, so a
-// mismatch publishes no borders, and the companion then gives no restore hint.
-static CompanionAbi::RestoreWindowHint MakeRestoreWindowHint(
-    const WindowRecord& record, uint32_t workspaceIndex, const std::optional<RECT>& restoredFrame) {
-  CompanionAbi::RestoreWindowHint hint{};
+// Ownership and treatment survive hiding and migration. Border measurements are
+// shared by restore and arrival hints, including owners on inactive desktops.
+static CompanionAbi::TrackedWindowHint MakeTrackedWindowHint(
+    const WindowRecord& record, const GUID& desktop, const RECT& monitorRect) {
+  CompanionAbi::TrackedWindowHint hint{};
   hint.hwnd = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(record.hwnd));
   hint.processId = record.pid;
-  hint.workspaceIndex = workspaceIndex;
-  if (restoredFrame) {
-    hint.frame = *restoredFrame;
-    hint.hasFrame = 1;
-  }
+  hint.desktopId = desktop;
+  hint.monitorRect = monitorRect;
+  using CompanionAbi::WindowTreatment;
+  if (record.state == ManageState::Tiled || (record.state == ManageState::Suspended && record.hasSavedSlot)) {
+    hint.treatment = WindowTreatment::Tiled;
+  } else if (record.state == ManageState::Floating) hint.treatment = WindowTreatment::Floating;
+  else if (record.state == ManageState::Ignored) hint.treatment = WindowTreatment::Ignored;
   const auto measured = g_publisher.frameMargins.find(record.hwnd);
   if (measured != g_publisher.frameMargins.end() && measured->second.processId == record.pid &&
       FrameInputsUnchanged(record.hwnd, measured->second)) {
@@ -198,28 +198,43 @@ static void AppendWorkspaceHints(const GUID& desktop, CompanionAbi::SnapshotBody
     });
     for (const WindowRecord* record : suspended) {
       if (body->restoreWindowCount == CompanionAbi::kMaxRestoreWindows) break;
-      body->restoreWindows[body->restoreWindowCount++] = MakeRestoreWindowHint(
-          *record, workspaceIndex, Placement::PredictRestoredFrame(workspace, record->hwnd, metrics));
+      const auto frame = Placement::PredictRestoredFrame(workspace, record->hwnd, metrics);
+      body->restoreWindows[body->restoreWindowCount++] = {
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(record->hwnd)), record->pid, workspaceIndex,
+          frame ? 1u : 0u, frame.value_or(RECT{})};
     }
   }
 }
 
-// Lists every window MultiWM has a record for, so the companion leaves a known
-// window alone when it is shown again (it returns to its own slot, not the next).
+// Lists every known window's model ownership and treatment. This is metadata
+// work only: no admission or restore plan is run for inactive desktops.
 static void AppendTrackedWindows(CompanionAbi::SnapshotBody* body) {
-  const std::vector<HWND> known = g_workspaces.KnownWindows();
-  std::vector<uint32_t> values;
-  values.reserve(known.size());
-  for (HWND hwnd : known) {
-    values.push_back(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd)));
+  std::vector<CompanionAbi::TrackedWindowHint> values;
+  for (const auto& [key, workspace] : g_workspaces.Snapshot()) {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    const HMONITOR monitor = key.ResolveMonitor();
+    const RECT monitorRect = monitor && GetMonitorInfoW(monitor, &info) ? info.rcMonitor : RECT{};
+    for (const auto& [hwnd, record] : workspace.Records()) {
+      values.push_back(MakeTrackedWindowHint(record, key.desktopId, monitorRect));
+    }
   }
-  std::sort(values.begin(), values.end());
-  values.erase(std::unique(values.begin(), values.end()), values.end());
-
-  const size_t count = std::min<size_t>(values.size(), CompanionAbi::kMaxTrackedWindows);
-  std::copy_n(values.begin(), count, body->trackedWindows);
-  body->trackedCount = static_cast<uint32_t>(count);
-  if (count == values.size()) body->flags |= CompanionAbi::kFlagTrackedComplete;
+  std::sort(values.begin(), values.end(), [](const auto& left, const auto& right) { return left.hwnd < right.hwnd; });
+  bool complete = true;
+  for (size_t index = 0; index < values.size();) {
+    auto hint = values[index];
+    size_t end = index + 1;
+    while (end < values.size() && values[end].hwnd == hint.hwnd) ++end;
+    if (end != index + 1) {
+      const uint32_t hwnd = hint.hwnd;
+      hint = {};
+      hint.hwnd = hwnd;  // Ambiguous ownership stays known, without a usable hint.
+    }
+    if (body->trackedCount == CompanionAbi::kMaxTrackedWindows) { complete = false; break; }
+    body->trackedWindows[body->trackedCount++] = hint;
+    index = end;
+  }
+  if (complete) body->flags |= CompanionAbi::kFlagTrackedComplete;
 }
 
 // Fills `*body` from current model state. Zeroes it first so unused entries

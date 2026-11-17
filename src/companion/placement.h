@@ -4,7 +4,7 @@
 //
 // One-shot: one decision when a window goes from hidden to shown, nothing after.
 // No per-window state is kept. A window MultiWM already knows (say, hidden to the
-// tray) uses its own restore frame rather than a new-window slot. restoration.h
+// tray) uses its own restore frame or a destination arrival frame. restoration.h
 // separately prepares the normal rectangle for minimized/maximized restores.
 // Unknown windows will be admitted as new, so the next slot is right on any show.
 // MultiWM stays the authority: a wrong guess costs one move by MultiWM afterwards,
@@ -276,14 +276,26 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
   if (matches(WindowRuleTreatment::Exclude)) return reject("excluded by a rule");
   const WorkspaceHint& workspace = *inputs.workspace;
   if (inputs.tracked) {
-    // Hide-to-tray need not minimize the window. Its next show uses the saved
-    // slot, while a known window with no usable restore hint stays untouched.
-    if (IsWindowVisible(hwnd) || workspace.floatingLayout || !inputs.restoreFrame ||
-        Width(*inputs.restoreFrame) <= 0 || Height(*inputs.restoreFrame) <= 0) {
-      return reject("no restore tile for this known window");
+    if (inputs.intent == PlacementIntent::KeepFloating) return reject("retaining this window's floating treatment");
+    if (inputs.intent != PlacementIntent::Restore && inputs.intent != PlacementIntent::Arrival) {
+      return reject("known window has no usable ownership or treatment");
     }
+    if (workspace.floatingLayout) return reject("known window's destination uses the Floating layout");
     if (!inputs.restoreFrameMargins || inputs.restoreMarginsDpi != workspace.dpi) {
       return reject("no current restore border measurement");
+    }
+    if (inputs.intent == PlacementIntent::Arrival) {
+      // Migration retains treatment and uses the same destination insertion as
+      // admission. Never rerun opening rules or guess how overflow will route it.
+      if (!workspace.hasTiledFrame || workspace.newWindowFloats ||
+          Width(workspace.tiledFrame) <= 0 || Height(workspace.tiledFrame) <= 0) {
+        return reject("no tiled arrival hint for the destination workspace");
+      }
+      *reason = "using MultiWM's destination arrival tile";
+      return workspace.tiledFrame;
+    }
+    if (!inputs.restoreFrame || Width(*inputs.restoreFrame) <= 0 || Height(*inputs.restoreFrame) <= 0) {
+      return reject("no restore tile for this workspace member");
     }
     *reason = "using MultiWM's restore tile";
     return inputs.restoreFrame;
@@ -371,6 +383,7 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
     LogDecision(hwnd, path, "no snapshot (MultiWM not running?)");
     return std::nullopt;
   }
+  if (inputs.tracked && IsWindowVisible(hwnd)) return std::nullopt;
   // Known hidden members use the same measured borders as minimized restores;
   // a hidden window's current DWM bounds can be missing or stale.
   if (inputs.tracked && inputs.restoreFrameMargins) margins = *inputs.restoreFrameMargins;

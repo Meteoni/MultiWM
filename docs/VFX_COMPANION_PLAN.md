@@ -1,6 +1,6 @@
 # MultiWM companion: implementation and remaining work
 
-Release preparation: MultiWM 1.14.0 and Companion 0.2.0, snapshot ABI 4.1.
+Release preparation: MultiWM 1.15.0 and Companion 0.3.0, snapshot ABI 5.0.
 Placement hints and diagnostics are implemented. Borders and animations remain
 future work. Source versions are updated; installation and the live checks
 below are separate steps.
@@ -11,13 +11,13 @@ below are separate steps.
   layouts, routing and conformance. The companion runs inside applications,
   including Explorer where permitted by Windhawk's process configuration.
 - **One-way snapshot.** MultiWM publishes current-desktop workspaces, admission
-  frames, known HWNDs, rules and per-window restore frames. Readers map the
+  frames, known window ownership/treatment, rules and per-window restore frames. Readers map the
   section read-only and never send placement requests back to MultiWM.
 - **Event-driven publication.** Between messages, repository revisions, mode,
   desktop, display and effective routing changes trigger a rebuild. Identical
   contents skip the write. There is no background minimized-window seeding.
-- **ABI 4.1.** The section is `Local\MultiWM.Companion.Snapshot.v4`; the
-  liveness event is `Local\MultiWM.Companion.Alive.v4`. Event presence identifies
+- **ABI 5.0.** The section is `Local\MultiWM.Companion.Snapshot.v5`; the
+  liveness event is `Local\MultiWM.Companion.Alive.v5`. Event presence identifies
   a running MultiWM; it is not a change-notification event. A seqlock protects
   writes. Limits are 16 workspaces, 2048 tracked HWNDs, 128 restore hints and
   32 KiB of serialized rules. Layout assertions cover x86 and x64.
@@ -32,8 +32,19 @@ below are separate steps.
   foreign-window preparation. Nested shows during preparation also pass through.
 - **Admission frames.** MultiWM runs its real admission and layout planner on a
   workspace copy. Frames include configured gap and insets, scaled to the
-  monitor's physical DPI. Windows known to MultiWM use their own restore hints
-  rather than admission frames.
+  monitor's physical DPI. Known members returning to their workspace use their
+  own restore frame. Tiled arrivals elsewhere share destination insertion frames.
+- **Ownership and placement intent.** Each tracked entry publishes HWND, PID,
+  owner desktop/monitor, tiled/floating treatment and valid measured borders.
+  The reader distinguishes admission, restore, arrival and retained floating
+  treatment. Missing restore geometry never implies new admission. Duplicate
+  ownership and stale PID records give no hint.
+- **Matching migration insertion.** Real migration and admission use the same
+  insertion methods. Hidden suspended migrants now reserve the configured
+  destination position, including After focused. The publisher reuses one
+  destination tile rather than planning every off-desktop HWND against it.
+  Arrival hints do not rerun opening rules or override explicit floating state.
+  Floating destinations and missing tiled hints (including overflow) pass through.
 - **Live limits.** The companion asks `WM_GETMINMAXINFO`, then converts the reply
   from the window's DPI units to physical visible-frame sizes. Both mods centre
   capped windows within their cells. System-default maxima mean no explicit cap.
@@ -74,7 +85,7 @@ below are separate steps.
   generation, contents, maximum sizes, rebuild/write counts, burst and unchanged
   rebuilds, and average/slowest build-and-compare time.
 
-## Current overflow coverage and remaining jumps (ABI 4.1)
+## Current overflow coverage and remaining jumps (ABI 5.0)
 
 The companion can hint a centred overflow float in two cases without an extra
 fit-envelope calculation: the workspace's window limit is reached (or admission
@@ -102,11 +113,19 @@ visible correction remains possible. No fit envelope is published. Predictions
 also do not model rollback of an explicit layout command that has not settled;
 such a rollback can change the destination after the hint was calculated.
 
-The overflow additions use ABI major 4, minor 1: a reserved workspace byte and a
-new flag, with no field offsets changed. A 4.0 companion ignores the additions;
-a 4.1 companion reading a 4.0 writer receives no overflow float hints. This minor
-update does not require reinstalling both mods together, provided both already
-use ABI major 4. Earlier major versions remain incompatible.
+ABI 5 adds ownership and treatment to tracked entries and moves measured borders
+out of restore entries so both restore and arrival decisions can use them. Both
+mods must be updated together; ABI 4 peers give no hints. The fixed section grows
+from 48840 to 169160 bytes. Cached readers copy it only on generation/writer
+changes. Off-desktop metadata publication adds no layout plans, but its metadata
+reads and larger body copies require a fresh live cost sample; the earlier ABI 4
+measurements below do not measure this change.
+
+Arrival prediction assumes the published active desktop is where the app intends
+to show its window. Desktop switches during showing, concurrent layout changes
+and live constraints can still produce a later correction. Native tests use
+test-owned windows and synthetic ownership; real shell desktop movement remains
+on the live checklist.
 
 General routed-overflow hints are deferred. Proving overflow and choosing the
 winning destination require the incoming window's live limits, the destination
@@ -172,6 +191,11 @@ All four maintained suites pass: layout, reconciliation, companion and native
 restoration. The overflow parity run uses 8000 generated workspaces: 98 predicted
 floats were actual floats, and none of 3016 predicted tiles floated. Three
 same-minimum floats received no hint; missing hints retain ordinary placement.
+Migration parity covers all six tiled layouts, both insertion modes, reverse
+Dwindle and hidden/minimized/maximized arrivals. Native tests cover 57 restore
+and arrival paths, including the first visible position and deferred commits.
+Ownership tests cover retained floating state, stale/ambiguous identity, missing
+geometry and truncated metadata.
 
 Warning checks cover x64 MultiWM and x86/x64 companion. The repository's warning
 profile passes with warnings treated as errors. Unsuppressed checks still report
@@ -199,6 +223,9 @@ capture a diagnostic report after the scenario.
 | DPI-unaware app at 200% | Reported limits convert to physical pixels and the visible frame matches the intended placement. |
 | Taskbar restore of a weighted/master member | Installed companion logs restore-tile use before the original restore; final saved slot and weight remain correct. |
 | Hide a normal window to the tray, change the layout, then show it | Installed companion uses the window's restore tile before it appears; test both hide-only and minimize-to-tray behavior. |
+| Hide a tiled UniGetUI window on A, show it on B | Logs destination arrival tile use; first position and final insertion follow B's configured insertion mode. |
+| Explicitly float UniGetUI, hide on A, show on B | Floating treatment survives and the companion gives no tiled hint. |
+| Collect a report after normal use with ABI 5 | Measure the larger snapshot and ownership metadata cost; compare with the historical ABI 4 sample. |
 | Minimize then restore in Manual mode | Companion passes calls through; ordinary MultiWM Manual membership policy applies. |
 | Restore Down in Manual mode | Companion gives no hint; MultiWM handles its retained group normally. |
 | One-monitor local overflow, Create desktop off | `overflowCenters=1`; definite overflow floats use the centred hint even with Try other monitors first on. |
@@ -237,4 +264,4 @@ Mobile Open Animation's resize-real-window mode conflicts with tiling, and
 DPI-unaware targets remain a separate compatibility item.
 
 Any border/event transport or animation settings need their own design. They
-are not part of snapshot ABI 4.1 or this release's placement implementation.
+are not part of snapshot ABI 5.0 or this release's placement implementation.

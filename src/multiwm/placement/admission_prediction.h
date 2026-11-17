@@ -61,7 +61,8 @@ static bool RecoveryFloatsPredictedWindow(const Workspace& trial, const Platform
 //   as RepairFloatingGeometry does for NewWindowCenter and FailureCenter.
 //
 // Pure model and geometry work: never queries or moves a window, never changes
-// `workspace`. WM thread only, because Workspace mutators assert it.
+// `workspace`. Tiled migrations use these same insertion operations, so their
+// arrivals share this template. WM thread only, because Workspace mutators assert it.
 static AdmissionPrediction PredictAutomaticAdmission(
     const Workspace& workspace, const Platform::Monitors::WorkspaceMetrics& metrics,
     bool windowLimitReached, bool insertAfterFocused) {

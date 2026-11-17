@@ -76,6 +76,7 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
   Companion::g_reader.view = section.get();
   Companion::g_reader.body = std::make_unique<CompanionAbi::SnapshotBody>();
   auto& body = section->body;
+  body.desktopId = GUID{0xC001};
   body.flags = CompanionAbi::kFlagRunning | CompanionAbi::kFlagAutomaticMode |
                CompanionAbi::kFlagRulesComplete | CompanionAbi::kFlagTrackedComplete;
   body.workspaceCount = body.trackedCount = body.restoreWindowCount = 1;
@@ -83,7 +84,9 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
   RECT restoreTile{};
   int checks = 0;
 
-  for (bool maximized : {false, true}) {
+  for (int state = 0; state < 4; ++state) {
+    const bool maximized = (state & 1) != 0;
+    const bool arrival = state >= 2;
     for (int path = 0; path < 5; ++path) {
       HWND hwnd = CreateWindowExW(0, L"STATIC", L"MultiWM restore test", WS_OVERLAPPEDWINDOW,
                                    100, 100, 600, 400, nullptr, nullptr, nullptr, nullptr);
@@ -97,7 +100,6 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
       workspace.dpi = GetDpiForWindow(hwnd);
       // The tile MultiWM publishes for this window's restore.
       restoreTile = {info.rcWork.left + 110, info.rcWork.top + 110, info.rcWork.left + 610, info.rcWork.top + 460};
-      body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
       // What MultiWM publishes: the borders measured while the window is restored.
       RECT restoredWindow{}, restoredFrame{};
       GetWindowRect(hwnd, &restoredWindow);
@@ -106,8 +108,13 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
       }
       const RECT margins{restoredFrame.left - restoredWindow.left, restoredFrame.top - restoredWindow.top,
                          restoredWindow.right - restoredFrame.right, restoredWindow.bottom - restoredFrame.bottom};
-      body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, margins,
-                                workspace.dpi};
+      body.trackedWindows[0] = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd)), GetCurrentProcessId(),
+                                arrival ? GUID{0xC002} : body.desktopId, workspace.monitorRect, CompanionAbi::WindowTreatment::Tiled,
+                                margins, workspace.dpi};
+      body.restoreWindows[0] = {body.trackedWindows[0].hwnd, GetCurrentProcessId(), 0, 1, restoreTile};
+      body.restoreWindowCount = arrival ? 0 : 1;
+      workspace.hasTiledFrame = 1;
+      workspace.tiledFrame = restoreTile;
       ++body.generation;  // A new publish; the reader reuses its copy otherwise.
 
       ShowWindow(hwnd, maximized ? SW_SHOWMAXIMIZED : SW_SHOWMINNOACTIVE);
@@ -152,6 +159,7 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
   // A hidden minimized or maximized member (hidden to the tray, say) being shown
   // again: the preparation must keep it hidden, so it never flashes at full size,
   // and the caller's show then restores it straight into the slot.
+  body.restoreWindowCount = 1;
   for (bool maximized : {false, true}) {
     HWND hidden = CreateWindowExW(0, L"STATIC", L"Hidden restore test", WS_OVERLAPPEDWINDOW,
                                    100, 100, 600, 400, nullptr, nullptr, nullptr, nullptr);
@@ -165,9 +173,10 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
     }
     const RECT margins{restoredFrame.left - restoredWindow.left, restoredFrame.top - restoredWindow.top,
                        restoredWindow.right - restoredFrame.right, restoredWindow.bottom - restoredFrame.bottom};
-    body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hidden));
-    body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, margins,
-                              workspace.dpi};
+    body.trackedWindows[0] = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hidden)), GetCurrentProcessId(),
+                              body.desktopId, workspace.monitorRect, CompanionAbi::WindowTreatment::Tiled,
+                              margins, workspace.dpi};
+    body.restoreWindows[0] = {body.trackedWindows[0].hwnd, GetCurrentProcessId(), 0, 1, restoreTile};
     ++body.generation;
     ShowWindow(hidden, maximized ? SW_SHOWMAXIMIZED : SW_SHOWMINNOACTIVE);
     ShowWindow(hidden, SW_HIDE);
@@ -195,7 +204,9 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
   hiddenClass.hInstance = GetModuleHandleW(nullptr);
   hiddenClass.lpszClassName = L"MultiWMHiddenRestoreTest";
   if (!RegisterClassW(&hiddenClass)) return 19;
-  for (int path = 0; path < 5; ++path) {
+  for (int scenario = 0; scenario < 10; ++scenario) {
+    const int path = scenario % 5;
+    const bool arrival = scenario >= 5;
     for (int command : {SW_SHOWNORMAL, SW_SHOWNOACTIVATE, SW_SHOW, SW_SHOWNA, SW_RESTORE}) {
       // Immediate/deferred positioning have flags rather than show commands.
       if (path >= 3 && command != SW_SHOWNORMAL) continue;
@@ -210,9 +221,11 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
       if (FAILED(DwmGetWindowAttribute(hidden, DWMWA_EXTENDED_FRAME_BOUNDS, &oldFrame, sizeof(oldFrame)))) return 22;
       const RECT margins{oldFrame.left - oldRect.left, oldFrame.top - oldRect.top,
                          oldRect.right - oldFrame.right, oldRect.bottom - oldFrame.bottom};
-      body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hidden));
-      body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, margins,
-                                workspace.dpi};
+      body.trackedWindows[0] = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hidden)), GetCurrentProcessId(),
+                                arrival ? GUID{0xC002} : body.desktopId, workspace.monitorRect, CompanionAbi::WindowTreatment::Tiled,
+                                margins, workspace.dpi};
+      body.restoreWindows[0] = {body.trackedWindows[0].hwnd, GetCurrentProcessId(), 0, 1, restoreTile};
+      body.restoreWindowCount = arrival ? 0 : 1;
       ++body.generation;
       preparations = 0;
       preparationPreservedState = true;
@@ -272,11 +285,13 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
   HWND restoreMax = CreateWindowExW(0, L"STATIC", L"Restore to maximized", WS_OVERLAPPEDWINDOW,
                                      100, 100, 600, 400, nullptr, nullptr, nullptr, nullptr);
   if (!restoreMax) return 7;
+  body.restoreWindowCount = 1;
   BOOL cloak = TRUE;
   if (FAILED(DwmSetWindowAttribute(restoreMax, DWMWA_CLOAK, &cloak, sizeof(cloak)))) return 8;
-  body.trackedWindows[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(restoreMax));
-  body.restoreWindows[0] = {body.trackedWindows[0], GetCurrentProcessId(), 0, 1, restoreTile, RECT{7, 0, 7, 7},
-                            workspace.dpi};
+  body.trackedWindows[0] = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(restoreMax)), GetCurrentProcessId(),
+                            body.desktopId, workspace.monitorRect, CompanionAbi::WindowTreatment::Tiled,
+                            RECT{7, 0, 7, 7}, workspace.dpi};
+  body.restoreWindows[0] = {body.trackedWindows[0].hwnd, GetCurrentProcessId(), 0, 1, restoreTile};
   ++body.generation;
   ShowWindow(restoreMax, SW_SHOWMAXIMIZED);
   ShowWindow(restoreMax, SW_SHOWMINNOACTIVE);
@@ -298,7 +313,7 @@ int main() {
   if (!desktop) return 10;
   HANDLE worker = CreateThread(nullptr, 0, RunNativeRestoreTests, desktop, 0, nullptr);
   if (!worker) { CloseDesktop(desktop); return 11; }
-  const DWORD wait = WaitForSingleObject(worker, 45000);
+  const DWORD wait = WaitForSingleObject(worker, 60000);
   if (wait != WAIT_OBJECT_0) return 12;
   DWORD result = 0;
   GetExitCodeThread(worker, &result);

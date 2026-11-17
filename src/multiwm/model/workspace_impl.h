@@ -908,32 +908,20 @@ void Workspace::AdmitMigrated(WindowRecord record, HWND anchor) {
   }
   Forget(hwnd);
 
-  // Automatic cross-workspace insertion follows the same destination-anchor
-  // policy as fresh admission. The caller supplies no anchor for Last slot or
-  // for Manual-mode migration, preserving the previous append behavior.
-  if (anchor && anchor != hwnd && IsTiled(anchor)) {
-    if (record.state == ManageState::Tiled) {
-      AdmitTiledAfter(std::move(record), anchor);
-      return;
-    }
-
-    if (record.state == ManageState::Suspended &&
-        record.suspensionReason != SuspensionReason::None &&
-        record.suspensionReason != SuspensionReason::Hidden) {
-      const SuspensionReason reason = record.suspensionReason;
-      AdmitInitialAfter(std::move(record), reason, anchor);
-      return;
-    }
-  }
-
-  if (record.state == ManageState::Tiled) {
+  // Every tiled arrival uses the same insertion operation as fresh admission.
+  // A suspended arrival reserves that position by suspending the inserted copy;
+  // this includes hidden members, which used to silently append instead.
+  if (record.state == ManageState::Tiled || record.state == ManageState::Suspended) {
+    const SuspensionReason reason = record.state == ManageState::Suspended
+                                        ? record.suspensionReason : SuspensionReason::None;
+    record.state = ManageState::Tiled;
     record.suspensionReason = SuspensionReason::None;
     record.savedSlot = {};
     record.hasSavedSlot = false;
-    AppendTiledWithDefaultWeight(hwnd);
-  } else if (record.state == ManageState::Suspended) {
-    record.savedSlot = MakeAppendedSuspendedSlot();
-    record.hasSavedSlot = true;
+    if (anchor && anchor != hwnd) AdmitTiledAfter(std::move(record), anchor);
+    else AdmitTiled(std::move(record));
+    if (reason != SuspensionReason::None) Suspend(hwnd, reason);
+    return;
   }
   records_[hwnd] = std::move(record);
   EnsureWeights();

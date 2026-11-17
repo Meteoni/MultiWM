@@ -27,16 +27,14 @@ namespace CompanionAbi {
 
 // The section exists while MultiWM or any reader holds a handle, so it outlives a
 // MultiWM restart; a restarted MultiWM reopens it and rewrites the header.
-inline constexpr wchar_t kSectionName[] = L"Local\\MultiWM.Companion.Snapshot.v4";
+inline constexpr wchar_t kSectionName[] = L"Local\\MultiWM.Companion.Snapshot.v5";
 // Held open by MultiWM only. Readers probe it to tell a live MultiWM from a
 // section that only their own handles keep alive.
-inline constexpr wchar_t kAliveEventName[] = L"Local\\MultiWM.Companion.Alive.v4";
+inline constexpr wchar_t kAliveEventName[] = L"Local\\MultiWM.Companion.Alive.v5";
 
 inline constexpr uint32_t kMagic = 0x5343574D;  // "MWCS"
-inline constexpr uint16_t kAbiMajor = 4;
-// 1: kFlagOverflowCentersFloat, WorkspaceHint::newWindowFloats, and
-//    floatingFrame for tiled layouts too.
-inline constexpr uint16_t kAbiMinor = 1;
+inline constexpr uint16_t kAbiMajor = 5;
+inline constexpr uint16_t kAbiMinor = 0;
 
 inline constexpr uint32_t kMaxWorkspaces = 16;
 inline constexpr uint32_t kMaxTrackedWindows = 2048;
@@ -74,14 +72,34 @@ struct WorkspaceHint {
   uint8_t floatingLayout;    // The workspace uses the Floating layout.
   uint8_t hasTiledFrame;
   uint8_t hasFloatingFrame;
-  // Tiled layouts (ABI minor 1): Automatic overflow will float the next new
+  // Tiled layouts: Automatic overflow will float the next new
   // window instead of tiling it, whatever its size: the window limit is reached,
   // or no slot fits even a minimal window. 0 from older writers.
   uint8_t newWindowFloats;
 };
 
-// A minimized or maximized member of a workspace, and where it goes when it is
-// restored.
+enum class WindowTreatment : uint32_t {
+  Unknown,  // Missing/ambiguous ownership: never infer new admission from it.
+  Tiled,    // Includes suspended tiled members keeping a saved slot.
+  Floating,
+  Ignored,
+};
+
+// Sorted by HWND. Ownership is model state, not a claim that a native desktop
+// move has completed. Destination hints describe this snapshot's desktop only.
+struct TrackedWindowHint {
+  uint32_t hwnd;
+  uint32_t processId;
+  GUID desktopId;
+  RECT monitorRect;  // Owning workspace's monitor; zero if no longer attached.
+  WindowTreatment treatment;
+  // Restored resize borders, retained across hiding and desktop changes. Zero
+  // DPI means unavailable; readers must also match the destination's DPI.
+  RECT frameMargins;
+  uint32_t marginsDpi;
+};
+
+// A suspended member of a published workspace, and its planned restore tile.
 struct RestoreWindowHint {
   uint32_t hwnd;
   uint32_t processId;
@@ -91,12 +109,6 @@ struct RestoreWindowHint {
   // workspace, planned with the window's cached size limits. Absent when that
   // plan is unsatisfiable (MultiWM would then move or float the window).
   RECT frame;
-  // The window's invisible resize borders (GetWindowRect minus the DWM frame on
-  // each side), measured by MultiWM while the window was last tiled and restored.
-  // A minimized or maximized window reports different values, so readers must not
-  // measure them now. Valid only at `marginsDpi`; 0 means never measured.
-  RECT frameMargins;
-  uint32_t marginsDpi;
 };
 
 struct SnapshotBody {
@@ -109,9 +121,9 @@ struct SnapshotBody {
   uint32_t restoreWindowCount;
   uint32_t reserved0;
   WorkspaceHint workspaces[kMaxWorkspaces];
-  // Every HWND MultiWM has a record for, in any state, truncated to 32 bits
-  // (Windows keeps HWND values 32-bit significant) and sorted ascending.
-  uint32_t trackedWindows[kMaxTrackedWindows];
+  // Every known window, including owners on other desktops. HWND values are
+  // 32-bit significant on Windows. Duplicate owners publish Unknown treatment.
+  TrackedWindowHint trackedWindows[kMaxTrackedWindows];
   uint8_t rules[kRulesCapacity];  // See SerializeRules.
   RestoreWindowHint restoreWindows[kMaxRestoreWindows];
 };
@@ -130,11 +142,13 @@ struct SnapshotSection {
 };
 
 static_assert(sizeof(WorkspaceHint) == 72, "WorkspaceHint layout");
-static_assert(sizeof(RestoreWindowHint) == 52, "RestoreWindowHint layout");
+static_assert(sizeof(TrackedWindowHint) == 64, "TrackedWindowHint layout");
+static_assert(offsetof(TrackedWindowHint, frameMargins) == 44, "TrackedWindowHint margins");
+static_assert(sizeof(RestoreWindowHint) == 32, "RestoreWindowHint layout");
 static_assert(offsetof(SnapshotBody, desktopId) == 8, "SnapshotBody layout");
 static_assert(offsetof(SnapshotBody, workspaces) == 48, "SnapshotBody layout");
 static_assert(offsetof(SnapshotBody, trackedWindows) == 48 + sizeof(WorkspaceHint) * kMaxWorkspaces, "SnapshotBody layout");
-static_assert(sizeof(SnapshotBody) == 48 + sizeof(WorkspaceHint) * kMaxWorkspaces + 4 * kMaxTrackedWindows +
+static_assert(sizeof(SnapshotBody) == 48 + sizeof(WorkspaceHint) * kMaxWorkspaces + sizeof(TrackedWindowHint) * kMaxTrackedWindows +
                                          kRulesCapacity + sizeof(RestoreWindowHint) * kMaxRestoreWindows,
               "SnapshotBody layout");
 static_assert(offsetof(SnapshotSection, sequence) == 16, "SnapshotSection layout");

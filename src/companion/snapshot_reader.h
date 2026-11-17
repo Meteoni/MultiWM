@@ -6,11 +6,14 @@
 
 namespace Companion {
 
+enum class PlacementIntent { Admission, Restore, Arrival, KeepFloating, Unavailable };
+
 // What one placement decision needs from the snapshot, copied out so the lock
 // is released before the window is touched.
 struct HintInputs {
   uint32_t flags = 0;
   bool tracked = false;  // MultiWM already has a record for the window.
+  PlacementIntent intent = PlacementIntent::Admission;
   std::optional<CompanionAbi::WorkspaceHint> workspace;  // The workspace on the window's monitor.
   // Where MultiWM will tile the window once restored (visible frame). Absent
   // when MultiWM can't tell, or the window isn't a suspended member.
@@ -124,12 +127,6 @@ static bool RefreshBodyLocked() {
   return true;
 }
 
-static bool IsTrackedIn(const CompanionAbi::SnapshotBody& body, HWND hwnd) {
-  const uint32_t value = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
-  const uint32_t count = std::min(body.trackedCount, CompanionAbi::kMaxTrackedWindows);
-  return std::binary_search(body.trackedWindows, body.trackedWindows + count, value);
-}
-
 // Fills `*out` for a decision about `hwnd` on the monitor whose rectangle is
 // `monitorRect`. Returns false when there is no usable snapshot: MultiWM not
 // running, an unknown ABI, or a writer that stayed busy.
@@ -139,32 +136,57 @@ static bool ReadHintInputs(HWND hwnd, const RECT& monitorRect, HintInputs* out) 
   if (ok) {
     const CompanionAbi::SnapshotBody& body = *g_reader.body;
     out->flags = body.flags;
-    out->tracked = IsTrackedIn(body, hwnd);
+    out->tracked = false;
+    out->intent = PlacementIntent::Admission;
     out->rules = g_reader.rules;
     out->workspace.reset();
     out->restoreFrame.reset();
     out->restoreFrameMargins.reset();
     out->restoreMarginsDpi = 0;
     const uint32_t count = std::min(body.workspaceCount, CompanionAbi::kMaxWorkspaces);
+    uint32_t workspaceIndex = count;
     for (uint32_t i = 0; i < count; ++i) {
       if (EqualRect(&body.workspaces[i].monitorRect, &monitorRect)) {
         out->workspace = body.workspaces[i];
+        workspaceIndex = i;
         break;
       }
     }
-    const uint32_t restoreCount = std::min(body.restoreWindowCount, CompanionAbi::kMaxRestoreWindows);
     const uint32_t windowValue = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
-    for (uint32_t i = 0; i < restoreCount; ++i) {
-      const auto& restore = body.restoreWindows[i];
-      if (restore.hwnd == windowValue && restore.processId == GetCurrentProcessId() &&
-          restore.workspaceIndex < count) {
-        out->workspace = body.workspaces[restore.workspaceIndex];
-        if (restore.hasFrame) out->restoreFrame = restore.frame;
-        if (restore.marginsDpi) {
-          out->restoreFrameMargins = restore.frameMargins;
-          out->restoreMarginsDpi = restore.marginsDpi;
+    const uint32_t trackedCount = std::min(body.trackedCount, CompanionAbi::kMaxTrackedWindows);
+    const auto* trackedEnd = body.trackedWindows + trackedCount;
+    const auto* window = std::lower_bound(body.trackedWindows, trackedEnd, windowValue,
+        [](const auto& entry, uint32_t value) { return entry.hwnd < value; });
+    if (window != trackedEnd && window->hwnd == windowValue) {
+      out->tracked = true;
+      out->intent = PlacementIntent::Unavailable;
+      // A stale or ambiguous record must never fall back to new admission.
+      if (window->processId == GetCurrentProcessId()) {
+        if (window->marginsDpi) {
+          out->restoreFrameMargins = window->frameMargins;
+          out->restoreMarginsDpi = window->marginsDpi;
         }
-        break;
+        if (window->treatment == CompanionAbi::WindowTreatment::Floating) {
+          out->intent = PlacementIntent::KeepFloating;
+        } else if (window->treatment == CompanionAbi::WindowTreatment::Tiled && out->workspace &&
+                   !IsEqualGUID(window->desktopId, GUID{}) && !IsEqualGUID(body.desktopId, GUID{}) &&
+                   window->monitorRect.right > window->monitorRect.left &&
+                   window->monitorRect.bottom > window->monitorRect.top) {
+          const bool sameWorkspace = IsEqualGUID(window->desktopId, body.desktopId) &&
+                                     EqualRect(&window->monitorRect, &out->workspace->monitorRect);
+          out->intent = sameWorkspace ? PlacementIntent::Restore : PlacementIntent::Arrival;
+        }
+      }
+    }
+    if (out->intent == PlacementIntent::Restore) {
+      const uint32_t restoreCount = std::min(body.restoreWindowCount, CompanionAbi::kMaxRestoreWindows);
+      for (uint32_t i = 0; i < restoreCount; ++i) {
+        const auto& restore = body.restoreWindows[i];
+        if (restore.hwnd == windowValue && restore.processId == GetCurrentProcessId() &&
+            restore.workspaceIndex == workspaceIndex) {
+          if (restore.hasFrame) out->restoreFrame = restore.frame;
+          break;
+        }
       }
     }
   }

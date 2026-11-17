@@ -493,6 +493,29 @@ static void RunAdmissionPredictionTests() {
               const RECT& actual = rects[admitted.TiledIndex(incoming)];
               check(EqualRect(&actual, &*prediction.tiledFrame), "predicted slot matches real admission");
             }
+            for (SuspensionReason reason : {SuspensionReason::None, SuspensionReason::Hidden,
+                                             SuspensionReason::Minimized, SuspensionReason::Maximized}) {
+              Workspace migrated = workspace;
+              WindowRecord returning;
+              returning.hwnd = incoming;
+              returning.state = reason == SuspensionReason::None ? ManageState::Tiled : ManageState::Suspended;
+              returning.suspensionReason = reason;
+              returning.hasSavedSlot = reason != SuspensionReason::None;
+              returning.savedSlot = {99, 0.8, true, true};  // Source slot must not leak into the destination.
+              const HWND anchor = position == AutomaticNewWindowPosition::AfterFocused
+                                      ? migrated.LastFocusedTiledWindow() : nullptr;
+              migrated.AdmitMigrated(returning, anchor);
+              if (reason != SuspensionReason::None) check(migrated.Restore(incoming), "restore a migrated suspended member");
+              std::vector<RECT> migratedRects;
+              const bool migrationPlanned = Layout::BuildWorkspaceLayoutPlan(
+                  migrated, metrics.workArea, metrics.gap, &migratedRects) == Layout::LayoutPlanStatus::Success;
+              check(migrationPlanned == planned && migrated.TiledIndex(incoming) == admitted.TiledIndex(incoming),
+                    "every tiled arrival follows destination admission order");
+              if (planned) {
+                check(EqualRect(&migratedRects[migrated.TiledIndex(incoming)], &*prediction.tiledFrame),
+                      "published admission tile also matches the real migration and restore");
+              }
+            }
             check(workspace.ActiveCount() == existing && !workspace.HasRecord(Placement::kPredictedWindow),
                   "prediction leaves the workspace unchanged");
           }
@@ -695,10 +718,11 @@ static void RunRestorePublicationTests() {
   }
   check(probes == Diagnostics::g_runtime.counters.constraintProbeAttempts,
         "restore publication adds no native constraint probes");
-  check(body->restoreWindows[0].marginsDpi == 192 &&
-            EqualRect(&body->restoreWindows[0].frameMargins, &measuredMargins),
+  const auto firstTracked = CompanionSnapshot::MakeTrackedWindowHint(*workspace.Find(windows[0]), desktop, metrics.workArea);
+  const auto lastTracked = CompanionSnapshot::MakeTrackedWindowHint(*workspace.Find(windows[3]), desktop, metrics.workArea);
+  check(firstTracked.marginsDpi == 192 && EqualRect(&firstTracked.frameMargins, &measuredMargins),
         "restore hints carry the borders measured while the window was restored");
-  check(body->restoreWindows[1].marginsDpi == 0,
+  check(lastTracked.marginsDpi == 0,
         "borders measured for another process are not published");
 
   // Borders measured at another window DPI (or with other frame styles) no
@@ -709,7 +733,8 @@ static void RunRestorePublicationTests() {
   otherDpi.windowDpi = 96;
   CompanionSnapshot::g_publisher.frameMargins[windows[0]] = otherDpi;
   CompanionSnapshot::AppendWorkspaceHints(desktop, stale.get());
-  check(stale->restoreWindowCount == 2 && stale->restoreWindows[0].marginsDpi == 0,
+  check(stale->restoreWindowCount == 2 &&
+            CompanionSnapshot::MakeTrackedWindowHint(*workspace.Find(windows[0]), desktop, metrics.workArea).marginsDpi == 0,
         "borders from another window DPI are not published");
   CompanionSnapshot::g_publisher.frameMargins.clear();
 
@@ -744,6 +769,80 @@ static void RunRestorePublicationTests() {
   check(unsatisfiable->restoreWindowCount == 1 && !unsatisfiable->restoreWindows[0].hasFrame,
         "an unsatisfiable restore publishes no frame");
   std::printf("Passed %d restore publication checks.\n", checks);
+}
+
+static void RunTrackedWindowPublicationTests() {
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  const GUID desktop{0xAABBC002};
+  DesktopMonitorKey source{};
+  check(DesktopMonitorKey::FromHMonitor(desktop, MonitorFromPoint(POINT{}, MONITOR_DEFAULTTOPRIMARY), &source),
+        "resolve tracked-window publication monitor");
+  DesktopMonitorKey target = source;
+  ++target.desktopId.Data1;
+  Workspace workspace;
+  WindowRecord tiled;
+  tiled.hwnd = reinterpret_cast<HWND>(0x70001000);
+  tiled.pid = 321;
+  workspace.AdmitTiled(tiled);
+  workspace.Suspend(tiled.hwnd, SuspensionReason::Hidden);
+  WindowRecord floating;
+  floating.hwnd = reinterpret_cast<HWND>(0x70001004);
+  floating.pid = 654;
+  floating.floatingRect = {100, 100, 700, 500};
+  floating.hasFloatingRect = true;
+  workspace.AdmitFloating(floating);
+  g_workspaces.Save(source, workspace);
+  const auto plans = Diagnostics::g_runtime.counters.layoutPlansBuilt;
+  auto body = std::make_unique<CompanionAbi::SnapshotBody>();
+  CompanionSnapshot::AppendTrackedWindows(body.get());
+  auto find = [&](HWND hwnd) -> const CompanionAbi::TrackedWindowHint* {
+    const uint32_t value = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
+    for (uint32_t i = 0; i < body->trackedCount; ++i) if (body->trackedWindows[i].hwnd == value) return &body->trackedWindows[i];
+    return nullptr;
+  };
+  const auto* hidden = find(tiled.hwnd);
+  check(hidden && hidden->processId == tiled.pid && IsEqualGUID(hidden->desktopId, desktop) &&
+            hidden->monitorRect.right > hidden->monitorRect.left && hidden->treatment == CompanionAbi::WindowTreatment::Tiled,
+        "inactive hidden owner publishes its identity, workspace and tiled treatment");
+  const auto* floated = find(floating.hwnd);
+  check(floated && floated->treatment == CompanionAbi::WindowTreatment::Floating,
+        "explicit floating treatment is distinguishable from tiled arrivals");
+  check(Diagnostics::g_runtime.counters.layoutPlansBuilt == plans && (body->flags & CompanionAbi::kFlagTrackedComplete),
+        "ownership publication is complete without additional layout plans");
+  Workspace migrated;
+  migrated.AdmitMigrated(*workspace.Find(floating.hwnd));
+  check(migrated.Find(floating.hwnd)->state == ManageState::Floating && migrated.ActiveCount() == 0 &&
+            migrated.Find(floating.hwnd)->hasFloatingRect &&
+            EqualRect(&migrated.Find(floating.hwnd)->floatingRect, &floating.floatingRect),
+        "migration retains explicit floating treatment and remembered geometry");
+  Workspace duplicate;
+  duplicate.AdmitTiled(tiled);
+  g_workspaces.Save(target, duplicate);
+  *body = {};
+  CompanionSnapshot::AppendTrackedWindows(body.get());
+  hidden = find(tiled.hwnd);
+  check(hidden && hidden->treatment == CompanionAbi::WindowTreatment::Unknown && hidden->processId == 0,
+        "duplicate ownership stays tracked without granting either placement policy");
+  g_workspaces.Save(source, Workspace{});
+  g_workspaces.Save(target, Workspace{});
+
+  Workspace crowded;
+  for (uint32_t i = 0; i <= CompanionAbi::kMaxTrackedWindows; ++i) {
+    WindowRecord record;
+    record.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x71000000 + i * 4));
+    crowded.AdmitTiled(record);
+  }
+  g_workspaces.Save(source, crowded);
+  *body = {};
+  CompanionSnapshot::AppendTrackedWindows(body.get());
+  check(body->trackedCount == CompanionAbi::kMaxTrackedWindows && !(body->flags & CompanionAbi::kFlagTrackedComplete),
+        "truncated ownership metadata disables placement hints");
+  g_workspaces.Save(source, Workspace{});
+  std::printf("Passed %d tracked-window publication checks.\n", checks);
 }
 
 static void RunCompanionSnapshotRecoveryTests() {
@@ -853,5 +952,6 @@ int main() {
   RunAdmissionPredictionTests();
   RunCompanionRuleEncodingTests();
   RunRestorePublicationTests();
+  RunTrackedWindowPublicationTests();
   RunCompanionSnapshotRecoveryTests();
 }

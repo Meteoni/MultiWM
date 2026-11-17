@@ -2,7 +2,7 @@
 // @id              multiwm-companion
 // @name            MultiWM Companion
 // @description     Opens new windows directly in the slot MultiWM will give them, so they don't appear elsewhere first and jump.
-// @version         0.2.0
+// @version         0.3.0
 // @author          meteoni
 // @github          https://github.com/Meteoni
 // @license         MIT
@@ -54,8 +54,10 @@ destination, reducing the visible jump when MultiWM arranges them afterward.
   just before explicit show/placement calls or default `SC_RESTORE` handling on
   the owning thread. Taskbar restores in the tested apps reached this path.
 - Known windows hidden to the tray without minimizing also use their own restore
-  tile when shown again, including saved and deferred placements. Missing restore
-  hints leave them untouched rather than giving them a new-window slot.
+  tile when shown in the same workspace. A tiled window arriving from another
+  desktop or monitor uses the destination insertion tile; explicitly floated
+  windows keep their floating treatment. Missing local restore hints stay skipped.
+  Arrivals into Floating layouts or without a tiled destination hint pass through.
 - Definite overflow floats can open at the centred floating position when MultiWM
   will keep them on the current monitor. With one monitor and desktop creation off,
   Try other monitors first also uses this path. Routed destinations are not hinted.
@@ -68,8 +70,8 @@ information also pass through. The companion does not pre-position minimized
 windows in the background or change MultiWM's saved slots and final layout rules.
 
 ## Compatibility
-Both mods must use snapshot ABI major 4. Version 0.2.0 understands ABI 4.1;
-4.0 peers remain compatible but do not provide the new overflow float hints.
+Both mods must use snapshot ABI major 5: MultiWM 1.15.0 or newer and Companion
+0.3.0 or newer. Update both mods together. Older major versions give no hints.
 Don't combine with mods that also move windows before they are shown, such as
 Window Centralizer or Center New Windows: both would move the same window.
 */

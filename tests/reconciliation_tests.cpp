@@ -991,7 +991,7 @@ static void RunFrameMarginCacheTests() {
     for (int command : {SW_HIDE, SW_SHOWMINNOACTIVE, SW_HIDE, SW_SHOWMAXIMIZED, SW_HIDE, SW_SHOWNOACTIVATE}) {
       ShowWindow(hwnd, command);
       CompanionSnapshot::RememberFrameMargins(workspace, dpi);
-      const auto hint = CompanionSnapshot::MakeRestoreWindowHint(record, 0, RECT{10, 10, 500, 400});
+      const auto hint = CompanionSnapshot::MakeTrackedWindowHint(record, GUID{0xC001}, RECT{0, 0, 1920, 1080});
       const auto cached = CompanionSnapshot::g_publisher.frameMargins.find(hwnd);
       check(cached != CompanionSnapshot::g_publisher.frameMargins.end() &&
                 cached->second.style == measured.style && EqualRect(&cached->second.margins, &measured.margins),
@@ -1026,7 +1026,7 @@ static void RunFrameMarginCacheTests() {
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, measured.exStyle ^ WS_EX_CLIENTEDGE);
       }
       CompanionSnapshot::g_publisher.frameMargins[hwnd] = measured;
-      const auto hint = CompanionSnapshot::MakeRestoreWindowHint(record, 0, RECT{10, 10, 500, 400});
+      const auto hint = CompanionSnapshot::MakeTrackedWindowHint(record, GUID{0xC001}, RECT{0, 0, 1920, 1080});
       check(hint.marginsDpi == 0, "changed frame styles suppress stale published borders");
       CompanionSnapshot::RememberFrameMargins(workspace, dpi);
       check(!CompanionSnapshot::g_publisher.frameMargins.contains(hwnd), "unmeasurable stale borders are discarded");
@@ -1039,7 +1039,7 @@ static void RunFrameMarginCacheTests() {
     stale = measured;
     ++stale.processId;
     CompanionSnapshot::g_publisher.frameMargins[hwnd] = stale;
-    check(CompanionSnapshot::MakeRestoreWindowHint(record, 0, RECT{10, 10, 500, 400}).marginsDpi == 0,
+    check(CompanionSnapshot::MakeTrackedWindowHint(record, GUID{0xC001}, RECT{0, 0, 1920, 1080}).marginsDpi == 0,
           "another process cannot inherit cached borders");
     CompanionSnapshot::g_publisher.frameMargins.clear();
     DestroyWindow(hwnd);

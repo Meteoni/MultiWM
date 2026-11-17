@@ -408,8 +408,8 @@ class Workspace {
 
   // Copies the record into `outRecord` (optional), then Forget()s it here.
   bool ExtractForMigration(HWND hwnd, WindowRecord* outRecord);
-  // Adds a record extracted from another workspace, after `anchor` if given and
-  // tiled, otherwise at the end. Tiled/suspended windows start settling again.
+  // Tiled arrivals use the same insertion as admission: after a tiled `anchor`
+  // or at the end. Suspended arrivals reserve that slot; floating stays floating.
   void AdmitMigrated(WindowRecord record, HWND anchor = nullptr);
   // Copies remembered floating frames from `source` for windows known here.
   void MergeRememberedFloatingGeometryFrom(const Workspace& source);

@@ -57,7 +57,7 @@ There is no polling or request back to MultiWM. A named liveness event distingui
 a running writer from a section kept alive only by readers.
 
 The snapshot holds each current-desktop workspace's next-admission tile and default
-floating frame, definite overflow-float predictions, known HWNDs, rules and per-window
+floating frame, definite overflow-float predictions, known window ownership/treatment, rules and per-window
 restore frames. Prediction uses MultiWM's layout planner with the monitor's physical
 work area, DPI-scaled insets and gap. The companion starts from the application's
 proposed geometry, queries its live size limits, and adjusts its original positioning
@@ -89,8 +89,23 @@ A known window hidden without minimizing uses the same published restore frame
 and measured borders when it is shown again. Show calls position it while hidden;
 immediate/deferred positioning and saved-placement calls have their geometry
 rewritten. Deferred batches still wait for the application's commit. Known
-windows without a usable restore hint are left untouched rather than assigned
-the new-window slot.
+windows returning to their workspace without a usable restore hint stay untouched.
+
+Tracked entries identify HWND, PID, owning desktop/monitor and tiled/floating
+treatment. The reader selects admission for unknown windows, restore for members
+returning to their workspace, and arrival for tiled owners elsewhere. Borders
+belong to the tracked entry, so inactive-desktop owners retain measurements too.
+Ambiguous ownership, PID mismatch and retained floating treatment pass through.
+
+Tiled migration uses the same AdmitTiled/AdmitTiledAfter insertion as fresh
+admission. Suspended arrivals reserve that position with Suspend; hidden members
+therefore honour After focused rather than silently appending. Once restored,
+they share the destination's published admission tile, without an additional
+layout plan for each inactive window or destination. Arrival prediction keeps the
+record's treatment and does not rerun opening rules. Floating destinations and
+destinations without a tiled hint pass through. Constraint fitting remains best
+effort, and the published active desktop is assumed to be the destination; an
+app/shell desktop switch during showing can still require later correction.
 
 Resize borders come from measurements taken while each window was tiled and
 restored. Their cached window DPI and frame styles must still match; the hint
@@ -114,12 +129,14 @@ there is exactly one monitor with desktop creation off. General routed-overflow
 destinations and full geometry-based admission prediction remain deferred; see
 [the plan](VFX_COMPANION_PLAN.md).
 
-ABI 4.1 uses fixed-width structures with layout assertions for x86 and x64. Bounds
+ABI 5.0 uses fixed-width structures with layout assertions for x86 and x64. Bounds
 are 16 workspaces, 2048 tracked HWNDs, 128 restore hints and 32 KiB of encoded rules.
 The reader caches the body by generation and writer PID and decodes rules only
-when their bytes change. A major-version mismatch gives no hint. The 4.1 overflow
-fields reuse reserved space, so 4.0/4.1 readers and writers interoperate, with no
-new float hints when either side lacks support.
+when their bytes change. ABI 5 uses 64-byte tracked entries and 32-byte restore
+entries; its fixed snapshot section is 169160 bytes. Ownership publication walks
+repository metadata and validates cached borders, without planning inactive
+workspaces. The larger body is copied only on generation/writer changes.
+A major-version mismatch gives no hint; both mods must be updated together.
 
 Diagnostics expose ABI, section/liveness state, published contents, rebuild/write
 counts, burst and unchanged rebuilds, and average/slowest rebuild time. The measured
