@@ -17,6 +17,96 @@ static decltype(&CreateWindowExA) g_unhookedCreateWindowExA = nullptr;
 static decltype(&DefWindowProcW) g_unhookedDefWindowProcW = nullptr;
 static decltype(&DefWindowProcA) g_unhookedDefWindowProcA = nullptr;
 
+// ApplicationFrameHost keeps a spare UWP frame: it creates and shows the next
+// frame, still cloaked, whenever an app takes the current one, so that show is
+// often minutes before any app uses it. A launch then reuses the spare: it sets
+// the title, sometimes moves the frame to where the app last closed, and
+// uncloaks it, with no show call. (Traced on Microsoft Store: the jump at launch
+// was the spare's stale position or the app's saved one.) Until it uncloaks,
+// such a frame counts as not shown yet. MultiWM ignores cloaked windows, so an
+// untracked one is still a new window to it.
+//
+// The launch is recognised by the spare's title going from empty to set. Other
+// cloaked frames (an app on another virtual desktop, say) already have a title,
+// so their title changes are left alone. ApplicationFrameHost's follow-up move
+// to the app's saved position is held by settling (placement.h).
+static bool IsCloakedUwpFrame(HWND hwnd) {
+  if (!IsWindowVisible(hwnd) || !IsUwpFrame(hwnd)) return false;
+  DWORD cloaked = 0;
+  return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0;
+}
+
+// Calls that need a hint: a hidden window's show.
+static bool NeedsPositionHint(HWND hwnd, UINT flags) {
+  return (flags & SWP_SHOWWINDOW) && !IsWindowVisible(hwnd);
+}
+
+// True for a WM_SETTEXT that may be an app taking a spare UWP frame. Read
+// before the title changes.
+static bool MayAttachUwpFrame(HWND hwnd, UINT message) {
+  return message == WM_SETTEXT && !g_placing && IsCloakedUwpFrame(hwnd) && !HasTitle(hwnd);
+}
+
+// After the title is set (so title rules match): place the frame at the current
+// prediction, which also starts settling it.
+static void PlaceAttachingUwpFrame(HWND hwnd) {
+  if (HasTitle(hwnd) && IsCloakedUwpFrame(hwnd)) PlaceAtPredictedFrame(hwnd, "UWP frame launch");
+}
+
+// Windows sets this WINDOWPOS flag (undocumented, seen as 0x8124 in traces) for
+// a minimize, maximize or restore.
+constexpr UINT kSwpStateChanged = 0x8000;
+
+// Holds a settling window (placement.h) at the companion's frame. Every
+// positioning call (SetWindowPos, MoveWindow, SetWindowPlacement, the end of a
+// DeferWindowPos batch) sends WM_WINDOWPOSCHANGING, and changing its WINDOWPOS
+// changes the move (documented), so this one place covers them all. Runs before
+// DefWindowProc, after the window's own procedure. Settling ends:
+//  - when MultiWM has taken the window: its snapshot entry changed, or its own
+//    placement arrived (WM_WINDOWPOSCHANGED from another thread; MultiWM uses
+//    SWP_NOSENDCHANGING, so its moves never reach the steering);
+//  - when anything but the app's own thread positions it, the user moves or
+//    resizes it, or it is minimized, maximized, hidden or destroyed.
+// From then on MultiWM handles the app's moves as before.
+static void SteerSettlingWindow(HWND hwnd, UINT message, LPARAM lparam) {
+  if (!hwnd || hwnd != g_settling.hwnd || g_placing) return;
+  if (message == WM_NCDESTROY) {
+    EndSettling();
+    return;
+  }
+  if (message != WM_WINDOWPOSCHANGING && message != WM_WINDOWPOSCHANGED) return;
+  auto* position = reinterpret_cast<WINDOWPOS*>(lparam);
+  if (!position || position->hwnd != hwnd) return;
+  const bool fromOtherThread = InSendMessageEx(nullptr) != ISMEX_NOSEND;
+  if (message == WM_WINDOWPOSCHANGED) {
+    if (fromOtherThread || (position->flags & SWP_NOSENDCHANGING)) EndSettling();
+    return;
+  }
+  if ((position->flags & (SWP_NOMOVE | SWP_NOSIZE)) == (SWP_NOMOVE | SWP_NOSIZE) &&
+      !(position->flags & SWP_HIDEWINDOW)) {
+    return;  // Z-order or activation only.
+  }
+  GUITHREADINFO gui{sizeof(gui)};
+  WindowFacts facts;
+  if (fromOtherThread || (position->flags & (SWP_HIDEWINDOW | kSwpStateChanged)) || IsIconic(hwnd) ||
+      IsZoomed(hwnd) || (GetGUIThreadInfo(GetCurrentThreadId(), &gui) && (gui.flags & GUI_INMOVESIZE)) ||
+      !ReadWindowFacts(hwnd, &facts) || !(facts == g_settling.facts)) {
+    EndSettling();
+    return;
+  }
+  const auto target = ConvertScreenRect(hwnd, g_settling.windowRect, PhysicalToLogicalPointForPerMonitorDPI);
+  if (!target) {
+    EndSettling();
+    return;
+  }
+  position->x = target->left;
+  position->y = target->top;
+  position->cx = Width(*target);
+  position->cy = Height(*target);
+  position->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+  LogDecision(hwnd, "WM_WINDOWPOSCHANGING", "held at the companion's frame until MultiWM takes the window");
+}
+
 static BOOL WINAPI ShowWindowHook(HWND hwnd, int command) {
   if (PrepareRestorePlacement(hwnd, command, "ShowWindow restore")) {
     PlacementScope placing;
@@ -42,7 +132,11 @@ static LRESULT WINAPI DefWindowProcWHook(HWND hwnd, UINT message, WPARAM wparam,
     PlacementScope placing;
     return g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
   }
-  return g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
+  SteerSettlingWindow(hwnd, message, lparam);
+  const bool attaching = MayAttachUwpFrame(hwnd, message);
+  const LRESULT result = g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
+  if (attaching) PlaceAttachingUwpFrame(hwnd);
+  return result;
 }
 
 static LRESULT WINAPI DefWindowProcAHook(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -51,13 +145,18 @@ static LRESULT WINAPI DefWindowProcAHook(HWND hwnd, UINT message, WPARAM wparam,
     PlacementScope placing;
     return g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
   }
-  return g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
+  SteerSettlingWindow(hwnd, message, lparam);
+  const bool attaching = MayAttachUwpFrame(hwnd, message);
+  const LRESULT result = g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
+  if (attaching) PlaceAttachingUwpFrame(hwnd);
+  return result;
 }
 
 // Both immediate and deferred placement take the same geometry. Rewrite it
 // without committing a move; a deferred batch must remain deferred. Callers
 // hold PlacementScope through the original API call to prevent nested hints.
-static void AdjustPositionForHint(WINDOWPOS& position, const char* path) {
+// Returns the frame to settle at (physical) when the hint set an exact frame.
+static std::optional<RECT> AdjustPositionForHint(WINDOWPOS& position, const char* path) {
   const HWND hwnd = position.hwnd;
   RECT current{};
   if (GetWindowRect(hwnd, &current)) {
@@ -80,24 +179,32 @@ static void AdjustPositionForHint(WINDOWPOS& position, const char* path) {
         position.flags &= ~SWP_NOSIZE;
       }
       LogDecision(hwnd, path, "using MultiWM's predicted placement");
+      if (!prediction->keepSize) return prediction->windowRect;
     }
   }
+  return std::nullopt;
 }
 
 static BOOL WINAPI SetWindowPosHook(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) {
-  if (g_placing || !hwnd || !(flags & SWP_SHOWWINDOW) || IsWindowVisible(hwnd) || RejectStructurally(hwnd)) {
+  if (g_placing || !hwnd || !NeedsPositionHint(hwnd, flags) || RejectStructurally(hwnd)) {
     return g_unhookedSetWindowPos(hwnd, after, x, y, cx, cy, flags);
   }
-  PlacementScope placing;
-  WINDOWPOS position{hwnd, after, x, y, cx, cy, flags};
-  AdjustPositionForHint(position, "SetWindowPos");
-  // Preserve the app's single native call, flags and result, including failure.
-  return g_unhookedSetWindowPos(hwnd, after, position.x, position.y, position.cx, position.cy, position.flags);
+  BOOL result = FALSE;
+  std::optional<RECT> settleAt;
+  {
+    PlacementScope placing;
+    WINDOWPOS position{hwnd, after, x, y, cx, cy, flags};
+    settleAt = AdjustPositionForHint(position, "SetWindowPos");
+    // Preserve the app's single native call, flags and result, including failure.
+    result = g_unhookedSetWindowPos(hwnd, after, position.x, position.y, position.cx, position.cy, position.flags);
+  }
+  if (result && settleAt) BeginSettling(hwnd, *settleAt);
+  return result;
 }
 
 static HDWP WINAPI DeferWindowPosHook(
     HDWP batch, HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) {
-  if (g_placing || !batch || !hwnd || !(flags & SWP_SHOWWINDOW) || IsWindowVisible(hwnd) || RejectStructurally(hwnd)) {
+  if (g_placing || !batch || !hwnd || !NeedsPositionHint(hwnd, flags) || RejectStructurally(hwnd)) {
     return g_unhookedDeferWindowPos(batch, hwnd, after, x, y, cx, cy, flags);
   }
   PlacementScope placing;
@@ -124,28 +231,35 @@ static BOOL WINAPI SetWindowPlacementHook(HWND hwnd, const WINDOWPLACEMENT* plac
       IsWindowVisible(hwnd) || RejectStructurally(hwnd)) {
     return g_unhookedSetWindowPlacement(hwnd, placement);
   }
-  PlacementScope placing;
-  // Non-tool top-level windows store rcNormalPosition in workspace coordinates.
-  // Convert to screen coordinates before prediction and back at its destination.
-  MONITORINFO monitorInfo{sizeof(monitorInfo)};
-  RECT proposedScreen = placement->rcNormalPosition;
-  if (GetMonitorInfoW(MonitorFromRect(&proposedScreen, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
-    OffsetRect(&proposedScreen, monitorInfo.rcWork.left - monitorInfo.rcMonitor.left,
-                monitorInfo.rcWork.top - monitorInfo.rcMonitor.top);
-    const auto proposed = ConvertScreenRect(hwnd, proposedScreen, LogicalToPhysicalPointForPerMonitorDPI);
-    const auto prediction = proposed ? PredictWindowPlacement(hwnd, *proposed, "SetWindowPlacement") : std::nullopt;
-    const auto target = prediction ? ConvertScreenRect(hwnd, prediction->windowRect,
-                                                       PhysicalToLogicalPointForPerMonitorDPI) : std::nullopt;
-    if (target && GetMonitorInfoW(MonitorFromRect(&*target, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
-      WINDOWPLACEMENT adjusted = *placement;
-      adjusted.rcNormalPosition = *target;
-      OffsetRect(&adjusted.rcNormalPosition, monitorInfo.rcMonitor.left - monitorInfo.rcWork.left,
-                  monitorInfo.rcMonitor.top - monitorInfo.rcWork.top);
-      LogDecision(hwnd, "SetWindowPlacement", "using MultiWM's predicted placement");
-      return g_unhookedSetWindowPlacement(hwnd, &adjusted);
+  std::optional<RECT> settleAt;
+  BOOL result = FALSE;
+  {
+    PlacementScope placing;
+    // Non-tool top-level windows store rcNormalPosition in workspace coordinates.
+    // Convert to screen coordinates before prediction and back at its destination.
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    RECT proposedScreen = placement->rcNormalPosition;
+    std::optional<WINDOWPLACEMENT> adjusted;
+    if (GetMonitorInfoW(MonitorFromRect(&proposedScreen, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
+      OffsetRect(&proposedScreen, monitorInfo.rcWork.left - monitorInfo.rcMonitor.left,
+                  monitorInfo.rcWork.top - monitorInfo.rcMonitor.top);
+      const auto proposed = ConvertScreenRect(hwnd, proposedScreen, LogicalToPhysicalPointForPerMonitorDPI);
+      const auto prediction = proposed ? PredictWindowPlacement(hwnd, *proposed, "SetWindowPlacement") : std::nullopt;
+      const auto target = prediction ? ConvertScreenRect(hwnd, prediction->windowRect,
+                                                         PhysicalToLogicalPointForPerMonitorDPI) : std::nullopt;
+      if (target && GetMonitorInfoW(MonitorFromRect(&*target, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
+        adjusted = *placement;
+        adjusted->rcNormalPosition = *target;
+        OffsetRect(&adjusted->rcNormalPosition, monitorInfo.rcMonitor.left - monitorInfo.rcWork.left,
+                    monitorInfo.rcMonitor.top - monitorInfo.rcWork.top);
+        LogDecision(hwnd, "SetWindowPlacement", "using MultiWM's predicted placement");
+        if (!prediction->keepSize) settleAt = prediction->windowRect;
+      }
     }
+    result = g_unhookedSetWindowPlacement(hwnd, adjusted ? &*adjusted : placement);
   }
-  return g_unhookedSetWindowPlacement(hwnd, placement);
+  if (result && settleAt) BeginSettling(hwnd, *settleAt);
+  return result;
 }
 
 // Visible creation can show inside the kernel. Adjust as soon as creation

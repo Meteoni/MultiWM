@@ -426,6 +426,50 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   return PredictedPlacement{placement, kind == TargetKind::KeepSize};
 }
 
+// --- Settling ----------------------------------------------------------------------
+//
+// After the companion places a window at its show, the app may still move it
+// before MultiWM gets to it: WeChat restores its pre-hide position 64 ms after
+// showing, ApplicationFrameHost the app's last position just before uncloaking
+// (traced). MultiWM would move it back, so the move is a visible jump. Until
+// MultiWM takes the window over, the app's own moves are kept at the frame the
+// companion chose (show_hooks.h, SteerSettlingWindow).
+//
+// "Taken over" is read from MultiWM itself, never guessed: its snapshot entry
+// for the window changes once it has processed the show (WindowFacts), or its
+// own placement arrives. One window per thread: the last one placed.
+struct SettlingWindow {
+  HWND hwnd = nullptr;
+  RECT windowRect{};  // Physical screen pixels, including resize borders.
+  WindowFacts facts;  // MultiWM's view of the window when it was placed.
+};
+static thread_local SettlingWindow g_settling;
+
+static bool IsUwpFrame(HWND hwnd) {
+  wchar_t className[32];
+  return GetClassNameW(hwnd, className, ARRAYSIZE(className)) && wcscmp(className, L"ApplicationFrameWindow") == 0;
+}
+
+// Reads the title without sending the window a message.
+static bool HasTitle(HWND hwnd) {
+  wchar_t first[2];
+  return InternalGetWindowText(hwnd, first, ARRAYSIZE(first)) > 0;
+}
+
+static void EndSettling() { g_settling = {}; }
+
+// Starts settling `hwnd` at `windowRect`, replacing any earlier window on this
+// thread. A spare UWP frame (no title yet) is not settled: no app uses it yet,
+// and the launch that takes it places it again (show_hooks.h).
+static void BeginSettling(HWND hwnd, const RECT& windowRect) {
+  WindowFacts facts;
+  if ((IsUwpFrame(hwnd) && !HasTitle(hwnd)) || !ReadWindowFacts(hwnd, &facts)) {
+    EndSettling();
+    return;
+  }
+  g_settling = {hwnd, windowRect, facts};
+}
+
 // Used by show and creation hooks that have no geometry arguments to rewrite.
 static bool PlaceAtPredictedFrame(HWND hwnd, const char* path) {
   if (g_placing || !hwnd || RejectStructurally(hwnd)) return false;
@@ -442,6 +486,8 @@ static bool PlaceAtPredictedFrame(HWND hwnd, const char* path) {
   const BOOL moved = g_setWindowPosForOwnMoves(hwnd, nullptr, placement.left, placement.top,
                                                Width(placement), Height(placement), flags);
   LogDecision(hwnd, path, moved ? "placed at MultiWM's frame" : "SetWindowPos failed");
+  // A window MultiWM only centres (keepSize) has no exact frame to hold.
+  if (moved && !prediction->keepSize) BeginSettling(hwnd, placement);
   return moved != FALSE;
 }
 

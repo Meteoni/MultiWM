@@ -194,6 +194,42 @@ static bool ReadHintInputs(HWND hwnd, const RECT& monitorRect, HintInputs* out) 
   return ok;
 }
 
+// What MultiWM's snapshot says about one window: its tracked entry (zero when
+// untracked) and whether it has a restore entry. When MultiWM processes a
+// window's show, this changes: an unknown window becomes tracked, a hidden
+// member loses its restore entry, an arriving one gets its new desktop or
+// monitor, an overflowed one becomes floating. Unrelated republishes don't.
+struct WindowFacts {
+  CompanionAbi::TrackedWindowHint entry{};
+  bool restoreEntry = false;
+
+  bool operator==(const WindowFacts& other) const {
+    return restoreEntry == other.restoreEntry && std::memcmp(&entry, &other.entry, sizeof(entry)) == 0;
+  }
+};
+
+// Fills `*out` for `hwnd`. Returns false when there is no usable snapshot.
+static bool ReadWindowFacts(HWND hwnd, WindowFacts* out) {
+  AcquireSRWLockExclusive(&g_reader.lock);
+  const bool ok = !g_reader.unloading && EnsureMappedLocked() && IsMultiWmRunning() && RefreshBodyLocked();
+  if (ok) {
+    const CompanionAbi::SnapshotBody& body = *g_reader.body;
+    *out = {};
+    const uint32_t windowValue = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
+    const uint32_t trackedCount = std::min(body.trackedCount, CompanionAbi::kMaxTrackedWindows);
+    const auto* trackedEnd = body.trackedWindows + trackedCount;
+    const auto* window = std::lower_bound(body.trackedWindows, trackedEnd, windowValue,
+        [](const auto& entry, uint32_t value) { return entry.hwnd < value; });
+    if (window != trackedEnd && window->hwnd == windowValue) out->entry = *window;
+    const uint32_t restoreCount = std::min(body.restoreWindowCount, CompanionAbi::kMaxRestoreWindows);
+    for (uint32_t i = 0; i < restoreCount && !out->restoreEntry; ++i) {
+      out->restoreEntry = body.restoreWindows[i].hwnd == windowValue;
+    }
+  }
+  ReleaseSRWLockExclusive(&g_reader.lock);
+  return ok;
+}
+
 // Unmaps the section. After this, ReadHintInputs always fails. Mod unload.
 static void CloseSnapshotReader() {
   AcquireSRWLockExclusive(&g_reader.lock);

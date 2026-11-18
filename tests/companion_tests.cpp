@@ -303,6 +303,117 @@ int main() {
     ++body.generation;
   }
 
+  // Settling: after the companion places a window at its show, the app's own
+  // moves are held at that frame until MultiWM takes the window over (its
+  // snapshot entry changes, or its own SWP_NOSENDCHANGING placement arrives).
+  // UWP launches reuse a spare ApplicationFrameWindow shown, cloaked, long
+  // before; the launch sets its empty title, which places and settles it.
+  {
+    WNDCLASSW frameClass = windowClass;
+    frameClass.lpszClassName = L"ApplicationFrameWindow";
+    check(RegisterClassW(&frameClass) != 0, "register a UWP frame class");
+    auto makeFrame = [&](const wchar_t* title) {
+      const HWND frame = CreateWindowExW(0, frameClass.lpszClassName, title, WS_OVERLAPPEDWINDOW, 100, 100, 800,
+                                         600, nullptr, nullptr, frameClass.hInstance, &limits);
+      BOOL cloak = TRUE;
+      check(frame && SUCCEEDED(DwmSetWindowAttribute(frame, DWMWA_CLOAK, &cloak, sizeof(cloak))),
+            "create a cloaked UWP frame");
+      ShowWindow(frame, SW_SHOWNOACTIVATE);
+      check(IsWindowVisible(frame) != FALSE, "the spare frame is shown while cloaked");
+      return frame;
+    };
+    Companion::g_unhookedDefWindowProcW = DefWindowProcW;
+    const BOOL savedResult = nativeResult;
+    nativeResult = TRUE;  // The companion's own placement succeeds, so settling starts.
+    constexpr UINT moveFlags = SWP_NOZORDER | SWP_NOACTIVATE;
+    // The app's own move, as its WM_WINDOWPOSCHANGING reaches DefWindowProc.
+    auto appMove = [&](HWND window, UINT flags = moveFlags) {
+      WINDOWPOS position{window, nullptr, 900, 900, 600, 500, flags};
+      Companion::DefWindowProcWHook(window, WM_WINDOWPOSCHANGING, 0, reinterpret_cast<LPARAM>(&position));
+      return position;
+    };
+    auto unchanged = [](const WINDOWPOS& position) {
+      return position.x == 900 && position.y == 900 && position.cx == 600 && position.cy == 500;
+    };
+    const RECT& slot = workspace.tiledFrame;
+    auto heldAt = [&](const WINDOWPOS& position, const RECT& margins) {
+      return position.x == slot.left - margins.left && position.y == slot.top - margins.top &&
+             position.cx == Companion::Width(slot) + margins.left + margins.right &&
+             position.cy == Companion::Height(slot) + margins.top + margins.bottom &&
+             !(position.flags & (SWP_NOMOVE | SWP_NOSIZE));
+    };
+
+    const HWND spare = makeFrame(L"");
+    RECT window{}, visible{};
+    GetWindowRect(spare, &window);
+    if (FAILED(DwmGetWindowAttribute(spare, DWMWA_EXTENDED_FRAME_BOUNDS, &visible, sizeof(visible)))) visible = window;
+    const RECT margins{visible.left - window.left, visible.top - window.top, window.right - visible.right,
+                       window.bottom - visible.bottom};
+    ++body.generation;
+
+    check(unchanged(appMove(spare)), "a spare frame no app has taken keeps its moves");
+    positionCalls.clear();
+    Companion::DefWindowProcWHook(spare, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"Microsoft Store"));
+    check(positionCalls.size() == 1 && positionCalls[0].x == slot.left - margins.left &&
+              positionCalls[0].y == slot.top - margins.top,
+          "taking a spare frame places it at the current slot");
+    check(heldAt(appMove(spare), margins), "ApplicationFrameHost's move to the saved position is held at the slot");
+    WINDOWPOS zOrder{spare, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE};
+    Companion::DefWindowProcWHook(spare, WM_WINDOWPOSCHANGING, 0, reinterpret_cast<LPARAM>(&zOrder));
+    check(zOrder.x == 0 && zOrder.cx == 0 && zOrder.flags == (SWP_NOMOVE | SWP_NOSIZE),
+          "a z-order-only change is unchanged");
+    positionCalls.clear();
+    Companion::DefWindowProcWHook(spare, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"Microsoft Store - Home"));
+    check(positionCalls.empty(), "later title changes don't place the frame");
+    check(heldAt(appMove(spare), margins), "an unrelated republish keeps the frame held");
+    ++body.generation;
+    check(heldAt(appMove(spare), margins), "a new generation alone doesn't end settling");
+
+    // MultiWM takes the frame (it uncloaked and was admitted): its entry appears.
+    body.trackedCount = 1;
+    body.trackedWindows[0] = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(spare)), GetCurrentProcessId(),
+                              GUID{1}, workspace.monitorRect, CompanionAbi::WindowTreatment::Tiled, {}, 0};
+    ++body.generation;
+    check(unchanged(appMove(spare)), "once MultiWM tracks the frame, its moves are its own again");
+    check(unchanged(appMove(spare)), "settling stays ended");
+    body.trackedCount = 0;
+    body.trackedWindows[0] = {};
+    ++body.generation;
+    DestroyWindow(spare);
+
+    const HWND titled = makeFrame(L"Settings");
+    positionCalls.clear();
+    Companion::DefWindowProcWHook(titled, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"Settings - Display"));
+    check(positionCalls.empty(), "a titled cloaked frame's title change doesn't place it");
+    check(unchanged(appMove(titled)), "a titled cloaked frame keeps its moves");
+    DestroyWindow(titled);
+
+    // WeChat: shown into its tile, then moves itself to its pre-hide position.
+    auto showPlaced = [&] {
+      positionCalls.clear();
+      showCommands.clear();
+      Companion::ShowWindowHook(hwnd, SW_SHOWNORMAL);
+      check(positionCalls.size() == 1, "a shown window is placed and settles");
+    };
+    showPlaced();
+    check(heldAt(appMove(hwnd), testMargins), "the app's own move after its show is held at the tile");
+    // MultiWM's own placement arrives (SWP_NOSENDCHANGING): settling ends.
+    WINDOWPOS multiwm{hwnd, nullptr, 1, 2, 3, 4, SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING};
+    Companion::DefWindowProcWHook(hwnd, WM_WINDOWPOSCHANGED, 0, reinterpret_cast<LPARAM>(&multiwm));
+    check(unchanged(appMove(hwnd)), "after MultiWM's own placement, the app's moves are its own");
+    showPlaced();
+    check(unchanged(appMove(hwnd, moveFlags | Companion::kSwpStateChanged)), "a maximize or minimize ends settling");
+    check(unchanged(appMove(hwnd)), "settling stays ended after a state change");
+    showPlaced();
+    WINDOWPOS hide{hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_HIDEWINDOW};
+    Companion::DefWindowProcWHook(hwnd, WM_WINDOWPOSCHANGING, 0, reinterpret_cast<LPARAM>(&hide));
+    check(hide.x == 0 && hide.cx == 0 && unchanged(appMove(hwnd)), "hiding the window ends settling");
+
+    Companion::EndSettling();
+    nativeResult = savedResult;
+    ++body.generation;
+  }
+
   // Process rules match on the executable's file name, read without a path limit.
   check(_wcsicmp(Companion::CurrentProcessName(nullptr).c_str(), L"companion_tests.exe") == 0,
         "the process name is the executable's file name");
