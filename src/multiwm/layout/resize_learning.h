@@ -80,6 +80,43 @@ static bool PlanDwindleCells(
   return count >= 2 && outSplits->size() + 1 == count;
 }
 
+// The Dwindle layout exactly as the saved ratios give it, without adaptive
+// fitting. Once a resize has accepted the shown layout, this is the layout the
+// resize works on. False when a window would be below its minimum.
+static bool PlanSavedDwindleCells(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    std::vector<RECT>* outRects, std::vector<Layout::DwindleSplit>* outSplits = nullptr) {
+  const size_t count = workspace.ActiveCount();
+  outRects->assign(count, RECT{});
+  if (outSplits) outSplits->clear();
+  if (count < 2) return false;
+  Layout::LayoutDwindle(workArea, gap, 0, count, workspace.DwindleRatios(),
+                        g_settings.reverseDwindle, *outRects, outSplits);
+  return Layout::RectsSatisfyWindowConstraints(*outRects, Layout::ActiveWindowConstraints(workspace));
+}
+
+// Moves `ratio` toward `target` as far as `allowed()` still holds, which it
+// must where the ratio starts. A move can be smaller than a pixel; callers
+// that need to know whether anything moved compare the planned layout.
+static void MoveRatioToward(double& ratio, double target, const std::function<bool()>& allowed) {
+  const double from = ratio;
+  ratio = target;
+  if (!allowed()) {
+    double low = 0.0;  // Fractions of the way to `target`; 0 is allowed.
+    double high = 1.0;
+    for (int i = 0; i < 24; ++i) {
+      const double middle = (low + high) / 2.0;
+      ratio = from + (target - from) * middle;
+      if (allowed()) {
+        low = middle;
+      } else {
+        high = middle;
+      }
+    }
+    ratio = from + (target - from) * low;
+  }
+}
+
 // Transfer a drag between the adjacent spans from the rendered layout. When
 // minimums displaced the divider, use the constrained allocation's weight scale
 // to remember the new visible spans without changing unrelated preferences.
@@ -262,9 +299,17 @@ bool Workspace::LearnDwindleResize(
     return false;
   }
 
+  // A drag that changes a divider accepts the shown layout, as size commands
+  // do (layout/resize_steps.h). A gesture that changes nothing saves nothing.
+  DwindleState before = SaveDwindleState();
+  AcceptShownDwindleLayout(workArea, gap);
+
   std::vector<RECT> expectedRects;
   std::vector<Layout::DwindleSplit> splits;
-  if (!PlanDwindleCells(*this, workArea, gap, &expectedRects, &splits)) return false;
+  if (!PlanDwindleCells(*this, workArea, gap, &expectedRects, &splits)) {
+    RestoreDwindleState(std::move(before));
+    return false;
+  }
 
   const RECT& resizedRect = expectedRects[resizedIndex];
   size_t selectedVerticalSplit = static_cast<size_t>(-1);
@@ -319,6 +364,12 @@ bool Workspace::LearnDwindleResize(
     }
   }
 
+  // The dragged divider stops where the accepted layout runs out of room, so
+  // adaptive fitting never has to move another divider to make the drag fit.
+  auto fits = [&] {
+    std::vector<RECT> rects;
+    return PlanSavedDwindleCells(*this, workArea, gap, &rects);
+  };
   bool changed = false;
   auto applySelectedDivider = [&](size_t splitIndex, LONG firstSpanDelta) {
     if (splitIndex >= splits.size()) return;
@@ -330,21 +381,29 @@ bool Workspace::LearnDwindleResize(
         split.firstSpan + firstSpanDelta,
         minimumSpan, split.usableSpan - minimumSpan);
     const double newRatio = Layout::ClampSplitRatio(static_cast<double>(newFirstSpan) / static_cast<double>(split.usableSpan));
-    if (std::abs(newRatio - dwindleRatios_[splitIndex]) <= 1e-9) return;
+    double& ratio = dwindleRatios_[splitIndex];
+    const double shownRatio = ratio;
+    MoveRatioToward(ratio, newRatio, fits);
+    if (Layout::SplitLeadingSpan(split.usableSpan, Layout::ClampSplitRatio(ratio)) == split.firstSpan) {
+      ratio = shownRatio;  // No room: not even a pixel moved.
+      return;
+    }
 
-    dwindleRatios_[splitIndex] = newRatio;
     KeepDwindleDivider(splitIndex);  // A dragged divider stays where it was put.
     changed = true;
     Wh_Log(
         L"Dwindle divider updated slot=%zu ratio=%.6f",
-        splitIndex, newRatio);
+        splitIndex, ratio);
     Diagnostics::RecordEvent(
         L"dwindle divider updated hwnd=%p slot=%zu ratio=%.6f",
-        windows_[resizedIndex], splitIndex, newRatio);
+        windows_[resizedIndex], splitIndex, ratio);
   };
   applySelectedDivider(selectedVerticalSplit, selectedVerticalDelta);
   applySelectedDivider(selectedHorizontalSplit, selectedHorizontalDelta);
-  if (!changed) return false;
+  if (!changed) {
+    RestoreDwindleState(std::move(before));
+    return false;
+  }
 
   DebugValidateMutation(L"Workspace::LearnDwindleResize");
   return true;

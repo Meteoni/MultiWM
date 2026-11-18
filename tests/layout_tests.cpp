@@ -73,9 +73,11 @@ static void RunAdaptiveDwindleTests() {
     if (reverse) gesture.end.left += 2;
     else gesture.end.right -= 2;
     check(dragged.LearnDwindleResize(area, 0, 0, gesture), "learn a two-pixel manual drag");
+    // A drag accepts the shown layout: the untouched divider is saved where
+    // adaptive fitting showed it (350 of 1000), not at its earlier 0.5.
     check(std::abs(dragged.DwindleRatios()[0] - 0.348) < 1e-9 &&
-              dragged.DwindleRatios()[1] == 0.5,
-          "manual drag starts from visible split and preserves untouched preference");
+              std::abs(dragged.DwindleRatios()[1] - 0.35) < 1e-9,
+          "manual drag starts from visible split and accepts the shown layout");
     check(Layout::BuildWorkspaceLayoutPlan(dragged, area, 0, &rects) ==
               Layout::LayoutPlanStatus::Success && Layout::RectWidth(rects[0]) == 348,
           "manual divider stays at dragged position while minimum remains");
@@ -91,13 +93,13 @@ static void RunAdaptiveDwindleTests() {
     if (reverse) gesture.end.top += 2;
     else gesture.end.bottom -= 2;
     check(nestedDrag.LearnDwindleResize(area, 0, 1, gesture), "learn nested divider drag");
-    check(nestedDrag.DwindleRatios()[0] == 0.5 &&
+    check(std::abs(nestedDrag.DwindleRatios()[0] - 0.35) < 1e-9 &&
               std::abs(nestedDrag.DwindleRatios()[1] - 0.348) < 1e-9,
-          "nested drag updates only touched preference");
+          "nested drag accepts the shown layout");
     check(nestedDrag.UpdateConstraints(large, {80, 80, 96, true}), "relax after nested drag");
     check(Layout::BuildWorkspaceLayoutPlan(nestedDrag, area, 0, &rects) ==
-              Layout::LayoutPlanStatus::Success && Layout::RectWidth(rects[0]) == 500 &&
-              Layout::RectHeight(rects[1]) == 348, "nested preference persists after constraint relaxes");
+              Layout::LayoutPlanStatus::Success && Layout::RectWidth(rects[0]) == 350 &&
+              Layout::RectHeight(rects[1]) == 348, "the accepted layout persists after the constraint relaxes");
 
     Workspace jitter = original;
     check(Layout::BuildWorkspaceLayoutPlan(jitter, area, 0, &rects) ==
@@ -398,11 +400,36 @@ static void RunWindowSizeStepTests() {
                 Layout::LayoutPlanStatus::Success, "plan deep Dwindle layout");
       return Layout::RectWidth(rects[index]);
     };
-    for (size_t index : {2u, 3u}) {
-      Workspace grown = deep;
-      check(grown.StepTiledSize(wide, wideGap, index, true, kStep) && width(grown, index) > width(deep, index),
-            "a deep Dwindle window grows its split under adaptive fitting");
-    }
+    // On the accepted layout only the stepped divider moves. LocalSend (3) can
+    // take room from Notepad (2); Notepad can't take any from LocalSend, which
+    // is at its minimum, and no longer borrows it by moving another divider.
+    Workspace grown = deep;
+    check(grown.StepTiledSize(wide, wideGap, 3, true, kStep) && width(grown, 3) > width(deep, 3) &&
+              width(grown, 0) == width(deep, 0) && width(grown, 1) == width(deep, 1),
+          "a deep Dwindle window grows its split; no other divider moves");
+    Workspace blocked = deep;
+    check(!blocked.StepTiledSize(wide, wideGap, 2, true, kStep) && blocked.DwindleRatios() == deep.DwindleRatios(),
+          "a window whose neighbour is at its minimum does not grow, and saves nothing");
+
+    // Drags follow the same rule: the dragged divider stops where the accepted
+    // layout runs out of room, so no other divider moves to make it fit.
+    std::vector<RECT> deepRects;
+    check(Layout::BuildWorkspaceLayoutPlan(deep, wide, wideGap, &deepRects) == Layout::LayoutPlanStatus::Success,
+          "plan before dragging");
+    MoveSizeGesture drag;
+    drag.intent = MoveSizeIntent::Resize;
+    drag.hasRects = true;
+    drag.start = drag.end = deepRects[2];
+    drag.end.right += 200;  // Notepad into LocalSend, which is at its minimum.
+    Workspace intoMinimum = deep;
+    check(!intoMinimum.LearnDwindleResize(wide, wideGap, 2, drag) && intoMinimum.DwindleRatios() == deep.DwindleRatios(),
+          "a drag into a neighbour at its minimum changes nothing");
+    drag.start = drag.end = deepRects[3];
+    drag.end.left -= 300;  // LocalSend into Notepad, which has 136 px to spare.
+    Workspace partial = deep;
+    check(partial.LearnDwindleResize(wide, wideGap, 3, drag) && width(partial, 0) == width(deep, 0) &&
+              width(partial, 1) == width(deep, 1) && std::abs(width(partial, 3) - (width(deep, 3) + 136)) <= 1,
+          "a drag stops where the neighbour reaches its minimum; no other divider moves");
     // A squeezed window: adaptive fitting holds the first window below its
     // saved half. Like a drag, a step saves the size it shows, so that size is
     // what remains once the squeeze ends.
@@ -450,9 +477,10 @@ static void RunWindowSizeStepTests() {
       for (const RECT& rect : rects) result.push_back(Layout::RectWidth(rect));
       return result;
     };
-    for (int i = 0; i < 3; ++i) check(pushed.StepTiledSize(wide, wideGap, 2, true, kStep), "grow the deep window");
+    // Grow the deep Explorer until Notepad, beside it, is at its minimum.
+    check(pushed.StepTiledSize(wide, wideGap, 2, true, kStep), "grow the deep window");
+    check(!pushed.StepTiledSize(wide, wideGap, 2, true, kStep), "the deep window stops at Notepad's minimum");
     const double deepRatio = pushed.DwindleRatios()[2];
-    const Workspace beforePush = pushed;
     LONG previous = widths(pushed)[0];
     int grown = 0;
     while (grown < 20 && pushed.StepTiledSize(wide, wideGap, 0, true, kStep)) {
@@ -493,8 +521,10 @@ static void RunWindowSizeStepTests() {
           "the reset window keeps its default size while the divider springs back");
 
     // A divider the user steps or drags itself, or whose window leaves the slot,
-    // stays where it is.
+    // stays where it is. Fully pushed, both windows beside the deep divider are
+    // at their minimums, so one shrink of the first window frees room to step it.
     Workspace kept = fullyPushed;
+    check(kept.StepTiledSize(wide, wideGap, 0, false, kStep), "free room beside the pushed divider");
     check(kept.StepTiledSize(wide, wideGap, 3, true, kStep), "step the pushed divider's last window");
     const double keptRatio = kept.DwindleRatios()[2];
     check(kept.StepTiledSize(wide, wideGap, 0, false, kStep) && kept.DwindleRatios()[2] == keptRatio,
@@ -504,7 +534,6 @@ static void RunWindowSizeStepTests() {
     check(swapped.SwapTiled(swapped.TiledWindows()[1], swapped.TiledWindows()[2]), "swap the pushed slot's window");
     check(swapped.StepTiledSize(wide, wideGap, 0, false, kStep) && swapped.DwindleRatios()[2] == pushedRatios[2],
           "a push lapses once its window leaves the slot");
-    (void)beforePush;
     g_settings = SettingsState{};
   }
 

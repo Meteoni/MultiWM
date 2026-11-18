@@ -49,14 +49,13 @@ static bool SetPreference(double& preference, double value) {
 // span reaches `target` (`grow`: at least it; otherwise at most it). `spanAt`
 // plans with a candidate value and has no value where no layout fits.
 //
-// The span is not monotone in the value: minimums make only part of the way
-// feasible, and fitting can hold a window back at some values but not others
-// (pushing deeper Dwindle dividers works until nothing fits, where adaptive
-// fitting snaps the window back). So the way is scanned in order and the first
-// sample that reaches the target is refined by bisection. If none does, the
-// result is the smallest move that gets as close as any sample, so a plateau
-// past it is never saved as a preference. Interpolates geometrically for
-// weights, linearly for ratios. No value when no sample fits.
+// The span need not be monotone in the value: minimums make only part of the
+// way feasible, and a constrained allocation can hold a window at its minimum
+// over a range of values. So the way is scanned in order and the first sample
+// that reaches the target is refined by bisection. If none does, the result is
+// the smallest move that gets as close as any sample, so a plateau past it is
+// never saved as a preference. Interpolates geometrically for weights, linearly
+// for ratios. No value when no sample fits.
 static std::optional<double> SolvePreference(
     double current, double end, bool geometric, bool grow, LONG target,
     const std::function<std::optional<LONG>(double)>& spanAt) {
@@ -150,23 +149,42 @@ static std::optional<std::pair<double, double>> DwindleSplitRoom(
   return std::pair{lowest, highest};
 }
 
-// The first split whose divider stays where its preference puts it: adaptive
-// splits before it are fitted by the planner, which never saves the result.
-static size_t FirstFixedDwindleSplit() {
-  return Layout::AutomaticDwindleAdaptationEnabled() ? g_settings.adaptiveDwindleSlots : 0;
-}
-
-// Moves the fixed Dwindle dividers after `split` only as far as their windows'
+// Moves the Dwindle dividers after `split` only as far as their windows'
 // minimums require, top-down, so a window that grows pushes deeper dividers
-// instead of stopping at their saved positions.
+// instead of stopping at their saved positions. Growing along one axis takes
+// room only along that axis, so only dividers on it are pushed: axes alternate
+// by depth, so those are every second split after `split`.
 static void FitDeeperDwindleRatios(
     std::vector<double>& ratios, size_t split, const std::vector<WindowConstraints>& constraints,
     const std::vector<SIZE>& flexible, const RECT& workArea, LONG gap) {
-  for (size_t k = std::max(split + 1, FirstFixedDwindleSplit()); k + 1 < constraints.size(); ++k) {
+  for (size_t k = split + 1; k + 1 < constraints.size(); ++k) {
+    if ((k - split) % 2 != 0) continue;
     const auto room = DwindleSplitRoom(ratios, k, constraints, flexible, workArea, gap);
     if (!room) continue;  // Nothing fits; the planner decides.
     ratios[k] = std::clamp(Layout::ClampSplitRatio(ratios[k]), room->first, room->second);
   }
+}
+
+// Accepts the Dwindle layout as shown: every divider that adaptive fitting
+// holds away from its saved ratio is saved where it is shown, so the saved
+// ratios alone reproduce what is on screen. Does nothing for other layouts.
+// True when a ratio changed.
+bool Workspace::AcceptShownDwindleLayout(const RECT& workArea, LONG gap) {
+  if (layout_ != TileLayout::Dwindle || windows_.size() < 2) return false;
+  std::vector<RECT> rects;
+  std::vector<Layout::DwindleSplit> splits;
+  if (!PlanDwindleCells(*this, workArea, gap, &rects, &splits)) return false;
+  bool changed = false;
+  for (size_t k = 0; k < splits.size() && k < dwindleRatios_.size(); ++k) {
+    const Layout::DwindleSplit& split = splits[k];
+    if (split.usableSpan < 2 ||
+        Layout::SplitLeadingSpan(split.usableSpan, Layout::ClampSplitRatio(dwindleRatios_[k])) == split.firstSpan) {
+      continue;
+    }
+    dwindleRatios_[k] = static_cast<double>(split.firstSpan) / static_cast<double>(split.usableSpan);
+    changed = true;
+  }
+  return changed;
 }
 
 bool Workspace::IsDwindlePushCurrent(const DwindlePush& push) const {
@@ -198,67 +216,58 @@ void Workspace::KeepDwindleDivider(size_t split) {
 }
 
 // Lets dividers after split `afterSplit` that a step pushed move back toward
-// their earlier ratios, top-down, as far as the layout still plans and the
-// window at `keepIndex` (the one the user is acting on) keeps its rectangle.
-// A divider that gets all the way back is forgotten. True when a ratio changed.
-bool Workspace::RelaxDwindlePushes(const RECT& workArea, LONG gap, size_t afterSplit, size_t keepIndex) {
+// their earlier ratios, top-down, as far as the saved layout still fits and
+// the window at `keepIndex` (the one the user is acting on) keeps its
+// rectangle. A divider that gets all the way back is forgotten.
+void Workspace::RelaxDwindlePushes(const RECT& workArea, LONG gap, size_t afterSplit, size_t keepIndex) {
   std::erase_if(dwindlePushes_, [&](const DwindlePush& push) { return !IsDwindlePushCurrent(push); });
-  if (dwindlePushes_.empty() || keepIndex >= windows_.size()) return false;
+  if (dwindlePushes_.empty() || keepIndex >= windows_.size()) return;
   std::sort(dwindlePushes_.begin(), dwindlePushes_.end(),
             [](const DwindlePush& a, const DwindlePush& b) { return a.split < b.split; });
   std::vector<RECT> rects;
-  if (Layout::BuildWorkspaceLayoutPlan(*this, workArea, gap, &rects) != Layout::LayoutPlanStatus::Success) {
-    return false;
-  }
+  if (!PlanSavedDwindleCells(*this, workArea, gap, &rects)) return;
   const RECT kept = rects[keepIndex];
-  auto acceptable = [&] {
+  auto keepsWindow = [&] {
     std::vector<RECT> planned;
-    return Layout::BuildWorkspaceLayoutPlan(*this, workArea, gap, &planned) == Layout::LayoutPlanStatus::Success &&
-           EqualRect(&planned[keepIndex], &kept);
+    return PlanSavedDwindleCells(*this, workArea, gap, &planned) && EqualRect(&planned[keepIndex], &kept);
   };
 
-  bool changed = false;
   std::vector<size_t> restored;
   for (const DwindlePush& push : dwindlePushes_) {
     if (push.split <= afterSplit) continue;
     double& ratio = dwindleRatios_[push.split];
-    const double from = ratio;
-    ratio = push.ratio;
-    if (acceptable()) {
-      restored.push_back(push.split);
-    } else {
-      double low = 0.0;  // Fractions of the way back; `from` is acceptable.
-      double high = 1.0;
-      for (int i = 0; i < 24; ++i) {
-        const double middle = (low + high) / 2.0;
-        ratio = from + (push.ratio - from) * middle;
-        if (acceptable()) {
-          low = middle;
-        } else {
-          high = middle;
-        }
-      }
-      ratio = from + (push.ratio - from) * low;
-    }
-    changed |= std::abs(ratio - from) > 1e-9;
+    MoveRatioToward(ratio, push.ratio, keepsWindow);
+    if (std::abs(ratio - push.ratio) <= 1e-9) restored.push_back(push.split);
   }
   for (size_t split : restored) KeepDwindleDivider(split);
-  return changed;
 }
 
 bool Workspace::StepTiledSize(
     const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::StepTiledSize");
   EnsureWeights();
+  // A Dwindle step works on the layout as shown. A step that changes nothing
+  // puts back what accepting it changed.
+  DwindleState before = SaveDwindleState();
+  AcceptShownDwindleLayout(workArea, gap);
+  if (ApplyTiledStep(workArea, gap, index, grow, stepPercent)) return true;
+  RestoreDwindleState(std::move(before));
+  return false;
+}
+
+// The step itself (see StepTiledSize). Changes nothing when it returns false.
+bool Workspace::ApplyTiledStep(
+    const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent) {
   const size_t count = windows_.size();
   if (count < 2 || index >= count || stepPercent <= 0) return false;
 
   // Visible cells of `workspace`, which has this layout and these windows.
+  // Dwindle has no adaptive fitting here: its saved ratios are the layout.
   auto plan = [&](const Workspace& workspace, std::vector<RECT>* rects,
                   std::vector<Layout::DwindleSplit>* splits) {
     if (IsGridLayout(layout_)) return PlanGridCells(workspace, workArea, gap, rects);
     if (IsMasterStackLayout(layout_)) return PlanMasterStackCells(workspace, workArea, gap, rects);
-    if (layout_ == TileLayout::Dwindle) return PlanDwindleCells(workspace, workArea, gap, rects, splits);
+    if (layout_ == TileLayout::Dwindle) return PlanSavedDwindleCells(workspace, workArea, gap, rects, splits);
     return false;
   };
   std::vector<RECT> rects;
@@ -331,11 +340,9 @@ bool Workspace::StepTiledSize(
     if (split.usableSpan < 2) return false;
     axis = split.axis;
     minimum = StepMinimum(constraints[index], axis);
-    // Adaptive splits can widen this split's region when its other side needs
-    // room, so its current size is no limit; the solver finds the real one.
-    maximum = SpanAlong(workArea, axis);
-    visibleStart = Layout::ClampSplitRatio(
-        static_cast<double>(split.firstSpan) / static_cast<double>(split.usableSpan));
+    // The other side may give way by pushing its own dividers, so the split's
+    // whole span is the bound; the solver finds how far the layout still fits.
+    maximum = split.usableSpan;
     preference = [splitIndex](Workspace& w) -> double& { return w.dwindleRatios_[splitIndex]; };
     // Only growing a first side squeezes the windows after it.
     if (increasing && grow) {
@@ -412,13 +419,40 @@ bool Workspace::ResetTiledSize(const RECT& workArea, LONG gap, size_t index, dou
       changed = mean && SetPreference(stackWeights_[index - 1], *mean);
     }
   } else if (layout_ == TileLayout::Dwindle) {
-    const size_t split = std::min(index, count - 2);
-    changed = SetPreference(dwindleRatios_[split], 0.5);
-    KeepDwindleDivider(split);
-    changed |= RelaxDwindlePushes(workArea, gap, split, index);
+    changed = ResetDwindleSplit(workArea, gap, index);
   }
 
   if (changed) DebugValidateMutation(L"Workspace::ResetTiledSize");
+  return changed;
+}
+
+// Resets the Dwindle split that sizes the window at `index`. Like a step, it
+// works on the layout as shown: the divider moves toward an even split only as
+// far as that layout has room, so no other divider moves, and dividers it had
+// pushed may spring back. Changes nothing when it returns false.
+bool Workspace::ResetDwindleSplit(const RECT& workArea, LONG gap, size_t index) {
+  DwindleState before = SaveDwindleState();
+  AcceptShownDwindleLayout(workArea, gap);
+  std::vector<RECT> shown;
+  if (!PlanSavedDwindleCells(*this, workArea, gap, &shown)) {
+    RestoreDwindleState(std::move(before));
+    return false;
+  }
+  auto fits = [&] {
+    std::vector<RECT> rects;
+    return PlanSavedDwindleCells(*this, workArea, gap, &rects);
+  };
+  const size_t split = std::min(index, windows_.size() - 2);
+  MoveRatioToward(dwindleRatios_[split], 0.5, fits);
+  KeepDwindleDivider(split);
+  RelaxDwindlePushes(workArea, gap, split, index);
+
+  // Changed means something on screen moved, not a sub-pixel ratio change.
+  std::vector<RECT> reset;
+  const bool changed = PlanSavedDwindleCells(*this, workArea, gap, &reset) &&
+                       !std::equal(shown.begin(), shown.end(), reset.begin(), reset.end(),
+                                   [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; });
+  if (!changed) RestoreDwindleState(std::move(before));
   return changed;
 }
 

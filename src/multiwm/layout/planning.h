@@ -107,7 +107,9 @@ static AdaptiveDwindleRatioEnvelope GetAdaptiveDwindleRatioEnvelope() {
 // configured leading splits may adapt; deeper ratios and window order stay fixed.
 // A feasible manual ratio outside the automatic envelope remains unchanged.
 // Never write fitted ratios back to the workspace: removing a constraint should
-// let the divider return to its preferred position.
+// let the divider return to its preferred position. Only a user resize (a drag
+// or a window-size command) saves fitted ratios, by accepting the layout as
+// shown (Workspace::AcceptShownDwindleLayout, layout/resize_steps.h).
 static bool BuildAdaptiveDwindleLayout(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     std::vector<RECT>* outRects,

@@ -203,7 +203,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     $name: Adaptive Dwindle Slots
     #! $min: 0
     #! $max: 64
-    $description: How many splits can temporarily adjust to fit windows (0-64). Splits return when the extra space is no longer needed. Manually resizing a divider saves its new position. 0 keeps all splits fixed.
+    $description: How many splits can temporarily adjust to fit windows (0-64). Splits return when the extra space is no longer needed, unless you resize a window first; resizing keeps the layout as shown. 0 keeps all splits fixed.
   - AdaptiveDwindlePercentage: 15
     $name: Adaptive Dwindle Percentage
     #! $min: 0

@@ -426,7 +426,10 @@ class Workspace {
   // Each compares the gesture's before/after frame of the window at
   // `resizedIndex` with the planned layout and updates the matching weights or
   // ratios. Returns true when a preference changed. `workArea` and `gap` are
-  // physical pixels. Call the variant that matches Layout().
+  // physical pixels. Call the variant that matches Layout(). A Dwindle drag
+  // that changes a divider also accepts the shown layout, as the size commands
+  // below do: every other divider is saved where adaptive fitting shows it,
+  // and the dragged one stops where that layout runs out of room.
 
   bool LearnMasterStackResize(
       const RECT& workArea, LONG gap, size_t resizedIndex,
@@ -449,16 +452,20 @@ class Workspace {
   // along the axis it shares with its neighbours, starting from its visible
   // size and stopping at cached native minimums. False when nothing changes.
   //
-  // Dwindle exception: a growing window may push fixed dividers after its own
-  // split as far as their windows' minimums require. Each pushed divider
-  // remembers its earlier ratio and springs back toward it when a shrink or
-  // reset frees room before it. Dragging or stepping that divider itself keeps
-  // its current position instead.
+  // Dwindle: acting on the layout accepts it as shown. Every divider is saved
+  // where adaptive fitting currently shows it, and the step is checked against
+  // that layout, so no other divider moves, except that a growing window may
+  // push later dividers on its axis as far as their windows' minimums require.
+  // Each pushed divider remembers its earlier ratio and springs back toward it
+  // when a shrink or reset frees room before it. Dragging or stepping that
+  // divider itself keeps its current position instead.
   bool StepTiledSize(
       const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent);
   // Returns the window's preference to the layout default: the mean of its
   // peers' weights, `defaultMasterRatio`, or an even Dwindle split (which also
-  // lets dividers it pushed spring back). `workArea` and `gap` are physical.
+  // lets dividers it pushed spring back). A Dwindle reset accepts the shown
+  // layout first and stops short of even where that layout has no room.
+  // `workArea` and `gap` are physical.
   bool ResetTiledSize(const RECT& workArea, LONG gap, size_t index, double defaultMasterRatio);
 
   // --- Construction and checks -----------------------------------------------
@@ -508,9 +515,23 @@ class Workspace {
     double ratio = 0.5;
   };
   bool IsDwindlePushCurrent(const DwindlePush& push) const;
+  // Saved Dwindle ratios and pushes, so a resize that ends up changing nothing
+  // can put back what accepting the shown layout changed.
+  struct DwindleState {
+    std::vector<double> ratios;
+    std::vector<DwindlePush> pushes;
+  };
+  DwindleState SaveDwindleState() const { return {dwindleRatios_, dwindlePushes_}; }
+  void RestoreDwindleState(DwindleState state) {
+    dwindleRatios_ = std::move(state.ratios);
+    dwindlePushes_ = std::move(state.pushes);
+  }
+  bool AcceptShownDwindleLayout(const RECT& workArea, LONG gap);
+  bool ApplyTiledStep(const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent);
+  bool ResetDwindleSplit(const RECT& workArea, LONG gap, size_t index);
   void RecordDwindlePushes(const std::vector<double>& before, size_t ownSplit);
   void KeepDwindleDivider(size_t split);
-  bool RelaxDwindlePushes(const RECT& workArea, LONG gap, size_t afterSplit, size_t keepIndex);
+  void RelaxDwindlePushes(const RECT& workArea, LONG gap, size_t afterSplit, size_t keepIndex);
 
   TileLayout layout_ = TileLayout::MasterStack;
   std::vector<HWND> windows_;
