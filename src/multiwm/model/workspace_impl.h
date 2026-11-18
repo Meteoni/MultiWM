@@ -1101,6 +1101,7 @@ void Workspace::CopyLayoutGeometryFrom(const Workspace& source) {
   rememberedGridWeights_ = source.rememberedGridWeights_;
   rememberedDwindleOrder_ = source.rememberedDwindleOrder_;
   rememberedDwindleRatios_ = source.rememberedDwindleRatios_;
+  dwindlePushes_ = source.dwindlePushes_;
 }
 
 bool Workspace::RestoreLayoutStateFrom(const Workspace& source) {

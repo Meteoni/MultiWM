@@ -89,7 +89,7 @@ These practices draw on the [C++ Core Guidelines](https://isocpp.github.io/CppCo
 | Suspended window | A retained member temporarily absent from the active layout, with its slot saved. | A maximized tiled editor returns to its saved slot when restored. |
 | Preferred geometry | Durable user intent, expressed by ratios or weights. | A divider prefers 50% even while a large minimum temporarily requires 65%. |
 | Observed geometry | The native window frame sampled from Windows. | An application reports a 700-pixel frame after a 650-pixel placement request. |
-| Conformance lease | A bounded period for a window to settle on its assigned tile. | A snap-back can trigger a repair; expiry checks the current tile before floating a persistently displaced window. |
+| Conformance lease | A bounded period for a window to settle on its assigned tile, or, in the Floating layout, on the frame MultiWM just gave it. | A snap-back can trigger a repair; expiry checks the current tile before floating a persistently displaced window. A floating lease's expiry instead keeps the app's frame. |
 
 ## Verification and review tools
 

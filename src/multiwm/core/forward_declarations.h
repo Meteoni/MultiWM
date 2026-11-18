@@ -14,9 +14,13 @@ enum class FloatingPlacementIntent {
   PreserveAnchor,          // Keep the window centered on `anchor` (where the user dropped it).
   CenterWithFloatingSize,  // Center on the workspace at the remembered/default floating size.
   NewWindowCenter,         // Center at the size a new floating window gets (rules apply).
-  CenterPreservingSize,    // Center without resizing; does nothing if the frame is unknown.
+  RuleFloatedCenter,       // A window a floating rule admitted: centered at its own size, or
+                           // at the size its override_size rule names (Automatic mode).
+                           // Does nothing if the frame is unknown.
   FailureCenter,           // Fallback after a failed tile: like NewWindowCenter, but rules
                            // that preserve the app's size are ignored.
+  ResetSizeKeepingCenter,  // The size a new floating window gets (rules apply), around
+                           // the window's current center.
 };
 struct FloatingPlacementHint {
   FloatingPlacementIntent intent = FloatingPlacementIntent::PassiveRestore;
@@ -27,8 +31,10 @@ static void ArrangeWorkspace(const DesktopMonitorKey& key, HWND preferredTiledWi
 // Defined in placement/conformance.h.
 static void BeginConformanceLease(
     HWND hwnd, const RECT& expectedRect, bool scheduleRepair = false,
-    HWND preferredTiledWindow = nullptr);
+    HWND preferredTiledWindow = nullptr,
+    ConformanceLeaseKind kind = ConformanceLeaseKind::Tiled);
 static bool CancelConformanceLease(HWND hwnd, uint64_t generation = 0);
+static bool CancelTiledConformanceLease(HWND hwnd);
 static bool ClearSettledInsertionPlacements(const DesktopMonitorKey& key, Workspace& workspace);
 static bool HasOutstandingConformanceLease(const Workspace& workspace);
 }  // namespace Placement

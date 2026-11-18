@@ -224,6 +224,135 @@ void FloatFocusedWindow() {
   Diagnostics::RecordEvent(L"Float Focused hwnd=%p", tiled);
 }
 
+// The window a size command acts on, or nullptr. A focused per-window floating
+// window (floated by a rule, Alt+F or a drag) is the target itself, never its
+// owner's tile. Otherwise the focused window resolves to the tiled window it
+// belongs to: itself or an owner.
+static HWND ResolveSizeCommandTarget(const Workspace& workspace, HWND focused) {
+  const WindowRecord* record = workspace.Find(focused);
+  if (record && record->state == ManageState::Floating) return focused;
+  return Platform::Windows::ResolveToTiledWindow(focused, workspace.TiledWindows());
+}
+
+// The window a size command acts on, with a copy of its workspace. `floating`
+// when it is sized as a floating window: a per-window floating record, or a
+// member of the Floating layout.
+struct FocusedMember {
+  DesktopMonitorKey key{};
+  HMONITOR monitor = nullptr;
+  Workspace workspace;
+  HWND hwnd = nullptr;
+  bool floating = false;
+};
+
+static std::optional<FocusedMember> LoadFocusedMember() {
+  HWND fg = GetForegroundWindow();
+  if (!fg) return std::nullopt;
+  FocusedMember focused;
+  focused.monitor = Platform::Windows::GetWindowPhysicalMonitor(fg);
+  GUID desktopId{};
+  if (!focused.monitor || !Platform::VirtualDesktop::GetWindowDesktopIdSafe(fg, &desktopId) ||
+      !DesktopMonitorKey::FromHMonitor(desktopId, focused.monitor, &focused.key) ||
+      !g_workspaces.Load(focused.key, &focused.workspace)) {
+    return std::nullopt;
+  }
+  focused.hwnd = ResolveSizeCommandTarget(focused.workspace, fg);
+  if (!focused.hwnd) return std::nullopt;
+  const WindowRecord* record = focused.workspace.Find(focused.hwnd);
+  focused.floating = focused.workspace.Layout() == TileLayout::Floating ||
+                     (record && record->state == ManageState::Floating);
+  return focused;
+}
+
+// Commits a tiled window-size change like a resize drag: validated against
+// cached minimums, kept for rollback, then arranged with the window preferred.
+static void CommitWindowSizeChange(FocusedMember& focused, Workspace candidate, const wchar_t* action) {
+  if (!ValidateUserLayoutMutation(
+          focused.key, focused.monitor, candidate, focused.hwnd,
+          Placement::UserLayoutMutationKind::Resize, action)) {
+    return;
+  }
+  Placement::RememberPendingLayoutMutation(
+      focused.key, focused.workspace, candidate, focused.hwnd,
+      Placement::UserLayoutMutationKind::Resize, action);
+  g_workspaces.Save(focused.key, candidate);
+  Placement::ArrangeWorkspace(focused.key, focused.hwnd);
+  Diagnostics::RecordEvent(L"%ls hwnd=%p", action, focused.hwnd);
+}
+
+// Grows or shrinks the focused window by one step (hotkeys.WindowSize).
+void StepFocusedWindowSize(bool grow) {
+  if (grow) {
+    ++Diagnostics::g_runtime.counters.growWindowCommands;
+  } else {
+    ++Diagnostics::g_runtime.counters.shrinkWindowCommands;
+  }
+  auto focused = LoadFocusedMember();
+  if (!focused) return;
+  const wchar_t* action = grow ? L"Grow window" : L"Shrink window";
+  // A press that can't move the window says why, rather than doing nothing
+  // silently. Rejections by the layout check report their own message.
+  auto reportNoRoom = [&] {
+    TrayUi::ShowCommandFailureFlyout(grow ? L"No room to grow" : L"Already at its smallest size",
+                                     focused->monitor);
+  };
+
+  if (focused->floating) {
+    const WindowRecord* record = focused->workspace.Find(focused->hwnd);
+    if (record && !record->canResize) {
+      TrayUi::ShowCommandFailureFlyout(L"This window can't be resized", focused->monitor);
+    } else if (Placement::StepFloatingWindowSize(focused->key, focused->workspace, focused->hwnd, grow ? 1 : -1)) {
+      g_workspaces.Save(focused->key, focused->workspace);
+      Diagnostics::RecordEvent(L"%ls floating hwnd=%p", action, focused->hwnd);
+    } else {
+      reportNoRoom();
+    }
+    return;
+  }
+  if (focused->workspace.Layout() == TileLayout::Monocle) return;  // Nothing to size.
+
+  Platform::Monitors::WorkspaceMetrics metrics;
+  if (!Platform::Monitors::GetWorkspaceMetrics(focused->monitor, &metrics)) return;
+  Workspace candidate = focused->workspace;
+  if (!candidate.StepTiledSize(
+          metrics.workArea, metrics.gap, candidate.TiledIndex(focused->hwnd), grow,
+          g_settings.resizeStepPercent)) {
+    reportNoRoom();
+    return;
+  }
+  CommitWindowSizeChange(*focused, std::move(candidate), action);
+}
+
+// Returns the focused window to its default size without moving it to another
+// position: the layout default when tiled. A floating window gets the size a
+// new floating window gets (its override-size rule's, else the default floating
+// size) around its current center; a preserve-size rule keeps its size.
+void ResetFocusedWindowSize() {
+  ++Diagnostics::g_runtime.counters.resetWindowSizeCommands;
+  auto focused = LoadFocusedMember();
+  if (!focused) return;
+
+  if (focused->floating) {
+    Placement::FloatingPlacementHint hint;
+    hint.intent = Placement::FloatingPlacementIntent::ResetSizeKeepingCenter;
+    if (Placement::RepairFloatingGeometry(focused->key, focused->workspace, focused->hwnd, hint)) {
+      g_workspaces.Save(focused->key, focused->workspace);
+      Diagnostics::RecordEvent(L"Reset window size floating hwnd=%p", focused->hwnd);
+    }
+    return;
+  }
+
+  Platform::Monitors::WorkspaceMetrics metrics;
+  if (!Platform::Monitors::GetWorkspaceMetrics(focused->monitor, &metrics)) return;
+  Workspace candidate = focused->workspace;
+  if (!candidate.ResetTiledSize(
+          metrics.workArea, metrics.gap, candidate.TiledIndex(focused->hwnd),
+          g_settings.masterPercent / 100.0)) {
+    return;
+  }
+  CommitWindowSizeChange(*focused, std::move(candidate), L"Reset window size");
+}
+
 // Manual tile: reconcile membership and explicitly adopt the user's current
 // geometry. Automatic events never call this with adoptCurrentGeometry=true.
 void TileWindows(HMONITOR monitor = nullptr) {
@@ -268,6 +397,10 @@ static bool CommitWorkspaceLayoutChange(
   if (previousLayout != TileLayout::Floating &&
       workspace.Layout() == TileLayout::Floating) {
     Placement::RestoreWorkspaceFloatingGeometry(key, workspace);
+  } else if (previousLayout == TileLayout::Floating &&
+             workspace.Layout() != TileLayout::Floating) {
+    // Floating leases end with the layout; tiling places every window afresh.
+    for (HWND hwnd : workspace.TiledWindows()) Placement::CancelConformanceLease(hwnd);
   }
   g_workspaces.Save(key, workspace);
   Placement::ArrangeWorkspace(key);

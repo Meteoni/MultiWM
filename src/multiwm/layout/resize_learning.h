@@ -10,6 +10,76 @@ static bool IsMeaningfulResizeDelta(LONG delta) {
   return std::abs(delta) > kResizeEdgeDeltaTolerance;
 }
 
+// --- Visible cells -------------------------------------------------------------
+//
+// The cells a layout renders before capped windows are centred inside them: the
+// preferred allocation, or the constrained one when native minimums displace
+// it. Resizes start from these, so a step or drag begins where the user sees the
+// divider. `outWeightPerPixel` (optional) receives the constrained allocation's
+// weight scale, or 0 when the preferred allocation fits. Weights must already be
+// sized for the active windows.
+
+static bool PlanGridCells(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    std::vector<RECT>* outRects, double* outWeightPerPixel = nullptr) {
+  const Layout::Axis axis = Layout::LayoutAxis(workspace.Layout());
+  const std::vector<WindowConstraints> constraints = Layout::ActiveWindowConstraints(workspace);
+  if (outWeightPerPixel) *outWeightPerPixel = 0.0;
+  Layout::LayoutGridWeighted(
+      workArea, gap, workspace.ActiveCount(), *outRects, axis, workspace.GridWeights());
+  if (!Layout::RectsSatisfyWindowConstraints(*outRects, constraints)) {
+    std::vector<RECT> constrainedRects;
+    double weightPerPixel = 0.0;
+    if (Layout::LayoutGridConstrained(
+            workArea, gap, workspace.GridWeights(), constraints,
+            axis, &constrainedRects, &weightPerPixel)) {
+      *outRects = std::move(constrainedRects);
+      if (outWeightPerPixel) *outWeightPerPixel = weightPerPixel;
+    }
+  }
+  return outRects->size() == workspace.ActiveCount();
+}
+
+static bool PlanMasterStackCells(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    std::vector<RECT>* outRects, double* outWeightPerPixel = nullptr) {
+  const Layout::Axis axis = Layout::LayoutAxis(workspace.Layout());
+  const double masterRatio = Layout::ClampSplitRatio(workspace.MasterRatio());
+  const std::vector<WindowConstraints> constraints = Layout::ActiveWindowConstraints(workspace);
+  if (outWeightPerPixel) *outWeightPerPixel = 0.0;
+  Layout::LayoutMasterStackWeighted(
+      workArea, gap, workspace.ActiveCount(), *outRects, axis,
+      masterRatio, workspace.StackWeights());
+  if (!Layout::RectsSatisfyWindowConstraints(*outRects, constraints)) {
+    std::vector<RECT> constrainedRects;
+    double weightPerPixel = 0.0;
+    if (Layout::LayoutMasterStackConstrained(
+            workArea, gap, axis, masterRatio, workspace.StackWeights(),
+            constraints, &constrainedRects, &weightPerPixel)) {
+      *outRects = std::move(constrainedRects);
+      if (outWeightPerPixel) *outWeightPerPixel = weightPerPixel;
+    }
+  }
+  return outRects->size() == workspace.ActiveCount();
+}
+
+static bool PlanDwindleCells(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    std::vector<RECT>* outRects, std::vector<Layout::DwindleSplit>* outSplits) {
+  const size_t count = workspace.ActiveCount();
+  outRects->assign(count, RECT{});
+  outSplits->clear();
+  Layout::LayoutDwindle(
+      workArea, gap, 0, count, workspace.DwindleRatios(),
+      g_settings.reverseDwindle, *outRects, outSplits);
+  if (!Layout::RectsSatisfyWindowConstraints(
+          *outRects, Layout::ActiveWindowConstraints(workspace)) &&
+      !Layout::BuildAdaptiveDwindleLayout(workspace, workArea, gap, outRects, outSplits)) {
+    return false;
+  }
+  return count >= 2 && outSplits->size() + 1 == count;
+}
+
 // Transfer a drag between the adjacent spans from the rendered layout. When
 // minimums displaced the divider, use the constrained allocation's weight scale
 // to remember the new visible spans without changing unrelated preferences.
@@ -78,19 +148,9 @@ bool Workspace::LearnMasterStackResize(
 
   double constrainedWeightPerPixel = 0.0;
   std::vector<RECT> expectedRects;
-  Layout::LayoutMasterStackWeighted(
-      workArea, gap, windows_.size(), expectedRects, axis,
-      Layout::ClampSplitRatio(masterRatio_), stackWeights_);
-  if (!Layout::RectsSatisfyWindowConstraints(expectedRects, constraints)) {
-    std::vector<RECT> constrainedRects;
-    if (Layout::LayoutMasterStackConstrained(
-            workArea, gap, axis,
-            Layout::ClampSplitRatio(masterRatio_), stackWeights_,
-            constraints, &constrainedRects, &constrainedWeightPerPixel)) {
-      expectedRects = std::move(constrainedRects);
-    }
+  if (!PlanMasterStackCells(*this, workArea, gap, &expectedRects, &constrainedWeightPerPixel)) {
+    return false;
   }
-  if (expectedRects.size() != windows_.size()) return false;
 
   bool changed = false;
 
@@ -162,18 +222,9 @@ bool Workspace::LearnGridResize(
 
   double constrainedWeightPerPixel = 0.0;
   std::vector<RECT> expectedRects;
-  Layout::LayoutGridWeighted(
-      workArea, gap, windows_.size(), expectedRects,
-      axis, gridWeights_);
-  if (!Layout::RectsSatisfyWindowConstraints(expectedRects, constraints)) {
-    std::vector<RECT> constrainedRects;
-    if (Layout::LayoutGridConstrained(
-            workArea, gap, gridWeights_, constraints,
-            axis, &constrainedRects, &constrainedWeightPerPixel)) {
-      expectedRects = std::move(constrainedRects);
-    }
+  if (!PlanGridCells(*this, workArea, gap, &expectedRects, &constrainedWeightPerPixel)) {
+    return false;
   }
-  if (expectedRects.size() != windows_.size()) return false;
 
   bool changed = false;
   const LONG leadingDelta = alongY
@@ -211,18 +262,9 @@ bool Workspace::LearnDwindleResize(
     return false;
   }
 
-  std::vector<RECT> expectedRects(windows_.size());
+  std::vector<RECT> expectedRects;
   std::vector<Layout::DwindleSplit> splits;
-  Layout::LayoutDwindle(
-      workArea, gap, 0, windows_.size(), dwindleRatios_,
-      g_settings.reverseDwindle, expectedRects, &splits);
-  if (!Layout::RectsSatisfyWindowConstraints(
-          expectedRects, Layout::ActiveWindowConstraints(*this)) &&
-      !Layout::BuildAdaptiveDwindleLayout(
-          *this, workArea, gap, &expectedRects, &splits)) {
-    return false;
-  }
-  if (splits.size() + 1 != dwindleRatios_.size()) return false;
+  if (!PlanDwindleCells(*this, workArea, gap, &expectedRects, &splits)) return false;
 
   const RECT& resizedRect = expectedRects[resizedIndex];
   size_t selectedVerticalSplit = static_cast<size_t>(-1);
@@ -291,6 +333,7 @@ bool Workspace::LearnDwindleResize(
     if (std::abs(newRatio - dwindleRatios_[splitIndex]) <= 1e-9) return;
 
     dwindleRatios_[splitIndex] = newRatio;
+    KeepDwindleDivider(splitIndex);  // A dragged divider stays where it was put.
     changed = true;
     Wh_Log(
         L"Dwindle divider updated slot=%zu ratio=%.6f",

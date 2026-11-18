@@ -438,6 +438,29 @@ class Workspace {
       const RECT& workArea, LONG gap, size_t resizedIndex,
       const ::MoveSizeGesture& gesture);
 
+  // --- Window-size commands (defined in layout/resize_steps.h) ---------------
+  //
+  // Both change only the preference that sizes the window at `index`: its grid
+  // or stack weight, the master ratio, or its own Dwindle split. Other windows'
+  // preferences stay as they are, so their temporary minimum-size fitting never
+  // becomes a preference. Monocle and Floating have none; both return false.
+
+  // Grows (`grow`) or shrinks the window by `stepPercent` of the work area's span
+  // along the axis it shares with its neighbours, starting from its visible
+  // size and stopping at cached native minimums. False when nothing changes.
+  //
+  // Dwindle exception: a growing window may push fixed dividers after its own
+  // split as far as their windows' minimums require. Each pushed divider
+  // remembers its earlier ratio and springs back toward it when a shrink or
+  // reset frees room before it. Dragging or stepping that divider itself keeps
+  // its current position instead.
+  bool StepTiledSize(
+      const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent);
+  // Returns the window's preference to the layout default: the mean of its
+  // peers' weights, `defaultMasterRatio`, or an even Dwindle split (which also
+  // lets dividers it pushed spring back). `workArea` and `gap` are physical.
+  bool ResetTiledSize(const RECT& workArea, LONG gap, size_t index, double defaultMasterRatio);
+
   // --- Construction and checks -----------------------------------------------
 
   // Checks the model invariants (core/shared_types.h). Returns true when all
@@ -474,6 +497,20 @@ class Workspace {
   void RememberCurrentLayoutGeometry();
   void RestoreRememberedLayoutGeometry();
   void DebugValidateMutation(const wchar_t* operation) const;
+  // Dwindle dividers a window-size step pushed, with the ratio each had before
+  // (layout/resize_steps.h). Ratios belong to slots, so a push is identified by
+  // its split index and the window that was the split's first side; it lapses
+  // (the push is kept) once that window leaves the slot.
+  struct DwindlePush {
+    size_t split = 0;
+    HWND owner = nullptr;
+    uint64_t ownerGeneration = 0;
+    double ratio = 0.5;
+  };
+  bool IsDwindlePushCurrent(const DwindlePush& push) const;
+  void RecordDwindlePushes(const std::vector<double>& before, size_t ownSplit);
+  void KeepDwindleDivider(size_t split);
+  bool RelaxDwindlePushes(const RECT& workArea, LONG gap, size_t afterSplit, size_t keepIndex);
 
   TileLayout layout_ = TileLayout::MasterStack;
   std::vector<HWND> windows_;
@@ -485,6 +522,7 @@ class Workspace {
   std::vector<double> gridWeights_;
   // User preferences; native minimums adjust rendered geometry only.
   std::vector<double> dwindleRatios_;
+  std::vector<DwindlePush> dwindlePushes_;
 
   // Active slot geometry is remembered per layout family. This makes Monocle
   // and ordinary layout cycling presentation-like with respect to the previous

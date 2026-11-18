@@ -30,14 +30,15 @@ uint64_t PendingProofs::AllocateGeneration() {
 }
 
 bool PendingProofs::BeginLease(
-    HWND hwnd, const RECT& expectedRect, HWND preferredTiledWindow,
-    bool scheduleRepair, ULONGLONG nowMs, const ConformanceLeaseTiming& timing) {
+    HWND hwnd, ConformanceLeaseKind kind, const RECT& expectedRect,
+    HWND preferredTiledWindow, bool scheduleRepair, ULONGLONG nowMs,
+    const ConformanceLeaseTiming& timing) {
   const auto it = leases_.find(hwnd);
 
   // Re-observing the same authoritative target while its lease is still active
   // must not extend the original deadline or replenish any implicit budget.
   if (it != leases_.end() && nowMs < it->second.expiresAtTickMs &&
-      EqualRect(&it->second.expectedRect, &expectedRect)) {
+      it->second.kind == kind && EqualRect(&it->second.expectedRect, &expectedRect)) {
     ConformanceLease& lease = it->second;
     if (preferredTiledWindow) lease.preferredTiledWindow = preferredTiledWindow;
     if (scheduleRepair && !lease.repairDueTickMs) {
@@ -48,6 +49,7 @@ bool PendingProofs::BeginLease(
   }
 
   ConformanceLease lease;
+  lease.kind = kind;
   lease.expectedRect = expectedRect;
   lease.preferredTiledWindow = preferredTiledWindow;
   lease.expiresAtTickMs = nowMs + timing.durationMs;
@@ -226,6 +228,17 @@ static bool CancelConformanceLease(HWND hwnd, uint64_t generation) {
   return g_pendingProofs.CancelLease(hwnd, generation);
 }
 
+// Cancels a tiled lease and leaves a floating one alone. Arranging the Floating
+// layout uses this: that layout has no tiles, but its floating leases outlive it.
+static bool CancelTiledConformanceLease(HWND hwnd) {
+  ConformanceLease lease;
+  if (ReadConformanceLease(hwnd, &lease) == ConformanceLeaseReadResult::Missing ||
+      lease.kind != ConformanceLeaseKind::Tiled) {
+    return false;
+  }
+  return CancelConformanceLease(hwnd, lease.generation);
+}
+
 // Forgets every unproven placement change: leases, pending layout mutations and
 // admission-recovery baselines.
 static void ClearAllConformanceLeases() {
@@ -268,7 +281,7 @@ static bool DeferConformanceLeaseRepair(
 
 static void BeginConformanceLease(
     HWND hwnd, const RECT& expectedRect, bool scheduleRepair,
-    HWND preferredTiledWindow) {
+    HWND preferredTiledWindow, ConformanceLeaseKind kind) {
   RuntimeLifecycle::AssertWmThread(L"BeginConformanceLease");
   if (!hwnd || g_settings.conformanceLeaseMs == 0 ||
       expectedRect.right <= expectedRect.left ||
@@ -279,7 +292,7 @@ static void BeginConformanceLease(
 
   const ConformanceLeaseTiming timing{g_settings.conformanceLeaseMs,
                                       g_settings.conformanceRepairIntervalMs};
-  if (g_pendingProofs.BeginLease(hwnd, expectedRect, preferredTiledWindow,
+  if (g_pendingProofs.BeginLease(hwnd, kind, expectedRect, preferredTiledWindow,
                                  scheduleRepair, GetTickCount64(), timing)) {
     ++Diagnostics::g_runtime.counters.conformanceLeasesStarted;
   }
@@ -301,10 +314,12 @@ static bool RecordConformanceLeaseAttempt(
       hwnd, generation, GetTickCount64(), outAttemptNumber);
 }
 
+// Tiled leases only: a floating lease proves no tile and settles no layout change.
 static bool HasOutstandingConformanceLease(const Workspace& workspace) {
   for (HWND hwnd : workspace.TiledWindows()) {
-    if (ReadConformanceLease(hwnd, nullptr) !=
-        ConformanceLeaseReadResult::Missing) {
+    ConformanceLease lease;
+    if (ReadConformanceLease(hwnd, &lease) != ConformanceLeaseReadResult::Missing &&
+        lease.kind == ConformanceLeaseKind::Tiled) {
       return true;
     }
   }
@@ -694,9 +709,113 @@ static bool ReinforceConformanceTile(
   return true;
 }
 
+// --- Floating leases ---------------------------------------------------------
+//
+// In the Floating layout MultiWM owns a window's frame only right after placing
+// it (RepairFloatingGeometry, the window-size commands). An app that snaps back
+// within the lease is put back; one that answers the placement with its own
+// adjustment keeps it, and at the deadline the window keeps wherever it is. A
+// floating lease never floats a window or rolls back a layout.
+
+// Loads the workspace a floating lease still applies to: the sole owner on the
+// active desktop, in the Floating layout, with the window a member whose
+// remembered frame is still the lease's target. No value means the lease is stale.
+static std::optional<ConformanceWorkspace> LoadFloatingLeaseWorkspace(
+    HWND hwnd, const ConformanceLease& lease) {
+  if (!IsWindow(hwnd) ||
+      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      Platform::Windows::IsWindowCloaked(hwnd)) {
+    return std::nullopt;
+  }
+  auto owner = LoadConformanceWorkspace(hwnd);
+  if (!owner || owner->workspace.Layout() != TileLayout::Floating) return std::nullopt;
+  const WindowRecord* record = owner->workspace.Find(hwnd);
+  if (!record || record->state != ManageState::Tiled || !record->hasFloatingRect ||
+      !Layout::RectsNear(record->floatingRect, lease.expectedRect) ||
+      !ConformanceWindowMatchesRecordIdentity(hwnd, *record)) {
+    return std::nullopt;
+  }
+  return owner;
+}
+
+// The app moved a window inside its floating lease. Put it back at the lease's
+// repair cadence. Returns true when handled; false after cancelling a stale lease.
+static bool HandleFloatingLeaseLocationChange(HWND hwnd, const ConformanceLease& lease) {
+  auto owner = LoadFloatingLeaseWorkspace(hwnd, lease);
+  RECT current{};
+  if (!owner || !Platform::Windows::GetWindowFrameRect(hwnd, &current)) {
+    CancelConformanceLease(hwnd, lease.generation);
+    return false;
+  }
+  if (Layout::RectsNear(current, lease.expectedRect)) return true;
+
+  switch (CheckConformanceRepairTiming(hwnd, lease)) {
+    case ConformanceRepairTiming::Waiting: return true;
+    case ConformanceRepairTiming::DeferFailed: return false;
+    case ConformanceRepairTiming::RepairNow: break;
+  }
+  if (!IsCurrentConformanceLease(hwnd, lease.generation)) return false;
+
+  Workspace& workspace = owner->workspace;
+  const WindowRecord* record = workspace.Find(hwnd);
+  const PlacementObservation placement =
+      Platform::Windows::PlaceWindowChecked(hwnd, record->canMove, lease.expectedRect);
+  unsigned attemptNumber = lease.attempts + 1;
+  const bool leaseRetained =
+      RecordConformanceLeaseAttempt(hwnd, lease.generation, &attemptNumber);
+  const Workspace::PlacementAction action = workspace.ApplyPlacementObservation(hwnd, placement);
+  ++Diagnostics::g_runtime.counters.conformanceLeaseRepairs;
+  Diagnostics::RecordEvent(
+      L"floating lease reinforced hwnd=%p attempt=%u result=%d",
+      hwnd, attemptNumber, static_cast<int>(placement.result));
+
+  if (action == Workspace::PlacementAction::Forget) {
+    CancelConformanceLease(hwnd, lease.generation);
+    workspace.Forget(hwnd);
+  } else if (placement.result == PlacementResult::AdjustedByWindow) {
+    // The app's answer to this placement is its own frame. Keep it.
+    CancelConformanceLease(hwnd, lease.generation);
+    RememberCurrentFloatingGeometry(owner->key, workspace, hwnd);
+  } else if (placement.result == PlacementResult::Refused && leaseRetained) {
+    const ULONGLONG due = std::min(
+        lease.expiresAtTickMs, GetTickCount64() + g_settings.conformanceRepairIntervalMs);
+    DeferConformanceLeaseRepair(hwnd, lease.generation, due);
+  } else if (placement.result != PlacementResult::Success) {
+    CancelConformanceLease(hwnd, lease.generation);  // Access denied or suppressed.
+  }
+  g_workspaces.Save(owner->key, workspace);
+  return true;
+}
+
+// The deadline of a floating lease: a window that left its frame keeps where the
+// app put it, which becomes its remembered floating frame.
+static void FinalizeExpiredFloatingLease(HWND hwnd, const ConformanceLease& lease) {
+  RuntimeLifecycle::AssertWmThread(L"FinalizeExpiredFloatingLease");
+  auto owner = Gestures::IsMoveSizeGestureInProgress(hwnd)
+      ? std::nullopt : LoadFloatingLeaseWorkspace(hwnd, lease);
+  RECT current{};
+  if (!owner || !Platform::Windows::GetWindowFrameRect(hwnd, &current)) {
+    ++Diagnostics::g_runtime.counters.conformanceLeaseExpiredStale;
+    return;
+  }
+  if (Layout::RectsNear(current, lease.expectedRect)) {
+    ++Diagnostics::g_runtime.counters.conformanceLeaseExpiredCompliant;
+    Diagnostics::RecordEvent(
+        L"floating lease completed compliant hwnd=%p attempts=%u", hwnd, lease.attempts);
+    return;
+  }
+  if (RememberCurrentFloatingGeometry(owner->key, owner->workspace, hwnd)) {
+    g_workspaces.Save(owner->key, owner->workspace);
+  }
+  ++Diagnostics::g_runtime.counters.conformanceLeaseExpiredAdopted;
+  Diagnostics::RecordEvent(
+      L"floating lease expired; kept the app's frame hwnd=%p attempts=%u", hwnd, lease.attempts);
+}
+
 // A tracked tiled HWND either confirms its authoritative rectangle or opens/reuses
 // one bounded conformance lease. Native user gestures remain authoritative and
-// are handled separately after MOVESIZEEND.
+// are handled separately after MOVESIZEEND. A window under a floating lease is
+// handled by HandleFloatingLeaseLocationChange instead.
 // Returns true when handled/deferred. False may cancel a stale lease; it does not
 // imply that this routine had no effects. All rectangles are physical screen pixels.
 static bool HandleTiledWindowLocationChange(HWND hwnd) {
@@ -709,6 +828,9 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
     return true;
   }
   const bool hasLease = leaseState == ConformanceLeaseReadResult::Active;
+  if (hasLease && lease.kind == ConformanceLeaseKind::Floating) {
+    return HandleFloatingLeaseLocationChange(hwnd, lease);
+  }
 
   auto observed = ObserveTiledWindowLocation(hwnd);
   if (!observed) {
@@ -743,8 +865,10 @@ static void ProcessConformanceTimer() {
   const DueConformanceWork work = g_pendingProofs.TakeDueLeaseWork(GetTickCount64());
   for (const DueConformanceWork::ExpiredLease& candidate : work.expired) {
     ConformanceLease lease;
-    if (TakeExpiredConformanceLease(
-            candidate.hwnd, candidate.generation, &lease)) {
+    if (!TakeExpiredConformanceLease(candidate.hwnd, candidate.generation, &lease)) continue;
+    if (lease.kind == ConformanceLeaseKind::Floating) {
+      FinalizeExpiredFloatingLease(candidate.hwnd, lease);
+    } else {
       FinalizeExpiredConformanceLease(candidate.hwnd, lease);
     }
   }

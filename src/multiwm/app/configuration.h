@@ -506,11 +506,15 @@ void LoadSettings() {
       {L"hotkeys.DemoteWindowKey", &g_settings.demoteWindowKey},
       {L"hotkeys.ManagementModeToggleKey", &g_settings.managementModeToggleKey},
       {L"hotkeys.FloatFocusedKey", &g_settings.floatFocusedKey},
+      {L"hotkeys.WindowSize.GrowKey", &g_settings.growWindowKey},
+      {L"hotkeys.WindowSize.ShrinkKey", &g_settings.shrinkWindowKey},
+      {L"hotkeys.WindowSize.ResetKey", &g_settings.resetWindowSizeKey},
       {L"hotkeys.DiagnosticDumpKey", &g_settings.diagnosticDumpKey},
   };
   for (const auto& [settingName, destination] : hotkeys) {
     *destination = ReadHotkeySetting<UINT>(settingName, ParseHotkeyKey);
   }
+  g_settings.resizeStepPercent = ReadBoundedIntSetting(L"hotkeys.WindowSize.StepPercent", 1, 50, 5);
 
   auto diagnosticsPath = StringSetting::make(L"diagnostics.DiagnosticsOutputPath");
   g_settings.diagnosticsOutputPath = *diagnosticsPath.get()

@@ -27,6 +27,12 @@ static void RegisterConfiguredHotkeys() {
               g_settings.managementModeToggleKey, L"Management mode");
   registerOne(HK_FLOAT_FOCUSED, g_settings.tilingModifiers,
               g_settings.floatFocusedKey, L"Float focused");
+  registerOne(HK_GROW_WINDOW, g_settings.tilingModifiers,
+              g_settings.growWindowKey, L"Grow window", true);
+  registerOne(HK_SHRINK_WINDOW, g_settings.tilingModifiers,
+              g_settings.shrinkWindowKey, L"Shrink window", true);
+  registerOne(HK_RESET_WINDOW_SIZE, g_settings.tilingModifiers,
+              g_settings.resetWindowSizeKey, L"Reset window size");
   registerOne(HK_LAYOUT, g_settings.tilingModifiers,
               g_settings.layoutKey, L"Layout cycle");
   registerOne(HK_DIAGNOSTIC_DUMP, g_settings.tilingModifiers,
@@ -40,6 +46,9 @@ static void UnregisterConfiguredHotkeys() {
   UnregisterHotKey(nullptr, HK_DEMOTE_WINDOW);
   UnregisterHotKey(nullptr, HK_MANAGEMENT_MODE_TOGGLE);
   UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
+  UnregisterHotKey(nullptr, HK_GROW_WINDOW);
+  UnregisterHotKey(nullptr, HK_SHRINK_WINDOW);
+  UnregisterHotKey(nullptr, HK_RESET_WINDOW_SIZE);
   UnregisterHotKey(nullptr, HK_LAYOUT);
   UnregisterHotKey(nullptr, HK_DIAGNOSTIC_DUMP);
 }
@@ -250,6 +259,15 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
           break;
         case HK_FLOAT_FOCUSED:
           Commands::FloatFocusedWindow();
+          break;
+        case HK_GROW_WINDOW:
+          Commands::StepFocusedWindowSize(true);
+          break;
+        case HK_SHRINK_WINDOW:
+          Commands::StepFocusedWindowSize(false);
+          break;
+        case HK_RESET_WINDOW_SIZE:
+          Commands::ResetFocusedWindowSize();
           break;
         case HK_DIAGNOSTIC_DUMP:
           Diagnostics::WriteDiagnosticReport();

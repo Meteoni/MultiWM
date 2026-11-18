@@ -34,6 +34,38 @@ static HMONITOR ResolveRememberedFloatingMonitor(
       &record.floatingRect, MONITOR_DEFAULTTONULL);
 }
 
+// Places a floating window at `target` and remembers the frame it ends up with.
+// A Floating-layout member placed exactly where asked gets a floating lease, so
+// an app that snaps back right afterwards is put back (placement/conformance.h).
+// False when the placement failed; nothing is remembered then.
+static bool PlaceFloatingWindow(
+    Workspace& workspace, HWND hwnd, HMONITOR monitor, UINT dpi,
+    const RECT& target, bool positionOnly) {
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record) return false;
+  const bool floatingLayoutMember =
+      workspace.Layout() == TileLayout::Floating && record->state == ManageState::Tiled;
+  PlacementObservation observation =
+      Platform::Windows::PlaceWindowChecked(hwnd, record->canMove, target, positionOnly);
+  if (observation.result != PlacementResult::Success &&
+      observation.result != PlacementResult::AdjustedByWindow) {
+    return false;
+  }
+
+  const RECT remembered =
+      observation.observed.right > observation.observed.left &&
+              observation.observed.bottom > observation.observed.top
+          ? observation.observed
+          : target;
+  workspace.RememberFloatingGeometry(hwnd, remembered, monitor, dpi);
+  ++Diagnostics::g_runtime.counters.floatingGeometryRepairs;
+  if (floatingLayoutMember && observation.result == PlacementResult::Success &&
+      observation.placementIssued) {
+    BeginConformanceLease(hwnd, remembered, false, nullptr, ConformanceLeaseKind::Floating);
+  }
+  return true;
+}
+
 // Converts remembered floating geometry into a destination-monitor rectangle.
 // Passive migration restores the full rectangle on the same monitor and centers
 // remembered/default size on a different monitor. Drag intent preserves the
@@ -60,20 +92,23 @@ static bool RepairFloatingGeometry(
                            current.right > current.left &&
                            current.bottom > current.top;
 
-  const bool centerWithoutResize =
-      hint.intent == FloatingPlacementIntent::CenterPreservingSize;
+  const bool ruleFloatedCenter =
+      hint.intent == FloatingPlacementIntent::RuleFloatedCenter;
+  if (ruleFloatedCenter && !haveCurrent) return false;
+  const bool keepCurrentCenter =
+      hint.intent == FloatingPlacementIntent::ResetSizeKeepingCenter && haveCurrent;
   const bool useNewWindowSize =
       hint.intent == FloatingPlacementIntent::NewWindowCenter ||
-      hint.intent == FloatingPlacementIntent::FailureCenter;
+      hint.intent == FloatingPlacementIntent::FailureCenter ||
+      hint.intent == FloatingPlacementIntent::ResetSizeKeepingCenter;
   const bool centerInWorkspace =
       hint.intent == FloatingPlacementIntent::CenterWithFloatingSize ||
-      useNewWindowSize || centerWithoutResize;
-  if (centerWithoutResize && !haveCurrent) return false;
+      (useNewWindowSize && !keepCurrentCenter) || ruleFloatedCenter;
 
   const bool needsFallbackSize =
-      useNewWindowSize || centerWithoutResize || !record->hasFloatingRect;
+      useNewWindowSize || ruleFloatedCenter || !record->hasFloatingRect;
   const WindowRule* placementOverride =
-      RuntimeLifecycle::IsAutomaticMode() && needsFallbackSize && !centerWithoutResize
+      RuntimeLifecycle::IsAutomaticMode() && needsFallbackSize
           ? Platform::Windows::FindMatchingWindowRule(
                 hwnd, WindowRuleTreatment::FloatingPlacementOverride)
           : nullptr;
@@ -82,6 +117,11 @@ static bool RepairFloatingGeometry(
       placementOverride && placementOverride->preserveFloatingSize;
   const bool useCustomSize =
       placementOverride && !placementOverride->preserveFloatingSize;
+  // A rule-floated window kept at its own size is only moved, and may extend
+  // past the work area. A size rule makes it an ordinary clamped placement,
+  // unless the window can't be resized anyway.
+  const bool centerWithoutResize =
+      ruleFloatedCenter && (!useCustomSize || !record->canResize);
 
   LONG width = 0;
   LONG height = 0;
@@ -117,6 +157,8 @@ static bool RepairFloatingGeometry(
   POINT center{};
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     center = hint.anchor;
+  } else if (keepCurrentCenter) {
+    center = SharedGeometry::RectCenter(current);
   } else if (!centerInWorkspace && record->hasFloatingRect &&
              ResolveRememberedFloatingMonitor(*record) == monitor) {
     center = SharedGeometry::RectCenter(record->floatingRect);
@@ -133,21 +175,48 @@ static bool RepairFloatingGeometry(
   if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     return false;
   }
-  PlacementObservation observation =
-      Platform::Windows::PlaceWindowChecked(hwnd, record->canMove, target, centerWithoutResize);
-  if (observation.result != PlacementResult::Success &&
-      observation.result != PlacementResult::AdjustedByWindow) {
+  return PlaceFloatingWindow(workspace, hwnd, monitor, targetDpi, target, centerWithoutResize);
+}
+
+// Grows (direction > 0) or shrinks a floating window (a Floating-layout member
+// or a per-window floating record) by one step around its center. Each dimension changes by the step percentage of the work area's,
+// within the app's size limits and the work area. A window already past a limit
+// is not pushed further in that direction. False when nothing changes.
+static bool StepFloatingWindowSize(
+    const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd, int direction) {
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record || !record->canMove || !record->canResize || !IsWindow(hwnd) ||
+      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+    return false;
+  }
+  HMONITOR monitor = key.ResolveMonitor();
+  Platform::Monitors::WorkspaceMetrics metrics;
+  RECT current{};
+  if (!monitor || !Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics) ||
+      !Platform::Windows::GetWindowFrameRect(hwnd, &current)) {
     return false;
   }
 
-  const RECT remembered =
-      observation.observed.right > observation.observed.left &&
-              observation.observed.bottom > observation.observed.top
-          ? observation.observed
-          : target;
-  workspace.RememberFloatingGeometry(hwnd, remembered, monitor, targetDpi);
-  ++Diagnostics::g_runtime.counters.floatingGeometryRepairs;
-  return true;
+  const RECT& workArea = metrics.workArea;
+  const WindowConstraints& limits = record->constraints;
+  const LONG smallest = SharedGeometry::ScaleDip(100, metrics.dpi);
+  auto stepSpan = [&](LONG span, LONG areaSpan, LONG minimum, LONG maximum) {
+    const LONG step = std::max<LONG>(1, MulDiv(areaSpan, static_cast<int>(g_settings.resizeStepPercent), 100));
+    const LONG lowest = std::max(smallest, limits.valid ? minimum : 1);
+    LONG highest = areaSpan;
+    if (limits.valid && maximum > 0) highest = std::min(highest, maximum);
+    return direction > 0 ? std::max(span, std::min(span + step, highest))
+                         : std::min(span, std::max(span - step, lowest));
+  };
+  const LONG width = Layout::RectWidth(current);
+  const LONG height = Layout::RectHeight(current);
+  const LONG newWidth = stepSpan(width, Layout::RectWidth(workArea), limits.minWidth, limits.maxWidth);
+  const LONG newHeight = stepSpan(height, Layout::RectHeight(workArea), limits.minHeight, limits.maxHeight);
+  if (newWidth == width && newHeight == height) return false;
+
+  const RECT target = SharedGeometry::ClampToArea(
+      SharedGeometry::CenteredRect(SharedGeometry::RectCenter(current), newWidth, newHeight), workArea);
+  return PlaceFloatingWindow(workspace, hwnd, monitor, metrics.dpi, target, false);
 }
 
 static bool RememberCurrentFloatingGeometry(

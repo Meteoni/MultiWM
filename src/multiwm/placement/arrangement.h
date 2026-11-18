@@ -1025,7 +1025,7 @@ static void ArrangeWorkspace(
     if (workspace.Layout() == TileLayout::Floating || workspace.Empty()) {
       if (workspace.Layout() == TileLayout::Floating) {
         for (HWND hwnd : workspace.TiledWindows()) {
-          CancelConformanceLease(hwnd);
+          CancelTiledConformanceLease(hwnd);
           workspace.ClearInsertionPlacement(hwnd);
         }
       }

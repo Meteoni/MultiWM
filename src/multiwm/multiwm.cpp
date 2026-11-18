@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.15.0
+// @version         1.16.0
 // @author          meteoni
 // @github          https://github.com/Meteoni
 // @license         MIT
@@ -47,8 +47,8 @@ continuous polling.
 Move a tiled window to **float it** or **swap it with the window underneath**. 
 
 By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
-moving windows through the logical order (Alt+, / .), floating a window (Alt+F), and switching between Automatic
-and Manual management (Alt+R).
+moving windows through the logical order (Alt+, / .), resizing the focused window (Alt+= / - / 0),
+floating a window (Alt+F), and switching between Automatic and Manual management (Alt+R).
 
 A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
 
@@ -281,6 +281,22 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
   - FloatFocusedKey: "F"
     $name: Float Focused Window
     $description: Remove the focused window from tiling. Blank disables this shortcut.
+  - WindowSize:
+    - GrowKey: "="
+      $name: Grow Focused Window
+      $description: Make the focused window larger by one step. Hold to repeat. Blank disables this shortcut.
+    - ShrinkKey: "-"
+      $name: Shrink Focused Window
+      $description: Make the focused window smaller by one step. Hold to repeat. Blank disables this shortcut.
+    - ResetKey: "0"
+      $name: Reset Focused Window Size
+      $description: Return the focused window to its default size. Blank disables this shortcut.
+    - StepPercent: 5
+      $name: Step Size (%)
+      #! $min: 1
+      #! $max: 50
+      $description: Size change per step, as a percentage of the work area.
+    $name: Window Size
   - DiagnosticDumpKey: ""
     $name: Write Diagnostic Report
     $description: Save a diagnostic report to the Output Directory. Blank disables this shortcut.
@@ -426,6 +442,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 // Planning and placing tiled windows.
 #include "layout/planning.h"
 #include "layout/resize_learning.h"
+#include "layout/resize_steps.h"
 #include "placement/arrangement.h"
 #include "placement/conformance.h"
 #include "placement/admission_prediction.h"

@@ -687,6 +687,7 @@ static constexpr DiagnosticCounterRowSpec kPlacementCounterRows[] = {
     {L"Conformance lease deferred burst repairs", &Counters::conformanceLeaseDeferredRepairs},
     {L"Conformance deadlines completed compliant", &Counters::conformanceLeaseExpiredCompliant},
     {L"Conformance deadlines floated window", &Counters::conformanceLeaseExpiredFloats},
+    {L"Conformance deadlines kept floating frame", &Counters::conformanceLeaseExpiredAdopted},
     {L"Conformance deadline stale/cancelled verdicts", &Counters::conformanceLeaseExpiredStale},
 };
 
@@ -712,6 +713,9 @@ static constexpr DiagnosticCounterRowSpec kRuntimeCounterRows[] = {
     {L"Swap master commands", &Counters::swapMasterCommands},
     {L"Promote window commands", &Counters::promoteWindowCommands},
     {L"Demote window commands", &Counters::demoteWindowCommands},
+    {L"Grow window commands", &Counters::growWindowCommands},
+    {L"Shrink window commands", &Counters::shrinkWindowCommands},
+    {L"Reset window size commands", &Counters::resetWindowSizeCommands},
     {L"Rejected order commands", &Counters::rejectedOrderCommands},
     {L"Rejected layout changes", &Counters::rejectedLayoutChanges},
 };
@@ -1207,7 +1211,7 @@ static void DumpConfigurationSnapshot(ReportBuilder& report) {
       L"Automatic insertion position: %ls",
       g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused
           ? L"After focused window" : L"Last slot");
-  report.Line(L"Tiled conformance lease: %u ms", g_settings.conformanceLeaseMs);
+  report.Line(L"Conformance lease: %u ms", g_settings.conformanceLeaseMs);
   report.Line(L"Conformance repair interval: %u ms", g_settings.conformanceRepairIntervalMs);
   report.Line(L"Lifecycle settle delay: %u ms", g_settings.reconcileDelayMs);
   report.Line(L"Slow application discovery delay: %u ms", g_settings.slowApplicationDelayMs);

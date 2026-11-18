@@ -890,9 +890,10 @@ static WorkspaceDiscovery DiscoverWorkspaceWindows(
   }
 
   // Automatic discovery owns the first floating geometry of a genuinely new
-  // restored window. A rule-floated admission always keeps its application-
-  // selected size, including when the whole workspace is already Floating.
-  // Other Floating-workspace admissions use the configured sizing policy.
+  // restored window. A rule-floated admission keeps its application-selected
+  // size unless a size rule overrides it, including when the whole workspace is
+  // already Floating. Other Floating-workspace admissions use the configured
+  // sizing policy.
   if (admitUntracked) {
     for (HWND hwnd : newlyAdmittedWindows) {
       const WindowRecord* record = workspace.Find(hwnd);
@@ -908,7 +909,7 @@ static WorkspaceDiscovery DiscoverWorkspaceWindows(
       Placement::FloatingPlacementHint newWindowHint;
       newWindowHint.intent =
           pendingDefaultCenter
-              ? Placement::FloatingPlacementIntent::CenterPreservingSize
+              ? Placement::FloatingPlacementIntent::RuleFloatedCenter
               : Placement::FloatingPlacementIntent::NewWindowCenter;
       if (Placement::RepairFloatingGeometry(key, workspace, hwnd, newWindowHint)) {
         workspace.ClearDefaultFloatingCenter(hwnd);

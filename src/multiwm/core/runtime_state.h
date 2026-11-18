@@ -89,6 +89,7 @@ struct Counters {
   uint64_t conformanceLeaseDeferredRepairs = 0;
   uint64_t conformanceLeaseExpiredCompliant = 0;
   uint64_t conformanceLeaseExpiredFloats = 0;
+  uint64_t conformanceLeaseExpiredAdopted = 0;
   uint64_t conformanceLeaseExpiredStale = 0;
 
   uint64_t tileCommands = 0;
@@ -97,6 +98,9 @@ struct Counters {
   uint64_t swapMasterCommands = 0;
   uint64_t promoteWindowCommands = 0;
   uint64_t demoteWindowCommands = 0;
+  uint64_t growWindowCommands = 0;
+  uint64_t shrinkWindowCommands = 0;
+  uint64_t resetWindowSizeCommands = 0;
   uint64_t rejectedOrderCommands = 0;
   uint64_t rejectedLayoutChanges = 0;
 
@@ -475,9 +479,17 @@ struct PendingAdmissionRecovery {
   uint64_t generation = 0;
 };
 
+// What a conformance lease holds a window to, and what its deadline does.
+enum class ConformanceLeaseKind {
+  Tiled,     // Its tile. A window still elsewhere at the deadline is floated.
+  Floating,  // The frame MultiWM gave it in the Floating layout. At the deadline
+             // the window keeps wherever the app left it.
+};
+
 // A bounded period after placement during which a window is pushed back onto its
 // tile if it drifts (see the glossary in CONTRIBUTING.md).
 struct ConformanceLease {
+  ConformanceLeaseKind kind = ConformanceLeaseKind::Tiled;
   RECT expectedRect{};
   // Preserve the user action that produced this target through asynchronous
   // constraint discovery and its subsequent arrangement.
@@ -530,11 +542,12 @@ class PendingProofs {
   // Copies the lease into outLease (when non-null) without consuming expiry.
   ConformanceLeaseReadResult ReadLease(
       HWND hwnd, ULONGLONG nowMs, ConformanceLease* outLease) const;
-  // Re-observing an active lease's target keeps its original deadline and only
-  // updates the preferred window/repair time. Otherwise starts a replacement with
-  // a new generation. Returns true only when a new lease was started.
-  bool BeginLease(HWND hwnd, const RECT& expectedRect, HWND preferredTiledWindow,
-                  bool scheduleRepair, ULONGLONG nowMs,
+  // Re-observing an active lease's target (same kind and rectangle) keeps its
+  // original deadline and only updates the preferred window/repair time.
+  // Otherwise starts a replacement with a new generation. Returns true only when
+  // a new lease was started.
+  bool BeginLease(HWND hwnd, ConformanceLeaseKind kind, const RECT& expectedRect,
+                  HWND preferredTiledWindow, bool scheduleRepair, ULONGLONG nowMs,
                   const ConformanceLeaseTiming& timing);
   // generation==0 cancels unconditionally; otherwise only that generation.
   bool CancelLease(HWND hwnd, uint64_t generation);

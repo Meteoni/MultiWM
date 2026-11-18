@@ -18,6 +18,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <cstdint>
 #include <cstdlib>
@@ -196,6 +197,9 @@ enum HotkeyIds {
   HK_DIAGNOSTIC_DUMP = 6,
   HK_PROMOTE_WINDOW = 7,
   HK_DEMOTE_WINDOW = 8,
+  HK_GROW_WINDOW = 9,
+  HK_SHRINK_WINDOW = 10,
+  HK_RESET_WINDOW_SIZE = 11,
 };
 
 // Messages consumed by the serialized WM thread.
@@ -295,6 +299,10 @@ struct SettingsState {
   UINT demoteWindowKey = VK_OEM_PERIOD;
   UINT managementModeToggleKey = 'R';
   UINT floatFocusedKey = 'F';
+  UINT growWindowKey = VK_OEM_PLUS;
+  UINT shrinkWindowKey = VK_OEM_MINUS;
+  UINT resetWindowSizeKey = '0';
+  LONG resizeStepPercent = 5;  // Of the work area's span, per grow/shrink step.
   UINT diagnosticDumpKey = 0;
 
   // User-facing pixel values are logical pixels at 96 DPI; scale only at a

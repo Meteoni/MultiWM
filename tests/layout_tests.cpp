@@ -279,6 +279,241 @@ static void RunWeightedResizeTests() {
   std::printf("Passed %d weighted resize checks.\n", checks);
 }
 
+// Grow, shrink and reset change only the preference that sizes the chosen
+// window, start from its visible span, and stop at minimums.
+static void RunWindowSizeStepTests() {
+  g_settings = SettingsState{};
+  const RECT area{0, 0, 1000, 1000};
+  constexpr LONG kStep = 5;  // 50 px of a 1000 px span.
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) {
+      std::fprintf(stderr, "FAILED: %s\n", message);
+      std::exit(1);
+    }
+    ++checks;
+  };
+  auto make = [&](TileLayout layout, size_t count, LONG firstMinWidth = 80) {
+    Workspace workspace;
+    workspace.SetLayout(layout);
+    for (size_t index = 0; index < count; ++index) {
+      WindowRecord record;
+      record.hwnd = reinterpret_cast<HWND>(index + 1);
+      record.pid = 1;
+      record.constraints = {index == 0 ? firstMinWidth : 80, 80, 96, true};
+      check(workspace.AdmitTiled(record), "admit test window");
+    }
+    return workspace;
+  };
+  auto span = [&](const Workspace& workspace, size_t index, bool alongY) {
+    std::vector<RECT> rects;
+    check(Layout::BuildWorkspaceLayoutPlan(workspace, area, 0, &rects) ==
+              Layout::LayoutPlanStatus::Success, "plan stepped layout");
+    return alongY ? Layout::RectHeight(rects[index]) : Layout::RectWidth(rects[index]);
+  };
+  auto aboutEqual = [](LONG actual, LONG expected) { return std::abs(actual - expected) <= 1; };
+
+  for (TileLayout layout : {TileLayout::Columns, TileLayout::Rows}) {
+    const bool alongY = layout == TileLayout::Rows;
+    Workspace grid = make(layout, 3);
+    const LONG initial = span(grid, 0, alongY);
+    check(grid.StepTiledSize(area, 0, 0, true, kStep) && aboutEqual(span(grid, 0, alongY), initial + 50),
+          "grow adds one step to the window");
+    check(grid.GridWeights()[1] == 1.0 && grid.GridWeights()[2] == 1.0, "grow changes only the window's weight");
+    check(aboutEqual(span(grid, 1, alongY), span(grid, 2, alongY)), "peers keep their relative sizes");
+    check(grid.StepTiledSize(area, 0, 0, false, kStep) && aboutEqual(span(grid, 0, alongY), initial),
+          "shrink undoes grow");
+    check(grid.StepTiledSize(area, 0, 0, true, kStep) && grid.ResetTiledSize(area, 0, 0, 0.5) &&
+              grid.GridWeights() == std::vector<double>({1, 1, 1}),
+          "reset returns the weight to its peers' mean");
+    check(!grid.ResetTiledSize(area, 0, 0, 0.5), "resetting a default size changes nothing");
+    int steps = 0;
+    while (steps < 100 && grid.StepTiledSize(area, 0, 0, true, kStep)) ++steps;
+    check(steps < 100 && span(grid, 1, alongY) >= 80 && span(grid, 2, alongY) >= 80,
+          "growth stops at the peers' minimums");
+  }
+
+  // A window pinned at its minimum: its own shrink stops there, and a peer's
+  // step leaves its preference alone.
+  Workspace pinned = make(TileLayout::Columns, 3, 650);
+  check(span(pinned, 0, false) == 650, "minimum displaces the divider");
+  check(!pinned.StepTiledSize(area, 0, 0, false, kStep), "shrink stops at the native minimum");
+  const LONG peer = span(pinned, 1, false);
+  check(pinned.StepTiledSize(area, 0, 1, true, kStep) && aboutEqual(span(pinned, 1, false), peer + 50) &&
+            span(pinned, 0, false) == 650 && pinned.GridWeights()[0] == 1.0,
+        "a peer grows from its visible size without saving the pinned window's fitting");
+
+  for (TileLayout layout : {TileLayout::MasterStack, TileLayout::MasterStackH}) {
+    const bool mainY = layout == TileLayout::MasterStackH;
+    Workspace stack = make(layout, 3);
+    check(stack.StepTiledSize(area, 0, 0, true, kStep) && std::abs(stack.MasterRatio() - 0.55) < 0.002 &&
+              stack.StackWeights() == std::vector<double>({1, 1}),
+          "growing the master moves only the master divider");
+    const LONG stackSpan = span(stack, 1, !mainY);
+    check(stack.StepTiledSize(area, 0, 1, true, kStep) && aboutEqual(span(stack, 1, !mainY), stackSpan + 50) &&
+              stack.StackWeights()[1] == 1.0 && std::abs(stack.MasterRatio() - 0.55) < 0.002,
+          "growing a stack window moves only its stack weight");
+    check(stack.ResetTiledSize(area, 0, 0, 0.5) && stack.MasterRatio() == 0.5, "reset returns the master ratio");
+    check(stack.ResetTiledSize(area, 0, 1, 0.5) && stack.StackWeights() == std::vector<double>({1, 1}),
+          "reset returns a stack weight to its peers' mean");
+
+    Workspace pair = make(layout, 2);
+    check(pair.StepTiledSize(area, 0, 1, true, kStep) && std::abs(pair.MasterRatio() - 0.45) < 0.002,
+          "a lone stack window grows by moving the master divider");
+    check(pair.ResetTiledSize(area, 0, 1, 0.5) && pair.MasterRatio() == 0.5, "a lone stack window resets the master ratio");
+  }
+
+  Workspace dwindle = make(TileLayout::Dwindle, 3);
+  check(dwindle.StepTiledSize(area, 0, 0, true, kStep) && std::abs(dwindle.DwindleRatios()[0] - 0.55) < 0.002 &&
+            dwindle.DwindleRatios()[1] == 0.5,
+        "a Dwindle window grows by its own split");
+  check(dwindle.StepTiledSize(area, 0, 2, true, kStep) && std::abs(dwindle.DwindleRatios()[1] - 0.45) < 0.002 &&
+            aboutEqual(span(dwindle, 2, true), 550),
+        "the last Dwindle window grows by the split before it");
+  check(dwindle.ResetTiledSize(area, 0, 2, 0.5) && dwindle.DwindleRatios()[1] == 0.5 &&
+            std::abs(dwindle.DwindleRatios()[0] - 0.55) < 0.002,
+        "reset evens only the window's own split");
+  check(dwindle.ResetTiledSize(area, 0, 0, 0.5) && dwindle.DwindleRatios() == std::vector<double>({0.5, 0.5}),
+        "reset evens the first split");
+
+  // Deep Dwindle splits under adaptive fitting: a minimum taller than half the
+  // work area (LocalSend) makes the plain layout unsatisfiable, and the ends of
+  // the ratio range don't fit at all. Steps must still move the deep dividers.
+  {
+    const RECT wide{12, 12, 3060, 1812};
+    const LONG wideGap = 12;
+    const LONG minimums[4][2] = {{824, 553}, {931, 193}, {650, 397}, {786, 993}};
+    Workspace deep;
+    deep.SetLayout(TileLayout::Dwindle);
+    for (size_t index = 0; index < 4; ++index) {
+      WindowRecord record;
+      record.hwnd = reinterpret_cast<HWND>(index + 1);
+      record.pid = 1;
+      record.constraints = {minimums[index][0], minimums[index][1], 192, true};
+      check(deep.AdmitTiled(record), "admit deep Dwindle window");
+    }
+    auto width = [&](const Workspace& workspace, size_t index) {
+      std::vector<RECT> rects;
+      check(Layout::BuildWorkspaceLayoutPlan(workspace, wide, wideGap, &rects) ==
+                Layout::LayoutPlanStatus::Success, "plan deep Dwindle layout");
+      return Layout::RectWidth(rects[index]);
+    };
+    for (size_t index : {2u, 3u}) {
+      Workspace grown = deep;
+      check(grown.StepTiledSize(wide, wideGap, index, true, kStep) && width(grown, index) > width(deep, index),
+            "a deep Dwindle window grows its split under adaptive fitting");
+    }
+    // A squeezed window: adaptive fitting holds the first window below its
+    // saved half. Like a drag, a step saves the size it shows, so that size is
+    // what remains once the squeeze ends.
+    Workspace squeezed = deep;
+    check(width(squeezed, 0) < (Layout::RectWidth(wide) - wideGap) / 2, "the first window is squeezed");
+    check(squeezed.StepTiledSize(wide, wideGap, 0, true, kStep), "grow the squeezed window");
+    const LONG shown = width(squeezed, 0);
+    for (HWND hwnd : squeezed.TiledWindows()) squeezed.UpdateConstraints(hwnd, {80, 80, 192, true});
+    check(std::abs(width(squeezed, 0) - shown) <= 1, "the size a step shows is the size kept after the squeeze");
+    Workspace shrunk = deep;
+    check(shrunk.StepTiledSize(wide, wideGap, 2, false, kStep) && width(shrunk, 2) < width(deep, 2),
+          "a deep Dwindle window shrinks its split under adaptive fitting");
+    Workspace pinnedDeep = deep;
+    check(!pinnedDeep.StepTiledSize(wide, wideGap, 3, false, kStep) &&
+              pinnedDeep.DwindleRatios() == deep.DwindleRatios(),
+          "a window at its minimum width does not shrink or change its ratio");
+    Workspace shrinkTop = deep;
+    check(shrinkTop.StepTiledSize(wide, wideGap, 1, false, kStep) &&
+              shrinkTop.DwindleRatios()[2] == deep.DwindleRatios()[2],
+          "shrinking a window leaves deeper dividers alone");
+  }
+
+  // Growing an early Dwindle window pushes a fixed deeper divider as far as its
+  // windows' minimums allow, instead of stopping at the divider's saved position.
+  {
+    g_settings.adaptiveDwindleSlots = 2;
+    g_settings.adaptiveDwindlePercentage = 15;
+    const RECT wide{14, 14, 3058, 1804};
+    const LONG wideGap = 14;
+    const LONG minimums[4][2] = {{802, 542}, {300, 475}, {300, 475}, {644, 394}};
+    Workspace pushed;
+    pushed.SetLayout(TileLayout::Dwindle);
+    for (size_t index = 0; index < 4; ++index) {
+      WindowRecord record;
+      record.hwnd = reinterpret_cast<HWND>(index + 1);
+      record.pid = 1;
+      record.constraints = {minimums[index][0], minimums[index][1], 192, true};
+      check(pushed.AdmitTiled(record), "admit pushed Dwindle window");
+    }
+    auto widths = [&](const Workspace& workspace) {
+      std::vector<RECT> rects;
+      check(Layout::BuildWorkspaceLayoutPlan(workspace, wide, wideGap, &rects) ==
+                Layout::LayoutPlanStatus::Success, "plan pushed Dwindle layout");
+      std::vector<LONG> result;
+      for (const RECT& rect : rects) result.push_back(Layout::RectWidth(rect));
+      return result;
+    };
+    for (int i = 0; i < 3; ++i) check(pushed.StepTiledSize(wide, wideGap, 2, true, kStep), "grow the deep window");
+    const double deepRatio = pushed.DwindleRatios()[2];
+    const Workspace beforePush = pushed;
+    LONG previous = widths(pushed)[0];
+    int grown = 0;
+    while (grown < 20 && pushed.StepTiledSize(wide, wideGap, 0, true, kStep)) {
+      const auto now = widths(pushed);
+      check(now[0] > previous && now[2] >= 300 && now[3] >= 644, "each grow widens the first window within minimums");
+      previous = now[0];
+      ++grown;
+    }
+    check(grown >= 3 && pushed.DwindleRatios()[2] < deepRatio,
+          "the first window grows past the deep divider's saved position by pushing it");
+    check(widths(pushed)[2] < 300 + 76, "growth stops once the pushed window reaches its minimum");
+    const Workspace fullyPushed = pushed;
+    const auto pushedRatios = pushed.DwindleRatios();
+
+    // Shrinking the window that pushed lets the divider spring back, one step
+    // at a time, and never costs the shrinking window more than its step.
+    check(pushed.StepTiledSize(wide, wideGap, 0, false, kStep) && widths(pushed)[0] < previous &&
+              widths(pushed)[0] >= previous - 152 - 2 && pushed.DwindleRatios()[0] < pushedRatios[0],
+          "one shrink moves the first divider back by one step");
+    check(pushed.DwindleRatios()[2] > pushedRatios[2] && pushed.DwindleRatios()[2] <= deepRatio + 1e-9,
+          "the shrink lets the pushed divider spring back toward its earlier position");
+    for (int i = 0; i < 20 && std::abs(pushed.DwindleRatios()[2] - deepRatio) > 1e-9; ++i) {
+      check(pushed.StepTiledSize(wide, wideGap, 0, false, kStep), "keep shrinking the first window");
+    }
+    check(std::abs(pushed.DwindleRatios()[2] - deepRatio) <= 1e-9,
+          "shrinking far enough returns the pushed divider exactly");
+
+    // Reset returns pushed dividers as far as the reset window's size allows.
+    Workspace reset = fullyPushed;
+    check(reset.ResetTiledSize(wide, wideGap, 0, 0.5) && reset.DwindleRatios()[0] == 0.5 &&
+              reset.DwindleRatios()[2] > pushedRatios[2] && reset.DwindleRatios()[2] <= deepRatio + 1e-9,
+          "resetting the window that pushed lets the divider spring back");
+    std::vector<RECT> resetRects;
+    std::vector<RECT> plainRects(4);
+    Layout::LayoutDwindle(wide, wideGap, 0, 4, reset.DwindleRatios(), false, plainRects);
+    check(Layout::BuildWorkspaceLayoutPlan(reset, wide, wideGap, &resetRects) == Layout::LayoutPlanStatus::Success &&
+              Layout::RectWidth(resetRects[0]) == Layout::RectWidth(plainRects[0]),
+          "the reset window keeps its default size while the divider springs back");
+
+    // A divider the user steps or drags itself, or whose window leaves the slot,
+    // stays where it is.
+    Workspace kept = fullyPushed;
+    check(kept.StepTiledSize(wide, wideGap, 3, true, kStep), "step the pushed divider's last window");
+    const double keptRatio = kept.DwindleRatios()[2];
+    check(kept.StepTiledSize(wide, wideGap, 0, false, kStep) && kept.DwindleRatios()[2] == keptRatio,
+          "a divider the user stepped no longer springs back");
+    Workspace swapped = fullyPushed;
+    // Both Explorers have the same minimums, so the swapped layout still fits.
+    check(swapped.SwapTiled(swapped.TiledWindows()[1], swapped.TiledWindows()[2]), "swap the pushed slot's window");
+    check(swapped.StepTiledSize(wide, wideGap, 0, false, kStep) && swapped.DwindleRatios()[2] == pushedRatios[2],
+          "a push lapses once its window leaves the slot");
+    (void)beforePush;
+    g_settings = SettingsState{};
+  }
+
+  Workspace monocle = make(TileLayout::Monocle, 2);
+  check(!monocle.StepTiledSize(area, 0, 0, true, kStep) && !monocle.ResetTiledSize(area, 0, 0, 0.5),
+        "Monocle has no window sizes");
+  std::printf("Passed %d window-size step checks.\n", checks);
+}
+
 // Characterization test for the Dwindle planner. Generates many deterministic
 // workspaces (window counts, areas, gaps, saved ratios, minimum sizes, reverse
 // and adaptive settings) and folds every planner output into one digest.
@@ -948,6 +1183,7 @@ int main() {
   RunRuleFieldParserTests();
   RunAdaptiveDwindleTests();
   RunWeightedResizeTests();
+  RunWindowSizeStepTests();
   RunDwindlePlannerDigest();
   RunAdmissionPredictionTests();
   RunCompanionRuleEncodingTests();
