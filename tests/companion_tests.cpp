@@ -303,6 +303,60 @@ int main() {
     ++body.generation;
   }
 
+  // Rule-floated windows are centred at their own size (RuleFloatedCenter),
+  // unless an override-size rule names another size.
+  {
+    using Companion::Width;
+    using Companion::Height;
+    const RECT& work = monitorInfo.rcWork;
+    auto rules = std::make_shared<std::vector<CompanionAbi::SnapshotRule>>(1);
+    (*rules)[0].treatment = WindowRuleTreatment::AlwaysFloating;
+    (*rules)[0].classNames = {windowClass.lpszClassName};
+    Companion::HintInputs inputs;
+    inputs.flags = completeFlags;
+    inputs.workspace = workspace;
+    inputs.rules = rules;
+    const RECT frame{work.left + 10, work.top + 10, work.left + 410, work.top + 310};
+    auto predict = [&](Companion::TargetKind* kind) {
+      std::optional<RECT> overflow;
+      const char* reason = nullptr;
+      return Companion::PredictFrame(hwnd, frame, inputs, kind, &overflow, &reason);
+    };
+    const POINT workCenter = SharedGeometry::RectCenter(work);
+    Companion::TargetKind kind{};
+    auto predicted = predict(&kind);
+    check(predicted && kind == Companion::TargetKind::KeepSize && Width(*predicted) == 400 &&
+              Height(*predicted) == 300 && SharedGeometry::RectCenter(*predicted).x == workCenter.x,
+          "a rule-floated window is centred at its own size");
+
+    CompanionAbi::SnapshotRule sizeRule;
+    sizeRule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
+    sizeRule.classNames = {windowClass.lpszClassName};
+    sizeRule.preserveFloatingSize = false;
+    sizeRule.floatingSizeDip = {489, 384};
+    rules->push_back(sizeRule);
+    predicted = predict(&kind);
+    const RECT expected = SharedGeometry::ClampToArea(
+        SharedGeometry::CenteredIn(work, SharedGeometry::ScaleDip(489, workspace.dpi),
+                                   SharedGeometry::ScaleDip(384, workspace.dpi)),
+        work);
+    check(predicted && kind == Companion::TargetKind::Float && EqualRect(&*predicted, &expected),
+          "an override-size rule sizes a rule-floated window");
+
+    rules->back().preserveFloatingSize = true;
+    predicted = predict(&kind);
+    check(predicted && kind == Companion::TargetKind::KeepSize && Width(*predicted) == 400,
+          "a preserve-size rule keeps a rule-floated window's own size");
+
+    rules->back().preserveFloatingSize = false;
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~WS_SIZEBOX);
+    predicted = predict(&kind);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+    check(predicted && kind == Companion::TargetKind::KeepSize && Width(*predicted) == 400,
+          "a window that can't resize keeps its size despite a size rule");
+  }
+
   // Settling: after the companion places a window at its show, the app's own
   // moves are held at that frame until MultiWM takes the window over (its
   // snapshot entry changes, or its own SWP_NOSENDCHANGING placement arrives).

@@ -2,7 +2,7 @@
 // @id              multiwm-companion
 // @name            MultiWM Companion
 // @description     Opens new windows directly in the slot MultiWM will give them, so they don't appear elsewhere first and jump.
-// @version         0.3.0
+// @version         0.3.1
 // @author          meteoni
 // @github          https://github.com/Meteoni
 // @license         MIT

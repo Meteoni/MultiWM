@@ -306,14 +306,20 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
   const bool resizable = (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_SIZEBOX) != 0;
   if (!resizable && !floatingRule) return reject("fixed-size window");
 
-  // Rule-floated windows keep the app's size and are centered without clamping
-  // (CenterPreservingSize), in every layout.
+  // Rule-floated windows are centered (RuleFloatedCenter), in every layout: at
+  // the size a matching override-size rule names, else at the app's own size
+  // without clamping. A window that can't resize keeps its size either way.
+  const SnapshotRule* sizeRule = matches(WindowRuleTreatment::FloatingPlacementOverride);
   if (floatingRule) {
+    if (sizeRule && !sizeRule->preserveFloatingSize && resizable) {
+      *kind = TargetKind::Float;
+      *reason = "rule-floated at its size rule's size";
+      return CenteredFloatingFrame(workspace, sizeRule, frame, false);
+    }
     *kind = TargetKind::KeepSize;
     return SharedGeometry::CenteredIn(workspace.workArea, Width(frame), Height(frame));
   }
 
-  const SnapshotRule* sizeRule = matches(WindowRuleTreatment::FloatingPlacementOverride);
   if (workspace.floatingLayout) {
     // NewWindowCenter: the default size unless a size rule says otherwise.
     *kind = TargetKind::Float;
