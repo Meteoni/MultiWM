@@ -683,6 +683,9 @@ class FloatingWindowFixture {
     g_wm.timers.conformance = 0;
   }
 
+  // The desktop Windows reports for every test window (GUID_NULL: none yet).
+  void SetWindowDesktop(const GUID& desktop) { windows_.desktop = desktop; }
+
   DesktopMonitorKey key;
   Platform::Monitors::WorkspaceMetrics metrics;
   RECT workArea{};
@@ -845,6 +848,81 @@ static void RunRuleFloatedSizeTests() {
   check(Layout::RectWidth(placed) == 400 && Layout::RectHeight(placed) == 300,
         "a preserve-size rule keeps its own size");
   std::printf("Passed %u rule-floated size checks.\n", check.passed);
+}
+
+// A hidden member of a Floating-layout workspace (a tray app) shown again on
+// another desktop moves to that desktop's workspace before it is restored. It
+// must never be restored at its old floating frame first: that was a visible
+// jump before its new tile. Until Windows assigns it a desktop (GUID_NULL) it
+// waits. Shown again on its own desktop, it returns to its floating frame.
+static void RunHiddenArrivalTests() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  const HWND hwnd = f.hwnd;
+  g_wm.managementMode = ManagementMode::Automatic;
+  f.Seed(TileLayout::Floating);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::CenterWithFloatingSize), "float it in the Floating layout");
+  const RECT floatingFrame = FloatingWindowFixture::Frame(hwnd);
+  Workspace source = f.Load();
+  check(source.Suspend(hwnd, SuspensionReason::Hidden), "hide it to the tray");
+  g_workspaces.Save(f.key, source);
+  // The companion has already moved it onto its new tile while it was hidden.
+  FloatingWindowFixture::AppMove(hwnd, f.workArea.left + 20, f.workArea.top + 20, 400, 300);
+  const RECT shownFrame = FloatingWindowFixture::Frame(hwnd);
+
+  auto stateIn = [&](const DesktopMonitorKey& key) {
+    Workspace workspace;
+    const WindowRecord* record = g_workspaces.Load(key, &workspace) ? workspace.Find(hwnd) : nullptr;
+    return record ? std::optional<ManageState>(record->state) : std::nullopt;
+  };
+  auto staysPut = [&] {
+    return Layout::RectsNear(FloatingWindowFixture::Frame(hwnd), shownFrame, 0);
+  };
+  const auto repairs = [] { return Diagnostics::g_runtime.counters.floatingGeometryRepairs; };
+  const auto repairsBefore = repairs();
+  std::vector<DesktopMonitorKey> changed;
+
+  // Shown before Windows assigned its desktop: nothing to restore it into yet.
+  f.SetWindowDesktop(GUID_NULL);
+  g_wm.lifecycle.dirtyWindows.clear();
+  Reconcile::ReconcileManagedWindowStateNow(hwnd, Reconcile::ReconcileScope::Participation |
+                                                      Reconcile::ReconcileScope::Monitor);
+  Reconcile::ReconcileSettledKnownWindows({hwnd}, false, &changed);
+  check(stateIn(f.key) == ManageState::Suspended && g_workspaces.OwnersOf(hwnd).size() == 1,
+        "without a desktop it is neither restored nor moved to a desktop-less workspace");
+  check(Model::ContainsWindow(g_wm.lifecycle.dirtyWindows, hwnd), "the next settled pass looks again");
+  check(staysPut() && repairs() == repairsBefore, "it isn't placed at its old floating frame");
+
+  // Assigned to the current desktop, not its owner's. The immediate pass waits;
+  // the settled pass moves it there first and restores it as a tile.
+  DesktopMonitorKey arrival = f.key;
+  arrival.desktopId.Data1 = 0xA7717;
+  Workspace destination;
+  destination.SetLayout(TileLayout::Dwindle);
+  g_workspaces.Save(arrival, destination);
+  f.SetWindowDesktop(arrival.desktopId);
+  Reconcile::ReconcileManagedWindowStateNow(hwnd, Reconcile::ReconcileScope::Participation |
+                                                      Reconcile::ReconcileScope::Monitor);
+  check(stateIn(f.key) == ManageState::Suspended && staysPut() && repairs() == repairsBefore,
+        "the immediate pass leaves it hidden in its old workspace");
+  const std::vector<HWND> dirty{hwnd};
+  g_wm.lifecycle.dirtyWindows.clear();
+  Reconcile::ReconcileSettledKnownWindows(dirty, false, &changed);
+  check(!stateIn(f.key) && stateIn(arrival) == ManageState::Tiled,
+        "the settled pass moves it to the current desktop's workspace, restored as a tile");
+  check(staysPut() && repairs() == repairsBefore, "it is never placed at its old floating frame");
+
+  // Hidden again and shown on its own desktop: back to its floating frame.
+  Reconcile::ForgetManagedWindow(hwnd);
+  f.SetWindowDesktop(f.key.desktopId);
+  g_workspaces.Save(f.key, source);
+  Reconcile::ReconcileSettledKnownWindows(dirty, false, &changed);
+  check(stateIn(f.key) == ManageState::Tiled && repairs() == repairsBefore + 1 &&
+            Layout::RectsNear(FloatingWindowFixture::Frame(hwnd), floatingFrame, 0),
+        "shown on its own desktop it returns to its floating frame");
+  g_workspaces.Save(arrival, Workspace{});
+  g_wm.lifecycle.dirtyWindows.clear();
+  std::printf("Passed %u hidden arrival checks.\n", check.passed);
 }
 
 // Sequences in which a window that fitted must not be floated later: a sibling
@@ -1595,6 +1673,7 @@ int main() {
   RunFloatingLeaseTests();
   RunFloatingSizeCommandTests();
   RunRuleFloatedSizeTests();
+  RunHiddenArrivalTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
   RunOverflowFloatPredictionTests();

@@ -32,6 +32,7 @@ static bool EnsureUniqueWindowOwnership(
 static void ForgetWindowFromOwners(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys);
+static void RequeueDirtyWindows(const std::vector<HWND>& dirtyWindows);
 
 // Commit boundary for desktop-bound discovery. False schedules a settled retry
 // and makes active-desktop checks query the shell; it never migrates records.
@@ -534,8 +535,11 @@ static bool GetObservedWorkspaceKey(
   bool observedAnything = false;
 
   if (HasReconcileScope(scope, ReconcileScope::Desktop)) {
+    // A window shown moments ago can report GUID_NULL until the shell assigns
+    // its desktop (about 10 ms, traced). That is no desktop to move it to.
     GUID desktopId{};
-    if (Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &desktopId)) {
+    if (Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &desktopId) &&
+        !IsEqualGUID(desktopId, GUID_NULL)) {
       observed.desktopId = desktopId;
       observedAnything = true;
     }
@@ -602,6 +606,18 @@ static std::vector<DesktopMonitorKey> ReconcileWindowOwnership(
   return ownerKeys;
 }
 
+// True when a suspended window that is visible again is on another desktop than
+// `ownerKey`'s, or has no desktop yet (GUID_NULL, just after it is shown). It is
+// leaving that workspace: restoring it there would place it at that workspace's
+// geometry first, a visible jump (a tray app restored on another desktop flashed
+// at its old Floating-layout frame before its new tile, traced). A failed query
+// can't tell, so it holds nothing back.
+static bool AwaitsDesktopOwnership(HWND hwnd, const DesktopMonitorKey& ownerKey) {
+  GUID desktopId{};
+  if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &desktopId)) return false;
+  return IsEqualGUID(desktopId, GUID_NULL) || !IsEqualGUID(desktopId, ownerKey.desktopId);
+}
+
 static void ReconcileWindowParticipation(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
@@ -657,6 +673,12 @@ static void ReconcileWindowParticipation(
       }
     } else if (record->state == ManageState::Suspended) {
       if (reason == SuspensionReason::None) {
+        if (AwaitsDesktopOwnership(hwnd, ownerKey)) {
+          // The next settled pass moves it to its desktop's workspace first,
+          // then restores it there (ReconcileSettledKnownWindows).
+          RequeueDirtyWindows({hwnd});
+          continue;
+        }
         const bool restored = workspace.Restore(hwnd);
         changed |= restored;
         restoredIntoFloatingLayout =
@@ -1320,6 +1342,22 @@ static void ScheduleDiscoveryRetries(const std::vector<HWND>& dirtyWindows) {
   if (addedRetry) ScheduleNextDiscoveryRetryTimer();
 }
 
+// The settled pass's known-window step. Desktop ownership comes first: dirty
+// tracked HWNDs (every known one after a missed switch) get a desktop check,
+// since per-window moves emit no desktop change. A hidden window shown on
+// another desktop then moves to that desktop's workspace before participation
+// restores it there, never at its old workspace's geometry first.
+static void ReconcileSettledKnownWindows(
+    const std::vector<HWND>& dirtyWindows, bool desktopSwitched,
+    std::vector<DesktopMonitorKey>* changedKeys) {
+  if (desktopSwitched) ReconcileKnownWindows(ReconcileScope::Desktop, changedKeys);
+  for (HWND hwnd : dirtyWindows) {
+    if (!hwnd || !Platform::Windows::IsWindowTrackedInAnyState(hwnd)) continue;
+    ReconcileKnownWindows(ReconcileScope::Desktop, changedKeys, hwnd);
+  }
+  ReconcileKnownWindows(ReconcileScope::Participation, changedKeys);
+}
+
 // After a lifecycle burst settles, reconcile tracked-window physical and desktop
 // state, discover eligible windows only on the current desktop, then arrange each
 // changed or pending workspace once and refresh the tray.
@@ -1358,16 +1396,10 @@ static void ReconcileDeferredLifecycle() {
   g_wm.desktop.reconciled = currentDesktop;
   g_wm.desktop.state = ReconciledDesktopState::Settled;
 
-  // 2. Repair liveness/exclusions and settled suspended participation globally
-  // before doing current-desktop discovery. Dirty tracked HWNDs also get a
-  // desktop ownership check; per-window moves do not emit a desktop change.
+  // 2. Repair ownership, liveness/exclusions and participation globally before
+  // doing current-desktop discovery.
   std::vector<DesktopMonitorKey> globallyChanged;
-  ReconcileKnownWindows(ReconcileScope::Participation, &globallyChanged);
-  if (missedDesktopSwitch) ReconcileKnownWindows(ReconcileScope::Desktop, &globallyChanged);
-  for (HWND hwnd : dirtyWindows) {
-    if (!hwnd || !Platform::Windows::IsWindowTrackedInAnyState(hwnd)) continue;
-    ReconcileKnownWindows(ReconcileScope::Desktop, &globallyChanged, hwnd);
-  }
+  ReconcileSettledKnownWindows(dirtyWindows, missedDesktopSwitch, &globallyChanged);
 
   // 3. Snapshot the monitors involved (one top-level enumeration for all).
   std::vector<HMONITOR> monitors =
