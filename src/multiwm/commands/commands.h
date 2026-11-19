@@ -323,10 +323,10 @@ void StepFocusedWindowSize(bool grow) {
   CommitWindowSizeChange(*focused, std::move(candidate), action);
 }
 
-// Returns the focused window to its default size without moving it to another
-// position: the layout default when tiled. A floating window gets the size a
-// new floating window gets (its override-size rule's, else the default floating
-// size) around its current center; a preserve-size rule keeps its size.
+// Returns the focused window to its default size. A tiled window gets the
+// layout default and keeps its position. A floating window is placed as if it
+// were newly admitted (NewWindowCenter): centered at its override-size rule's
+// size, else the default floating size; a preserve-size rule keeps its size.
 void ResetFocusedWindowSize() {
   ++Diagnostics::g_runtime.counters.resetWindowSizeCommands;
   auto focused = LoadFocusedMember();
@@ -334,7 +334,7 @@ void ResetFocusedWindowSize() {
 
   if (focused->floating) {
     Placement::FloatingPlacementHint hint;
-    hint.intent = Placement::FloatingPlacementIntent::ResetSizeKeepingCenter;
+    hint.intent = Placement::FloatingPlacementIntent::NewWindowCenter;
     if (Placement::RepairFloatingGeometry(focused->key, focused->workspace, focused->hwnd, hint)) {
       g_workspaces.Save(focused->key, focused->workspace);
       Diagnostics::RecordEvent(L"Reset window size floating hwnd=%p", focused->hwnd);

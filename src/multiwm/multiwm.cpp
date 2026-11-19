@@ -290,7 +290,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       $description: Make the focused window smaller by one step. Hold to repeat. Blank disables this shortcut.
     - ResetKey: "0"
       $name: Reset Focused Window Size
-      $description: Return the focused window to its default size. Blank disables this shortcut.
+      $description: Return the focused window to its default size. Floating windows are also centered. Blank disables this shortcut.
     - StepPercent: 5
       $name: Step Size (%)
       #! $min: 1

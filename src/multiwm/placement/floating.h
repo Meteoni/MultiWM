@@ -95,15 +95,12 @@ static bool RepairFloatingGeometry(
   const bool ruleFloatedCenter =
       hint.intent == FloatingPlacementIntent::RuleFloatedCenter;
   if (ruleFloatedCenter && !haveCurrent) return false;
-  const bool keepCurrentCenter =
-      hint.intent == FloatingPlacementIntent::ResetSizeKeepingCenter && haveCurrent;
   const bool useNewWindowSize =
       hint.intent == FloatingPlacementIntent::NewWindowCenter ||
-      hint.intent == FloatingPlacementIntent::FailureCenter ||
-      hint.intent == FloatingPlacementIntent::ResetSizeKeepingCenter;
+      hint.intent == FloatingPlacementIntent::FailureCenter;
   const bool centerInWorkspace =
       hint.intent == FloatingPlacementIntent::CenterWithFloatingSize ||
-      (useNewWindowSize && !keepCurrentCenter) || ruleFloatedCenter;
+      useNewWindowSize || ruleFloatedCenter;
 
   const bool needsFallbackSize =
       useNewWindowSize || ruleFloatedCenter || !record->hasFloatingRect;
@@ -157,8 +154,6 @@ static bool RepairFloatingGeometry(
   POINT center{};
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     center = hint.anchor;
-  } else if (keepCurrentCenter) {
-    center = SharedGeometry::RectCenter(current);
   } else if (!centerInWorkspace && record->hasFloatingRect &&
              ResolveRememberedFloatingMonitor(*record) == monitor) {
     center = SharedGeometry::RectCenter(record->floatingRect);
