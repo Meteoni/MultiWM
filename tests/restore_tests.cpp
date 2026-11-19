@@ -11,6 +11,34 @@ static HANDLE WINAPI OpenTestAliveEvent(DWORD, BOOL, LPCWSTR) {
 #undef OpenEventW
 #include <cstdio>
 
+// Activating a window on this private, input-less desktop sometimes stalls
+// inside Windows for about two seconds (measured: about one activating show in
+// three, cloaked or not), which pushed the suite past its watchdog. Activation
+// is not what these tests check, so the native calls behind the companion's
+// hooks show without activating; the companion still receives the caller's
+// original command. Each substitute leaves the window in the same state as the
+// original from normal, minimized, maximized and hidden, except SW_SHOWNORMAL
+// on a window minimized from maximized, which is passed through.
+static int WithoutActivation(HWND hwnd, int command) {
+  switch (command) {
+    case SW_RESTORE: return SW_SHOWNOACTIVATE;
+    case SW_SHOW: return SW_SHOWNA;
+    case SW_SHOWNORMAL: {
+      WINDOWPLACEMENT placement{sizeof(placement)};
+      const bool restoresToMaximized = IsIconic(hwnd) && GetWindowPlacement(hwnd, &placement) &&
+                                       (placement.flags & WPF_RESTORETOMAXIMIZED);
+      return restoresToMaximized ? command : SW_SHOWNOACTIVATE;
+    }
+    default: return command;
+  }
+}
+static BOOL WINAPI ShowWithoutActivation(HWND hwnd, int command) {
+  return ShowWindow(hwnd, WithoutActivation(hwnd, command));
+}
+static BOOL WINAPI ShowAsyncWithoutActivation(HWND hwnd, int command) {
+  return ShowWindowAsync(hwnd, WithoutActivation(hwnd, command));
+}
+
 static bool preparationPreservedState = true;
 static int preparations = 0;
 // The companion's restore preparation must change only the normal rectangle:
@@ -20,7 +48,9 @@ static BOOL WINAPI ObservePlacement(HWND hwnd, const WINDOWPLACEMENT* placement)
   const bool maximized = IsZoomed(hwnd) != FALSE;
   const bool visible = IsWindowVisible(hwnd) != FALSE;
   const HWND active = GetActiveWindow();
-  const BOOL result = SetWindowPlacement(hwnd, placement);
+  WINDOWPLACEMENT native = *placement;
+  native.showCmd = WithoutActivation(hwnd, static_cast<int>(placement->showCmd));
+  const BOOL result = SetWindowPlacement(hwnd, &native);
   const UINT command = placement->showCmd;
   if (command == SW_SHOWMINNOACTIVE || (command == SW_SHOWNA && visible) || command == SW_HIDE) {
     ++preparations;
@@ -63,8 +93,8 @@ static DWORD WINAPI RunNativeRestoreTests(void* parameter) {
   if (!SetThreadDesktop(static_cast<HDESK>(parameter))) return 1;
   Companion::PhysicalCoordinatesScope physical;
   Companion::g_unhookedSetWindowPlacement = ObservePlacement;
-  Companion::g_unhookedShowWindow = ShowWindow;
-  Companion::g_unhookedShowWindowAsync = ShowWindowAsync;
+  Companion::g_unhookedShowWindow = ShowWithoutActivation;
+  Companion::g_unhookedShowWindowAsync = ShowAsyncWithoutActivation;
   Companion::g_unhookedSetWindowPos = SetWindowPos;
   Companion::g_setWindowPosForOwnMoves = ObservePosition;
   Companion::g_unhookedDeferWindowPos = DeferWindowPos;

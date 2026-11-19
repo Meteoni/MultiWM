@@ -23,6 +23,9 @@ $isolatedRunner = Join-Path $buildDirectory 'isolated_runner.exe'
   '-municode' '-static' (Join-Path $PSScriptRoot 'isolated_runner.cpp') '-o' $isolatedRunner
 if ($LASTEXITCODE -ne 0) { throw 'Compilation failed: isolated test runner' }
 $suites = if ($Suite -eq 'all') { @('layout', 'reconciliation', 'companion', 'restore') } else { @($Suite) }
+# Every suite runs even when an earlier one fails, so one failure doesn't hide
+# the others' results; all failures are reported together at the end.
+$failures = @()
 foreach ($name in $suites) {
   $source = Join-Path $PSScriptRoot ($name + '_tests.cpp')
   $executable = Join-Path $buildDirectory ($name + '_tests.exe')
@@ -34,7 +37,11 @@ foreach ($name in $suites) {
     '-lversion', '-lgdi32', '-ladvapi32', '-static', '-o', $executable
   )
   & $compilerPath @compilerArguments
-  if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $name" }
+  if ($LASTEXITCODE -ne 0) {
+    $failures += "compilation failed: $name"
+    continue
+  }
   & $isolatedRunner $executable
-  if ($LASTEXITCODE -ne 0) { throw "Regression failed: $name" }
+  if ($LASTEXITCODE -ne 0) { $failures += "regression failed: $name (exit code $LASTEXITCODE)" }
 }
+if ($failures) { throw ($failures -join '; ') }

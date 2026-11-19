@@ -542,185 +542,295 @@ static void RunConformanceLocationTests() {
               checks, static_cast<unsigned long long>(digest));
 }
 
-// Floating leases: in the Floating layout, a window MultiWM placed is put back if
-// the app snaps away, and keeps the app's frame at the deadline. The window-size
-// commands place through the same path. Same invisible test window as above.
-static void RunFloatingLeaseTests() {
-  unsigned checks = 0;
-  auto check = [&](bool passed, const char* message) {
-    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
-    ++checks;
-  };
-  const DPI_AWARENESS_CONTEXT previousDpiContext =
-      SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  const SettingsState savedSettings = g_settings;
-  g_settings.conformanceLeaseMs = 3000;
-  g_settings.conformanceRepairIntervalMs = 75;
-  g_settings.resizeStepPercent = 5;
-  TestWindowDesktops windows;
-  TestManager manager;
-  GUID desktop{};
-  desktop.Data1 = 0xF10A7;
-  windows.desktop = desktop;
-  manager.desktop.id = desktop;
-  g_vd.initialized = true;
-  g_vd.desktopManager = &windows;
-  g_vd.managerInternal = &manager;
-  g_wm.desktop.reconciled = desktop;
-  g_wm.desktop.state = ReconciledDesktopState::Settled;
-  g_wm.managementMode = ManagementMode::Manual;
+// Counts passed checks; the first failure ends the test run.
+struct CheckCounter {
+  unsigned passed = 0;
+  void operator()(bool ok, const char* message) {
+    if (!ok) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++passed;
+  }
+};
 
-  const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
-  DesktopMonitorKey key;
-  Platform::Monitors::WorkspaceMetrics metrics;
-  check(DesktopMonitorKey::FromHMonitor(desktop, monitor, &key) &&
-            Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics),
-        "resolve floating lease test monitor");
-  const RECT& workArea = metrics.workArea;
-  const POINT center = SharedGeometry::RectCenter(workArea);
-  const HWND hwnd = CreateWindowExW(
-      WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
-      L"STATIC", L"MultiWM floating lease test", WS_POPUP,
-      center.x - 150, center.y - 100, 300, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-  check(hwnd != nullptr, "create transparent test window");
-  SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
-  ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+// Real windows that are invisible to the user (transparent, click-through,
+// never activated, tool windows that a live MultiWM ignores) on the primary
+// monitor, owned by one fake virtual desktop. Floating placement tests use it;
+// everything it changes is put back when it goes out of scope.
+class FloatingWindowFixture {
+ public:
+  explicit FloatingWindowFixture(CheckCounter& check)
+      : check_(check),
+        previousDpi_(SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)),
+        savedSettings_(g_settings) {
+    g_settings.conformanceLeaseMs = 3000;
+    g_settings.conformanceRepairIntervalMs = 75;
+    g_settings.resizeStepPercent = 5;
+    GUID desktop{};
+    desktop.Data1 = 0xF10A7;
+    windows_.desktop = desktop;
+    manager_.desktop.id = desktop;
+    g_vd.initialized = true;
+    g_vd.desktopManager = &windows_;
+    g_vd.managerInternal = &manager_;
+    g_wm.desktop.reconciled = desktop;
+    g_wm.desktop.state = ReconciledDesktopState::Settled;
+    g_wm.managementMode = ManagementMode::Manual;
+    const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    check_(DesktopMonitorKey::FromHMonitor(desktop, monitor, &key) &&
+               Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics),
+           "resolve the test monitor");
+    workArea = metrics.workArea;
+    center = SharedGeometry::RectCenter(workArea);
+    hwnd = CreateTestWindow(nullptr);
+  }
 
-  auto seed = [&](TileLayout layout) {
+  ~FloatingWindowFixture() {
+    // Newest first: destroying an owner also destroys the windows it owns.
+    for (auto it = created_.rbegin(); it != created_.rend(); ++it) {
+      Reconcile::ForgetManagedWindow(*it);
+      DestroyWindow(*it);
+    }
+    ClearLeases();
+    g_settings = savedSettings_;
+    g_wm.managementMode = ManagementMode::Manual;
+    g_wm.desktop.state = ReconciledDesktopState::Unknown;
+    g_vd.desktopManager = nullptr;
+    g_vd.managerInternal = nullptr;
+    g_vd.initialized = false;
+    SetThreadDpiAwarenessContext(previousDpi_);
+  }
+
+  // A 400x300 test window off-center in the work area, optionally owned.
+  HWND CreateTestWindow(HWND owner) {
+    const HWND window = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"STATIC",
+        L"MultiWM floating test", WS_POPUP, workArea.left + 20, workArea.top + 20, 400, 300, owner, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    check_(window != nullptr, "create an invisible test window");
+    SetLayeredWindowAttributes(window, 0, 0, LWA_ALPHA);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    created_.push_back(window);
+    return window;
+  }
+
+  // A workspace in `layout` whose only member is `hwnd`, replacing any other.
+  void Seed(TileLayout layout) {
     Workspace workspace;
     workspace.SetLayout(layout);
-    WindowRecord record;
-    record.hwnd = hwnd;
-    record.pid = GetCurrentProcessId();
-    record.canMove = true;
-    record.canResize = true;
-    workspace.AdmitTiled(record);
+    workspace.AdmitTiled(Record(hwnd));
     workspace.ClearInsertionPlacement(hwnd);
     g_workspaces.Save(key, workspace);
-  };
-  auto load = [&] {
+  }
+
+  static WindowRecord Record(HWND window) {
+    WindowRecord record;
+    record.hwnd = window;
+    record.pid = GetCurrentProcessId();
+    record.canMove = record.canResize = true;
+    return record;
+  }
+
+  Workspace Load() {
     Workspace workspace;
-    check(g_workspaces.Load(key, &workspace), "load floating lease workspace");
+    check_(g_workspaces.Load(key, &workspace), "load the test workspace");
     return workspace;
-  };
-  auto frame = [&] {
+  }
+
+  static RECT Frame(HWND window) {
     RECT rect{};
-    Platform::Windows::GetWindowFrameRect(hwnd, &rect);
+    Platform::Windows::GetWindowFrameRect(window, &rect);
     return rect;
-  };
-  auto lease = [&]() -> Placement::ConformanceLease* {
-    auto it = TestLeases().find(hwnd);
+  }
+
+  // The app moves or resizes `window` itself.
+  static void AppMove(HWND window, LONG left, LONG top, LONG width, LONG height) {
+    SetWindowPos(window, nullptr, left, top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+  }
+
+  // MultiWM places `window` with `intent` and saves the workspace.
+  bool Place(HWND window, Placement::FloatingPlacementIntent intent) {
+    Workspace workspace = Load();
+    Placement::FloatingPlacementHint hint;
+    hint.intent = intent;
+    if (!Placement::RepairFloatingGeometry(key, workspace, window, hint)) return false;
+    g_workspaces.Save(key, workspace);
+    return true;
+  }
+
+  // One window-size step on a floating window; saves the workspace.
+  bool Step(HWND window, int direction) {
+    Workspace workspace = Load();
+    if (!Placement::StepFloatingWindowSize(key, workspace, window, direction)) return false;
+    g_workspaces.Save(key, workspace);
+    return true;
+  }
+
+  // Where centering a window of `widthDip` x `heightDip` puts it.
+  RECT Centered(LONG widthDip, LONG heightDip) const {
+    return SharedGeometry::ClampToArea(
+        SharedGeometry::CenteredIn(workArea, SharedGeometry::ScaleDip(widthDip, metrics.dpi),
+                                   SharedGeometry::ScaleDip(heightDip, metrics.dpi)),
+        workArea);
+  }
+
+  static Placement::ConformanceLease* Lease(HWND window) {
+    auto it = TestLeases().find(window);
     return it == TestLeases().end() ? nullptr : &it->second;
-  };
-  auto remembered = [&] {
-    Workspace workspace = load();
-    const WindowRecord* record = workspace.Find(hwnd);
-    return record && record->hasFloatingRect ? record->floatingRect : RECT{};
-  };
-  auto appMove = [&](LONG dx) {
-    RECT r = frame();
-    SetWindowPos(hwnd, nullptr, r.left + dx, r.top, r.right - r.left, r.bottom - r.top,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-  };
-  auto clearLeases = [&] {
+  }
+
+  static void ClearLeases() {
     TestLeases().clear();
     if (g_wm.timers.conformance) KillTimer(nullptr, g_wm.timers.conformance);
     g_wm.timers.conformance = 0;
+  }
+
+  DesktopMonitorKey key;
+  Platform::Monitors::WorkspaceMetrics metrics;
+  RECT workArea{};
+  POINT center{};
+  HWND hwnd = nullptr;  // The first test window.
+
+ private:
+  CheckCounter& check_;
+  DPI_AWARENESS_CONTEXT previousDpi_;
+  SettingsState savedSettings_;
+  TestWindowDesktops windows_;
+  TestManager manager_;
+  std::vector<HWND> created_;
+};
+
+static bool IsCenteredIn(const RECT& rect, POINT center) {
+  const POINT actual = SharedGeometry::RectCenter(rect);
+  return std::abs(actual.x - center.x) <= 1 && std::abs(actual.y - center.y) <= 1;
+}
+
+// Floating leases: in the Floating layout, a window MultiWM placed is put back
+// if the app snaps away, and keeps the app's frame at the deadline.
+static void RunFloatingLeaseTests() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  const HWND hwnd = f.hwnd;
+  auto lease = [&] { return FloatingWindowFixture::Lease(hwnd); };
+  auto remembered = [&] {
+    const WindowRecord* record = f.Load().Find(hwnd);
+    return record && record->hasFloatingRect ? record->floatingRect : RECT{};
+  };
+  auto appShift = [&](LONG dx) {
+    const RECT r = FloatingWindowFixture::Frame(hwnd);
+    FloatingWindowFixture::AppMove(hwnd, r.left + dx, r.top, Layout::RectWidth(r), Layout::RectHeight(r));
   };
 
-  // Reset: the size a new floating window gets, around the current center.
-  seed(TileLayout::Floating);
-  const POINT before = SharedGeometry::RectCenter(frame());
-  Workspace workspace = load();
-  Placement::FloatingPlacementHint reset;
-  reset.intent = Placement::FloatingPlacementIntent::ResetSizeKeepingCenter;
-  check(Placement::RepairFloatingGeometry(key, workspace, hwnd, reset), "reset places the window");
-  g_workspaces.Save(key, workspace);
-  const RECT placed = frame();
-  check(Layout::RectWidth(placed) == SharedGeometry::ScaleDip(960, metrics.dpi) &&
-            Layout::RectHeight(placed) == SharedGeometry::ScaleDip(640, metrics.dpi),
-        "reset uses the default floating size");
-  const POINT after = SharedGeometry::RectCenter(placed);
-  check(std::abs(after.x - before.x) <= 1 && std::abs(after.y - before.y) <= 1, "reset keeps the window's center");
+  f.Seed(TileLayout::Floating);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::NewWindowCenter), "place the window");
+  const RECT placed = FloatingWindowFixture::Frame(hwnd);
   check(lease() && lease()->kind == Placement::ConformanceLeaseKind::Floating &&
             Layout::RectsNear(lease()->expectedRect, placed) && Layout::RectsNear(remembered(), placed),
         "a Floating-layout placement opens a floating lease at its frame");
-
-  Placement::ArrangeWorkspace(key);
+  Placement::ArrangeWorkspace(f.key);
   check(lease() != nullptr, "arranging the Floating layout keeps its floating leases");
 
-  // The app snaps away: put back.
-  appMove(41);
-  check(Placement::HandleTiledWindowLocationChange(hwnd) && Layout::RectsNear(frame(), placed),
-        "a snap-back inside the lease is put back");
-  check(lease() && lease()->attempts == 1, "the reinforcement is counted");
-
-  // Again right away: rate-limited into one deferred re-check.
-  appMove(41);
+  appShift(41);
+  check(Placement::HandleTiledWindowLocationChange(hwnd) &&
+            Layout::RectsNear(FloatingWindowFixture::Frame(hwnd), placed) && lease() && lease()->attempts == 1,
+        "a snap-back inside the lease is put back, and the attempt counted");
+  appShift(41);
   check(Placement::HandleTiledWindowLocationChange(hwnd) && lease() && lease()->repairDueTickMs,
-        "a burst is deferred, not dropped");
+        "a second snap-back right away is deferred, not dropped");
 
-  // The deadline keeps the app's frame.
   const uint64_t adoptedBefore = Diagnostics::g_runtime.counters.conformanceLeaseExpiredAdopted;
-  const RECT appFrame = frame();
+  const RECT appFrame = FloatingWindowFixture::Frame(hwnd);
   lease()->expiresAtTickMs = 1;
   Placement::ProcessConformanceTimer();
-  check(!lease() && Layout::RectsNear(frame(), appFrame) && Layout::RectsNear(remembered(), appFrame) &&
+  check(!lease() && Layout::RectsNear(FloatingWindowFixture::Frame(hwnd), appFrame) &&
+            Layout::RectsNear(remembered(), appFrame) &&
             Diagnostics::g_runtime.counters.conformanceLeaseExpiredAdopted == adoptedBefore + 1,
         "at the deadline the window keeps the app's frame, which is remembered");
-  check(load().Layout() == TileLayout::Floating && load().IsTiled(hwnd),
+  check(f.Load().Layout() == TileLayout::Floating && f.Load().IsTiled(hwnd),
         "a floating deadline never floats the window or changes the layout");
 
-  // Grow and shrink by one step around the center.
-  const RECT start = frame();
-  workspace = load();
-  check(Placement::StepFloatingWindowSize(key, workspace, hwnd, 1), "grow steps the window");
-  g_workspaces.Save(key, workspace);
-  const RECT grown = frame();
-  const LONG stepX = MulDiv(Layout::RectWidth(workArea), 5, 100);
-  const LONG stepY = MulDiv(Layout::RectHeight(workArea), 5, 100);
-  check(Layout::RectWidth(grown) == Layout::RectWidth(start) + stepX &&
-            Layout::RectHeight(grown) == Layout::RectHeight(start) + stepY,
-        "grow adds the step percentage of the work area to each dimension");
-  check(lease() && Layout::RectsNear(lease()->expectedRect, grown), "a step opens a floating lease");
-  workspace = load();
-  check(Placement::StepFloatingWindowSize(key, workspace, hwnd, -1), "shrink steps the window");
-  g_workspaces.Save(key, workspace);
-  check(Layout::RectWidth(frame()) == Layout::RectWidth(start) &&
-            Layout::RectHeight(frame()) == Layout::RectHeight(start), "shrink undoes grow");
-  workspace = load();
-  for (int i = 0; i < 100 && Placement::StepFloatingWindowSize(key, workspace, hwnd, 1); ++i) {}
-  check(Layout::RectWidth(frame()) <= Layout::RectWidth(workArea) &&
-            Layout::RectHeight(frame()) <= Layout::RectHeight(workArea) &&
-            !Placement::StepFloatingWindowSize(key, workspace, hwnd, 1),
-        "growth stops at the work area");
-  g_workspaces.Save(key, workspace);
-
-  // A floating lease left behind by a tiled layout is stale.
-  seed(TileLayout::Columns);
-  check(lease() != nullptr, "the floating lease is still recorded");
+  check(f.Step(hwnd, 1) && lease() && Layout::RectsNear(lease()->expectedRect, FloatingWindowFixture::Frame(hwnd)),
+        "a size step opens a floating lease too");
+  f.Seed(TileLayout::Columns);
   check(!Placement::HandleTiledWindowLocationChange(hwnd) && !lease(),
         "outside the Floating layout a floating lease is dropped");
-  clearLeases();
+  std::printf("Passed %u floating lease checks.\n", check.passed);
+}
 
-  // A rule-floated admission is centred at the app's own size, unless an
-  // override-size rule names another size (Automatic mode).
+// Window-size commands on floating windows: Floating-layout members and
+// per-window floating windows step around their center and reset as if newly
+// admitted; a per-window floating window is its own target, never its owner.
+static void RunFloatingSizeCommandTests() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  const HWND hwnd = f.hwnd;
+  auto frame = [](HWND window) { return FloatingWindowFixture::Frame(window); };
+  const LONG stepX = MulDiv(Layout::RectWidth(f.workArea), 5, 100);
+  const LONG stepY = MulDiv(Layout::RectHeight(f.workArea), 5, 100);
+
+  f.Seed(TileLayout::Floating);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::NewWindowCenter) &&
+            Layout::RectsNear(frame(hwnd), f.Centered(960, 640), 1),
+        "reset centers the window at the default floating size");
+  const RECT start = frame(hwnd);
+  check(f.Step(hwnd, 1) && Layout::RectWidth(frame(hwnd)) == Layout::RectWidth(start) + stepX &&
+            Layout::RectHeight(frame(hwnd)) == Layout::RectHeight(start) + stepY,
+        "grow adds the step percentage of the work area to each dimension");
+  check(f.Step(hwnd, -1) && Layout::RectsNear(frame(hwnd), start, 0), "shrink undoes grow");
+  for (int i = 0; i < 100 && f.Step(hwnd, 1); ++i) {}
+  check(!f.Step(hwnd, 1) && Layout::RectWidth(frame(hwnd)) <= Layout::RectWidth(f.workArea) &&
+            Layout::RectHeight(frame(hwnd)) <= Layout::RectHeight(f.workArea),
+        "growth stops at the work area");
+  FloatingWindowFixture::ClearLeases();
+
+  // A per-window floating window owned by a tiled one.
+  f.Seed(TileLayout::Columns);
+  const HWND owned = f.CreateTestWindow(hwnd);
+  check(Commands::ResolveSizeCommandTarget(f.Load(), owned) == hwnd,
+        "an unmanaged owned window resolves to its tiled owner");
+  Workspace workspace = f.Load();
+  check(workspace.AdmitFloating(FloatingWindowFixture::Record(owned)), "float the owned window");
+  g_workspaces.Save(f.key, workspace);
+  check(Commands::ResolveSizeCommandTarget(f.Load(), owned) == owned,
+        "a per-window floating window is its own target");
+  const RECT ownedStart = frame(owned);
+  check(f.Step(owned, 1) && Layout::RectWidth(frame(owned)) == Layout::RectWidth(ownedStart) + stepX &&
+            !FloatingWindowFixture::Lease(owned),
+        "it grows by one step, without a floating lease outside the Floating layout");
+  FloatingWindowFixture::AppMove(owned, f.workArea.left + 20, f.workArea.top + 20, 400, 300);
+  check(f.Place(owned, Placement::FloatingPlacementIntent::NewWindowCenter) &&
+            Layout::RectsNear(frame(owned), f.Centered(960, 640), 1),
+        "without a size rule, reset centers it at the default floating size");
+
+  WindowRule sizeRule;
+  sizeRule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
+  sizeRule.classNames = {L"Static"};
+  sizeRule.preserveFloatingSize = false;
+  sizeRule.floatingSizeDip = {489, 384};
+  g_settings.windowRules = {sizeRule};
   g_wm.managementMode = ManagementMode::Automatic;
-  auto ruleFloat = [&] {
-    SetWindowPos(hwnd, nullptr, workArea.left + 10, workArea.top + 10, 400, 300, SWP_NOZORDER | SWP_NOACTIVATE);
-    workspace = load();
-    Placement::FloatingPlacementHint hint;
-    hint.intent = Placement::FloatingPlacementIntent::RuleFloatedCenter;
-    check(Placement::RepairFloatingGeometry(key, workspace, hwnd, hint), "rule-floated centring places the window");
-    g_workspaces.Save(key, workspace);
-    const POINT placedCenter = SharedGeometry::RectCenter(frame());
-    check(std::abs(placedCenter.x - center.x) <= 1 && std::abs(placedCenter.y - center.y) <= 1,
-          "a rule-floated window is centred in the work area");
-    return frame();
+  check(f.Place(owned, Placement::FloatingPlacementIntent::NewWindowCenter) &&
+            Layout::RectsNear(frame(owned), f.Centered(489, 384), 1),
+        "with an override-size rule, reset centers it at the rule's size");
+  std::printf("Passed %u floating size command checks.\n", check.passed);
+}
+
+// A window a floating rule admits is centered at its own size, unless an
+// override-size rule names another size (Automatic mode only).
+static void RunRuleFloatedSizeTests() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  const HWND hwnd = f.hwnd;
+  f.Seed(TileLayout::Columns);
+  g_wm.managementMode = ManagementMode::Automatic;
+  auto placeRuleFloated = [&] {
+    FloatingWindowFixture::AppMove(hwnd, f.workArea.left + 10, f.workArea.top + 10, 400, 300);
+    check(f.Place(hwnd, Placement::FloatingPlacementIntent::RuleFloatedCenter), "place the rule-floated window");
+    const RECT frame = FloatingWindowFixture::Frame(hwnd);
+    check(IsCenteredIn(frame, f.center), "a rule-floated window is centered in the work area");
+    return frame;
   };
-  g_settings.windowRules.clear();
-  RECT ruleFloated = ruleFloat();
-  check(Layout::RectWidth(ruleFloated) == 400 && Layout::RectHeight(ruleFloated) == 300,
+
+  RECT placed = placeRuleFloated();
+  check(Layout::RectWidth(placed) == 400 && Layout::RectHeight(placed) == 300,
         "without a size rule it keeps its own size");
   WindowRule sizeRule;
   sizeRule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
@@ -728,85 +838,13 @@ static void RunFloatingLeaseTests() {
   sizeRule.preserveFloatingSize = false;
   sizeRule.floatingSizeDip = {489, 384};
   g_settings.windowRules = {sizeRule};
-  ruleFloated = ruleFloat();
-  check(Layout::RectWidth(ruleFloated) == SharedGeometry::ScaleDip(489, metrics.dpi) &&
-            Layout::RectHeight(ruleFloated) == SharedGeometry::ScaleDip(384, metrics.dpi),
-        "an override-size rule sizes it");
+  placed = placeRuleFloated();
+  check(Layout::RectsNear(placed, f.Centered(489, 384), 1), "an override-size rule sizes it");
   g_settings.windowRules[0].preserveFloatingSize = true;
-  ruleFloated = ruleFloat();
-  check(Layout::RectWidth(ruleFloated) == 400 && Layout::RectHeight(ruleFloated) == 300,
+  placed = placeRuleFloated();
+  check(Layout::RectWidth(placed) == 400 && Layout::RectHeight(placed) == 300,
         "a preserve-size rule keeps its own size");
-  g_wm.managementMode = ManagementMode::Manual;
-  clearLeases();
-
-  // Size commands: a focused per-window floating window is sized itself, never
-  // its tiled owner; an unmanaged owned window still resolves to its owner.
-  g_settings.windowRules.clear();
-  seed(TileLayout::Columns);
-  const HWND owned = CreateWindowExW(
-      WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
-      L"STATIC", L"MultiWM owned test", WS_POPUP,
-      center.x - 200, center.y - 150, 400, 300, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-  check(owned != nullptr, "create owned test window");
-  SetLayeredWindowAttributes(owned, 0, 0, LWA_ALPHA);
-  ShowWindow(owned, SW_SHOWNOACTIVATE);
-  check(Commands::ResolveSizeCommandTarget(load(), owned) == hwnd,
-        "an unmanaged owned window resolves to its tiled owner");
-  workspace = load();
-  WindowRecord ownedRecord;
-  ownedRecord.hwnd = owned;
-  ownedRecord.pid = GetCurrentProcessId();
-  ownedRecord.canMove = true;
-  ownedRecord.canResize = true;
-  check(workspace.AdmitFloating(ownedRecord), "admit owned window as per-window floating");
-  g_workspaces.Save(key, workspace);
-  check(Commands::ResolveSizeCommandTarget(load(), owned) == owned,
-        "a per-window floating window is its own target");
-
-  auto ownedFrame = [&] {
-    RECT rect{};
-    Platform::Windows::GetWindowFrameRect(owned, &rect);
-    return rect;
-  };
-  const RECT ownedStart = ownedFrame();
-  workspace = load();
-  check(Placement::StepFloatingWindowSize(key, workspace, owned, 1), "a per-window floating window grows");
-  g_workspaces.Save(key, workspace);
-  check(Layout::RectWidth(ownedFrame()) == Layout::RectWidth(ownedStart) + stepX &&
-            !TestLeases().count(owned),
-        "it grows by one step, without a floating lease outside the Floating layout");
-  workspace = load();
-  check(Placement::RepairFloatingGeometry(key, workspace, owned, reset), "a per-window floating window resets");
-  g_workspaces.Save(key, workspace);
-  const POINT ownedCenter = SharedGeometry::RectCenter(ownedFrame());
-  const POINT startCenter = SharedGeometry::RectCenter(ownedStart);
-  check(Layout::RectWidth(ownedFrame()) == SharedGeometry::ScaleDip(960, metrics.dpi) &&
-            Layout::RectHeight(ownedFrame()) == SharedGeometry::ScaleDip(640, metrics.dpi) &&
-            std::abs(ownedCenter.x - startCenter.x) <= 1 && std::abs(ownedCenter.y - startCenter.y) <= 1,
-        "without a size rule, reset uses the default floating size around its center");
-  g_wm.managementMode = ManagementMode::Automatic;
-  sizeRule.preserveFloatingSize = false;
-  g_settings.windowRules = {sizeRule};
-  workspace = load();
-  check(Placement::RepairFloatingGeometry(key, workspace, owned, reset), "reset with a size rule");
-  g_workspaces.Save(key, workspace);
-  check(Layout::RectWidth(ownedFrame()) == SharedGeometry::ScaleDip(489, metrics.dpi) &&
-            Layout::RectHeight(ownedFrame()) == SharedGeometry::ScaleDip(384, metrics.dpi),
-        "with an override-size rule, reset uses the rule's size");
-  g_wm.managementMode = ManagementMode::Manual;
-  g_settings.windowRules.clear();
-  Reconcile::ForgetManagedWindow(owned);
-  DestroyWindow(owned);
-
-  Reconcile::ForgetManagedWindow(hwnd);
-  DestroyWindow(hwnd);
-  g_settings = savedSettings;
-  g_wm.desktop.state = ReconciledDesktopState::Unknown;
-  g_vd.desktopManager = nullptr;
-  g_vd.managerInternal = nullptr;
-  g_vd.initialized = false;
-  SetThreadDpiAwarenessContext(previousDpiContext);
-  std::printf("Passed %u floating lease checks.\n", checks);
+  std::printf("Passed %u rule-floated size checks.\n", check.passed);
 }
 
 // Sequences in which a window that fitted must not be floated later: a sibling
@@ -1553,7 +1591,10 @@ int main() {
   RunWinEventRoutingTests();
   RunConformanceLocationTests();
   RunDiagnosticReportShapeTest();
-  RunFloatingLeaseTests();  // After the report test: it records events the report lists.
+  // After the report test: these record events the report lists.
+  RunFloatingLeaseTests();
+  RunFloatingSizeCommandTests();
+  RunRuleFloatedSizeTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
   RunOverflowFloatPredictionTests();
