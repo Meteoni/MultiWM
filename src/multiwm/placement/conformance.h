@@ -208,15 +208,8 @@ static ConformanceLeaseReadResult ReadConformanceLease(
   return g_pendingProofs.ReadLease(hwnd, GetTickCount64(), outLease);
 }
 
-static bool ReadActiveConformanceLease(HWND hwnd, ConformanceLease* outLease) {
-  if (!outLease) return false;
-  return ReadConformanceLease(hwnd, outLease) ==
-         ConformanceLeaseReadResult::Active;
-}
-
 static bool HasActiveConformanceLease(HWND hwnd) {
-  ConformanceLease ignored;
-  return ReadActiveConformanceLease(hwnd, &ignored);
+  return ReadConformanceLease(hwnd, nullptr) == ConformanceLeaseReadResult::Active;
 }
 
 // generation==0 means an unconditional cancellation (explicit user intent,
@@ -239,11 +232,13 @@ static bool CancelTiledConformanceLease(HWND hwnd) {
   return CancelConformanceLease(hwnd, lease.generation);
 }
 
-// Forgets every unproven placement change: leases, pending layout mutations and
-// admission-recovery baselines.
-static void ClearAllConformanceLeases() {
-  RuntimeLifecycle::AssertWmThread(L"ClearAllConformanceLeases");
+// Forgets every unproven placement change (conformance leases, pending layout
+// mutations and admission-recovery baselines) and stops the conformance timer,
+// which has nothing left to wait for.
+static void DiscardAllPendingProofs() {
+  RuntimeLifecycle::AssertWmThread(L"DiscardAllPendingProofs");
   g_pendingProofs.Clear();
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.conformance);
 }
 
 static size_t CountActiveConformanceLeases() {
@@ -253,10 +248,7 @@ static size_t CountActiveConformanceLeases() {
 
 static void ScheduleNextConformanceTimer() {
   RuntimeLifecycle::AssertWmThread(L"ScheduleNextConformanceTimer");
-  if (g_wm.timers.conformance) {
-    KillTimer(nullptr, g_wm.timers.conformance);
-    g_wm.timers.conformance = 0;
-  }
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.conformance);
 
   const ULONGLONG now = GetTickCount64();
   const ULONGLONG earliestDue = g_pendingProofs.NextLeaseDeadline();
@@ -302,7 +294,7 @@ static void BeginConformanceLease(
 static bool IsCurrentConformanceLease(HWND hwnd, uint64_t generation) {
   if (!hwnd || generation == 0) return false;
   ConformanceLease current;
-  return ReadActiveConformanceLease(hwnd, &current) &&
+  return ReadConformanceLease(hwnd, &current) == ConformanceLeaseReadResult::Active &&
          current.generation == generation;
 }
 
@@ -326,19 +318,6 @@ static bool HasOutstandingConformanceLease(const Workspace& workspace) {
   return false;
 }
 
-// Consumes one expired generation. A user gesture, migration, or new
-// authoritative placement that cancelled/replaced it wins if it happens first.
-static bool TakeExpiredConformanceLease(
-    HWND hwnd, uint64_t generation, ConformanceLease* outLease) {
-  RuntimeLifecycle::AssertWmThread(L"TakeExpiredConformanceLease");
-  if (!hwnd || !outLease) return false;
-  std::optional<ConformanceLease> taken =
-      g_pendingProofs.TakeExpiredLease(hwnd, generation, GetTickCount64());
-  if (!taken) return false;
-  *outLease = *taken;
-  return true;
-}
-
 // Recomputes the target from the current workspace rather than trusting a copied
 // lease blindly. This makes expiry harmless if a layout/work-area change replaced
 // the authoritative tile without issuing another SetWindowPos for this HWND.
@@ -352,7 +331,7 @@ static bool GetCurrentAuthoritativeTiledRect(
   if (!record || record->state != ManageState::Tiled) return false;
 
   const size_t tiledIndex = workspace.TiledIndex(hwnd);
-  if (tiledIndex == static_cast<size_t>(-1)) return false;
+  if (tiledIndex == Workspace::kNotFound) return false;
 
   HMONITOR monitor = key.ResolveMonitor();
   if (!monitor) return false;
@@ -427,18 +406,15 @@ static std::optional<ConformanceWorkspace> LoadConformanceWorkspace(HWND hwnd) {
 // Changed means a valid native report changed geometry and requires replanning.
 static ConformanceConstraintRefresh RefreshConformanceConstraints(
     HWND hwnd, Workspace& workspace, const WindowRecord& record) {
-  const WindowConstraints before = record.constraints;
-  const WindowConstraints fresh = Platform::Windows::ProbeWindowConstraints(hwnd);
-  const WindowConstraints observed = Model::MergeConstraintProbeWithCache(before, fresh);
+  const ConstraintProbeRefresh refresh = ProbeConstraintsAgainstCache(hwnd, record.constraints);
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, record) ||
       Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
       Platform::Windows::IsWindowCloaked(hwnd)) {
     return ConformanceConstraintRefresh::Stale;
   }
-  const bool geometryChanged = !Model::SameConstraintGeometry(before, observed);
-  workspace.UpdateConstraints(hwnd, observed);
-  return fresh.valid && geometryChanged ? ConformanceConstraintRefresh::Changed
-                                       : ConformanceConstraintRefresh::Unchanged;
+  workspace.UpdateConstraints(hwnd, refresh.merged);
+  return refresh.reportChanged ? ConformanceConstraintRefresh::Changed
+                               : ConformanceConstraintRefresh::Unchanged;
 }
 
 // The deadline is a final passive verdict, not one more fight with the app. If
@@ -857,19 +833,19 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
 }
 static void ProcessConformanceTimer() {
   RuntimeLifecycle::AssertWmThread(L"ProcessConformanceTimer");
-  if (g_wm.timers.conformance) {
-    KillTimer(nullptr, g_wm.timers.conformance);
-    g_wm.timers.conformance = 0;
-  }
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.conformance);
 
   const DueConformanceWork work = g_pendingProofs.TakeDueLeaseWork(GetTickCount64());
   for (const DueConformanceWork::ExpiredLease& candidate : work.expired) {
-    ConformanceLease lease;
-    if (!TakeExpiredConformanceLease(candidate.hwnd, candidate.generation, &lease)) continue;
-    if (lease.kind == ConformanceLeaseKind::Floating) {
-      FinalizeExpiredFloatingLease(candidate.hwnd, lease);
+    // Consumes one expired generation. A user gesture, migration, or new
+    // authoritative placement that cancelled/replaced it wins if it happened first.
+    const std::optional<ConformanceLease> lease =
+        g_pendingProofs.TakeExpiredLease(candidate.hwnd, candidate.generation, GetTickCount64());
+    if (!lease) continue;
+    if (lease->kind == ConformanceLeaseKind::Floating) {
+      FinalizeExpiredFloatingLease(candidate.hwnd, *lease);
     } else {
-      FinalizeExpiredConformanceLease(candidate.hwnd, lease);
+      FinalizeExpiredConformanceLease(candidate.hwnd, *lease);
     }
   }
   for (HWND hwnd : work.repairs) {

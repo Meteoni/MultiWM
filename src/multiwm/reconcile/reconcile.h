@@ -4,8 +4,6 @@
 
 namespace Reconcile {
 
-static bool SameWorkspaceKey(const DesktopMonitorKey& a, const DesktopMonitorKey& b);
-
 enum class ReconcileScope : uint8_t {
   None = 0,
   Participation = 1 << 0,
@@ -19,8 +17,13 @@ constexpr ReconcileScope operator|(ReconcileScope a, ReconcileScope b) {
       static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
 }
 
+constexpr ReconcileScope operator&(ReconcileScope a, ReconcileScope b) {
+  return static_cast<ReconcileScope>(
+      static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
+}
+
 constexpr bool HasReconcileScope(ReconcileScope value, ReconcileScope flag) {
-  return (static_cast<uint8_t>(value) & static_cast<uint8_t>(flag)) != 0;
+  return (value & flag) != ReconcileScope::None;
 }
 
 static void ReconcileKnownWindows(
@@ -377,27 +380,13 @@ static bool EnsureWorkspaceFromSnapshot(
   return true;
 }
 
-// A managed HWND is allowed to have exactly one logical workspace owner.
-static std::vector<DesktopMonitorKey> FindWorkspaceKeysContainingWindow(HWND hwnd) {
-  return g_workspaces.OwnersOf(hwnd);
-}
-
 static void ForgetManagedWindow(HWND hwnd) {
   Placement::CancelConformanceLease(hwnd);
-  const std::vector<DesktopMonitorKey> keys = g_workspaces.OwnersOf(hwnd);
-  for (const auto& key : keys) {
-    Workspace workspace;
-    if (!g_workspaces.Load(key, &workspace)) continue;
-    if (workspace.Forget(hwnd)) {
-      g_workspaces.Save(key, workspace);
-      Placement::ArrangeWorkspace(key);
-    }
-  }
+  g_workspaces.UpdateEach(
+      g_workspaces.OwnersOf(hwnd),
+      [&](const DesktopMonitorKey&, Workspace& workspace) { return workspace.Forget(hwnd); },
+      [](const DesktopMonitorKey& key) { Placement::ArrangeWorkspace(key); });
   Gestures::ClearMoveSizeSamples(hwnd);
-}
-
-static bool SameWorkspaceKey(const DesktopMonitorKey& a, const DesktopMonitorKey& b) {
-  return a.monitor == b.monitor && IsEqualGUID(a.desktopId, b.desktopId);
 }
 
 static void AddUniqueWorkspaceKey(
@@ -405,7 +394,7 @@ static void AddUniqueWorkspaceKey(
   if (!key.monitor) return;
   if (std::none_of(keys.begin(), keys.end(),
                    [&](const DesktopMonitorKey& existing) {
-                     return SameWorkspaceKey(existing, key);
+                     return existing == key;
                    })) {
     keys.push_back(key);
   }
@@ -415,7 +404,7 @@ static void AddUniqueWorkspaceKey(
 // rebase its layout-specific logical slot/weight at the destination.
 static bool MigrateManagedWindow(
     HWND hwnd, const DesktopMonitorKey& sourceKey, const DesktopMonitorKey& targetKey) {
-  if (!hwnd || SameWorkspaceKey(sourceKey, targetKey)) return false;
+  if (!hwnd || sourceKey == targetKey) return false;
   Placement::CancelConformanceLease(hwnd);
   Placement::DiscardPendingAdmissionRecovery(hwnd);
 
@@ -479,12 +468,12 @@ static bool MigrateManagedWindow(
 static bool EnsureUniqueWindowOwnership(
     HWND hwnd, const DesktopMonitorKey& targetKey,
     std::vector<DesktopMonitorKey>* changedKeys) {
-  std::vector<DesktopMonitorKey> owners = FindWorkspaceKeysContainingWindow(hwnd);
+  const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
   if (owners.empty()) return false;
 
   const bool targetAlreadyOwns = std::any_of(
       owners.begin(), owners.end(), [&](const DesktopMonitorKey& key) {
-        return SameWorkspaceKey(key, targetKey);
+        return key == targetKey;
       });
 
   bool changed = false;
@@ -505,17 +494,15 @@ static bool EnsureUniqueWindowOwnership(
   // MigrateManagedWindow removes its selected source and any pre-existing
   // destination record, but an old bug may have left more than two copies.
   // Remove every remaining non-target owner explicitly.
-  for (const auto& ownerKey : owners) {
-    if (SameWorkspaceKey(ownerKey, targetKey)) continue;
-
-    Workspace ownerState;
-    if (!g_workspaces.Load(ownerKey, &ownerState)) continue;
-    if (ownerState.Forget(hwnd)) {
-      g_workspaces.Save(ownerKey, ownerState);
-      changed = true;
-      if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, ownerKey);
-    }
-  }
+  g_workspaces.UpdateEach(
+      owners,
+      [&](const DesktopMonitorKey& ownerKey, Workspace& ownerState) {
+        return ownerKey != targetKey && ownerState.Forget(hwnd);
+      },
+      [&](const DesktopMonitorKey& ownerKey) {
+        changed = true;
+        if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, ownerKey);
+      });
 
   if (owners.size() > 1) {
     Wh_Log(L"Repaired duplicate HWND ownership for %p (%zu logical owners)",
@@ -564,14 +551,12 @@ static void ForgetWindowFromOwners(
     std::vector<DesktopMonitorKey>* changedKeys) {
   Placement::CancelConformanceLease(hwnd);
   Placement::DiscardPendingAdmissionRecovery(hwnd);
-  for (const auto& ownerKey : ownerKeys) {
-    Workspace workspace;
-    if (!g_workspaces.Load(ownerKey, &workspace)) continue;
-    if (workspace.Forget(hwnd)) {
-      g_workspaces.Save(ownerKey, workspace);
-      if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, ownerKey);
-    }
-  }
+  g_workspaces.UpdateEach(
+      ownerKeys,
+      [&](const DesktopMonitorKey&, Workspace& workspace) { return workspace.Forget(hwnd); },
+      [&](const DesktopMonitorKey& ownerKey) {
+        if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, ownerKey);
+      });
   Gestures::ClearMoveSizeSamples(hwnd);
 }
 
@@ -579,10 +564,7 @@ static std::vector<DesktopMonitorKey> ReconcileWindowOwnership(
     HWND hwnd, ReconcileScope scope,
     std::vector<DesktopMonitorKey> ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
-  const ReconcileScope ownershipScope = static_cast<ReconcileScope>(
-      static_cast<uint8_t>(scope) &
-      (static_cast<uint8_t>(ReconcileScope::Desktop) |
-       static_cast<uint8_t>(ReconcileScope::Monitor)));
+  const ReconcileScope ownershipScope = scope & (ReconcileScope::Desktop | ReconcileScope::Monitor);
   if (ownershipScope == ReconcileScope::None || ownerKeys.empty()) return ownerKeys;
 
   DesktopMonitorKey observedKey{};
@@ -735,8 +717,6 @@ static void ReconcileKnownWindow(
         L"discarded stale HWND ownership after PID reuse hwnd=%p livePid=%lu",
         hwnd, livePid);
     ForgetWindowFromOwners(hwnd, ownerKeys, changedKeys);
-    Gestures::ClearMoveSizeSamples(hwnd);
-    Placement::CancelConformanceLease(hwnd);
     return;
   }
 
@@ -748,16 +728,13 @@ static void ReconcileKnownWindow(
   // it for that HWND's lifetime even if a title-based match later changes.
   if (Platform::Windows::ShouldWindowAlwaysFloat(hwnd)) {
     bool policyChanged = false;
-    for (const auto& ownerKey : ownerKeys) {
-      Workspace workspace;
-      if (!g_workspaces.Load(ownerKey, &workspace) ||
-          !workspace.EnforceAlwaysFloating(hwnd)) {
-        continue;
-      }
-      policyChanged = true;
-      g_workspaces.Save(ownerKey, workspace);
-      if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, ownerKey);
-    }
+    g_workspaces.UpdateEach(
+        ownerKeys,
+        [&](const DesktopMonitorKey&, Workspace& workspace) { return workspace.EnforceAlwaysFloating(hwnd); },
+        [&](const DesktopMonitorKey& ownerKey) {
+          policyChanged = true;
+          if (changedKeys) AddUniqueWorkspaceKey(*changedKeys, ownerKey);
+        });
     if (policyChanged) Placement::CancelConformanceLease(hwnd);
   }
 
@@ -975,9 +952,7 @@ static bool DiscoverCurrentWorkspaceOnMonitor(HMONITOR monitor) {
         DiscoverWorkspaceWindows(monitors[i], currentDesktop, snapshots[i]);
 
     // An unchanged workspace may still need its existing layout reinforced.
-    Workspace existing;
-    if (discovery.status != WorkspaceDiscoveryStatus::Saved &&
-        !g_workspaces.Load(key, &existing)) continue;
+    if (discovery.status != WorkspaceDiscoveryStatus::Saved && !g_workspaces.Contains(key)) continue;
     Placement::ArrangeWorkspace(key);
     arranged = true;
   }
@@ -1051,8 +1026,7 @@ static void HandleVirtualDesktopChanged() {
     // The native callback is an authoritative transition signal, but without a
     // current GUID we cannot prove that an existing placement lease still belongs
     // to the active desktop. Drop those short-lived contracts and retry normally.
-    Placement::ClearAllConformanceLeases();
-    Placement::ScheduleNextConformanceTimer();
+    Placement::DiscardAllPendingProofs();
     Wh_Log(L"Native VD change received but current desktop query failed");
     Diagnostics::RecordEvent(L"virtual desktop notification: current desktop query failed");
     ScheduleLifecycleReconcile(nullptr);
@@ -1068,8 +1042,7 @@ static void HandleVirtualDesktopChanged() {
     // A lease describes post-placement behavior on one active desktop. Never carry
     // it across DWM's cloak/uncloak transition; the incoming settled arrange pass
     // will establish fresh leases for any placements it actually has to issue.
-    Placement::ClearAllConformanceLeases();
-    Placement::ScheduleNextConformanceTimer();
+    Placement::DiscardAllPendingProofs();
   }
   g_wm.desktop.reconciled = currentDesktop;
   g_wm.desktop.state = ReconciledDesktopState::Settled;
@@ -1100,8 +1073,7 @@ static void HandleVirtualDesktopChanged() {
   for (HMONITOR monitor : monitors) {
     DesktopMonitorKey knownKey{};
     if (!DesktopMonitorKey::FromHMonitor(currentDesktop, monitor, &knownKey)) continue;
-    Workspace knownState;
-    if (g_workspaces.Load(knownKey, &knownState)) {
+    if (g_workspaces.Contains(knownKey)) {
       AddPendingWorkspaceArrange(currentDesktop, monitor);
     }
   }
@@ -1132,11 +1104,8 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
     g_wm.lifecycle.dirtyWindows.push_back(hwnd);
   }
 
-  if (g_wm.timers.lifecycle) {
-    ++Diagnostics::g_runtime.counters.lifecycleTimerResets;
-    KillTimer(nullptr, g_wm.timers.lifecycle);
-    g_wm.timers.lifecycle = 0;
-  }
+  if (g_wm.timers.lifecycle) ++Diagnostics::g_runtime.counters.lifecycleTimerResets;
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.lifecycle);
 
   g_wm.timers.lifecycle = SetTimer(nullptr, 0, g_settings.reconcileDelayMs, nullptr);
   if (!g_wm.timers.lifecycle) {
@@ -1149,10 +1118,7 @@ static void ScheduleLifecycleReconcile(HWND hwnd) {
 }
 
 static void ScheduleNextDiscoveryRetryTimer() {
-  if (g_wm.timers.discoveryRetry) {
-    KillTimer(nullptr, g_wm.timers.discoveryRetry);
-    g_wm.timers.discoveryRetry = 0;
-  }
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.discoveryRetry);
   if (g_wm.lifecycle.discoveryRetries.empty()) return;
 
   const ULONGLONG now = GetTickCount64();
@@ -1174,10 +1140,7 @@ static void ScheduleNextDiscoveryRetryTimer() {
 // ArrangeWorkspace establishes any needed post-placement conformance lease.
 static void ProcessDiscoveryRetryTimer() {
   RuntimeLifecycle::AssertWmThread(L"ProcessDiscoveryRetryTimer");
-  if (g_wm.timers.discoveryRetry) {
-    KillTimer(nullptr, g_wm.timers.discoveryRetry);
-    g_wm.timers.discoveryRetry = 0;
-  }
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.discoveryRetry);
   if (!RuntimeLifecycle::IsAutomaticMode() && !g_wm.routing.ready) {
     g_wm.lifecycle.discoveryRetries.clear();
     return;
@@ -1228,8 +1191,7 @@ static void RequeueDirtyWindows(const std::vector<HWND>& dirtyWindows) {
 // where the WM can prove the active desktop changed, so discard leases created
 // on the old desktop before ownership repair and incoming-workspace work.
 static void HandleMissedDesktopSwitch(const GUID& currentDesktop) {
-  Placement::ClearAllConformanceLeases();
-  Placement::ScheduleNextConformanceTimer();
+  Placement::DiscardAllPendingProofs();
   ++Diagnostics::g_runtime.counters.virtualDesktopFallbackChanges;
   Diagnostics::RecordEvent(
       L"virtual desktop change recovered from settled WinEvents currentDesktop=%08X",
@@ -1258,8 +1220,7 @@ static std::vector<HMONITOR> CollectMonitorsForPass(
     for (HMONITOR monitor : monitors) {
       DesktopMonitorKey key{};
       if (!DesktopMonitorKey::FromHMonitor(currentDesktop, monitor, &key)) continue;
-      Workspace existing;
-      if (g_workspaces.Load(key, &existing)) AddPendingWorkspaceArrange(currentDesktop, monitor);
+      if (g_workspaces.Contains(key)) AddPendingWorkspaceArrange(currentDesktop, monitor);
     }
   } else {
     monitors = g_workspaces.MonitorsOnDesktop(currentDesktop);
@@ -1366,10 +1327,7 @@ static void ReconcileSettledKnownWindows(
 // work; nothing it already committed is lost. WM thread only.
 static void ReconcileDeferredLifecycle() {
   ++Diagnostics::g_runtime.counters.lifecycleReconciles;
-  if (g_wm.timers.lifecycle) {
-    KillTimer(nullptr, g_wm.timers.lifecycle);
-    g_wm.timers.lifecycle = 0;
-  }
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.lifecycle);
 
   std::vector<HWND> dirtyWindows;
   dirtyWindows.swap(g_wm.lifecycle.dirtyWindows);
@@ -1426,7 +1384,7 @@ static void ReconcileDeferredLifecycle() {
   ScheduleDiscoveryRetries(dirtyWindows);
   for (const auto& key : globallyChanged) {
     if (std::none_of(arrangedKeys.begin(), arrangedKeys.end(),
-                     [&](const DesktopMonitorKey& arranged) { return SameWorkspaceKey(arranged, key); })) {
+                     [&](const DesktopMonitorKey& arranged) { return arranged == key; })) {
       Placement::ArrangeWorkspace(key);
     }
   }

@@ -83,6 +83,9 @@ geometry-based overflow and routing to another monitor can still need correction
 Known tiled windows shown on another desktop or monitor can use that workspace's
 insertion tile; explicitly floated windows retain their treatment. Hidden arrivals
 follow the configured destination insertion position, including after focus.
+A new window the companion moves onto its tile keeps the frame the app asked for
+on the window, so floating it later (Alt+F, a drag, the Floating layout) still uses
+the app's own size rather than the tile.
 Both mods must use snapshot ABI major 5: update MultiWM to 1.15.0 and Companion to
 0.3.0 together. Older major versions give no companion hints.
 

@@ -235,6 +235,55 @@ static bool BuildAdaptiveDwindleLayout(
   return true;
 }
 
+// Planning step 1: the cells the saved preferences give, ignoring native
+// minimums. Monocle gives every window the whole work area. `outSplits`
+// (optional, Dwindle only) receives the split geometry. Not for Floating.
+static void PlanPreferredCells(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    std::vector<RECT>* outRects, std::vector<DwindleSplit>* outSplits = nullptr) {
+  const TileLayout layout = workspace.Layout();
+  const size_t count = workspace.ActiveCount();
+  outRects->assign(count, RECT{});
+  if (outSplits) outSplits->clear();
+  if (IsMasterStackLayout(layout)) {
+    LayoutMasterStackWeighted(workArea, gap, count, *outRects, LayoutAxis(layout),
+                              ClampSplitRatio(workspace.MasterRatio()), workspace.StackWeights());
+  } else if (IsGridLayout(layout)) {
+    LayoutGridWeighted(workArea, gap, count, *outRects, LayoutAxis(layout), workspace.GridWeights());
+  } else if (layout == TileLayout::Dwindle) {
+    LayoutDwindle(workArea, gap, 0, count, workspace.DwindleRatios(),
+                  g_settings.reverseDwindle, *outRects, outSplits);
+  } else {  // Monocle
+    outRects->assign(count, workArea);
+  }
+}
+
+// Planning step 2: re-solves with the windows' native minimums (`constraints`,
+// in tiled order) as hard limits. Saved preferences are not changed, so
+// dividers return once room is available. False when nothing fits: Grid and
+// Master + Stack may then leave partial output in `outRects`; Dwindle leaves it
+// unchanged. `outWeightPerPixel` (optional) receives the Grid or Master + Stack
+// allocation's weight scale; `outSplits` is as for PlanPreferredCells.
+static bool PlanConstrainedCells(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    const std::vector<WindowConstraints>& constraints, std::vector<RECT>* outRects,
+    double* outWeightPerPixel = nullptr, std::vector<DwindleSplit>* outSplits = nullptr) {
+  const TileLayout layout = workspace.Layout();
+  if (IsMasterStackLayout(layout)) {
+    return LayoutMasterStackConstrained(workArea, gap, LayoutAxis(layout),
+                                        ClampSplitRatio(workspace.MasterRatio()), workspace.StackWeights(),
+                                        constraints, outRects, outWeightPerPixel);
+  }
+  if (IsGridLayout(layout)) {
+    return LayoutGridConstrained(workArea, gap, workspace.GridWeights(), constraints,
+                                 LayoutAxis(layout), outRects, outWeightPerPixel);
+  }
+  if (layout == TileLayout::Dwindle) {
+    return BuildAdaptiveDwindleLayout(workspace, workArea, gap, outRects, outSplits);
+  }
+  return LayoutMonocleConstrained(workArea, constraints, outRects);  // Monocle
+}
+
 // Uses cached constraints to calculate physical screen rectangles without native
 // window queries or workspace mutation. Output is usable only on Success; other
 // outcomes may leave partial geometry, which callers must discard.
@@ -248,48 +297,14 @@ static LayoutPlanStatus BuildWorkspaceLayoutPlan(
     return LayoutPlanStatus::NotApplicable;
   }
 
-  const size_t count = workspace.ActiveCount();
-  const Axis axis = LayoutAxis(layout);
-  const double masterRatio = ClampSplitRatio(workspace.MasterRatio());
-  outRects->assign(count, RECT{});
-
-  // Step 1: the ordinary layout from saved preferences. When every window's
-  // minimum size already fits, this is the result.
-  if (IsMasterStackLayout(layout)) {
-    LayoutMasterStackWeighted(workArea, gap, count, *outRects, axis, masterRatio,
-                              workspace.StackWeights());
-  } else if (IsGridLayout(layout)) {
-    LayoutGridWeighted(workArea, gap, count, *outRects, axis, workspace.GridWeights());
-  } else if (layout == TileLayout::Dwindle) {
-    LayoutDwindle(workArea, gap, 0, count, workspace.DwindleRatios(),
-                  g_settings.reverseDwindle, *outRects);
-  } else {  // Monocle
-    outRects->assign(count, workArea);
-  }
-
-  // Every successful plan ends here: maximum sizes never change other windows'
-  // cells, only where a capped window sits inside its own.
+  // Every successful plan ends by centring capped windows: maximum sizes never
+  // change other windows' cells, only where a capped window sits inside its own.
+  PlanPreferredCells(workspace, workArea, gap, outRects);
   const std::vector<WindowConstraints> constraints = ActiveWindowConstraints(workspace);
-  if (RectsSatisfyWindowConstraints(*outRects, constraints)) {
-    CenterWithinMaximumSizes(*outRects, constraints);
-    return LayoutPlanStatus::Success;
+  if (!RectsSatisfyWindowConstraints(*outRects, constraints) &&
+      !PlanConstrainedCells(workspace, workArea, gap, constraints, outRects)) {
+    return LayoutPlanStatus::Unsatisfiable;
   }
-
-  // Step 2: some window is too small. Re-solve with minimum sizes as hard limits.
-  // Saved preferences are not changed, so dividers return once room is available.
-  bool fitted = false;
-  if (IsMasterStackLayout(layout)) {
-    fitted = LayoutMasterStackConstrained(workArea, gap, axis, masterRatio,
-                                          workspace.StackWeights(), constraints, outRects);
-  } else if (IsGridLayout(layout)) {
-    fitted = LayoutGridConstrained(workArea, gap, workspace.GridWeights(), constraints,
-                                   axis, outRects);
-  } else if (layout == TileLayout::Dwindle) {
-    fitted = BuildAdaptiveDwindleLayout(workspace, workArea, gap, outRects);
-  } else {  // Monocle
-    fitted = LayoutMonocleConstrained(workArea, constraints, outRects);
-  }
-  if (!fitted) return LayoutPlanStatus::Unsatisfiable;
   CenterWithinMaximumSizes(*outRects, constraints);
   return LayoutPlanStatus::Success;
 }
@@ -333,6 +348,16 @@ static ConstraintSlotCompatibility BuildConstraintSlotCompatibility(
   return compatibility;
 }
 
+// slotOwner value for a slot no window has been matched to yet.
+constexpr size_t kUnassignedSlot = static_cast<size_t>(-1);
+
+// True when `window` fits `slot` according to `compatibility`.
+static bool IsCompatibleSlot(
+    const ConstraintSlotCompatibility& compatibility, size_t window, size_t slot) {
+  const auto& compatibleSlots = compatibility.slotsByWindow[window];
+  return std::find(compatibleSlots.begin(), compatibleSlots.end(), slot) != compatibleSlots.end();
+}
+
 static bool TryAssignConstraintWindow(
     size_t candidateWindow,
     const ConstraintSlotCompatibility& compatibility,
@@ -342,13 +367,12 @@ static bool TryAssignConstraintWindow(
       candidateWindow >= compatibility.slotsByWindow.size()) {
     return false;
   }
-  constexpr size_t kUnassigned = static_cast<size_t>(-1);
   const auto& compatibleSlots = compatibility.slotsByWindow[candidateWindow];
 
   if (preferFreeSlots) {
     for (size_t slotIndex : compatibleSlots) {
       if (slotIndex >= slotOwner->size() || (*visitedSlots)[slotIndex] ||
-          (*slotOwner)[slotIndex] != kUnassigned) {
+          (*slotOwner)[slotIndex] != kUnassignedSlot) {
         continue;
       }
       (*visitedSlots)[slotIndex] = true;
@@ -361,7 +385,7 @@ static bool TryAssignConstraintWindow(
     if (slotIndex >= slotOwner->size() || (*visitedSlots)[slotIndex]) continue;
     (*visitedSlots)[slotIndex] = true;
     const size_t displacedWindow = (*slotOwner)[slotIndex];
-    if (displacedWindow == kUnassigned ||
+    if (displacedWindow == kUnassignedSlot ||
         (displacedWindow < fixedWindows.size() &&
          !fixedWindows[displacedWindow] &&
          TryAssignConstraintWindow(
@@ -372,6 +396,38 @@ static bool TryAssignConstraintWindow(
     }
   }
   return false;
+}
+
+// Completes a window-to-slot matching. `slotOwner` arrives holding pinned and
+// seeded assignments; `fixedWindows` are never displaced. Every window that has
+// no slot yet is then assigned, the one with the fewest compatible slots first
+// (ties by index), along augmenting paths that prefer free slots. True when
+// every slot ends up with a window; false leaves a partial matching.
+static bool CompleteSlotMatching(
+    const ConstraintSlotCompatibility& compatibility, std::vector<size_t>& slotOwner,
+    const std::vector<bool>& fixedWindows) {
+  const size_t windowCount = compatibility.slotsByWindow.size();
+  std::vector<size_t> assignmentOrder;
+  assignmentOrder.reserve(windowCount);
+  for (size_t window = 0; window < windowCount; ++window) {
+    if (!fixedWindows[window]) assignmentOrder.push_back(window);
+  }
+  std::stable_sort(
+      assignmentOrder.begin(), assignmentOrder.end(),
+      [&](size_t first, size_t second) {
+        const size_t firstChoices = compatibility.slotsByWindow[first].size();
+        const size_t secondChoices = compatibility.slotsByWindow[second].size();
+        return firstChoices != secondChoices ? firstChoices < secondChoices : first < second;
+      });
+
+  for (size_t window : assignmentOrder) {
+    if (std::find(slotOwner.begin(), slotOwner.end(), window) != slotOwner.end()) continue;
+    std::vector<bool> visitedSlots(slotOwner.size(), false);
+    if (!TryAssignConstraintWindow(window, compatibility, &slotOwner, fixedWindows, &visitedSlots, true)) {
+      return false;
+    }
+  }
+  return std::find(slotOwner.begin(), slotOwner.end(), kUnassignedSlot) == slotOwner.end();
 }
 
 // Applies an already-decided active-slot permutation without changing membership.
@@ -463,9 +519,7 @@ static bool MatchDwindleTail(
     if (compatibleSlots.empty()) return false;
   }
 
-  constexpr size_t kUnassigned = static_cast<size_t>(-1);
-  std::vector<size_t> slotOwner(tailCount, kUnassigned);
-  std::vector<bool> fixed(tailCount, false);
+  std::vector<size_t> slotOwner(tailCount, kUnassignedSlot);
 
   // Seed surviving exact positions first so a layout conversion disturbs as
   // little order as possible before augmenting paths are allowed to move them.
@@ -473,36 +527,13 @@ static bool MatchDwindleTail(
     const size_t originalIndex = remainingWindows[localWindow];
     if (originalIndex < slotIndex) continue;
     const size_t localSlot = originalIndex - slotIndex;
-    if (localSlot >= tailCount || slotOwner[localSlot] != kUnassigned) continue;
-    const auto& compatibleSlots = compatibility.slotsByWindow[localWindow];
-    if (std::find(compatibleSlots.begin(), compatibleSlots.end(), localSlot) != compatibleSlots.end()) {
-      slotOwner[localSlot] = localWindow;
-    }
+    if (localSlot >= tailCount || slotOwner[localSlot] != kUnassignedSlot) continue;
+    if (IsCompatibleSlot(compatibility, localWindow, localSlot)) slotOwner[localSlot] = localWindow;
   }
 
-  // Assign the most constrained windows first; ties keep their original order.
-  std::vector<size_t> assignmentOrder(tailCount);
-  for (size_t i = 0; i < tailCount; ++i) assignmentOrder[i] = i;
-  std::stable_sort(
-      assignmentOrder.begin(), assignmentOrder.end(),
-      [&](size_t first, size_t second) {
-        const size_t firstChoices = compatibility.slotsByWindow[first].size();
-        const size_t secondChoices = compatibility.slotsByWindow[second].size();
-        return firstChoices != secondChoices
-            ? firstChoices < secondChoices
-            : remainingWindows[first] < remainingWindows[second];
-      });
-
-  for (size_t localWindow : assignmentOrder) {
-    if (std::find(slotOwner.begin(), slotOwner.end(), localWindow) != slotOwner.end()) continue;
-    std::vector<bool> visitedSlots(tailCount, false);
-    if (!TryAssignConstraintWindow(localWindow, compatibility, &slotOwner, fixed, &visitedSlots, true)) {
-      return false;
-    }
-  }
-
+  // remainingWindows is ascending, so ties by local index keep the original order.
+  if (!CompleteSlotMatching(compatibility, slotOwner, std::vector<bool>(tailCount, false))) return false;
   for (size_t localSlot = 0; localSlot < tailCount; ++localSlot) {
-    if (slotOwner[localSlot] == kUnassigned) return false;
     (*desiredOrder)[slotIndex + localSlot] = windows[remainingWindows[slotOwner[localSlot]]];
   }
   return true;
@@ -741,18 +772,12 @@ static bool ReassignPendingDwindleAdmissionForConstraints(
     if (compatibleSlots.empty()) return false;
   }
 
-  constexpr size_t kUnassigned = static_cast<size_t>(-1);
-  std::vector<size_t> slotOwner(count, kUnassigned);
+  std::vector<size_t> slotOwner(count, kUnassignedSlot);
   std::vector<bool> fixed(count, false);
   auto pinWindow = [&](size_t windowIndex, size_t slotIndex) {
     if (windowIndex >= count || slotIndex >= count ||
-        slotOwner[slotIndex] != kUnassigned) {
-      return false;
-    }
-    const auto& compatibleSlots = compatibility.slotsByWindow[windowIndex];
-    if (std::find(
-            compatibleSlots.begin(), compatibleSlots.end(), slotIndex) ==
-        compatibleSlots.end()) {
+        slotOwner[slotIndex] != kUnassignedSlot ||
+        !IsCompatibleSlot(compatibility, windowIndex, slotIndex)) {
       return false;
     }
     slotOwner[slotIndex] = windowIndex;
@@ -770,43 +795,15 @@ static bool ReassignPendingDwindleAdmissionForConstraints(
   // Seed every compatible current placement. Starting with empty slots allowed
   // later flexible windows to evict earlier ones and shuffle the whole order.
   for (size_t i = 0; i < count; ++i) {
-    const auto& compatibleSlots = compatibility.slotsByWindow[i];
-    if (!fixed[i] && slotOwner[i] == kUnassigned &&
-        std::find(compatibleSlots.begin(), compatibleSlots.end(), i) !=
-            compatibleSlots.end()) {
+    if (!fixed[i] && slotOwner[i] == kUnassignedSlot && IsCompatibleSlot(compatibility, i, i)) {
       slotOwner[i] = i;
     }
   }
-  std::vector<size_t> assignmentOrder;
-  assignmentOrder.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    if (!fixed[i]) assignmentOrder.push_back(i);
-  }
-  std::stable_sort(
-      assignmentOrder.begin(), assignmentOrder.end(),
-      [&](size_t first, size_t second) {
-        const size_t firstChoices = compatibility.slotsByWindow[first].size();
-        const size_t secondChoices = compatibility.slotsByWindow[second].size();
-        return firstChoices != secondChoices
-            ? firstChoices < secondChoices
-            : first < second;
-      });
-
-  for (size_t windowIndex : assignmentOrder) {
-    if (std::find(slotOwner.begin(), slotOwner.end(), windowIndex) != slotOwner.end())
-      continue;
-    std::vector<bool> visitedSlots(count, false);
-    if (!TryAssignConstraintWindow(
-            windowIndex, compatibility, &slotOwner, fixed,
-            &visitedSlots, true)) {
-      return false;
-    }
-  }
+  if (!CompleteSlotMatching(compatibility, slotOwner, fixed)) return false;
 
   std::vector<HWND> desiredOrder(count);
   size_t movedWindowCount = 0;
   for (size_t slotIndex = 0; slotIndex < count; ++slotIndex) {
-    if (slotOwner[slotIndex] == kUnassigned) return false;
     desiredOrder[slotIndex] = windows[slotOwner[slotIndex]];
     if (desiredOrder[slotIndex] != windows[slotIndex]) ++movedWindowCount;
   }

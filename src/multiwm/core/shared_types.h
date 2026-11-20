@@ -220,6 +220,33 @@ enum class WmMessageDisposition {
 
 enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, Dwindle, Monocle, Floating, COUNT };
 
+// Every name a layout goes by, in TileLayout order.
+struct LayoutNames {
+  const wchar_t* setting;     // Settings value, e.g. "master_stack".
+  const wchar_t* display;     // Tray menu and single-monitor tooltip.
+  const wchar_t* flyout;      // Toasts and the per-monitor tooltip rows.
+  const wchar_t* trayIcon;    // Two-letter text of the built-in tray icon.
+  const wchar_t* diagnostic;  // Diagnostic reports.
+};
+
+inline constexpr LayoutNames kLayoutNames[] = {
+    {L"master_stack", L"Master + Stack (Vertical)", L"Master + Stack V", L"MV", L"MasterStack"},
+    {L"columns", L"Columns", L"Columns", L"CL", L"Columns"},
+    {L"rows", L"Rows", L"Rows", L"RW", L"Rows"},
+    {L"master_stack_h", L"Master + Stack (Horizontal)", L"Master + Stack H", L"MH", L"MasterStackH"},
+    {L"dwindle", L"Dwindle", L"Dwindle", L"DW", L"Dwindle"},
+    {L"monocle", L"Monocle", L"Monocle", L"MN", L"Monocle"},
+    {L"floating", L"Floating", L"Floating", L"FL", L"Floating"},
+};
+static_assert(std::size(kLayoutNames) == static_cast<size_t>(TileLayout::COUNT),
+              "kLayoutNames needs one entry per TileLayout");
+
+// The names of `layout`, or nullptr for COUNT and out-of-range values.
+inline const LayoutNames* FindLayoutNames(TileLayout layout) {
+  const auto index = static_cast<size_t>(layout);
+  return index < std::size(kLayoutNames) ? &kLayoutNames[index] : nullptr;
+}
+
 // Master + Stack in either orientation: one master window plus a weighted stack.
 constexpr bool IsMasterStackLayout(TileLayout layout) {
   return layout == TileLayout::MasterStack || layout == TileLayout::MasterStackH;
@@ -283,6 +310,9 @@ struct WorkspaceInitializationRule {
   int settingsIndex = 0;
 };
 
+// Used when the diagnostics Output Directory setting is blank.
+inline constexpr wchar_t kDefaultDiagnosticsOutputPath[] = L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";
+
 // Windhawk settings and immutable-at-runtime policy values. Settings reloads
 // replace these fields; transient WM state lives in WmRuntime instead.
 struct SettingsState {
@@ -331,8 +361,36 @@ struct SettingsState {
     size_t limit = 0;
   };
   std::vector<MonitorWindowLimit> monitorWindowLimits;
-  std::wstring diagnosticsOutputPath =
-      L"%USERPROFILE%\\Documents\\MultiWMDiagnostics";
+  std::wstring diagnosticsOutputPath = kDefaultDiagnosticsOutputPath;
+};
+
+// One configurable hotkey: its message ID, the Windhawk setting naming its key,
+// where the parsed key is kept, a name for logs, and whether holding the key
+// repeats it. Every hotkey uses SettingsState::tilingModifiers. Listed in
+// registration order, which matters: when two hotkeys share a key, the earlier
+// one gets it. The command each ID runs is chosen in HandleWmThreadMessage.
+struct HotkeyBinding {
+  HotkeyIds id;
+  PCWSTR setting;
+  UINT SettingsState::*key;
+  const wchar_t* name;
+  bool allowRepeat;
+};
+
+inline constexpr HotkeyBinding kHotkeyBindings[] = {
+    {HK_TILE, L"hotkeys.TileKey", &SettingsState::tileKey, L"Tile", false},
+    {HK_SWAP_MASTER, L"hotkeys.SwapMasterKey", &SettingsState::swapMasterKey, L"Swap master", false},
+    {HK_PROMOTE_WINDOW, L"hotkeys.PromoteWindowKey", &SettingsState::promoteWindowKey, L"Promote window", true},
+    {HK_DEMOTE_WINDOW, L"hotkeys.DemoteWindowKey", &SettingsState::demoteWindowKey, L"Demote window", true},
+    {HK_MANAGEMENT_MODE_TOGGLE, L"hotkeys.ManagementModeToggleKey", &SettingsState::managementModeToggleKey,
+     L"Management mode", false},
+    {HK_FLOAT_FOCUSED, L"hotkeys.FloatFocusedKey", &SettingsState::floatFocusedKey, L"Float focused", false},
+    {HK_GROW_WINDOW, L"hotkeys.WindowSize.GrowKey", &SettingsState::growWindowKey, L"Grow window", true},
+    {HK_SHRINK_WINDOW, L"hotkeys.WindowSize.ShrinkKey", &SettingsState::shrinkWindowKey, L"Shrink window", true},
+    {HK_RESET_WINDOW_SIZE, L"hotkeys.WindowSize.ResetKey", &SettingsState::resetWindowSizeKey, L"Reset window size",
+     false},
+    {HK_LAYOUT, L"hotkeys.LayoutKey", &SettingsState::layoutKey, L"Layout cycle", false},
+    {HK_DIAGNOSTIC_DUMP, L"hotkeys.DiagnosticDumpKey", &SettingsState::diagnosticDumpKey, L"Diagnostic dump", false},
 };
 
 struct MoveSizeGesture;

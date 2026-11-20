@@ -130,7 +130,6 @@ static CompanionAbi::TrackedWindowHint MakeTrackedWindowHint(
   if (record.state == ManageState::Tiled || (record.state == ManageState::Suspended && record.hasSavedSlot)) {
     hint.treatment = WindowTreatment::Tiled;
   } else if (record.state == ManageState::Floating) hint.treatment = WindowTreatment::Floating;
-  else if (record.state == ManageState::Ignored) hint.treatment = WindowTreatment::Ignored;
   const auto measured = g_publisher.frameMargins.find(record.hwnd);
   if (measured != g_publisher.frameMargins.end() && measured->second.processId == record.pid &&
       FrameInputsUnchanged(record.hwnd, measured->second)) {

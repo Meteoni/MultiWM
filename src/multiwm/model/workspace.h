@@ -64,6 +64,10 @@ struct DesktopMonitorKey {
   }
 
   HMONITOR ResolveMonitor() const { return monitor.Resolve(); }
+
+  bool operator==(const DesktopMonitorKey& other) const {
+    return IsEqualGUID(desktopId, other.desktopId) && monitor == other.monitor;
+  }
 };
 
 struct DesktopMonitorKeyHash {
@@ -75,9 +79,7 @@ struct DesktopMonitorKeyHash {
 };
 
 struct DesktopMonitorKeyEqual {
-  bool operator()(const DesktopMonitorKey& a, const DesktopMonitorKey& b) const {
-    return IsEqualGUID(a.desktopId, b.desktopId) && a.monitor == b.monitor;
-  }
+  bool operator()(const DesktopMonitorKey& a, const DesktopMonitorKey& b) const { return a == b; }
 };
 
 // Where a suspended (minimized/maximized/hidden) window returns to when restored.
@@ -93,7 +95,6 @@ enum class ManageState {
   Tiled,      // Occupies a slot in the active layout (listed in TiledWindows()).
   Floating,   // Known, but placed freely; never occupies a slot.
   Suspended,  // Tiled member temporarily out of the layout; keeps a SuspendedSlot.
-  Ignored,    // Reserved. Current code never assigns it; treated like Floating.
 };
 
 // Why a logically managed tiled window is temporarily absent from the active
@@ -499,6 +500,16 @@ class Workspace {
   size_t LogicalWindowCount() const;
   SuspendedSlot MakeAppendedSuspendedSlot() const;
   void AppendTiledWithDefaultWeight(HWND hwnd);
+  // The weight a new slot at `weightIndex` of the current layout's weights
+  // starts with: the one an overflow-created workspace inherited for that
+  // position, else 1.0 (an even 0.5 split in Dwindle).
+  double NewSlotWeight(size_t weightIndex) const;
+  // The weights the current layout keeps (stack weights, grid weights or Dwindle
+  // ratios), or nullptr for Monocle and Floating, which keep none.
+  std::vector<double>* CurrentLayoutWeights();
+  const std::vector<double>* CurrentLayoutWeights() const;
+  // How many weights the current layout keeps for its tiled windows.
+  size_t ExpectedWeightCount() const;
   void ResetSuspendedLayoutHints();
   void CopyLayoutGeometryFrom(const Workspace& source);
   void RememberCurrentLayoutGeometry();
@@ -550,12 +561,17 @@ class Workspace {
   // tiling geometry: switching away and back restores the exact weights/ratios
   // when the active window order is unchanged. Membership/order changes make the
   // remembered snapshot ineligible rather than trying to reinterpret old slots.
-  std::vector<HWND> rememberedMasterStackOrder_;
-  std::vector<double> rememberedMasterStackWeights_;
-  std::vector<HWND> rememberedGridOrder_;
-  std::vector<double> rememberedGridWeights_;
-  std::vector<HWND> rememberedDwindleOrder_;
-  std::vector<double> rememberedDwindleRatios_;
+  struct RememberedGeometry {
+    std::vector<HWND> order;
+    std::vector<double> weights;
+    bool operator==(const RememberedGeometry&) const = default;
+  };
+  // Where the current layout family's geometry is remembered, or nullptr for
+  // Monocle and Floating.
+  RememberedGeometry* RememberedGeometryForCurrentLayout();
+  RememberedGeometry rememberedMasterStack_;
+  RememberedGeometry rememberedGrid_;
+  RememberedGeometry rememberedDwindle_;
 
   HWND lastFocusedWindow_ = nullptr;
 };
@@ -565,8 +581,9 @@ constexpr LONG kPlacementTolerancePx = 4;
 using WorkspaceMap = std::unordered_map<
     DesktopMonitorKey, Workspace, DesktopMonitorKeyHash, DesktopMonitorKeyEqual>;
 
-// Access boundary for the workspace graph. All current callers, including
-// WinEvent callbacks, run on the serialized WM thread; the repository keeps its
+// Access boundary for the workspace graph. WM thread only: every caller,
+// including the out-of-context WinEvent callbacks, the tray windows and the
+// companion publisher, runs there, so the repository needs no lock. It keeps its
 // workspace snapshots and reverse ownership index consistent.
 //
 // The repository hands out copies. Nothing you do to a loaded Workspace is
@@ -576,9 +593,31 @@ class WorkspaceRepository {
   // Copies the workspace for `key` into `*workspace`. Returns false, leaving
   // `*workspace` unchanged, when no workspace has been saved for `key` yet.
   bool Load(const DesktopMonitorKey& key, Workspace* workspace) const;
+  // True when a workspace has been saved for `key`.
+  bool Contains(const DesktopMonitorKey& key) const;
+  // The layout of `key`'s saved workspace, without copying it.
+  std::optional<TileLayout> LayoutOf(const DesktopMonitorKey& key) const;
   // Stores a copy of `workspace` under `key`, replacing any previous one, and
   // updates the HWND -> owner index. Logs (but still saves) invariant violations.
   void Save(const DesktopMonitorKey& key, const Workspace& workspace);
+  // For each of `keys` with a saved workspace, in order: loads a copy, passes it
+  // to `change(key, workspace)`, and when that returns true saves the copy and
+  // then calls `afterSave(key)`. Each save happens before the next key is
+  // loaded, so `afterSave` may arrange or reload. `keys` must not be changed
+  // by the callbacks.
+  template <typename Change, typename AfterSave>
+  void UpdateEach(const std::vector<DesktopMonitorKey>& keys, Change&& change, AfterSave&& afterSave) {
+    for (const DesktopMonitorKey& key : keys) {
+      Workspace workspace;
+      if (!Load(key, &workspace) || !change(key, workspace)) continue;
+      Save(key, workspace);
+      afterSave(key);
+    }
+  }
+  template <typename Change>
+  void UpdateEach(const std::vector<DesktopMonitorKey>& keys, Change&& change) {
+    UpdateEach(keys, std::forward<Change>(change), [](const DesktopMonitorKey&) {});
+  }
   // True when any workspace has a record for `hwnd`, in any state.
   bool IsTracked(HWND hwnd) const;
   // True when some owning workspace has `hwnd` in its tiled layout.
@@ -602,7 +641,6 @@ class WorkspaceRepository {
   uint64_t Revision() const;
 
  private:
-  mutable SRWLOCK lock_ = SRWLOCK_INIT;
   WorkspaceMap states_;
   uint64_t revision_ = 0;
 

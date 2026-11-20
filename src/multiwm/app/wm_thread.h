@@ -3,67 +3,31 @@
 
 namespace RuntimeLifecycle {
 
+// Registers every hotkey with a key set, in kHotkeyBindings order.
 static void RegisterConfiguredHotkeys() {
-  auto registerOne = [](
-      int id, UINT modifiers, UINT key, const wchar_t* name,
-      bool allowRepeat = false) {
-    if (!key) return;
-    const UINT registrationModifiers =
-        allowRepeat ? modifiers : modifiers | MOD_NOREPEAT;
-    if (!RegisterHotKey(nullptr, id, registrationModifiers, key)) {
+  for (const HotkeyBinding& hotkey : kHotkeyBindings) {
+    const UINT key = g_settings.*hotkey.key;
+    if (!key) continue;
+    const UINT modifiers = hotkey.allowRepeat ? g_settings.tilingModifiers
+                                              : g_settings.tilingModifiers | MOD_NOREPEAT;
+    if (!RegisterHotKey(nullptr, hotkey.id, modifiers, key)) {
       Wh_Log(L"Failed to register %s hotkey (id=%d error=%lu)",
-             name, id, GetLastError());
+             hotkey.name, static_cast<int>(hotkey.id), GetLastError());
     }
-  };
-
-  registerOne(HK_TILE, g_settings.tilingModifiers, g_settings.tileKey, L"Tile");
-  registerOne(HK_SWAP_MASTER, g_settings.tilingModifiers,
-              g_settings.swapMasterKey, L"Swap master");
-  registerOne(HK_PROMOTE_WINDOW, g_settings.tilingModifiers,
-              g_settings.promoteWindowKey, L"Promote window", true);
-  registerOne(HK_DEMOTE_WINDOW, g_settings.tilingModifiers,
-              g_settings.demoteWindowKey, L"Demote window", true);
-  registerOne(HK_MANAGEMENT_MODE_TOGGLE, g_settings.tilingModifiers,
-              g_settings.managementModeToggleKey, L"Management mode");
-  registerOne(HK_FLOAT_FOCUSED, g_settings.tilingModifiers,
-              g_settings.floatFocusedKey, L"Float focused");
-  registerOne(HK_GROW_WINDOW, g_settings.tilingModifiers,
-              g_settings.growWindowKey, L"Grow window", true);
-  registerOne(HK_SHRINK_WINDOW, g_settings.tilingModifiers,
-              g_settings.shrinkWindowKey, L"Shrink window", true);
-  registerOne(HK_RESET_WINDOW_SIZE, g_settings.tilingModifiers,
-              g_settings.resetWindowSizeKey, L"Reset window size");
-  registerOne(HK_LAYOUT, g_settings.tilingModifiers,
-              g_settings.layoutKey, L"Layout cycle");
-  registerOne(HK_DIAGNOSTIC_DUMP, g_settings.tilingModifiers,
-              g_settings.diagnosticDumpKey, L"Diagnostic dump");
+  }
 }
 
 static void UnregisterConfiguredHotkeys() {
-  UnregisterHotKey(nullptr, HK_TILE);
-  UnregisterHotKey(nullptr, HK_SWAP_MASTER);
-  UnregisterHotKey(nullptr, HK_PROMOTE_WINDOW);
-  UnregisterHotKey(nullptr, HK_DEMOTE_WINDOW);
-  UnregisterHotKey(nullptr, HK_MANAGEMENT_MODE_TOGGLE);
-  UnregisterHotKey(nullptr, HK_FLOAT_FOCUSED);
-  UnregisterHotKey(nullptr, HK_GROW_WINDOW);
-  UnregisterHotKey(nullptr, HK_SHRINK_WINDOW);
-  UnregisterHotKey(nullptr, HK_RESET_WINDOW_SIZE);
-  UnregisterHotKey(nullptr, HK_LAYOUT);
-  UnregisterHotKey(nullptr, HK_DIAGNOSTIC_DUMP);
+  for (const HotkeyBinding& hotkey : kHotkeyBindings) UnregisterHotKey(nullptr, hotkey.id);
 }
 
 static void RememberManagedForeground(HWND hwnd) {
   AssertWmThread(L"RememberManagedForeground");
   if (!hwnd) return;
 
-  const std::vector<DesktopMonitorKey> owners = g_workspaces.OwnersOf(hwnd);
-  for (const auto& key : owners) {
-    Workspace workspace;
-    if (!g_workspaces.Load(key, &workspace)) continue;
-    if (!workspace.RememberFocusedWindow(hwnd)) continue;
-    g_workspaces.Save(key, workspace);
-  }
+  g_workspaces.UpdateEach(g_workspaces.OwnersOf(hwnd), [&](const DesktopMonitorKey&, Workspace& workspace) {
+    return workspace.RememberFocusedWindow(hwnd);
+  });
 }
 
 static void InitializeCurrentDesktopWorkspaces() {
@@ -87,8 +51,7 @@ static void SetWindowManagementMode(ManagementMode mode) {
   if (!automatic) {
     g_wm.overflow.queue.clear();
     g_wm.overflow.follow = {};
-    if (g_wm.timers.overflow) KillTimer(nullptr, g_wm.timers.overflow);
-    g_wm.timers.overflow = 0;
+    CancelActorTimer(g_wm.timers.overflow);
   }
   Wh_Log(L"Window management mode: %s", automatic ? L"Automatic" : L"Manual");
   Diagnostics::RecordEvent(
@@ -320,17 +283,18 @@ static void CleanupWmThread() {
   for (const PendingWindowOverflow& pending : deferredOverflow) {
     if (!Platform::Windows::IsSameLiveWindow(pending.hwnd, pending.processId) ||
         !g_wm.overflow.windows.count(pending.hwnd)) continue;
-    for (const auto& key : g_workspaces.OwnersOf(pending.hwnd)) {
-      Workspace workspace;
-      if (!g_workspaces.Load(key, &workspace) || workspace.Layout() == TileLayout::Floating) continue;
+    g_workspaces.UpdateEach(g_workspaces.OwnersOf(pending.hwnd), [&](const DesktopMonitorKey&, Workspace& workspace) {
+      if (workspace.Layout() == TileLayout::Floating) return false;
       const WindowRecord* record = workspace.Find(pending.hwnd);
       if (!record || record->pid != pending.processId || record->state != ManageState::Floating ||
-          record->alwaysFloating || record->tilingGeneration != pending.tilingGeneration) continue;
+          record->alwaysFloating || record->tilingGeneration != pending.tilingGeneration) {
+        return false;
+      }
       workspace.ActivateTiled(pending.hwnd);
       const SuspensionReason reason = Platform::Windows::GetPhysicalSuspensionReason(pending.hwnd);
       if (reason != SuspensionReason::None) workspace.Suspend(pending.hwnd, reason);
-      g_workspaces.Save(key, workspace);
-    }
+      return true;
+    });
   }
   // Unhook WinEvent delivery before clearing transient callback observations so
   // no reentrant delivery can repopulate the next settings-reload session.
@@ -339,42 +303,8 @@ static void CleanupWmThread() {
   Platform::WindowEvents::RemoveWinEventHooks();
   Platform::VirtualDesktop::CleanupVirtualDesktopAPI();
 
-  if (g_wm.timers.lifecycle) {
-    KillTimer(nullptr, g_wm.timers.lifecycle);
-    g_wm.timers.lifecycle = 0;
-  }
-  if (g_wm.timers.discoveryRetry) {
-    KillTimer(nullptr, g_wm.timers.discoveryRetry);
-    g_wm.timers.discoveryRetry = 0;
-  }
-  if (g_wm.timers.maintenance) {
-    KillTimer(nullptr, g_wm.timers.maintenance);
-    g_wm.timers.maintenance = 0;
-  }
-  if (g_wm.timers.conformance) {
-    KillTimer(nullptr, g_wm.timers.conformance);
-    g_wm.timers.conformance = 0;
-  }
-  g_wm.lifecycle.dirtyWindows.clear();
-  g_wm.lifecycle.discoveryRetries.clear();
-  g_wm.lifecycle.pendingArranges.clear();
-  if (g_wm.timers.overflow) KillTimer(nullptr, g_wm.timers.overflow);
-  g_wm.timers.overflow = 0;
-  g_wm.overflow.windows.clear();
-  g_wm.overflow.queue.clear();
-  g_wm.overflow.follow = {};
-  g_wm.routing.ready = false;
-  g_wm.routing.evaluated.clear();
-  g_wm.routing.pending.clear();
-  g_wm.routing.follow = {};
-  g_wm.maintenance.attempts = 0;
-  g_wm.maintenance.running = false;
-  g_wm.lifecycle.retryAfterPlatformRecovery = false;
-  g_wm.lifecycle.forceMonitorReconcile = false;
-  g_wm.desktop.reconciled = {};
-  g_wm.desktop.state = ReconciledDesktopState::Unknown;
-  g_wm.desktop.pendingSwitchFlyouts = false;
-  Placement::ClearAllConformanceLeases();
+  g_wm.ResetSession();
+  Placement::DiscardAllPendingProofs();
   Gestures::ClearAllMoveSizeSamples();
   Platform::Monitors::ClearMonitorIdentityCache();
   InterlockedExchange(&g_vd.changeQueued, 0);

@@ -1,3 +1,6 @@
+// WinEvent hooks and the callback that turns their events into WM-thread messages.
+// Part of MultiWM's single source file; see the include order in src/multiwm/multiwm.cpp.
+
 namespace Platform::WindowEvents {
 
 void OnWindowMoveSizeEnd(HWND hwnd) {
@@ -204,104 +207,53 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     OnLifecycleEvent(event, hwnd);
   }
 }
+// One SetWinEventHook registration per WinEventHooks member, in installation and
+// removal order. All are out-of-context, so callbacks arrive on the WM thread.
+struct WinEventHookSpec {
+  HWINEVENTHOOK WinEventHooks::*slot;
+  DWORD firstEvent;
+  DWORD lastEvent;
+  const wchar_t* name;
+};
+
+static constexpr WinEventHookSpec kWinEventHookSpecs[] = {
+    {&WinEventHooks::foreground, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, L"foreground"},
+    {&WinEventHooks::locationChange, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, L"location-change"},
+    {&WinEventHooks::moveSize, EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND, L"move/size"},
+    {&WinEventHooks::minimize, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, L"minimization"},
+    {&WinEventHooks::hideDestroy, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, L"hide/destroy"},
+    {&WinEventHooks::cloak, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, L"cloak"},
+    {&WinEventHooks::state, EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE, L"state-change"},
+};
+
 bool AllWinEventHooksInstalled() {
-  return g_hooks.foreground && g_hooks.locationChange && g_hooks.moveSize &&
-         g_hooks.minimize && g_hooks.hideDestroy && g_hooks.cloak && g_hooks.state;
+  return std::all_of(std::begin(kWinEventHookSpecs), std::end(kWinEventHookSpecs),
+                     [](const WinEventHookSpec& spec) { return g_hooks.*spec.slot != nullptr; });
 }
 
+// Installs every hook that is missing; already installed ones are kept.
 bool InstallWinEventHooks() {
   RuntimeLifecycle::AssertWmThread(L"Platform::WindowEvents::InstallWinEventHooks");
-  auto noteFailure = [](const wchar_t* name) {
-    ++Diagnostics::g_runtime.counters.winEventHookInstallFailures;
-    Wh_Log(L"Failed to install %s WinEvent hook: %lu", name, GetLastError());
-  };
-
-  if (!g_hooks.foreground) {
-    g_hooks.foreground = SetWinEventHook(
-        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc,
-        0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.foreground) noteFailure(L"foreground");
+  for (const WinEventHookSpec& spec : kWinEventHookSpecs) {
+    HWINEVENTHOOK& hook = g_hooks.*spec.slot;
+    if (hook) continue;
+    hook = SetWinEventHook(spec.firstEvent, spec.lastEvent, nullptr, WinEventProc, 0, 0,
+                           WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!hook) {
+      ++Diagnostics::g_runtime.counters.winEventHookInstallFailures;
+      Wh_Log(L"Failed to install %s WinEvent hook: %lu", spec.name, GetLastError());
+    }
   }
-
-  if (!g_hooks.locationChange) {
-    g_hooks.locationChange = SetWinEventHook(
-        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr, WinEventProc,
-        0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.locationChange) noteFailure(L"location-change");
-  }
-
-  if (!g_hooks.moveSize) {
-    g_hooks.moveSize = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
-                                      nullptr, WinEventProc, 0, 0,
-                                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.moveSize) noteFailure(L"move/size");
-  }
-
-  if (!g_hooks.minimize) {
-    g_hooks.minimize = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
-                                      nullptr, WinEventProc, 0, 0,
-                                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.minimize) noteFailure(L"minimization");
-  }
-
-  if (!g_hooks.hideDestroy) {
-    g_hooks.hideDestroy = SetWinEventHook(
-      EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
-      nullptr, WinEventProc, 0, 0,
-      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-    );
-    if (!g_hooks.hideDestroy) noteFailure(L"hide/destroy");
-  }
-
-  if (!g_hooks.cloak) {
-    g_hooks.cloak = SetWinEventHook(
-      EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED,
-      nullptr, WinEventProc, 0, 0,
-      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-    );
-    if (!g_hooks.cloak) noteFailure(L"cloak");
-  }
-
-  if (!g_hooks.state) {
-    g_hooks.state = SetWinEventHook(
-        EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE,
-        nullptr, WinEventProc, 0, 0,
-        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_hooks.state) noteFailure(L"state-change");
-  }
-
   return AllWinEventHooksInstalled();
 }
 
 void RemoveWinEventHooks() {
-    if (g_hooks.foreground) {
-        UnhookWinEvent(g_hooks.foreground);
-        g_hooks.foreground = nullptr;
-    }
-    if (g_hooks.locationChange) {
-        UnhookWinEvent(g_hooks.locationChange);
-        g_hooks.locationChange = nullptr;
-    }
-    if (g_hooks.moveSize) {
-        UnhookWinEvent(g_hooks.moveSize);
-        g_hooks.moveSize = nullptr;
-    }
-    if (g_hooks.minimize) {
-        UnhookWinEvent(g_hooks.minimize);
-        g_hooks.minimize = nullptr;
-    }
-    if (g_hooks.hideDestroy) {
-        UnhookWinEvent(g_hooks.hideDestroy);
-        g_hooks.hideDestroy = nullptr;
-    }
-    if (g_hooks.cloak) {
-        UnhookWinEvent(g_hooks.cloak);
-        g_hooks.cloak = nullptr;
-    }
-    if (g_hooks.state) {
-        UnhookWinEvent(g_hooks.state);
-        g_hooks.state = nullptr;
-    }
+  for (const WinEventHookSpec& spec : kWinEventHookSpecs) {
+    HWINEVENTHOOK& hook = g_hooks.*spec.slot;
+    if (!hook) continue;
+    UnhookWinEvent(hook);
+    hook = nullptr;
+  }
 }
 
 }  // namespace Platform::WindowEvents

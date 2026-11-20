@@ -28,62 +28,35 @@
 /*
 # MultiWM Companion
 
-An add-on for [MultiWM](https://github.com/Meteoni/MultiWM). Requires MultiWM to be
-installed and running.
+An optional add-on for [MultiWM](https://github.com/Meteoni/MultiWM). Without it,
+a new window first appears where the app puts it, then jumps into its tile. With
+it, the window opens in its tile directly.
 
-The companion prepares new windows and supported restores for their MultiWM
-destination, reducing the visible jump when MultiWM arranges them afterward.
+## What it does
+- New windows open in the tile MultiWM will give them, with your gap, insets and
+  window rules applied.
+- Windows restored from the taskbar or the tray reappear in their own tile.
+- Windows that will float (by a rule, in the Floating layout, or because they
+  don't fit) open where they'll float.
+- If a guess turns out wrong (say the app resizes itself right after opening),
+  MultiWM moves the window as usual.
 
-## How it works
-- Placement hints, including restoration, apply only in Automatic mode. In Manual
-  mode this mod passes the application's placement and restore calls through.
-- MultiWM publishes, read-only, where the next window on each monitor would go, along
-  with its window rules.
-- Just before a window is shown for the first time, this mod checks whether MultiWM
-  would manage it, and if so moves it there. It never follows ongoing window
-  movement and never talks back to MultiWM.
-- Predicted tiles include the configured gap and workspace insets. Live minimum
-  and maximum sizes are converted for the window's DPI; capped windows are centred
-  within their tile. Minimum-size growth can still need a later layout correction.
-- Asynchronous shows are hinted only on the window's owning thread. Deferred
-  positioning keeps the application's batch timing. Windows that paint during
-  visible creation may appear before the creation hook can place them.
-- For each suspended member, MultiWM publishes the tile calculated by restoring
-  its saved slot on a workspace copy, including saved weights and size limits.
-  The companion uses measured resize borders to prepare Windows' restore rectangle
-  just before explicit show/placement calls or default `SC_RESTORE` handling on
-  the owning thread. Taskbar restores in the tested apps reached this path.
-- Known windows hidden to the tray without minimizing also use their own restore
-  tile when shown in the same workspace. A tiled window arriving from another
-  desktop or monitor uses the destination insertion tile; explicitly floated
-  windows keep their floating treatment. Missing local restore hints stay skipped.
-  Arrivals into Floating layouts or without a tiled destination hint pass through.
-- Definite overflow floats can open at the centred floating position when MultiWM
-  will keep them on the current monitor. With one monitor and desktop creation off,
-  Try other monitors first also uses this path. Routed destinations are not hinted.
-- If the guess is wrong (for example, the app changes its title or minimum size right
-  after opening), MultiWM moves the window as it always does.
+Dialogs, tool windows, excluded windows, and windows that open maximized or
+fullscreen are left alone.
 
-Dialogs, tool windows, excluded windows and new maximized/fullscreen windows
-are left alone. Restore-to-maximized and missing, stale-DPI or unavailable restore
-information also pass through. The companion does not pre-position minimized
-windows in the background or change MultiWM's saved slots and final layout rules.
+## Requirements
+- MultiWM installed and running, in Automatic mode. In Manual mode this mod does
+  nothing.
+- Update MultiWM and the companion together; mismatched versions may give no hints.
 
 ## Compatibility
-Both mods must use snapshot ABI major 5: MultiWM 1.15.0 or newer and Companion
-0.3.0 or newer. Update both mods together. Older major versions give no hints.
-Don't combine with mods that also move windows before they are shown, such as
+Don't combine with other mods that move windows before they appear, such as
 Window Centralizer or Center New Windows: both would move the same window.
+
+## Troubleshooting
+Enable logging for this mod in Windhawk to see each placement decision.
 */
 // ==/WindhawkModReadme==
-
-// ==WindhawkModSettings==
-/*
-- logDecisions: false
-  $name: Log decisions
-  $description: Write each placement decision to the Windhawk log, for troubleshooting.
-*/
-// ==/WindhawkModSettings==
 
 // Like src/multiwm/multiwm.cpp, the headers below are chapters of this one file, pasted
 // in order by WHAM into output/companion/multiwm-companion.wh.cpp. This mod runs inside
@@ -105,6 +78,7 @@ Window Centralizer or Center New Windows: both would move the same window.
 #include "../shared/window_rules.h"
 #include "../shared/companion_snapshot.h"
 #include "../shared/geometry.h"
+#include "../shared/app_frame.h"
 
 #include "snapshot_reader.h"
 #include "placement.h"
@@ -112,13 +86,8 @@ Window Centralizer or Center New Windows: both would move the same window.
 #include "show_hooks.h"
 
 BOOL Wh_ModInit() {
-  Companion::LoadSettings();
   if (!Companion::InstallShowHooks()) Wh_Log(L"Some show hooks could not be installed");
   return TRUE;
-}
-
-void Wh_ModSettingsChanged() {
-  Companion::LoadSettings();
 }
 
 void Wh_ModUninit() {

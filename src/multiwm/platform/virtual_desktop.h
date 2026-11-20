@@ -88,6 +88,16 @@ static const IID IID_IVirtualDesktopManagerInternal_Win11_22621 = {
 static const IID IID_IVirtualDesktopManagerInternal_Win11_26100 = {
     0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}};
 
+// IVirtualDesktop generations, paired with the manager interfaces above.
+static const IID IID_IVirtualDesktop_Win10Old = {
+    0xFF72FFDD, 0xBE7E, 0x43FC, {0x9C, 0x03, 0xAD, 0x81, 0x68, 0x1E, 0x88, 0xE4}};
+static const IID IID_IVirtualDesktop_Win10_20348 = {
+    0x62FDF88B, 0x11CA, 0x4AFB, {0x8B, 0xD8, 0x22, 0x96, 0xDF, 0xAE, 0x49, 0xE2}};
+static const IID IID_IVirtualDesktop_Win11_22000 = {
+    0x536D3495, 0xB208, 0x4CC9, {0xAE, 0x26, 0xDE, 0x81, 0x11, 0x27, 0x5B, 0xF8}};
+static const IID IID_IVirtualDesktop_Win11_22621 = {
+    0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}};
+
 struct IVirtualDesktop : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE IsViewVisible(IUnknown*, BOOL*) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetId(GUID*) = 0;
@@ -172,6 +182,14 @@ DesktopMetadata ReadDesktopMetadata(const GUID& desktopId) {
 
 static const int VTABLE_GET_CURRENT_DESKTOP = 6;
 
+// The process ID of the current Explorer shell window, or 0 when there is none.
+static DWORD CurrentShellProcessId() {
+  DWORD processId = 0;
+  const HWND shell = GetShellWindow();
+  if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &processId);
+  return processId;
+}
+
 static const NotificationInterfaceConfig& GetNotificationInterfaceConfig() {
   return g_vd.abi.notification;
 }
@@ -186,15 +204,15 @@ static bool SelectVirtualDesktopAbiProfile(
 
   if (build < 20348) {
     profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win10Old;
-    profile.virtualDesktop = {0xFF72FFDD, 0xBE7E, 0x43FC, {0x9C, 0x03, 0xAD, 0x81, 0x68, 0x1E, 0x88, 0xE4}};
+    profile.virtualDesktop = IID_IVirtualDesktop_Win10Old;
     profile.usesHMonitor = false;
   } else if (build < 22000) {
     profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win10_20348;
-    profile.virtualDesktop = {0x62FDF88B, 0x11CA, 0x4AFB, {0x8B, 0xD8, 0x22, 0x96, 0xDF, 0xAE, 0x49, 0xE2}};
+    profile.virtualDesktop = IID_IVirtualDesktop_Win10_20348;
     profile.usesHMonitor = true;
   } else if (build < 22483 || (build == 22621 && revision < 2215)) {
     profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win11_22000;
-    profile.virtualDesktop = {0x536D3495, 0xB208, 0x4CC9, {0xAE, 0x26, 0xDE, 0x81, 0x11, 0x27, 0x5B, 0xF8}};
+    profile.virtualDesktop = IID_IVirtualDesktop_Win11_22000;
     profile.usesHMonitor = true;
     if (build >= 22449) {
       profile.getDesktopsIndex = 8;
@@ -202,11 +220,11 @@ static bool SelectVirtualDesktopAbiProfile(
     }
   } else if (build >= 22621 && build < 26100) {
     profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win11_22621;
-    profile.virtualDesktop = {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}};
+    profile.virtualDesktop = IID_IVirtualDesktop_Win11_22621;
     profile.usesHMonitor = false;
   } else if (build >= 26100) {
     profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win11_26100;
-    profile.virtualDesktop = {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}};
+    profile.virtualDesktop = IID_IVirtualDesktop_Win11_22621;
     profile.usesHMonitor = false;
     profile.animatedSwitchIndex = 22;
     profile.animationWaitIndex = 24;
@@ -243,6 +261,28 @@ static bool SelectVirtualDesktopAbiProfile(
 
   *outProfile = profile;
   return true;
+}
+
+// Builds from 22621 try the 24H2 manager interface before their own profile's:
+// 23H2 builds that answer to it number its slots one lower from the desktop
+// switch (MScholtes' separate 23H2/24H2 definitions; 24H2 inserts
+// SwitchDesktopAndMoveForegroundView at slot 10). On 24H2 this is the base
+// profile again. The notification ABI stays the base profile's.
+static std::optional<VirtualDesktopAbiProfile> PreferredManagerProfile(
+    const VirtualDesktopAbiProfile& base, DWORD build) {
+  if (build < 22621) return std::nullopt;
+  VirtualDesktopAbiProfile profile = base;
+  profile.managerInternal = IID_IVirtualDesktopManagerInternal_Win11_26100;
+  profile.virtualDesktop = IID_IVirtualDesktop_Win11_22621;
+  profile.usesHMonitor = false;
+  profile.getDesktopsIndex = 7;
+  profile.switchDesktopIndex = 9;
+  profile.animatedSwitchIndex = build >= 26100 ? 22 : 21;
+  profile.animationWaitIndex = profile.animatedSwitchIndex + 2;
+  profile.createDesktopIndex = build >= 26100 ? 11 : 10;
+  profile.moveDesktopIndex = profile.createDesktopIndex + 1;
+  profile.removeDesktopIndex = profile.createDesktopIndex + 2;
+  return profile;
 }
 
 static bool ReadExplorerVersion(DWORD* outBuild, DWORD* outRevision) {
@@ -524,10 +564,7 @@ bool RegisterVirtualDesktopNotifications() {
 
   g_vd.notificationCookie = cookie;
   g_vd.notificationsRegistered = true;
-  if (!g_vd.shellPid) {
-    HWND shell = GetShellWindow();
-    if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &g_vd.shellPid);
-  }
+  if (!g_vd.shellPid) g_vd.shellPid = CurrentShellProcessId();
   g_vd.notificationLastHr = S_OK;
   g_vd.notificationLastSuccessTickMs = GetTickCount64();
   ++Diagnostics::g_runtime.counters.vdNotificationRegisterSuccesses;
@@ -560,29 +597,17 @@ bool InitializeVirtualDesktopAPIOnce() {
     return false;
   }
 
-  if (g_vd.explorerBuild >= 22621) {
+  // The first manager interface that answers selects the profile.
+  std::vector<VirtualDesktopAbiProfile> candidates;
+  if (auto preferred = PreferredManagerProfile(g_vd.abi, g_vd.explorerBuild)) candidates.push_back(*preferred);
+  candidates.push_back(g_vd.abi);
+  for (const VirtualDesktopAbiProfile& candidate : candidates) {
     hr = g_vd.serviceProvider->QueryService(
-        CLSID_VirtualDesktopManagerInternal, IID_IVirtualDesktopManagerInternal_Win11_26100,
+        CLSID_VirtualDesktopManagerInternal, candidate.managerInternal,
         reinterpret_cast<void**>(&g_vd.managerInternal));
-    if (SUCCEEDED(hr) && g_vd.managerInternal) {
-      g_vd.abi.managerInternal = IID_IVirtualDesktopManagerInternal_Win11_26100;
-      g_vd.abi.virtualDesktop = {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}};
-      g_vd.abi.usesHMonitor = false;
-      g_vd.abi.getDesktopsIndex = 7;
-      g_vd.abi.switchDesktopIndex = 9;
-      // MScholtes supplies separate 23H2/24H2 definitions for this same IID:
-      // 24H2 inserts SwitchDesktopAndMoveForegroundView at slot 10.
-      g_vd.abi.animatedSwitchIndex = g_vd.explorerBuild >= 26100 ? 22 : 21;
-      g_vd.abi.animationWaitIndex = g_vd.abi.animatedSwitchIndex + 2;
-      g_vd.abi.createDesktopIndex = g_vd.explorerBuild >= 26100 ? 11 : 10;
-      g_vd.abi.moveDesktopIndex = g_vd.abi.createDesktopIndex + 1;
-      g_vd.abi.removeDesktopIndex = g_vd.abi.createDesktopIndex + 2;
-    }
-  }
-  if (!g_vd.managerInternal) {
-    hr = g_vd.serviceProvider->QueryService(
-        CLSID_VirtualDesktopManagerInternal, g_vd.abi.managerInternal,
-        reinterpret_cast<void**>(&g_vd.managerInternal));
+    if (!g_vd.managerInternal) continue;
+    if (SUCCEEDED(hr)) g_vd.abi = candidate;
+    break;
   }
   if (FAILED(hr) || !g_vd.managerInternal) {
     Wh_Log(L"Failed to get VirtualDesktopManagerInternal: 0x%08X", hr);
@@ -605,11 +630,7 @@ bool InitializeVirtualDesktopAPIOnce() {
     return false;
   }
 
-  HWND shell = GetShellWindow();
-  g_vd.shellPid = 0;
-  if (shell && IsWindow(shell)) {
-    GetWindowThreadProcessId(shell, &g_vd.shellPid);
-  }
+  g_vd.shellPid = CurrentShellProcessId();
 
   ++Diagnostics::g_runtime.counters.vdApiInitSuccesses;
   return true;
@@ -632,12 +653,8 @@ static void ResetVirtualDesktopMetadata() {
 // Releases virtual-desktop COM state while Explorer is responsive. During shell
 // teardown, pointers are intentionally dropped without Release to avoid hangs.
 void CleanupVirtualDesktopAPI() {
-  HWND hShell = GetShellWindow();
-  DWORD currentShellPid = 0;
-  const bool shellAvailable = hShell && IsWindow(hShell);
-  if (shellAvailable) GetWindowThreadProcessId(hShell, &currentShellPid);
-  const bool sameShell =
-      shellAvailable && g_vd.shellPid != 0 && currentShellPid == g_vd.shellPid;
+  const DWORD currentShellPid = CurrentShellProcessId();
+  const bool sameShell = currentShellPid != 0 && currentShellPid == g_vd.shellPid;
 
   // A replacement Explorer can already have a valid ShellWindow while our COM
   // proxies still point at the dead predecessor. Never call Unregister/Release on
@@ -983,7 +1000,6 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
   if (!desktop) return false;
   IUnknown* const manager = g_vd.managerInternal;
   auto canFollow = [&] {
-    LASTINPUTINFO input{sizeof(input)};
     if (!IsWindowOnDesktop(hwnd, desktopId) || !IsCurrentDesktop(sourceDesktop) ||
         !manager || g_vd.managerInternal != manager) return false;
     // Owner queries can pump destroy/user-gesture events. Check intent last.
@@ -994,7 +1010,7 @@ bool SwitchToDesktop(HWND hwnd, DWORD processId, const GUID& desktopId, const GU
           initial.inputTickMs == inputTickMs && IsEqualGUID(initial.sourceDesktop, sourceDesktop) &&
           IsEqualGUID(initial.targetDesktop, desktopId) && !Gestures::IsMoveSizeGestureInProgress(hwnd);
     return Platform::Windows::IsSameLiveWindow(hwnd, processId) && requestPending &&
-           GetLastInputInfo(&input) && input.dwTime == inputTickMs;
+           Platform::Input::NoInputSince(inputTickMs);
   };
   if (!canFollow()) return false;
   HRESULT hr = E_NOINTERFACE;
@@ -1076,17 +1092,20 @@ bool GetCurrentDesktopId(GUID* outGuid) {
   return false;
 }
 
-bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid) {
-  if (!hwnd || !outGuid) return false;
+// Runs one public IVirtualDesktopManager query. A dead proxy gets one core-API
+// reinitialization and retry; one that is still dead asks maintenance to recover.
+// Per-window failures (a rejected or vanished HWND) are returned as they are.
+template <typename Query>
+static bool QueryDesktopManager(Query query) {
   if (!g_vd.initialized || !g_vd.desktopManager) {
     RuntimeLifecycle::RequestMaintenance(false);
     return false;
   }
 
-  HRESULT hr = g_vd.desktopManager->GetWindowDesktopId(hwnd, outGuid);
+  HRESULT hr = query(g_vd.desktopManager);
   if (FAILED(hr) && IsDeadVirtualDesktopProxy(hr) &&
       ReinitializeVirtualDesktopAPI() && g_vd.desktopManager) {
-    hr = g_vd.desktopManager->GetWindowDesktopId(hwnd, outGuid);
+    hr = query(g_vd.desktopManager);
   }
   if (FAILED(hr) && IsDeadVirtualDesktopProxy(hr)) {
     RuntimeLifecycle::RequestMaintenance(false);
@@ -1094,22 +1113,18 @@ bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid) {
   return SUCCEEDED(hr);
 }
 
+bool GetWindowDesktopIdSafe(HWND hwnd, GUID* outGuid) {
+  if (!hwnd || !outGuid) return false;
+  return QueryDesktopManager([&](IVirtualDesktopManager* manager) {
+    return manager->GetWindowDesktopId(hwnd, outGuid);
+  });
+}
+
 bool IsWindowOnCurrentDesktopSafe(HWND hwnd, BOOL* onCurrent) {
   if (!hwnd || !onCurrent) return false;
-  if (!g_vd.initialized || !g_vd.desktopManager) {
-    RuntimeLifecycle::RequestMaintenance(false);
-    return false;
-  }
-
-  HRESULT hr = g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, onCurrent);
-  if (FAILED(hr) && IsDeadVirtualDesktopProxy(hr) &&
-      ReinitializeVirtualDesktopAPI() && g_vd.desktopManager) {
-    hr = g_vd.desktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, onCurrent);
-  }
-  if (FAILED(hr) && IsDeadVirtualDesktopProxy(hr)) {
-    RuntimeLifecycle::RequestMaintenance(false);
-  }
-  return SUCCEEDED(hr);
+  return QueryDesktopManager([&](IVirtualDesktopManager* manager) {
+    return manager->IsWindowOnCurrentVirtualDesktop(hwnd, onCurrent);
+  });
 }
 
 }  // namespace Platform::VirtualDesktop

@@ -213,8 +213,8 @@ desktop.
 ## Remaining live checks
 
 Run these after installing the prepared builds; no installation is performed by
-the test runner. Enable the companion's `logDecisions` while investigating, and
-capture a diagnostic report after the scenario.
+the test runner. Enable Windhawk's logging for the companion while investigating,
+and capture a diagnostic report after the scenario.
 
 | Scenario | Expected result |
 | --- | --- |

@@ -141,5 +141,4 @@ for how branching and nesting contribute to the score.
 
 Review acceptance: can a new contributor explain what an operation decides,
 what it changes, and what happens on failure after reading it and its immediate
-types? The [saved cleanup review](docs/readability-review.md) records the scope
-and verification of the current refactoring pass.
+types?

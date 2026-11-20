@@ -19,43 +19,18 @@ static bool IsMeaningfulResizeDelta(LONG delta) {
 // weight scale, or 0 when the preferred allocation fits. Weights must already be
 // sized for the active windows.
 
-static bool PlanGridCells(
+// Grid and Master + Stack. Keeps the preferred cells when no constrained
+// allocation fits, so a resize can still start from what is shown.
+static bool PlanWeightedCells(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     std::vector<RECT>* outRects, double* outWeightPerPixel = nullptr) {
-  const Layout::Axis axis = Layout::LayoutAxis(workspace.Layout());
   const std::vector<WindowConstraints> constraints = Layout::ActiveWindowConstraints(workspace);
   if (outWeightPerPixel) *outWeightPerPixel = 0.0;
-  Layout::LayoutGridWeighted(
-      workArea, gap, workspace.ActiveCount(), *outRects, axis, workspace.GridWeights());
+  Layout::PlanPreferredCells(workspace, workArea, gap, outRects);
   if (!Layout::RectsSatisfyWindowConstraints(*outRects, constraints)) {
     std::vector<RECT> constrainedRects;
     double weightPerPixel = 0.0;
-    if (Layout::LayoutGridConstrained(
-            workArea, gap, workspace.GridWeights(), constraints,
-            axis, &constrainedRects, &weightPerPixel)) {
-      *outRects = std::move(constrainedRects);
-      if (outWeightPerPixel) *outWeightPerPixel = weightPerPixel;
-    }
-  }
-  return outRects->size() == workspace.ActiveCount();
-}
-
-static bool PlanMasterStackCells(
-    const Workspace& workspace, const RECT& workArea, LONG gap,
-    std::vector<RECT>* outRects, double* outWeightPerPixel = nullptr) {
-  const Layout::Axis axis = Layout::LayoutAxis(workspace.Layout());
-  const double masterRatio = Layout::ClampSplitRatio(workspace.MasterRatio());
-  const std::vector<WindowConstraints> constraints = Layout::ActiveWindowConstraints(workspace);
-  if (outWeightPerPixel) *outWeightPerPixel = 0.0;
-  Layout::LayoutMasterStackWeighted(
-      workArea, gap, workspace.ActiveCount(), *outRects, axis,
-      masterRatio, workspace.StackWeights());
-  if (!Layout::RectsSatisfyWindowConstraints(*outRects, constraints)) {
-    std::vector<RECT> constrainedRects;
-    double weightPerPixel = 0.0;
-    if (Layout::LayoutMasterStackConstrained(
-            workArea, gap, axis, masterRatio, workspace.StackWeights(),
-            constraints, &constrainedRects, &weightPerPixel)) {
+    if (Layout::PlanConstrainedCells(workspace, workArea, gap, constraints, &constrainedRects, &weightPerPixel)) {
       *outRects = std::move(constrainedRects);
       if (outWeightPerPixel) *outWeightPerPixel = weightPerPixel;
     }
@@ -67,14 +42,10 @@ static bool PlanDwindleCells(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     std::vector<RECT>* outRects, std::vector<Layout::DwindleSplit>* outSplits) {
   const size_t count = workspace.ActiveCount();
-  outRects->assign(count, RECT{});
-  outSplits->clear();
-  Layout::LayoutDwindle(
-      workArea, gap, 0, count, workspace.DwindleRatios(),
-      g_settings.reverseDwindle, *outRects, outSplits);
-  if (!Layout::RectsSatisfyWindowConstraints(
-          *outRects, Layout::ActiveWindowConstraints(workspace)) &&
-      !Layout::BuildAdaptiveDwindleLayout(workspace, workArea, gap, outRects, outSplits)) {
+  Layout::PlanPreferredCells(workspace, workArea, gap, outRects, outSplits);
+  const std::vector<WindowConstraints> constraints = Layout::ActiveWindowConstraints(workspace);
+  if (!Layout::RectsSatisfyWindowConstraints(*outRects, constraints) &&
+      !Layout::PlanConstrainedCells(workspace, workArea, gap, constraints, outRects, nullptr, outSplits)) {
     return false;
   }
   return count >= 2 && outSplits->size() + 1 == count;
@@ -86,12 +57,12 @@ static bool PlanDwindleCells(
 static bool PlanSavedDwindleCells(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     std::vector<RECT>* outRects, std::vector<Layout::DwindleSplit>* outSplits = nullptr) {
-  const size_t count = workspace.ActiveCount();
-  outRects->assign(count, RECT{});
-  if (outSplits) outSplits->clear();
-  if (count < 2) return false;
-  Layout::LayoutDwindle(workArea, gap, 0, count, workspace.DwindleRatios(),
-                        g_settings.reverseDwindle, *outRects, outSplits);
+  if (workspace.ActiveCount() < 2) {
+    outRects->assign(workspace.ActiveCount(), RECT{});
+    if (outSplits) outSplits->clear();
+    return false;
+  }
+  Layout::PlanPreferredCells(workspace, workArea, gap, outRects, outSplits);
   return Layout::RectsSatisfyWindowConstraints(*outRects, Layout::ActiveWindowConstraints(workspace));
 }
 
@@ -185,7 +156,7 @@ bool Workspace::LearnMasterStackResize(
 
   double constrainedWeightPerPixel = 0.0;
   std::vector<RECT> expectedRects;
-  if (!PlanMasterStackCells(*this, workArea, gap, &expectedRects, &constrainedWeightPerPixel)) {
+  if (!PlanWeightedCells(*this, workArea, gap, &expectedRects, &constrainedWeightPerPixel)) {
     return false;
   }
 
@@ -259,7 +230,7 @@ bool Workspace::LearnGridResize(
 
   double constrainedWeightPerPixel = 0.0;
   std::vector<RECT> expectedRects;
-  if (!PlanGridCells(*this, workArea, gap, &expectedRects, &constrainedWeightPerPixel)) {
+  if (!PlanWeightedCells(*this, workArea, gap, &expectedRects, &constrainedWeightPerPixel)) {
     return false;
   }
 

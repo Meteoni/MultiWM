@@ -3,38 +3,23 @@
 
 namespace Model {
 
-// Holds an SRW lock in shared (read) mode until the end of the enclosing scope.
-class SharedLockGuard {
- public:
-  explicit SharedLockGuard(SRWLOCK* lock) : lock_(lock) { AcquireSRWLockShared(lock_); }
-  ~SharedLockGuard() { ReleaseSRWLockShared(lock_); }
-  SharedLockGuard(const SharedLockGuard&) = delete;
-  SharedLockGuard& operator=(const SharedLockGuard&) = delete;
-
- private:
-  SRWLOCK* lock_;
-};
-
-// Holds an SRW lock in exclusive (write) mode until the end of the enclosing scope.
-class ExclusiveLockGuard {
- public:
-  explicit ExclusiveLockGuard(SRWLOCK* lock) : lock_(lock) { AcquireSRWLockExclusive(lock_); }
-  ~ExclusiveLockGuard() { ReleaseSRWLockExclusive(lock_); }
-  ExclusiveLockGuard(const ExclusiveLockGuard&) = delete;
-  ExclusiveLockGuard& operator=(const ExclusiveLockGuard&) = delete;
-
- private:
-  SRWLOCK* lock_;
-};
-
 bool WorkspaceRepository::Load(
     const DesktopMonitorKey& key, Workspace* workspace) const {
   if (!workspace) return false;
-  SharedLockGuard guard(&lock_);
   auto it = states_.find(key);
   if (it == states_.end()) return false;
   *workspace = it->second;
   return true;
+}
+
+bool WorkspaceRepository::Contains(const DesktopMonitorKey& key) const {
+  return states_.find(key) != states_.end();
+}
+
+std::optional<TileLayout> WorkspaceRepository::LayoutOf(const DesktopMonitorKey& key) const {
+  const auto it = states_.find(key);
+  if (it == states_.end()) return std::nullopt;
+  return it->second.Layout();
 }
 
 void WorkspaceRepository::Save(
@@ -42,8 +27,6 @@ void WorkspaceRepository::Save(
   RuntimeLifecycle::AssertWmThread(L"WorkspaceRepository::Save");
   ++Diagnostics::g_runtime.counters.workspaceSaves;
   workspace.Validate(key, L"repository save");
-
-  ExclusiveLockGuard guard(&lock_);
 
   // Remove this workspace key from the reverse index for the previous snapshot.
   // Re-indexing the whole small workspace keeps the code simple and guarantees the
@@ -56,7 +39,7 @@ void WorkspaceRepository::Save(
 
       auto& owners = ownersIt->second;
       std::erase_if(owners, [&](const DesktopMonitorKey& ownerKey) {
-        return DesktopMonitorKeyEqual{}(ownerKey, key);
+        return ownerKey == key;
       });
       if (owners.empty()) ownersByWindow_.erase(ownersIt);
     }
@@ -72,7 +55,7 @@ void WorkspaceRepository::Save(
     if (std::none_of(
             owners.begin(), owners.end(),
             [&](const DesktopMonitorKey& ownerKey) {
-              return DesktopMonitorKeyEqual{}(ownerKey, key);
+              return ownerKey == key;
             })) {
       owners.push_back(key);
     }
@@ -81,14 +64,12 @@ void WorkspaceRepository::Save(
 
 bool WorkspaceRepository::IsTracked(HWND hwnd) const {
   if (!hwnd) return false;
-  SharedLockGuard guard(&lock_);
   auto it = ownersByWindow_.find(hwnd);
   return it != ownersByWindow_.end() && !it->second.empty();
 }
 
 bool WorkspaceRepository::IsTiled(HWND hwnd) const {
   if (!hwnd) return false;
-  SharedLockGuard guard(&lock_);
   auto ownersIt = ownersByWindow_.find(hwnd);
   if (ownersIt == ownersByWindow_.end()) return false;
   for (const auto& key : ownersIt->second) {
@@ -100,7 +81,6 @@ bool WorkspaceRepository::IsTiled(HWND hwnd) const {
 
 bool WorkspaceRepository::IsSuspendedMaximized(HWND hwnd) const {
   if (!hwnd) return false;
-  SharedLockGuard guard(&lock_);
   auto ownersIt = ownersByWindow_.find(hwnd);
   if (ownersIt == ownersByWindow_.end()) return false;
   for (const auto& key : ownersIt->second) {
@@ -117,14 +97,12 @@ bool WorkspaceRepository::IsSuspendedMaximized(HWND hwnd) const {
 
 std::vector<DesktopMonitorKey> WorkspaceRepository::OwnersOf(HWND hwnd) const {
   if (!hwnd) return {};
-  SharedLockGuard guard(&lock_);
   auto it = ownersByWindow_.find(hwnd);
   return it != ownersByWindow_.end() ? it->second : std::vector<DesktopMonitorKey>{};
 }
 
 std::vector<HWND> WorkspaceRepository::KnownWindows() const {
   std::vector<HWND> known;
-  SharedLockGuard guard(&lock_);
   known.reserve(ownersByWindow_.size());
   for (const auto& entry : ownersByWindow_) {
     if (!entry.second.empty()) known.push_back(entry.first);
@@ -134,18 +112,15 @@ std::vector<HWND> WorkspaceRepository::KnownWindows() const {
 
 std::vector<std::pair<DesktopMonitorKey, Workspace>>
 WorkspaceRepository::Snapshot() const {
-  SharedLockGuard guard(&lock_);
   return {states_.begin(), states_.end()};
 }
 
 std::vector<std::pair<HWND, std::vector<DesktopMonitorKey>>>
 WorkspaceRepository::OwnershipIndexSnapshot() const {
-  SharedLockGuard guard(&lock_);
   return {ownersByWindow_.begin(), ownersByWindow_.end()};
 }
 
 uint64_t WorkspaceRepository::Revision() const {
-  SharedLockGuard guard(&lock_);
   return revision_;
 }
 

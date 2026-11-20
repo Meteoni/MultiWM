@@ -816,6 +816,38 @@ static void RunFloatingSizeCommandTests() {
   std::printf("Passed %u floating size command checks.\n", check.passed);
 }
 
+// A new window's natural floating frame: the companion's app-frame properties
+// when present (the companion already moved the window onto its tile), else
+// its current frame. Float Focused floats a tiled window at that natural size.
+static void RunAppFrameRecordTests() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  const HWND hwnd = f.hwnd;
+  const RECT current = FloatingWindowFixture::Frame(hwnd);
+  const WindowRecord plain = Platform::Windows::MakeWindowRecord(hwnd);
+  check(plain.hasFloatingRect && EqualRect(&plain.floatingRect, &current),
+        "without the companion's properties the current frame is the natural one");
+
+  const RECT appFrame{f.workArea.left + 100, f.workArea.top + 80, f.workArea.left + 740, f.workArea.top + 560};
+  AppFrame::Remember(hwnd, appFrame);
+  WindowRecord record = Platform::Windows::MakeWindowRecord(hwnd);
+  check(record.hasFloatingRect && EqualRect(&record.floatingRect, &appFrame),
+        "the companion's app frame is the natural one, not the window's current (tile) frame");
+
+  record.canResize = true;  // The invisible test window has no sizing border.
+  Workspace workspace;
+  workspace.SetLayout(TileLayout::Columns);
+  workspace.AdmitTiled(record);
+  check(workspace.Float(hwnd), "float the tiled window");
+  g_workspaces.Save(f.key, workspace);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::CenterWithFloatingSize), "Float Focused places it");
+  const RECT floated = FloatingWindowFixture::Frame(hwnd);
+  check(Layout::RectWidth(floated) == 640 && Layout::RectHeight(floated) == 480 && IsCenteredIn(floated, f.center),
+        "Float Focused floats it at the app's own size, centered");
+  AppFrame::Forget(hwnd);
+  std::printf("Passed %u app-frame record checks.\n", check.passed);
+}
+
 // A window a floating rule admits is centered at its own size, unless an
 // override-size rule names another size (Automatic mode only).
 static void RunRuleFloatedSizeTests() {
@@ -1673,6 +1705,7 @@ int main() {
   RunFloatingLeaseTests();
   RunFloatingSizeCommandTests();
   RunRuleFloatedSizeTests();
+  RunAppFrameRecordTests();
   RunHiddenArrivalTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();

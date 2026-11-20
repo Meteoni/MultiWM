@@ -282,6 +282,30 @@ static void RunWeightedResizeTests() {
   std::printf("Passed %d weighted resize checks.\n", checks);
 }
 
+// The companion's app-frame window properties (shared/app_frame.h) hold one
+// 32-bit value each, so a frame round-trips only within 16-bit coordinates.
+static void RunAppFramePackingTests() {
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  auto roundTrips = [](const RECT& frame) {
+    const auto packed = AppFrame::Pack(frame);
+    const auto unpacked = packed ? AppFrame::Unpack(*packed) : std::nullopt;
+    return unpacked && EqualRect(&*unpacked, &frame);
+  };
+  check(roundTrips({100, 200, 1060, 840}), "an ordinary frame round-trips");
+  check(roundTrips({0, 0, 800, 600}), "an origin of 0,0 round-trips (size marks presence)");
+  check(roundTrips({-2560, -300, -1600, 340}), "a frame on a monitor left of the primary round-trips");
+  check(roundTrips({INT16_MIN, INT16_MAX, INT16_MIN + 0xFFFF, INT16_MAX + 1}), "the extremes round-trip");
+  check(!AppFrame::Pack({0, 0, 0, 600}) && !AppFrame::Pack({10, 10, 5, 600}), "an empty frame is not recorded");
+  check(!AppFrame::Pack({INT16_MAX + 1, 0, INT16_MAX + 101, 100}) && !AppFrame::Pack({0, 0, 0x10000, 100}),
+        "a frame that doesn't fit 16 bits is not recorded");
+  check(!AppFrame::Unpack({0x00640064, 0}), "no size means no recorded frame");
+  std::printf("Passed %d app-frame packing checks.\n", checks);
+}
+
 // A tiled workspace of `layout` with one window per minimum size (physical
 // pixels at `dpi`) and fake HWNDs 1..n. For model tests only.
 static Workspace MakeTiledWorkspace(TileLayout layout, const std::vector<SIZE>& minimums, UINT dpi = 96) {
@@ -1276,6 +1300,7 @@ int main() {
   RunRuleFieldParserTests();
   RunAdaptiveDwindleTests();
   RunWeightedResizeTests();
+  RunAppFramePackingTests();
   RunWindowSizeStepTests();
   RunWindowSizePropertyTests();
   RunDwindleResizeScenarioTests();

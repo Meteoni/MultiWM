@@ -1,4 +1,5 @@
-
+// Hotkey and tray commands, and the policy for completed user drags and resizes.
+// Part of MultiWM's single source file; see the include order in src/multiwm/multiwm.cpp.
 
 namespace Commands {
 
@@ -79,40 +80,64 @@ static bool ValidateUserLayoutMutation(
   return false;
 }
 
+// Validates `candidate`, a user change to `previous`, and on success keeps
+// `previous` so the change can be rolled back if the windows refuse their new
+// tiles. Validation may update `candidate` (refreshed native minimums, or a
+// Dwindle reassignment for a layout change). Saving the candidate stays with
+// the caller. False when the change is rejected; the user was told why.
+static bool AcceptUserLayoutMutation(
+    const DesktopMonitorKey& key, HMONITOR monitor, const Workspace& previous,
+    Workspace& candidate, HWND subject, Placement::UserLayoutMutationKind kind,
+    const wchar_t* action) {
+  if (!ValidateUserLayoutMutation(key, monitor, candidate, subject, kind, action)) return false;
+  Placement::RememberPendingLayoutMutation(key, previous, candidate, subject, kind, action);
+  return true;
+}
+
+// The foreground window with a copy of the workspace that owns its desktop and
+// monitor. No value without a foreground window or a saved workspace there.
+struct ForegroundWorkspace {
+  HWND foreground = nullptr;
+  HMONITOR monitor = nullptr;
+  DesktopMonitorKey key{};
+  Workspace workspace;
+};
+
+static std::optional<ForegroundWorkspace> LoadForegroundWorkspace() {
+  ForegroundWorkspace current;
+  current.foreground = GetForegroundWindow();
+  if (!current.foreground) return std::nullopt;
+  current.monitor = Platform::Windows::GetWindowPhysicalMonitor(current.foreground);
+  GUID desktopId{};
+  if (!current.monitor ||
+      !Platform::VirtualDesktop::GetWindowDesktopIdSafe(current.foreground, &desktopId) ||
+      !DesktopMonitorKey::FromHMonitor(desktopId, current.monitor, &current.key) ||
+      !g_workspaces.Load(current.key, &current.workspace)) {
+    return std::nullopt;
+  }
+  return current;
+}
+
 // Promotes the foreground window, or its tiled owner, to the master slot, then
 // clears stale gesture samples for both windows and reflows the workspace.
 void SwapMaster() {
   ++Diagnostics::g_runtime.counters.swapMasterCommands;
-  HWND fg = GetForegroundWindow();
-  if (!fg) return;
-
-  HMONITOR monitor = Platform::Windows::GetWindowPhysicalMonitor(fg);
-  if (!monitor) return;
-
-  GUID desktopId{};
-  if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(fg, &desktopId)) return;
-
-  DesktopMonitorKey key{};
-  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
-  Workspace workspace;
-  if (!g_workspaces.Load(key, &workspace) || workspace.ActiveCount() < 2 ||
-      workspace.Layout() == TileLayout::Floating) {
+  auto current = LoadForegroundWorkspace();
+  if (!current || current->workspace.ActiveCount() < 2 ||
+      current->workspace.Layout() == TileLayout::Floating) {
     return;
   }
+  const DesktopMonitorKey& key = current->key;
+  const Workspace& workspace = current->workspace;
 
-  HWND resolved = Platform::Windows::ResolveToTiledWindow(fg, workspace.TiledWindows());
+  HWND resolved = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
   Workspace candidate = workspace;
   HWND oldMaster = nullptr;
   if (!resolved || !candidate.MakeMaster(resolved, &oldMaster)) return;
-  if (!ValidateUserLayoutMutation(
-          key, monitor, candidate, resolved, Placement::UserLayoutMutationKind::Order,
-          L"Set master")) {
+  if (!AcceptUserLayoutMutation(key, current->monitor, workspace, candidate, resolved,
+                                Placement::UserLayoutMutationKind::Order, L"Set master")) {
     return;
   }
-
-  Placement::RememberPendingLayoutMutation(
-      key, workspace, candidate, resolved, Placement::UserLayoutMutationKind::Order,
-      L"Set master");
   g_workspaces.Save(key, candidate);
   Gestures::ClearMoveSizeSamples(oldMaster);
   Gestures::ClearMoveSizeSamples(resolved);
@@ -131,25 +156,15 @@ static void MoveFocusedWindowOneSlot(bool promote) {
     ++Diagnostics::g_runtime.counters.demoteWindowCommands;
   }
 
-  HWND fg = GetForegroundWindow();
-  if (!fg) return;
-
-  HMONITOR monitor = Platform::Windows::GetWindowPhysicalMonitor(fg);
-  if (!monitor) return;
-
-  GUID desktopId{};
-  if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(fg, &desktopId)) return;
-
-  DesktopMonitorKey key{};
-  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
-
-  Workspace workspace;
-  if (!g_workspaces.Load(key, &workspace) || workspace.ActiveCount() < 2 ||
-      workspace.Layout() == TileLayout::Floating) {
+  auto current = LoadForegroundWorkspace();
+  if (!current || current->workspace.ActiveCount() < 2 ||
+      current->workspace.Layout() == TileLayout::Floating) {
     return;
   }
+  const DesktopMonitorKey& key = current->key;
+  const Workspace& workspace = current->workspace;
 
-  HWND resolved = Platform::Windows::ResolveToTiledWindow(fg, workspace.TiledWindows());
+  HWND resolved = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
   if (!resolved) return;
 
   const size_t index = workspace.TiledIndex(resolved);
@@ -164,15 +179,11 @@ static void MoveFocusedWindowOneSlot(bool promote) {
   HWND other = workspace.TiledWindows()[otherIndex];
   Workspace candidate = workspace;
   if (!candidate.SwapTiled(resolved, other)) return;
-  if (!ValidateUserLayoutMutation(
-          key, monitor, candidate, resolved, Placement::UserLayoutMutationKind::Order,
-          promote ? L"Promote" : L"Demote")) {
+  if (!AcceptUserLayoutMutation(key, current->monitor, workspace, candidate, resolved,
+                                Placement::UserLayoutMutationKind::Order,
+                                promote ? L"Promote" : L"Demote")) {
     return;
   }
-
-  Placement::RememberPendingLayoutMutation(
-      key, workspace, candidate, resolved, Placement::UserLayoutMutationKind::Order,
-      promote ? L"Promote" : L"Demote");
   g_workspaces.Save(key, candidate);
   Gestures::ClearMoveSizeSamples(resolved);
   Gestures::ClearMoveSizeSamples(other);
@@ -194,21 +205,14 @@ void DemoteFocusedWindow() {
 
 void FloatFocusedWindow() {
   ++Diagnostics::g_runtime.counters.floatFocusedCommands;
-  HWND hwnd = GetForegroundWindow();
-  if (!hwnd) return;
-
-  HMONITOR monitor = Platform::Windows::GetWindowPhysicalMonitor(hwnd);
-  GUID desktopId{};
-  if (!monitor || !Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &desktopId)) return;
-
-  DesktopMonitorKey key{};
-  if (!DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) return;
-  Workspace workspace;
-  if (!g_workspaces.Load(key, &workspace)) return;
+  auto current = LoadForegroundWorkspace();
+  if (!current) return;
+  const DesktopMonitorKey& key = current->key;
+  Workspace& workspace = current->workspace;
 
   // Explicit floating also cancels a queued overflow of this focused HWND.
-  g_wm.CancelPendingOverflow(hwnd);
-  HWND tiled = Platform::Windows::ResolveToTiledWindow(hwnd, workspace.TiledWindows());
+  g_wm.CancelPendingOverflow(current->foreground);
+  HWND tiled = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
   if (!tiled) return;
 
   Placement::FloatingPlacementHint hint;
@@ -246,17 +250,13 @@ struct FocusedMember {
 };
 
 static std::optional<FocusedMember> LoadFocusedMember() {
-  HWND fg = GetForegroundWindow();
-  if (!fg) return std::nullopt;
+  auto current = LoadForegroundWorkspace();
+  if (!current) return std::nullopt;
   FocusedMember focused;
-  focused.monitor = Platform::Windows::GetWindowPhysicalMonitor(fg);
-  GUID desktopId{};
-  if (!focused.monitor || !Platform::VirtualDesktop::GetWindowDesktopIdSafe(fg, &desktopId) ||
-      !DesktopMonitorKey::FromHMonitor(desktopId, focused.monitor, &focused.key) ||
-      !g_workspaces.Load(focused.key, &focused.workspace)) {
-    return std::nullopt;
-  }
-  focused.hwnd = ResolveSizeCommandTarget(focused.workspace, fg);
+  focused.key = std::move(current->key);
+  focused.monitor = current->monitor;
+  focused.workspace = std::move(current->workspace);
+  focused.hwnd = ResolveSizeCommandTarget(focused.workspace, current->foreground);
   if (!focused.hwnd) return std::nullopt;
   const WindowRecord* record = focused.workspace.Find(focused.hwnd);
   focused.floating = focused.workspace.Layout() == TileLayout::Floating ||
@@ -267,14 +267,10 @@ static std::optional<FocusedMember> LoadFocusedMember() {
 // Commits a tiled window-size change like a resize drag: validated against
 // cached minimums, kept for rollback, then arranged with the window preferred.
 static void CommitWindowSizeChange(FocusedMember& focused, Workspace candidate, const wchar_t* action) {
-  if (!ValidateUserLayoutMutation(
-          focused.key, focused.monitor, candidate, focused.hwnd,
-          Placement::UserLayoutMutationKind::Resize, action)) {
+  if (!AcceptUserLayoutMutation(focused.key, focused.monitor, focused.workspace, candidate,
+                                focused.hwnd, Placement::UserLayoutMutationKind::Resize, action)) {
     return;
   }
-  Placement::RememberPendingLayoutMutation(
-      focused.key, focused.workspace, candidate, focused.hwnd,
-      Placement::UserLayoutMutationKind::Resize, action);
   g_workspaces.Save(focused.key, candidate);
   Placement::ArrangeWorkspace(focused.key, focused.hwnd);
   Diagnostics::RecordEvent(L"%ls hwnd=%p", action, focused.hwnd);
@@ -371,7 +367,7 @@ void TileWindows(HMONITOR monitor = nullptr) {
   // target workspace until after geometry adoption so manual tiling does not
   // overwrite the user's geometry before capturing it.
   for (const auto& key : changedKeys) {
-    if (!Reconcile::SameWorkspaceKey(key, targetKey)) Placement::ArrangeWorkspace(key);
+    if (key != targetKey) Placement::ArrangeWorkspace(key);
   }
 
   TrayUi::RefreshForMonitor(monitor);
@@ -385,14 +381,10 @@ static bool CommitWorkspaceLayoutChange(
     const DesktopMonitorKey& key, HMONITOR monitor,
     Workspace& workspace, Workspace candidate) {
   const TileLayout previousLayout = workspace.Layout();
-  if (!ValidateUserLayoutMutation(
-          key, monitor, candidate, nullptr,
-          Placement::UserLayoutMutationKind::LayoutChange, L"Change layout")) {
+  if (!AcceptUserLayoutMutation(key, monitor, workspace, candidate, nullptr,
+                                Placement::UserLayoutMutationKind::LayoutChange, L"Change layout")) {
     return false;
   }
-  Placement::RememberPendingLayoutMutation(
-      key, workspace, candidate, nullptr, Placement::UserLayoutMutationKind::LayoutChange,
-      L"Change layout");
   workspace = std::move(candidate);
   if (previousLayout != TileLayout::Floating &&
       workspace.Layout() == TileLayout::Floating) {
@@ -518,12 +510,8 @@ static void HandleUserMove(
   if (target) {
     Workspace candidate = workspace;
     if (candidate.SwapTiled(hwnd, target) &&
-        ValidateUserLayoutMutation(
-            key, key.ResolveMonitor(), candidate, hwnd,
-            Placement::UserLayoutMutationKind::Order, L"Swap")) {
-      Placement::RememberPendingLayoutMutation(
-          key, workspace, candidate, hwnd, Placement::UserLayoutMutationKind::Order,
-          L"Swap");
+        AcceptUserLayoutMutation(key, key.ResolveMonitor(), workspace, candidate, hwnd,
+                                 Placement::UserLayoutMutationKind::Order, L"Swap")) {
       workspace = std::move(candidate);
       preferredTiledWindow = hwnd;
       g_workspaces.Save(key, workspace);
@@ -547,7 +535,7 @@ static void HandleUserResize(
   }
 
   const size_t resizedIndex = workspace.TiledIndex(hwnd);
-  if (resizedIndex == static_cast<size_t>(-1)) {
+  if (resizedIndex == Workspace::kNotFound) {
     Placement::ArrangeWorkspace(key);
     return;
   }
@@ -581,15 +569,11 @@ static void HandleUserResize(
   }
 
   if (changed) {
-    if (!ValidateUserLayoutMutation(
-            key, key.ResolveMonitor(), candidate, hwnd,
-            Placement::UserLayoutMutationKind::Resize, L"Resize")) {
+    if (!AcceptUserLayoutMutation(key, key.ResolveMonitor(), workspace, candidate, hwnd,
+                                  Placement::UserLayoutMutationKind::Resize, L"Resize")) {
       Placement::ArrangeWorkspace(key, hwnd);
       return;
     }
-    Placement::RememberPendingLayoutMutation(
-        key, workspace, candidate, hwnd, Placement::UserLayoutMutationKind::Resize,
-        L"Resize");
     workspace = std::move(candidate);
     g_workspaces.Save(key, workspace);
     ++Diagnostics::g_runtime.counters.dividerUpdates;

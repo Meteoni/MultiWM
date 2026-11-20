@@ -39,7 +39,7 @@ except the sibling `shared/` and `companion/` roots.
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |
 | `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot |
 | `windhawk/` | — | Windhawk's stock tool-mod launcher. Not MultiWM logic. |
-| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry` | Code compiled by both mods: window-rule matching, the companion snapshot layout, and geometry/size-limit arithmetic. Windows and the standard library only. |
+| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry`, `AppFrame` | Code compiled by both mods: window-rule matching, the companion snapshot layout, geometry/size-limit arithmetic, and the app-frame window properties. Windows and the standard library only. |
 | `companion/` | `Companion` | The separate MultiWM Companion mod (`src/companion/multiwm-companion.cpp`). Never included by MultiWM. |
 
 ## The companion mod
@@ -55,6 +55,15 @@ display changes and effective overflow routing. Changed inputs rebuild a snapsho
 changed contents are written with a seqlock. Unchanged contents skip the write.
 There is no polling or request back to MultiWM. A named liveness event distinguishes
 a running writer from a section kept alive only by readers.
+
+One thing travels the other way, on the window itself. When the companion moves a
+new window onto its tile before showing it, the app's own frame would be lost, and
+MultiWM would take the tile for the window's natural floating frame. So the
+companion leaves the app's frame on the window as two window properties
+(`shared/app_frame.h`), which MultiWM reads when it first records the window
+(`MakeWindowRecord`) and the companion removes when the window is destroyed.
+Without the properties MultiWM uses the window's current frame, as without the
+companion.
 
 The snapshot holds each current-desktop workspace's next-admission tile and default
 floating frame, definite overflow-float predictions, known window ownership/treatment, rules and per-window
@@ -196,7 +205,7 @@ anything. When you see a check repeated after a native call, that is why.
 | Add a layout or change how one divides space | `layout/algorithms.h`, then `layout/planning.h` (`BuildWorkspaceLayoutPlan`) |
 | Change what happens when a window appears | `reconcile/reconcile.h` (admission helpers near the top) |
 | Change a window rule's effect | `app/configuration.h` (parsing) and `platform/native_windows.h` (`FindMatchingWindowRule`) |
-| Add a hotkey or tray command | `core/shared_types.h` (IDs), `app/configuration.h`, `app/wm_thread.h`, `commands/commands.h` |
+| Add a hotkey or tray command | `core/shared_types.h` (IDs), `app/wm_thread.h`, `commands/commands.h` |
 | Investigate a bug report | `app/diagnostics.h`: the report lists counters, workspaces and recent events |
 
 ## Tests

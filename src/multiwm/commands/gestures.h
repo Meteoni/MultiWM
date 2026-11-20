@@ -1,9 +1,10 @@
-
+// Classifying a user's completed drag or resize from WinEvent frame samples.
+// Part of MultiWM's single source file; see the include order in src/multiwm/multiwm.cpp.
 
 enum class MoveSizeIntent {
-    None,
-    Move,
-    Resize,
+  None,
+  Move,
+  Resize,
 };
 
 struct MoveSizeGesture {
@@ -22,37 +23,37 @@ namespace Gestures {
 // and size together. Opposite edges moving together is therefore the stronger
 // signal for translation.
 MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LONG tol = 1) {
-    const LONG dl = after.left - before.left;
-    const LONG dr = after.right - before.right;
-    const LONG dt = after.top - before.top;
-    const LONG db = after.bottom - before.bottom;
+  const LONG dl = after.left - before.left;
+  const LONG dr = after.right - before.right;
+  const LONG dt = after.top - before.top;
+  const LONG db = after.bottom - before.bottom;
 
-    const LONG maxEdgeDelta = std::max(
-        std::max(std::abs(dl), std::abs(dr)),
-        std::max(std::abs(dt), std::abs(db)));
-    if (maxEdgeDelta <= tol) {
-        Wh_Log(L"Move/size intent: none");
-        return MoveSizeIntent::None;
-    }
+  const LONG maxEdgeDelta = std::max(
+    std::max(std::abs(dl), std::abs(dr)),
+    std::max(std::abs(dt), std::abs(db)));
+  if (maxEdgeDelta <= tol) {
+    Wh_Log(L"Move/size intent: none");
+    return MoveSizeIntent::None;
+  }
 
-    // Twice the center displacement versus actual width/height deformation.
-    // Use 64-bit intermediates so adding two LONG deltas cannot overflow.
-    const long long moveScore = std::max(
-        std::llabs(static_cast<long long>(dl) + dr),
-        std::llabs(static_cast<long long>(dt) + db));
-    const long long resizeScore = std::max(
-        std::llabs(static_cast<long long>(dr) - dl),
-        std::llabs(static_cast<long long>(db) - dt));
+  // Twice the center displacement versus actual width/height deformation.
+  // Use 64-bit intermediates so adding two LONG deltas cannot overflow.
+  const long long moveScore = std::max(
+    std::llabs(static_cast<long long>(dl) + dr),
+    std::llabs(static_cast<long long>(dt) + db));
+  const long long resizeScore = std::max(
+    std::llabs(static_cast<long long>(dr) - dl),
+    std::llabs(static_cast<long long>(db) - dt));
 
-    // A translation must dominate deformation by a healthy margin. A normal
-    // one-edge resize produces roughly equal scores, so it remains Resize.
-    if (moveScore > resizeScore * 2) {
-        Wh_Log(L"Move/size intent: move (move=%lld resize=%lld)", moveScore, resizeScore);
-        return MoveSizeIntent::Move;
-    }
+  // A translation must dominate deformation by a healthy margin. A normal
+  // one-edge resize produces roughly equal scores, so it remains Resize.
+  if (moveScore > resizeScore * 2) {
+    Wh_Log(L"Move/size intent: move (move=%lld resize=%lld)", moveScore, resizeScore);
+    return MoveSizeIntent::Move;
+  }
 
-    Wh_Log(L"Move/size intent: resize (move=%lld resize=%lld)", moveScore, resizeScore);
-    return MoveSizeIntent::Resize;
+  Wh_Log(L"Move/size intent: resize (move=%lld resize=%lld)", moveScore, resizeScore);
+  return MoveSizeIntent::Resize;
 }
 
 static MoveSizeGesture PeekMoveSizeGesture(HWND hwnd) {
@@ -98,27 +99,8 @@ static void ClearAllMoveSizeSamples() {
 // Consumes and clears the WinEvent samples for one completed gesture.
 // The WM core never reads these caches piecemeal after this boundary.
 static MoveSizeGesture ConsumeMoveSizeGesture(HWND hwnd) {
-  RuntimeLifecycle::AssertWmThread(L"ConsumeMoveSizeGesture");
-  MoveSizeGesture gesture;
-
-  auto startIt = g_moveSize.startRects.find(hwnd);
-  auto endIt = g_moveSize.endRects.find(hwnd);
-  auto pointIt = g_moveSize.endPoints.find(hwnd);
-
-  if (startIt != g_moveSize.startRects.end() && endIt != g_moveSize.endRects.end()) {
-    gesture.start = startIt->second;
-    gesture.end = endIt->second;
-    gesture.hasRects = true;
-  }
-  if (pointIt != g_moveSize.endPoints.end()) {
-    gesture.dropPoint = pointIt->second;
-    gesture.hasDropPoint = true;
-  }
-
+  const MoveSizeGesture gesture = PeekMoveSizeGesture(hwnd);
   g_moveSize.Forget(hwnd);
-  if (gesture.hasRects) {
-    gesture.intent = ClassifyMoveSizeIntent(gesture.start, gesture.end, 1);
-  }
   return gesture;
 }
 

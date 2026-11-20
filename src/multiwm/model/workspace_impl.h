@@ -92,7 +92,6 @@ bool Workspace::Validate(
         break;
 
       case ManageState::Floating:
-      case ManageState::Ignored:
         if (isActive) fail(L"non-tiled record appears in active tiled order", hwnd);
         if (record.hasSavedSlot) fail(L"non-suspended record retains a saved slot", hwnd);
         break;
@@ -344,8 +343,7 @@ bool Workspace::ActivateTiled(HWND hwnd) {
     record->suspensionReason = SuspensionReason::None;
     record->savedSlot = {};
     record->hasSavedSlot = false;
-    if (previousState == ManageState::Floating ||
-        previousState == ManageState::Ignored) {
+    if (previousState == ManageState::Floating) {
       record->tilingGeneration = NextTilingGeneration();
       record->pendingInsertionPlacement = true;
       // Explicitly re-tiling a floating window is a new placement attempt, but
@@ -420,18 +418,16 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
   if (IsGridLayout(layout_)) {
     gridWeights_.insert(
         gridWeights_.begin() + std::min(insertionActiveIndex, gridWeights_.size()),
-        insertionActiveIndex < inheritedSlotWeights_.size() ? inheritedSlotWeights_[insertionActiveIndex] : 1.0);
+        NewSlotWeight(insertionActiveIndex));
   } else if (IsMasterStackLayout(layout_) &&
              insertionActiveIndex > 0) {
     const size_t stackIndex =
         std::min(insertionActiveIndex - 1, stackWeights_.size());
-    stackWeights_.insert(stackWeights_.begin() + stackIndex,
-        stackIndex < inheritedSlotWeights_.size() ? inheritedSlotWeights_[stackIndex] : 1.0);
+    stackWeights_.insert(stackWeights_.begin() + stackIndex, NewSlotWeight(stackIndex));
   } else if (layout_ == TileLayout::Dwindle) {
     const size_t ratioIndex =
         std::min(insertionActiveIndex, dwindleRatios_.size());
-    dwindleRatios_.insert(dwindleRatios_.begin() + ratioIndex,
-        ratioIndex < inheritedSlotWeights_.size() ? inheritedSlotWeights_[ratioIndex] : 0.5);
+    dwindleRatios_.insert(dwindleRatios_.begin() + ratioIndex, NewSlotWeight(ratioIndex));
   }
 
   record.state = ManageState::Tiled;
@@ -652,12 +648,8 @@ Workspace Workspace::EmptyWithInheritedLayoutSettings() const {
   Workspace empty;
   empty.layout_ = layout_;
   empty.masterRatio_ = masterRatio_;
-  if (IsMasterStackLayout(layout_)) {
-    empty.inheritedSlotWeights_ = stackWeights_;
-  } else if (IsGridLayout(layout_)) {
-    empty.inheritedSlotWeights_ = gridWeights_;
-  } else if (layout_ == TileLayout::Dwindle) {
-    empty.inheritedSlotWeights_ = dwindleRatios_;
+  if (const std::vector<double>* weights = CurrentLayoutWeights()) {
+    empty.inheritedSlotWeights_ = *weights;
   }
   if (empty.inheritedSlotWeights_.size() < inheritedSlotWeights_.size()) {
     empty.inheritedSlotWeights_.insert(empty.inheritedSlotWeights_.end(),
@@ -859,30 +851,56 @@ void Workspace::AppendTiledWithDefaultWeight(HWND hwnd) {
   const size_t oldCount = windows_.size();
   windows_.push_back(hwnd);
   if (IsGridLayout(layout_)) {
-    gridWeights_.push_back(oldCount < inheritedSlotWeights_.size() ? inheritedSlotWeights_[oldCount] : 1.0);
+    gridWeights_.push_back(NewSlotWeight(oldCount));
   } else if (IsMasterStackLayout(layout_) &&
              oldCount > 0) {
-    stackWeights_.push_back(oldCount - 1 < inheritedSlotWeights_.size() ? inheritedSlotWeights_[oldCount - 1] : 1.0);
+    stackWeights_.push_back(NewSlotWeight(oldCount - 1));
   } else if (layout_ == TileLayout::Dwindle) {
-    dwindleRatios_.push_back(oldCount < inheritedSlotWeights_.size() ? inheritedSlotWeights_[oldCount] : 0.5);
+    dwindleRatios_.push_back(NewSlotWeight(oldCount));
   }
+}
+
+double Workspace::NewSlotWeight(size_t weightIndex) const {
+  if (weightIndex < inheritedSlotWeights_.size()) return inheritedSlotWeights_[weightIndex];
+  return layout_ == TileLayout::Dwindle ? 0.5 : 1.0;
+}
+
+const std::vector<double>* Workspace::CurrentLayoutWeights() const {
+  if (IsMasterStackLayout(layout_)) return &stackWeights_;
+  if (IsGridLayout(layout_)) return &gridWeights_;
+  if (layout_ == TileLayout::Dwindle) return &dwindleRatios_;
+  return nullptr;
+}
+
+std::vector<double>* Workspace::CurrentLayoutWeights() {
+  return const_cast<std::vector<double>*>(std::as_const(*this).CurrentLayoutWeights());
+}
+
+size_t Workspace::ExpectedWeightCount() const {
+  if (IsMasterStackLayout(layout_)) return windows_.empty() ? 0 : windows_.size() - 1;
+  if (IsGridLayout(layout_) || layout_ == TileLayout::Dwindle) return windows_.size();
+  return 0;
+}
+
+Workspace::RememberedGeometry* Workspace::RememberedGeometryForCurrentLayout() {
+  if (IsMasterStackLayout(layout_)) return &rememberedMasterStack_;
+  if (IsGridLayout(layout_)) return &rememberedGrid_;
+  if (layout_ == TileLayout::Dwindle) return &rememberedDwindle_;
+  return nullptr;
 }
 
 SuspendedSlot Workspace::MakeAppendedSuspendedSlot() const {
   SuspendedSlot slot{};
   slot.index = LogicalWindowCount();
-  if (IsGridLayout(layout_)) {
-    slot.weight = slot.index < inheritedSlotWeights_.size() ? inheritedSlotWeights_[slot.index] : 1.0;
+  if (IsGridLayout(layout_) || layout_ == TileLayout::Dwindle) {
+    slot.weight = NewSlotWeight(slot.index);
     slot.hasWeight = true;
   } else if (IsMasterStackLayout(layout_)) {
     if (slot.index == 0) slot.wasMaster = true;
     else {
-      slot.weight = slot.index - 1 < inheritedSlotWeights_.size() ? inheritedSlotWeights_[slot.index - 1] : 1.0;
+      slot.weight = NewSlotWeight(slot.index - 1);
       slot.hasWeight = true;
     }
-  } else if (layout_ == TileLayout::Dwindle) {
-    slot.weight = slot.index < inheritedSlotWeights_.size() ? inheritedSlotWeights_[slot.index] : 0.5;
-    slot.hasWeight = true;
   }
   return slot;
 }
@@ -953,44 +971,20 @@ void Workspace::MergeNonTiledRecordsFrom(const Workspace& source) {
 
 void Workspace::RememberCurrentLayoutGeometry() {
   RuntimeLifecycle::AssertWmThread(L"Workspace::RememberCurrentLayoutGeometry");
-
-  if (IsMasterStackLayout(layout_)) {
-    rememberedMasterStackOrder_ = windows_;
-    rememberedMasterStackWeights_ = stackWeights_;
-  } else if (IsGridLayout(layout_)) {
-    rememberedGridOrder_ = windows_;
-    rememberedGridWeights_ = gridWeights_;
-  } else if (layout_ == TileLayout::Dwindle) {
-    rememberedDwindleOrder_ = windows_;
-    rememberedDwindleRatios_ = dwindleRatios_;
+  if (RememberedGeometry* remembered = RememberedGeometryForCurrentLayout()) {
+    *remembered = {windows_, *CurrentLayoutWeights()};
   }
 }
 
 void Workspace::RestoreRememberedLayoutGeometry() {
   RuntimeLifecycle::AssertWmThread(L"Workspace::RestoreRememberedLayoutGeometry");
-
-  if (IsMasterStackLayout(layout_)) {
-    const size_t expected = windows_.empty() ? 0 : windows_.size() - 1;
-    if (rememberedMasterStackOrder_ == windows_ &&
-        rememberedMasterStackWeights_.size() == expected) {
-      stackWeights_ = rememberedMasterStackWeights_;
-    } else {
-      stackWeights_.clear();
-    }
-  } else if (IsGridLayout(layout_)) {
-    if (rememberedGridOrder_ == windows_ &&
-        rememberedGridWeights_.size() == windows_.size()) {
-      gridWeights_ = rememberedGridWeights_;
-    } else {
-      gridWeights_.clear();
-    }
-  } else if (layout_ == TileLayout::Dwindle) {
-    if (rememberedDwindleOrder_ == windows_ &&
-        rememberedDwindleRatios_.size() == windows_.size()) {
-      dwindleRatios_ = rememberedDwindleRatios_;
-    } else {
-      dwindleRatios_.clear();
-    }
+  const RememberedGeometry* remembered = RememberedGeometryForCurrentLayout();
+  if (!remembered) return;
+  std::vector<double>& weights = *CurrentLayoutWeights();
+  if (remembered->order == windows_ && remembered->weights.size() == ExpectedWeightCount()) {
+    weights = remembered->weights;
+  } else {
+    weights.clear();
   }
 }
 
@@ -1077,12 +1071,9 @@ bool Workspace::HasSameLayoutStateAs(const Workspace& other) const {
       stackWeights_ == other.stackWeights_ &&
       gridWeights_ == other.gridWeights_ &&
       dwindleRatios_ == other.dwindleRatios_ &&
-      rememberedMasterStackOrder_ == other.rememberedMasterStackOrder_ &&
-      rememberedMasterStackWeights_ == other.rememberedMasterStackWeights_ &&
-      rememberedGridOrder_ == other.rememberedGridOrder_ &&
-      rememberedGridWeights_ == other.rememberedGridWeights_ &&
-      rememberedDwindleOrder_ == other.rememberedDwindleOrder_ &&
-      rememberedDwindleRatios_ == other.rememberedDwindleRatios_;
+      rememberedMasterStack_ == other.rememberedMasterStack_ &&
+      rememberedGrid_ == other.rememberedGrid_ &&
+      rememberedDwindle_ == other.rememberedDwindle_;
 }
 
 // Both rollback policies validate membership before copying geometry. Window
@@ -1095,12 +1086,9 @@ void Workspace::CopyLayoutGeometryFrom(const Workspace& source) {
   stackWeights_ = source.stackWeights_;
   gridWeights_ = source.gridWeights_;
   dwindleRatios_ = source.dwindleRatios_;
-  rememberedMasterStackOrder_ = source.rememberedMasterStackOrder_;
-  rememberedMasterStackWeights_ = source.rememberedMasterStackWeights_;
-  rememberedGridOrder_ = source.rememberedGridOrder_;
-  rememberedGridWeights_ = source.rememberedGridWeights_;
-  rememberedDwindleOrder_ = source.rememberedDwindleOrder_;
-  rememberedDwindleRatios_ = source.rememberedDwindleRatios_;
+  rememberedMasterStack_ = source.rememberedMasterStack_;
+  rememberedGrid_ = source.rememberedGrid_;
+  rememberedDwindle_ = source.rememberedDwindle_;
   dwindlePushes_ = source.dwindlePushes_;
 }
 

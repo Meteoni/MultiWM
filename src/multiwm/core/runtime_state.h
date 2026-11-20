@@ -291,6 +291,16 @@ struct PendingWindowRoute {
   uint64_t visibleGeneration = 0;  // Counts a maximized arrival without admitting it.
 };
 
+namespace RuntimeLifecycle {
+// Kills an actor timer created with SetTimer(nullptr, ...) and marks it
+// unscheduled. Does nothing when the timer is not scheduled.
+static void CancelActorTimer(UINT_PTR& timer) {
+  if (!timer) return;
+  KillTimer(nullptr, timer);
+  timer = 0;
+}
+}  // namespace RuntimeLifecycle
+
 // State of the WM thread (the "actor"): everything below is read and written
 // only on that thread, except `threadId`, which callbacks read to post messages.
 // Management mode affects admission/retention policy only; observation,
@@ -369,6 +379,21 @@ struct WmRuntime {
     if (overflow.follow.hwnd == hwnd) overflow.follow = {};
     if (routing.follow.hwnd == hwnd) routing.follow = {};
   }
+
+  // Ends one WM session: kills every actor timer and drops all queued and
+  // per-session work. Keeps the thread identity, COM state and management mode,
+  // which outlive a settings reload.
+  void ResetSession() {
+    for (UINT_PTR* timer : {&timers.lifecycle, &timers.discoveryRetry, &timers.overflow,
+                            &timers.maintenance, &timers.conformance}) {
+      RuntimeLifecycle::CancelActorTimer(*timer);
+    }
+    lifecycle = {};
+    desktop = {};
+    maintenance = {};
+    overflow = {};
+    routing = {};
+  }
 };
 static SettingsState g_settings;
 static VirtualDesktopRuntime g_vd;
@@ -381,6 +406,17 @@ static bool IsManualMode() {
 
 static bool IsAutomaticMode() {
   return g_wm.managementMode == ManagementMode::Automatic;
+}
+
+// The active virtual desktop: the one the model was last reconciled against
+// while that state is settled, else a live shell query (one COM call, which may
+// deliver messages). False when the query fails.
+static bool GetActiveDesktopId(GUID* outDesktop) {
+  if (g_wm.desktop.state == ReconciledDesktopState::Settled) {
+    *outDesktop = g_wm.desktop.reconciled;
+    return true;
+  }
+  return Platform::VirtualDesktop::GetCurrentDesktopId(outDesktop);
 }
 
 static void AssertWmThread(const wchar_t* operation) {

@@ -13,22 +13,16 @@ UINT ParseModifiers(PCWSTR str) {
 
 static bool TryParseLayoutSetting(PCWSTR str, TileLayout* outLayout) {
   if (!str || !outLayout) return false;
-  static const std::pair<PCWSTR, TileLayout> kLayoutMap[] = {
-      {L"master_stack", TileLayout::MasterStack},
-      {L"master_stack_h", TileLayout::MasterStackH},
-      {L"columns", TileLayout::Columns},
-      {L"rows", TileLayout::Rows},
-      {L"dwindle", TileLayout::Dwindle},
-      // Compatibility alias for configurations saved before 1.13.29.
-      {L"bsp", TileLayout::Dwindle},
-      {L"monocle", TileLayout::Monocle},
-      {L"floating", TileLayout::Floating},
-  };
-  for (const auto& entry : kLayoutMap) {
-    if (wcscmp(str, entry.first) == 0) {
-      *outLayout = entry.second;
+  for (size_t index = 0; index < std::size(kLayoutNames); ++index) {
+    if (wcscmp(str, kLayoutNames[index].setting) == 0) {
+      *outLayout = static_cast<TileLayout>(index);
       return true;
     }
+  }
+  // Compatibility alias for configurations saved before 1.13.29.
+  if (wcscmp(str, L"bsp") == 0) {
+    *outLayout = TileLayout::Dwindle;
+    return true;
   }
   return false;
 }
@@ -498,28 +492,14 @@ void LoadSettings() {
   LoadWindowRules();
 
   // Hotkeys. Blank disables a hotkey; an unparseable key is logged and disabled.
-  const std::pair<PCWSTR, UINT*> hotkeys[] = {
-      {L"hotkeys.TileKey", &g_settings.tileKey},
-      {L"hotkeys.LayoutKey", &g_settings.layoutKey},
-      {L"hotkeys.SwapMasterKey", &g_settings.swapMasterKey},
-      {L"hotkeys.PromoteWindowKey", &g_settings.promoteWindowKey},
-      {L"hotkeys.DemoteWindowKey", &g_settings.demoteWindowKey},
-      {L"hotkeys.ManagementModeToggleKey", &g_settings.managementModeToggleKey},
-      {L"hotkeys.FloatFocusedKey", &g_settings.floatFocusedKey},
-      {L"hotkeys.WindowSize.GrowKey", &g_settings.growWindowKey},
-      {L"hotkeys.WindowSize.ShrinkKey", &g_settings.shrinkWindowKey},
-      {L"hotkeys.WindowSize.ResetKey", &g_settings.resetWindowSizeKey},
-      {L"hotkeys.DiagnosticDumpKey", &g_settings.diagnosticDumpKey},
-  };
-  for (const auto& [settingName, destination] : hotkeys) {
-    *destination = ReadHotkeySetting<UINT>(settingName, ParseHotkeyKey);
+  for (const HotkeyBinding& hotkey : kHotkeyBindings) {
+    g_settings.*hotkey.key = ReadHotkeySetting<UINT>(hotkey.setting, ParseHotkeyKey);
   }
   g_settings.resizeStepPercent = ReadBoundedIntSetting(L"hotkeys.WindowSize.StepPercent", 1, 50, 5);
 
   auto diagnosticsPath = StringSetting::make(L"diagnostics.DiagnosticsOutputPath");
-  g_settings.diagnosticsOutputPath = *diagnosticsPath.get()
-      ? std::wstring(diagnosticsPath.get())
-      : std::wstring(L"%USERPROFILE%\\Documents\\MultiWMDiagnostics");
+  g_settings.diagnosticsOutputPath =
+      *diagnosticsPath.get() ? diagnosticsPath.get() : kDefaultDiagnosticsOutputPath;
 
   TrayUi::LoadSettings();
 }

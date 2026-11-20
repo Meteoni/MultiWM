@@ -18,13 +18,8 @@ static bool IsWorkspaceOnActiveDesktop(const DesktopMonitorKey& key) {
   // signals. Avoid re-querying Explorer from high-frequency placement and
   // LOCATIONCHANGE paths; a dirty transition deliberately retains the old GUID
   // for comparison while falling through to the existing live query.
-  if (g_wm.desktop.state == ReconciledDesktopState::Settled) {
-    return IsEqualGUID(g_wm.desktop.reconciled, key.desktopId);
-  }
-
-  GUID currentDesktop{};
-  if (!Platform::VirtualDesktop::GetCurrentDesktopId(&currentDesktop)) return false;
-  return IsEqualGUID(currentDesktop, key.desktopId);
+  GUID activeDesktop{};
+  return RuntimeLifecycle::GetActiveDesktopId(&activeDesktop) && IsEqualGUID(activeDesktop, key.desktopId);
 }
 
 // Repairs only model-local arrangement preconditions. OS lifecycle/ownership
@@ -43,6 +38,24 @@ static void ObserveAndRepairWorkspaceForArrangement(Workspace& workspace) {
     }
   }
   workspace.RepairForArrangement(invalidWindows, missingActiveRecords);
+}
+
+// A fresh native size-limit report merged with the cached one.
+struct ConstraintProbeRefresh {
+  WindowConstraints merged;    // What the record should hold now.
+  bool reportChanged = false;  // A valid fresh report changed the cached limits.
+};
+
+// Probes `hwnd`'s native size limits and merges the reply with `cached`: a failed
+// probe keeps the last valid report. The probe sends WM_GETMINMAXINFO, which runs
+// application code, so callers recheck identity/physical state when that matters.
+// Changes nothing; callers store `merged` with Workspace::UpdateConstraints.
+static ConstraintProbeRefresh ProbeConstraintsAgainstCache(HWND hwnd, WindowConstraints cached) {
+  const WindowConstraints fresh = Platform::Windows::ProbeWindowConstraints(hwnd);
+  ConstraintProbeRefresh refresh;
+  refresh.merged = Model::MergeConstraintProbeWithCache(cached, fresh);
+  refresh.reportChanged = fresh.valid && !Model::SameConstraintGeometry(cached, refresh.merged);
+  return refresh;
 }
 
 // Refreshes the application-owned native minimum contract without introducing a
@@ -71,19 +84,13 @@ static bool RefreshWorkspaceNativeConstraints(
         (currentDpi && currentDpi != record->constraints.dpi);
     if (!needsProbe) continue;
 
-    const WindowConstraints before = record->constraints;
-    const WindowConstraints fresh = Platform::Windows::ProbeWindowConstraints(hwnd);
-    const WindowConstraints refreshed =
-        Model::MergeConstraintProbeWithCache(before, fresh);
-    const bool geometryChanged =
-        !Model::SameConstraintGeometry(before, refreshed);
-    changed |= workspace.UpdateConstraints(hwnd, refreshed);
-
-    if (fresh.valid && geometryChanged) {
+    const ConstraintProbeRefresh refresh = ProbeConstraintsAgainstCache(hwnd, record->constraints);
+    changed |= workspace.UpdateConstraints(hwnd, refresh.merged);
+    if (refresh.reportChanged) {
       Diagnostics::RecordEvent(
           L"native constraint report refreshed reason=%ls hwnd=%p min=%ldx%ld dpi=%u",
-          reason ? reason : L"arrange", hwnd, refreshed.minWidth,
-          refreshed.minHeight, refreshed.dpi);
+          reason ? reason : L"arrange", hwnd, refresh.merged.minWidth,
+          refresh.merged.minHeight, refresh.merged.dpi);
     }
   }
   return changed;
@@ -118,7 +125,7 @@ static void RememberPendingAdmissionRecovery(
   const PendingAdmissionRecovery* existing =
       g_pendingProofs.FindAdmissionRecovery(hwnd);
   if (existing && existing->generation == record->tilingGeneration &&
-      Model::DesktopMonitorKeyEqual{}(existing->key, key)) {
+      existing->key == key) {
     // Keep the earliest pre-recovery snapshot for this unsettled admission.
     return;
   }
@@ -143,7 +150,7 @@ static bool RestorePendingAdmissionRecoveryAfterSuspension(
   if (!taken) return false;
 
   const PendingAdmissionRecovery recovery = std::move(*taken);
-  if (!Model::DesktopMonitorKeyEqual{}(recovery.key, key)) return false;
+  if (recovery.key != key) return false;
 
   const WindowRecord* currentRecord = workspace->Find(hwnd);
   const WindowRecord* baselineRecord = recovery.baseline.Find(hwnd);
@@ -186,8 +193,7 @@ static void ShowWindowConstraintConflict(
   // even when they currently fit (e.g. Pixeval already occupies the only slot).
   if (workspace.Layout() == TileLayout::Dwindle &&
       rects.size() == constraints.size()) {
-    constexpr size_t kUnassigned = static_cast<size_t>(-1);
-    std::vector<size_t> owner(rects.size(), kUnassigned);
+    std::vector<size_t> owner(rects.size(), Layout::kUnassignedSlot);
     std::vector<bool> fixed(constraints.size(), false);
     std::vector<size_t> unmatched;
     for (size_t window = 0; window < constraints.size(); ++window) {
@@ -203,7 +209,7 @@ static void ShowWindowConstraintConflict(
         if (member >= involved.size() || involved[member]) return;
         involved[member] = true;
         for (size_t slot : compatibility.slotsByWindow[member]) {
-          if (slot < owner.size() && owner[slot] != kUnassigned) {
+          if (slot < owner.size() && owner[slot] != Layout::kUnassignedSlot) {
             self(self, owner[slot]);
           }
         }
@@ -211,20 +217,24 @@ static void ShowWindowConstraintConflict(
       for (size_t window : unmatched) include(include, window);
     }
   }
+  // The process file name without ".exe", or empty when it can't be read.
+  auto processDisplayName = [](HWND hwnd) {
+    std::wstring name = Platform::Windows::GetWindowProcessName(hwnd);
+    if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0) {
+      name.resize(name.size() - 4);
+    }
+    return name;
+  };
   std::vector<std::wstring> names;
   for (size_t i = 0; i < involved.size(); ++i) {
     if (!involved[i]) continue;
-    std::wstring name = Platform::Windows::GetWindowProcessName(workspace.TiledWindows()[i]);
-    if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0)
-      name.resize(name.size() - 4);
+    std::wstring name = processDisplayName(workspace.TiledWindows()[i]);
     if (name.empty()) name = L"A window";
     if (std::find(names.begin(), names.end(), name) == names.end())
       names.push_back(std::move(name));
   }
   if (names.empty() && fallback) {
-    std::wstring name = Platform::Windows::GetWindowProcessName(fallback);
-    if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0)
-      name.resize(name.size() - 4);
+    std::wstring name = processDisplayName(fallback);
     if (!name.empty()) names.push_back(std::move(name));
   }
   std::wstring message;
@@ -886,21 +896,15 @@ static ArrangementStep ApplyWorkspacePlacements(
         // unchanged, leave the event to conformance handling rather than
         // inventing a second empirical minimum-size policy.
         if (observation.result == PlacementResult::AdjustedByWindow) {
-          const WindowConstraints before = record->constraints;
-          const WindowConstraints fresh = Platform::Windows::ProbeWindowConstraints(hwnd);
-          const WindowConstraints observed =
-              Model::MergeConstraintProbeWithCache(before, fresh);
-          const bool geometryChanged =
-              !Model::SameConstraintGeometry(before, observed);
-          workspace.UpdateConstraints(hwnd, observed);
-
-          if (fresh.valid && geometryChanged) {
+          const ConstraintProbeRefresh refresh = ProbeConstraintsAgainstCache(hwnd, record->constraints);
+          workspace.UpdateConstraints(hwnd, refresh.merged);
+          if (refresh.reportChanged) {
             action = Workspace::PlacementAction::None;
             reflow = Reflow::NativeConstraints;
             CancelConformanceLease(hwnd);
             Diagnostics::RecordEvent(
                 L"placement refreshed native constraints hwnd=%p min=%ldx%ld dpi=%u",
-                hwnd, observed.minWidth, observed.minHeight, observed.dpi);
+                hwnd, refresh.merged.minWidth, refresh.merged.minHeight, refresh.merged.dpi);
           }
         }
 

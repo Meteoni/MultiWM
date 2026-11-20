@@ -6,17 +6,9 @@ namespace Diagnostics {
 // only when the user explicitly invokes the diagnostic hotkey.
 
 static const wchar_t* DiagnosticLayoutName(TileLayout layout) {
-  switch (layout) {
-    case TileLayout::MasterStack: return L"MasterStack";
-    case TileLayout::Columns: return L"Columns";
-    case TileLayout::Rows: return L"Rows";
-    case TileLayout::MasterStackH: return L"MasterStackH";
-    case TileLayout::Dwindle: return L"Dwindle";
-    case TileLayout::Monocle: return L"Monocle";
-    case TileLayout::Floating: return L"Floating";
-    case TileLayout::COUNT: return L"COUNT";
-    default: return L"Unknown";
-  }
+  if (layout == TileLayout::COUNT) return L"COUNT";
+  const LayoutNames* names = FindLayoutNames(layout);
+  return names ? names->diagnostic : L"Unknown";
 }
 
 static const wchar_t* DiagnosticManageStateName(ManageState state) {
@@ -24,7 +16,6 @@ static const wchar_t* DiagnosticManageStateName(ManageState state) {
     case ManageState::Tiled: return L"Tiled";
     case ManageState::Floating: return L"Floating";
     case ManageState::Suspended: return L"Suspended";
-    case ManageState::Ignored: return L"Ignored";
     default: return L"Unknown";
   }
 }
@@ -444,15 +435,6 @@ static DiagnosticWindowIdentity DiagnosticReadWindowIdentity(
   return identity;
 }
 
-static size_t DiagnosticActiveIndex(const Workspace& state, HWND hwnd) {
-  return state.TiledIndex(hwnd);
-}
-
-static size_t DiagnosticLogicalIndex(
-    const Workspace& state, HWND hwnd, const WindowRecord&) {
-  return state.LogicalIndex(hwnd);
-}
-
 static bool DiagnosticIsMinimizedSentinelFrame(const RECT& frame) {
   return frame.left <= -30000 || frame.top <= -30000;
 }
@@ -467,10 +449,10 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
     ReportBuilder& report, const Workspace& state, HWND mapHwnd,
     const WindowRecord& record, const wchar_t* prefix, size_t ordinal) {
   DiagnosticRecordAudit audit;
-  const size_t activeIndex = DiagnosticActiveIndex(state, mapHwnd);
-  const size_t logicalIndex = DiagnosticLogicalIndex(state, mapHwnd, record);
-  const bool hasActiveIndex = activeIndex != static_cast<size_t>(-1);
-  const bool hasLogicalIndex = logicalIndex != static_cast<size_t>(-1);
+  const size_t activeIndex = state.TiledIndex(mapHwnd);
+  const size_t logicalIndex = state.LogicalIndex(mapHwnd);
+  const bool hasActiveIndex = activeIndex != Workspace::kNotFound;
+  const bool hasLogicalIndex = logicalIndex != Workspace::kNotFound;
 
   report.Line(
       L"  %ls[%zu] logicalIndex=%ls activeIndex=%ls hwnd=%p",
@@ -957,18 +939,12 @@ static void DumpPlatformHealth(ReportBuilder& report) {
       g_vd.initialized ? 1 : 0, g_vd.abiResolved ? 1 : 0,
       g_vd.explorerBuild, g_vd.explorerRevision,
       g_vd.abi.usesHMonitor ? 1 : 0);
-  HWND currentShell = GetShellWindow();
-  DWORD currentShellPid = 0;
-  if (currentShell && IsWindow(currentShell)) {
-    GetWindowThreadProcessId(currentShell, &currentShellPid);
-  }
+  DWORD currentShellPid = Platform::VirtualDesktop::CurrentShellProcessId();
   report.Line(
       L"Explorer shell identity: boundPid=%lu currentPid=%lu match=%d",
       g_vd.shellPid, currentShellPid,
       g_vd.shellPid && currentShellPid && g_vd.shellPid == currentShellPid ? 1 : 0);
-  currentShellPid = 0;
-  HWND shell = GetShellWindow();
-  if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &currentShellPid);
+  currentShellPid = Platform::VirtualDesktop::CurrentShellProcessId();
   report.Line(
       L"Explorer shell binding: currentPid=%lu boundPid=%lu match=%d",
       currentShellPid, g_vd.shellPid,
@@ -1065,7 +1041,6 @@ struct ReportOwnershipSummary {
   size_t tiled = 0;
   size_t floating = 0;
   size_t suspended = 0;
-  size_t ignored = 0;
   size_t duplicateOwners = 0;           // HWNDs recorded by more than one workspace.
   size_t ownershipIndexMismatches = 0;  // Reverse index disagrees with the records.
 };
@@ -1085,7 +1060,6 @@ static ReportOwnershipSummary SummarizeOwnership(
         case ManageState::Tiled: ++summary.tiled; break;
         case ManageState::Floating: ++summary.floating; break;
         case ManageState::Suspended: ++summary.suspended; break;
-        case ManageState::Ignored: ++summary.ignored; break;
       }
     }
   }
@@ -1097,7 +1071,7 @@ static ReportOwnershipSummary SummarizeOwnership(
     if (a.size() != b.size()) return false;
     for (const DesktopMonitorKey& key : a) {
       if (std::none_of(b.begin(), b.end(), [&](const DesktopMonitorKey& candidate) {
-            return Model::DesktopMonitorKeyEqual{}(key, candidate);
+            return key == candidate;
           })) {
         return false;
       }
@@ -1163,10 +1137,10 @@ static void DumpRuntimeSummary(
     const ReportOwnershipSummary& summary, const Counters& counters) {
   report.Section(L"Current runtime summary");
   report.Line(L"Management mode: %ls", RuntimeLifecycle::IsAutomaticMode() ? L"Automatic" : L"Manual");
+  // "ignored=0" keeps the report format stable; no window state is ignored any more.
   report.Line(
-      L"Workspaces=%zu records=%zu tiled=%zu suspended=%zu perWindowFloating=%zu ignored=%zu",
-      workspaceCount, summary.totalRecords, summary.tiled, summary.suspended, summary.floating,
-      summary.ignored);
+      L"Workspaces=%zu records=%zu tiled=%zu suspended=%zu perWindowFloating=%zu ignored=0",
+      workspaceCount, summary.totalRecords, summary.tiled, summary.suspended, summary.floating);
   report.Line(
       L"Pending lifecycle HWNDs=%zu pending workspace reinforcements=%zu duplicate-owned HWNDs=%zu",
       g_wm.lifecycle.dirtyWindows.size(), g_wm.lifecycle.pendingArranges.size(),
@@ -1250,13 +1224,12 @@ static void DumpWorkspace(
     ReportBuilder& report, size_t workspaceIndex, size_t workspaceCount,
     const DesktopMonitorKey& key, const Workspace& state, ReportWorkspaceAudit* audit) {
   const std::wstring desktopId = DiagnosticGuidString(key.desktopId);
-  size_t workspaceTiled = 0, workspaceFloating = 0, workspaceSuspended = 0, workspaceIgnored = 0;
+  size_t workspaceTiled = 0, workspaceFloating = 0, workspaceSuspended = 0;
   for (const auto& recordKv : state.Records()) {
     switch (recordKv.second.state) {
       case ManageState::Tiled: ++workspaceTiled; break;
       case ManageState::Floating: ++workspaceFloating; break;
       case ManageState::Suspended: ++workspaceSuspended; break;
-      case ManageState::Ignored: ++workspaceIgnored; break;
     }
   }
 
@@ -1308,10 +1281,11 @@ static void DumpWorkspace(
   report.Line(
       L"layout=%ls (%d) masterRatio=%.9g",
       DiagnosticLayoutName(state.Layout()), static_cast<int>(state.Layout()), state.MasterRatio());
+  // "ignored=0" keeps the report format stable; no window state is ignored any more.
   report.Line(
-      L"counts: active=%zu records=%zu tiled=%zu suspended=%zu floating=%zu ignored=%zu",
+      L"counts: active=%zu records=%zu tiled=%zu suspended=%zu floating=%zu ignored=0",
       state.ActiveCount(), state.Records().size(), workspaceTiled,
-      workspaceSuspended, workspaceFloating, workspaceIgnored);
+      workspaceSuspended, workspaceFloating);
   report.Line(L"overflow: visibleTiled=%zu limit=%zu",
               state.VisibleWindowCount(), Placement::AutomaticWindowLimitForMonitor(key.monitor));
   report.Line(L"pendingReinforcement=%d invariants=%ls",
@@ -1337,7 +1311,7 @@ static void DumpWorkspace(
   otherRecords.reserve(state.Records().size());
   for (const auto& recordKv : state.Records()) {
     const WindowRecord& record = recordKv.second;
-    const size_t logicalIndex = DiagnosticLogicalIndex(state, recordKv.first, record);
+    const size_t logicalIndex = state.LogicalIndex(recordKv.first);
     if ((record.state == ManageState::Tiled || record.state == ManageState::Suspended) &&
         logicalIndex != Workspace::kNotFound) {
       logicalRecords.push_back({logicalIndex, recordKv.first, &record});
@@ -1467,9 +1441,7 @@ static void DumpAuditSummary(
       audit.currentDesktopRecordsOnStaleMonitorWorkspaces);
   const bool telemetryHealthy = DumpTelemetryConsistency(report, counters);
 
-  DWORD shellPid = 0;
-  const HWND shell = GetShellWindow();
-  if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &shellPid);
+  const DWORD shellPid = Platform::VirtualDesktop::CurrentShellProcessId();
   const bool shellBindingHealthy = !g_vd.initialized || (shellPid != 0 && g_vd.shellPid == shellPid);
   const bool vdCoreHealthy = g_vd.initialized && g_vd.abiResolved;
   const bool vdNotificationsHealthy = g_vd.abi.notification.methodCount <= 0 || g_vd.notificationsRegistered;

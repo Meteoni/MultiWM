@@ -8,12 +8,6 @@ namespace RuntimeLifecycle {
 static constexpr UINT kMaintenanceRetryMs = 1000;
 static constexpr UINT kMaintenanceMaxAttempts = 30;
 
-static void CancelMaintenanceTimer() {
-  if (!g_wm.timers.maintenance) return;
-  KillTimer(nullptr, g_wm.timers.maintenance);
-  g_wm.timers.maintenance = 0;
-}
-
 static void ArmMaintenanceTimer() {
   if (g_wm.timers.maintenance ||
       g_wm.maintenance.attempts >= kMaintenanceMaxAttempts) {
@@ -46,7 +40,7 @@ void RequestMaintenance(bool resetAttempts) {
 
 void RunMaintenanceNow() {
   AssertWmThread(L"RuntimeLifecycle::RunMaintenanceNow");
-  CancelMaintenanceTimer();
+  CancelActorTimer(g_wm.timers.maintenance);
   g_wm.maintenance.running = true;
   ++Diagnostics::g_runtime.counters.runtimeMaintenanceRuns;
 
@@ -80,7 +74,7 @@ void RunMaintenanceNow() {
     ++Diagnostics::g_runtime.counters.runtimeMaintenanceRetries;
     ArmMaintenanceTimer();
   } else {
-    CancelMaintenanceTimer();
+    CancelActorTimer(g_wm.timers.maintenance);
     ++Diagnostics::g_runtime.counters.runtimeMaintenanceExhausted;
     Diagnostics::RecordEvent(
         L"runtime maintenance retry burst exhausted attempts=%u hooks=%d vdCore=%d notifications=%d",
@@ -94,6 +88,13 @@ void RunMaintenanceNow() {
   g_wm.maintenance.running = false;
 }
 
+// True when a WinEvent hook, the private virtual-desktop core or its change
+// notification subscription is missing.
+static bool PlatformNeedsRecovery() {
+  return !Platform::WindowEvents::AllWinEventHooksInstalled() || !g_vd.initialized ||
+         (g_vd.abi.notification.methodCount > 0 && !g_vd.notificationsRegistered);
+}
+
 void NotifyShellRestarted() {
   AssertWmThread(L"RuntimeLifecycle::NotifyShellRestarted");
   ++Diagnostics::g_runtime.counters.shellRestartSignals;
@@ -102,9 +103,7 @@ void NotifyShellRestarted() {
   // recreate taskbar UI inside the same process. Only abandon private COM proxies
   // when the shell process identity actually changed (or disappeared). This avoids
   // duplicating a still-live notification subscription in the same Explorer.
-  HWND shell = GetShellWindow();
-  DWORD currentShellPid = 0;
-  if (shell && IsWindow(shell)) GetWindowThreadProcessId(shell, &currentShellPid);
+  const DWORD currentShellPid = Platform::VirtualDesktop::CurrentShellProcessId();
   const bool shellReplaced =
       !currentShellPid || !g_vd.shellPid || currentShellPid != g_vd.shellPid;
 
@@ -120,14 +119,9 @@ void NotifyShellRestarted() {
 
   // A shell replacement can move/recreate windows asynchronously. Never let a
   // pre-restart conformance rectangle fight the replacement shell.
-  Placement::ClearAllConformanceLeases();
-  Placement::ScheduleNextConformanceTimer();
+  Placement::DiscardAllPendingProofs();
   g_wm.lifecycle.forceMonitorReconcile = true;
-  const bool platformNeedsRecovery =
-      !Platform::WindowEvents::AllWinEventHooksInstalled() ||
-      !g_vd.initialized ||
-      (g_vd.abi.notification.methodCount > 0 && !g_vd.notificationsRegistered);
-  if (shellReplaced || platformNeedsRecovery) RequestMaintenance(true);
+  if (shellReplaced || PlatformNeedsRecovery()) RequestMaintenance(true);
   Reconcile::ScheduleLifecycleReconcile(nullptr);
 }
 
@@ -140,8 +134,7 @@ void NotifyDisplayTopologyChanged() {
 
   // Every existing lease was computed against the old work-area/monitor topology.
   // Cancel it before Windows' own topology-induced LOCATIONCHANGE burst arrives.
-  Placement::ClearAllConformanceLeases();
-  Placement::ScheduleNextConformanceTimer();
+  Placement::DiscardAllPendingProofs();
   g_wm.lifecycle.pendingArranges.erase(
       std::remove_if(
           g_wm.lifecycle.pendingArranges.begin(), g_wm.lifecycle.pendingArranges.end(),
@@ -153,11 +146,7 @@ void NotifyDisplayTopologyChanged() {
 
   // Display/work-area changes normally require only model/geometry reconciliation.
   // Do not start a COM retry burst unless platform resources are already unhealthy.
-  const bool platformNeedsRecovery =
-      !Platform::WindowEvents::AllWinEventHooksInstalled() ||
-      !g_vd.initialized ||
-      (g_vd.abi.notification.methodCount > 0 && !g_vd.notificationsRegistered);
-  if (platformNeedsRecovery) RequestMaintenance(true);
+  if (PlatformNeedsRecovery()) RequestMaintenance(true);
   Reconcile::ScheduleLifecycleReconcile(nullptr);
 }
 

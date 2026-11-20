@@ -133,6 +133,7 @@ static LRESULT WINAPI DefWindowProcWHook(HWND hwnd, UINT message, WPARAM wparam,
     return g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
   }
   SteerSettlingWindow(hwnd, message, lparam);
+  if (message == WM_NCDESTROY) AppFrame::Forget(hwnd);
   const bool attaching = MayAttachUwpFrame(hwnd, message);
   const LRESULT result = g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
   if (attaching) PlaceAttachingUwpFrame(hwnd);
@@ -146,6 +147,7 @@ static LRESULT WINAPI DefWindowProcAHook(HWND hwnd, UINT message, WPARAM wparam,
     return g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
   }
   SteerSettlingWindow(hwnd, message, lparam);
+  if (message == WM_NCDESTROY) AppFrame::Forget(hwnd);
   const bool attaching = MayAttachUwpFrame(hwnd, message);
   const LRESULT result = g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
   if (attaching) PlaceAttachingUwpFrame(hwnd);
@@ -179,6 +181,7 @@ static std::optional<RECT> AdjustPositionForHint(WINDOWPOS& position, const char
         position.flags &= ~SWP_NOSIZE;
       }
       LogDecision(hwnd, path, "using MultiWM's predicted placement");
+      RememberAppFrame(hwnd, *prediction);
       if (!prediction->keepSize) return prediction->windowRect;
     }
   }
@@ -253,6 +256,7 @@ static BOOL WINAPI SetWindowPlacementHook(HWND hwnd, const WINDOWPLACEMENT* plac
         OffsetRect(&adjusted->rcNormalPosition, monitorInfo.rcMonitor.left - monitorInfo.rcWork.left,
                     monitorInfo.rcMonitor.top - monitorInfo.rcWork.top);
         LogDecision(hwnd, "SetWindowPlacement", "using MultiWM's predicted placement");
+        RememberAppFrame(hwnd, *prediction);
         if (!prediction->keepSize) settleAt = prediction->windowRect;
       }
     }

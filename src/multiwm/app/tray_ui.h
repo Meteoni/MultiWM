@@ -66,42 +66,24 @@ static TrayPreferences g_preferences;
 static TraySession g_session;
 
 static const wchar_t* LayoutDisplayName(TileLayout layout) {
-  switch (layout) {
-    case TileLayout::MasterStack: return L"Master + Stack (Vertical)";
-    case TileLayout::MasterStackH: return L"Master + Stack (Horizontal)";
-    case TileLayout::Columns: return L"Columns";
-    case TileLayout::Rows: return L"Rows";
-    case TileLayout::Dwindle: return L"Dwindle";
-    case TileLayout::Monocle: return L"Monocle";
-    case TileLayout::Floating: return L"Floating";
-    default: return L"Unknown";
-  }
+  const LayoutNames* names = FindLayoutNames(layout);
+  return names ? names->display : L"Unknown";
 }
 
 static const wchar_t* LayoutTrayText(TileLayout layout) {
-  switch (layout) {
-    case TileLayout::MasterStack: return L"MV";
-    case TileLayout::MasterStackH: return L"MH";
-    case TileLayout::Columns: return L"CL";
-    case TileLayout::Rows: return L"RW";
-    case TileLayout::Dwindle: return L"DW";
-    case TileLayout::Monocle: return L"MN";
-    case TileLayout::Floating: return L"FL";
-    default: return L"??";
-  }
+  const LayoutNames* names = FindLayoutNames(layout);
+  return names ? names->trayIcon : L"??";
 }
 
 static const wchar_t* LayoutFlyoutText(TileLayout layout) {
-  switch (layout) {
-    case TileLayout::MasterStack: return L"Master + Stack V";
-    case TileLayout::MasterStackH: return L"Master + Stack H";
-    case TileLayout::Columns: return L"Columns";
-    case TileLayout::Rows: return L"Rows";
-    case TileLayout::Dwindle: return L"Dwindle";
-    case TileLayout::Monocle: return L"Monocle";
-    case TileLayout::Floating: return L"Floating";
-    default: return L"Unknown";
-  }
+  const LayoutNames* names = FindLayoutNames(layout);
+  return names ? names->flyout : L"Unknown";
+}
+
+// The layout `key`'s workspace uses, or the one it will start with.
+static TileLayout LayoutShownFor(const DesktopMonitorKey& key) {
+  if (const std::optional<TileLayout> layout = g_workspaces.LayoutOf(key)) return *layout;
+  return Reconcile::ResolveInitialWorkspaceLayout(key);
 }
 
 static void LoadSettings() {
@@ -266,13 +248,7 @@ static void SetTooltip(TileLayout layout) {
     tooltip += LayoutDisplayName(layout);
   } else {
     GUID desktopId{};
-    bool haveDesktop = false;
-    if (g_wm.desktop.state == ReconciledDesktopState::Settled) {
-      desktopId = g_wm.desktop.reconciled;
-      haveDesktop = true;
-    } else {
-      haveDesktop = Platform::VirtualDesktop::GetCurrentDesktopId(&desktopId);
-    }
+    bool haveDesktop = RuntimeLifecycle::GetActiveDesktopId(&desktopId);
     if (!haveDesktop && g_session.haveDisplayedDesktopId) {
       desktopId = g_session.displayedDesktopId;
       haveDesktop = true;
@@ -286,12 +262,8 @@ static void SetTooltip(TileLayout layout) {
       for (size_t i = 0; i < monitors.size(); ++i) {
         const HMONITOR monitor = monitors[i];
         TileLayout monitorLayout = g_settings.defaultLayout;
-        Workspace state;
         DesktopMonitorKey key{};
-        if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) {
-          monitorLayout = g_workspaces.Load(key, &state)
-              ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
-        }
+        if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) monitorLayout = LayoutShownFor(key);
 
         tooltip += L"\n";
         // Reserve the same visual marker column for every row. A figure space
@@ -605,36 +577,23 @@ static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
   Reconcile::EnumerateCurrentMonitors(monitors);
   for (HMONITOR monitor : monitors) {
     TileLayout layout = g_settings.defaultLayout;
-    Workspace state;
     DesktopMonitorKey key{};
-    if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) {
-      layout = g_workspaces.Load(key, &state)
-          ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
-    }
+    if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) layout = LayoutShownFor(key);
     ShowLayoutFlyout(layout, monitor);
   }
 }
 
-static HMONITOR GetContextMenuMonitor() {
-  MONITORINFO info{sizeof(info)};
-  if (g_session.displayedMonitor && GetMonitorInfoW(g_session.displayedMonitor, &info)) {
-    return g_session.displayedMonitor;
-  }
-
-  HMONITOR monitor = Platform::Monitors::GetForegroundMonitor();
-  if (!monitor) monitor = Platform::Monitors::GetCursorMonitor();
-  return monitor;
+// The monitor the tray icon currently shows, while it is connected; else the
+// foreground window's, else the cursor's.
+static HMONITOR GetDisplayedOrFocusedMonitor() {
+  if (Platform::Monitors::IsLiveMonitorHandle(g_session.displayedMonitor)) return g_session.displayedMonitor;
+  return Platform::Monitors::GetForegroundOrCursorMonitor();
 }
 
 static TileLayout GetMonitorLayoutOrDefault(HMONITOR monitor) {
-  TileLayout layout = g_settings.defaultLayout;
   DesktopMonitorKey key{};
-  Workspace state;
-  if (monitor && Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key)) {
-    layout = g_workspaces.Load(key, &state)
-        ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
-  }
-  return layout;
+  if (monitor && Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key)) return LayoutShownFor(key);
+  return g_settings.defaultLayout;
 }
 
 // TrackPopupMenuEx runs a modal loop which otherwise retrieves and discards
@@ -655,7 +614,7 @@ static LRESULT CALLBACK TrayMenuMessageFilterProc(
 static void ShowContextMenu() {
   if (!g_session.trayWindow) return;
 
-  const HMONITOR monitor = GetContextMenuMonitor();
+  const HMONITOR monitor = GetDisplayedOrFocusedMonitor();
   if (!monitor) return;
 
   HMENU menu = CreatePopupMenu();
@@ -746,14 +705,8 @@ static void RefreshForMonitor(HMONITOR monitor) {
 
   TileLayout layout = g_settings.defaultLayout;
   DesktopMonitorKey key{};
-  Workspace state;
-  const bool haveKey = Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key);
-  if (haveKey) {
-    layout = g_workspaces.Load(key, &state)
-        ? state.Layout() : Reconcile::ResolveInitialWorkspaceLayout(key);
-  }
-
-  if (haveKey) {
+  if (Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key)) {
+    layout = LayoutShownFor(key);
     g_session.displayedDesktopId = key.desktopId;
     g_session.haveDisplayedDesktopId = true;
   }
@@ -761,22 +714,14 @@ static void RefreshForMonitor(HMONITOR monitor) {
 }
 
 static void RefreshDisplayedMonitor() {
-  HMONITOR monitor = g_session.displayedMonitor;
-  MONITORINFO info{sizeof(info)};
-  if (!monitor || !GetMonitorInfoW(monitor, &info)) {
-    monitor = Platform::Monitors::GetForegroundMonitor();
-    if (!monitor) monitor = Platform::Monitors::GetCursorMonitor();
-  }
-  if (monitor) RefreshForMonitor(monitor);
+  if (HMONITOR monitor = GetDisplayedOrFocusedMonitor()) RefreshForMonitor(monitor);
 }
 
 // Foreground changes deliberately retarget the one physical tray icon. Explicit
 // workspace commands call RefreshForMonitor directly with their cursor-selected
 // monitor instead of going through this focus-driven path.
 static void RefreshForCurrentWorkspace() {
-  HMONITOR monitor = Platform::Monitors::GetForegroundMonitor();
-  if (!monitor) monitor = Platform::Monitors::GetCursorMonitor();
-  if (monitor) RefreshForMonitor(monitor);
+  if (HMONITOR monitor = Platform::Monitors::GetForegroundOrCursorMonitor()) RefreshForMonitor(monitor);
 }
 
 static void HandleThemeChanged() {

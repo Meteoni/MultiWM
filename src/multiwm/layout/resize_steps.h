@@ -265,8 +265,8 @@ bool Workspace::ApplyTiledStep(
   // Dwindle has no adaptive fitting here: its saved ratios are the layout.
   auto plan = [&](const Workspace& workspace, std::vector<RECT>* rects,
                   std::vector<Layout::DwindleSplit>* splits) {
-    if (IsGridLayout(layout_)) return PlanGridCells(workspace, workArea, gap, rects);
-    if (IsMasterStackLayout(layout_)) return PlanMasterStackCells(workspace, workArea, gap, rects);
+    if (IsGridLayout(layout_)) return PlanWeightedCells(workspace, workArea, gap, rects);
+    if (IsMasterStackLayout(layout_)) return PlanWeightedCells(workspace, workArea, gap, rects);
     if (layout_ == TileLayout::Dwindle) return PlanSavedDwindleCells(workspace, workArea, gap, rects, splits);
     return false;
   };

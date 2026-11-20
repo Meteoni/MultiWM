@@ -12,11 +12,6 @@
 
 namespace Companion {
 
-struct Settings {
-  bool logDecisions = false;
-};
-
-static Settings g_settings;
 // Set while the companion itself moves a window, so its own calls never re-enter.
 static thread_local bool g_placing = false;
 
@@ -40,10 +35,6 @@ static SetWindowPos_t g_unhookedSetWindowPos = nullptr;
 // the old rectangle. The companion's own NtUserSetWindowPos hook passes the call
 // through because the caller holds PlacementScope. Tests redirect this pointer.
 static SetWindowPos_t g_setWindowPosForOwnMoves = SetWindowPos;
-
-static void LoadSettings() {
-  g_settings.logDecisions = Wh_GetIntSetting(L"logDecisions") != 0;
-}
 
 // The process name of the current process: the companion only handles windows
 // of its own process, so it never needs OpenProcess.
@@ -343,17 +334,32 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
   return workspace.tiledFrame;
 }
 
-static void LogDecision(HWND hwnd, const char* path, const char* outcome) {
-  if (!g_settings.logDecisions) return;
+static std::wstring ClassNameOf(HWND hwnd) {
   wchar_t className[128] = L"";
   GetClassNameW(hwnd, className, ARRAYSIZE(className));
-  Wh_Log(L"%S hwnd=%p class=%s: %S", path, hwnd, className, outcome);
+  return className;
+}
+
+// Windhawk's per-mod logging switch gates this: with logging off, Wh_Log skips
+// its arguments, so not even the class name is read.
+static void LogDecision(HWND hwnd, const char* path, const char* outcome) {
+  Wh_Log(L"%S hwnd=%p class=%s: %S", path, hwnd, ClassNameOf(hwnd).c_str(), outcome);
 }
 
 struct PredictedPlacement {
   RECT windowRect;
   bool keepSize;
+  // The app's own visible frame (physical pixels), for a window MultiWM doesn't
+  // track yet: what MultiWM should float it at later (shared/app_frame.h).
+  std::optional<RECT> appFrame;
 };
+
+// Leaves the app's own frame on a new window the companion is moving, so
+// MultiWM doesn't take the tile for the window's natural floating frame. Call
+// where the prediction is applied.
+static void RememberAppFrame(HWND hwnd, const PredictedPlacement& prediction) {
+  if (prediction.appFrame) AppFrame::Remember(hwnd, *prediction.appFrame);
+}
 
 // Calculates without placing. `proposed` is the app's intended window rectangle
 // in physical screen pixels, including resize borders. DWM margins translate
@@ -429,7 +435,8 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   // which includes the invisible resize borders.
   const RECT placement{frameTarget.left - margins.left, frameTarget.top - margins.top,
                        frameTarget.right + margins.right, frameTarget.bottom + margins.bottom};
-  return PredictedPlacement{placement, kind == TargetKind::KeepSize};
+  return PredictedPlacement{placement, kind == TargetKind::KeepSize,
+                            inputs.tracked ? std::nullopt : std::optional<RECT>{frame}};
 }
 
 // --- Settling ----------------------------------------------------------------------
@@ -492,6 +499,7 @@ static bool PlaceAtPredictedFrame(HWND hwnd, const char* path) {
   const BOOL moved = g_setWindowPosForOwnMoves(hwnd, nullptr, placement.left, placement.top,
                                                Width(placement), Height(placement), flags);
   LogDecision(hwnd, path, moved ? "placed at MultiWM's frame" : "SetWindowPos failed");
+  if (moved) RememberAppFrame(hwnd, *prediction);
   // A window MultiWM only centres (keepSize) has no exact frame to hold.
   if (moved && !prediction->keepSize) BeginSettling(hwnd, placement);
   return moved != FALSE;

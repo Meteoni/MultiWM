@@ -13,8 +13,7 @@ static bool IsLiveMonitorHandle(HMONITOR monitor) {
   return GetMonitorInfoW(monitor, &monitorInfo) != FALSE;
 }
 
-
-bool GetMonitorWorkArea(HMONITOR monitor, RECT* outRect) {
+static bool GetMonitorWorkArea(HMONITOR monitor, RECT* outRect) {
   if (!monitor || !outRect) return false;
   MONITORINFO monitorInfo = {sizeof(monitorInfo)};
   if (!GetMonitorInfoW(monitor, &monitorInfo)) return false;
@@ -23,7 +22,7 @@ bool GetMonitorWorkArea(HMONITOR monitor, RECT* outRect) {
 }
 
 static UINT GetMonitorEffectiveDpi(HMONITOR monitor) {
-  if (!monitor || !IsLiveMonitorHandle(monitor)) return 96;
+  if (!IsLiveMonitorHandle(monitor)) return 96;
 
   using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
   using GetScaleFactorForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int*);
@@ -78,6 +77,12 @@ static HMONITOR GetForegroundMonitor() {
   return foregroundWindow ? Platform::Windows::GetWindowPhysicalMonitor(foregroundWindow) : nullptr;
 }
 
+// Passive UI refreshes: the foreground window's monitor, else the cursor's.
+static HMONITOR GetForegroundOrCursorMonitor() {
+  HMONITOR monitor = GetForegroundMonitor();
+  return monitor ? monitor : GetCursorMonitor();
+}
+
 static HMONITOR GetWorkspaceCommandMonitor() {
   HMONITOR monitor = GetCursorMonitor();
   return monitor ? monitor : GetForegroundMonitor();
@@ -87,17 +92,15 @@ static HMONITOR GetWorkspaceCommandMonitor() {
 static bool GetCurrentWorkspaceKey(
     HMONITOR monitor, DesktopMonitorKey* outKey) {
   if (!outKey || !IsLiveMonitorHandle(monitor)) return false;
-  GUID desktopId{};
-  if (g_wm.desktop.state == ReconciledDesktopState::Settled) {
-    desktopId = g_wm.desktop.reconciled;
-  } else {
-    // Never collapse separate desktops into a zero-GUID workspace when the
-    // private API is temporarily unavailable; let the caller retry after recovery.
-    if (!Platform::VirtualDesktop::InitializeVirtualDesktopAPI() || !Platform::VirtualDesktop::GetCurrentDesktopId(&desktopId)) {
-      return false;
-    }
+  // Never collapse separate desktops into a zero-GUID workspace when the
+  // private API is temporarily unavailable; let the caller retry after recovery.
+  if (g_wm.desktop.state != ReconciledDesktopState::Settled &&
+      !Platform::VirtualDesktop::InitializeVirtualDesktopAPI()) {
+    return false;
   }
-  return DesktopMonitorKey::FromHMonitor(desktopId, monitor, outKey);
+  GUID desktopId{};
+  return RuntimeLifecycle::GetActiveDesktopId(&desktopId) &&
+         DesktopMonitorKey::FromHMonitor(desktopId, monitor, outKey);
 }
 
 struct WorkspaceMetrics {
@@ -142,6 +145,26 @@ static bool GetWorkspaceWorkArea(HMONITOR monitor, RECT* outWorkArea) {
 }
 
 } // namespace Platform::Monitors
+
+// The user's last keyboard or mouse input. Automatic moves record this tick when
+// they start and give way if the user acts before they finish.
+namespace Platform::Input {
+
+// The tick of the user's last input, or no value when Windows can't say.
+static std::optional<DWORD> LastInputTick() {
+  LASTINPUTINFO input{sizeof(input)};
+  if (!GetLastInputInfo(&input)) return std::nullopt;
+  return input.dwTime;
+}
+
+// True when Windows reports no user input since `inputTickMs` was read. A failed
+// query counts as input.
+static bool NoInputSince(DWORD inputTickMs) {
+  const std::optional<DWORD> tick = LastInputTick();
+  return tick && *tick == inputTickMs;
+}
+
+}  // namespace Platform::Input
 
 namespace Model {
 
@@ -226,7 +249,6 @@ HMONITOR MonitorId::Resolve() const {
 std::vector<HMONITOR> WorkspaceRepository::MonitorsOnDesktop(
     const GUID& desktopId) const {
   std::vector<MonitorId> monitorIds;
-  AcquireSRWLockShared(&lock_);
   for (const auto& kv : states_) {
     if (!IsEqualGUID(kv.first.desktopId, desktopId)) continue;
     if (std::find(monitorIds.begin(), monitorIds.end(), kv.first.monitor) ==
@@ -234,7 +256,6 @@ std::vector<HMONITOR> WorkspaceRepository::MonitorsOnDesktop(
       monitorIds.push_back(kv.first.monitor);
     }
   }
-  ReleaseSRWLockShared(&lock_);
 
   // Repository identity survives topology churn. Only return identities that
   // currently resolve to a live HMONITOR; detached workspaces remain dormant.

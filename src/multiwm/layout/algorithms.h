@@ -79,6 +79,46 @@ constexpr Axis LayoutAxis(TileLayout layout) {
   return layout == TileLayout::MasterStackH || layout == TileLayout::Rows ? Axis::Y : Axis::X;
 }
 
+// The gap between `count` members sharing `totalSize` pixels: `gap`, reduced so
+// every member keeps at least one pixel. 0 for fewer than two members.
+static LONG WeightedLayoutGap(LONG totalSize, LONG gap, size_t count) {
+  if (count < 2 || totalSize <= static_cast<LONG>(count)) return 0;
+  const LONG maximumGap =
+      (totalSize - static_cast<LONG>(count)) / static_cast<LONG>(count - 1);
+  return std::clamp<LONG>(gap, 0, maximumGap);
+}
+
+// Cuts `band` along `axis` into consecutive rectangles of `sizes` pixels with
+// `gap` between them, written to out[0..sizes.size()). The last rectangle always
+// ends at the band's far edge, absorbing rounding.
+static void SplitBandAlongAxis(
+    const RECT& band, Axis axis, const std::vector<LONG>& sizes, LONG gap, RECT* out) {
+  const bool alongY = axis == Axis::Y;
+  LONG position = alongY ? band.top : band.left;
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    const LONG end = i + 1 == sizes.size() ? (alongY ? band.bottom : band.right) : position + sizes[i];
+    out[i] = alongY ? RECT{band.left, position, band.right, end} : RECT{position, band.top, end, band.bottom};
+    position = end + gap;
+  }
+}
+
+// Writes the master rectangle (`masterSize` pixels along `axis`, from the
+// top-left) to out[0] and the stack, split across the other axis by
+// `stackSizes`, to out[1..]. `masterGap` separates master and stack.
+static void PlaceMasterStackRects(
+    const RECT& area, Axis axis, LONG masterSize, LONG masterGap,
+    const std::vector<LONG>& stackSizes, LONG stackGap, RECT* out) {
+  if (axis == Axis::Y) {
+    out[0] = {area.left, area.top, area.right, area.top + masterSize};
+    const RECT stack{area.left, area.top + masterSize + masterGap, area.right, area.bottom};
+    SplitBandAlongAxis(stack, Axis::X, stackSizes, stackGap, out + 1);
+  } else {
+    out[0] = {area.left, area.top, area.left + masterSize, area.bottom};
+    const RECT stack{area.left + masterSize + masterGap, area.top, area.right, area.bottom};
+    SplitBandAlongAxis(stack, Axis::Y, stackSizes, stackGap, out + 1);
+  }
+}
+
 std::vector<LONG> ComputeWeightedSizes(
     LONG totalSize, LONG gap, const std::vector<double>& weights,
     LONG* outEffectiveGap = nullptr) {
@@ -87,13 +127,7 @@ std::vector<LONG> ComputeWeightedSizes(
   if (outEffectiveGap) *outEffectiveGap = 0;
   if (count == 0 || totalSize <= 0) return sizes;
 
-  LONG effectiveGap = 0;
-  if (count > 1 && totalSize > static_cast<LONG>(count)) {
-    const LONG maximumGap =
-        (totalSize - static_cast<LONG>(count)) /
-        static_cast<LONG>(count - 1);
-    effectiveGap = std::clamp<LONG>(gap, 0, maximumGap);
-  }
+  const LONG effectiveGap = WeightedLayoutGap(totalSize, gap, count);
   if (outEffectiveGap) *outEffectiveGap = effectiveGap;
 
   LONG available =
@@ -149,14 +183,7 @@ void LayoutGridWeighted(
   LONG effectiveGap = 0;
   std::vector<LONG> sizes =
       ComputeWeightedSizes(totalSize, gap, *effectiveWeights, &effectiveGap);
-  LONG position = alongY ? area.top : area.left;
-
-  for (size_t i = 0; i < windowCount; ++i) {
-    LONG size = sizes[i];
-    LONG end = (i == windowCount - 1) ? (alongY ? area.bottom : area.right) : position + size;
-    outRects[i] = alongY ? RECT{area.left, position, area.right, end} : RECT{position, area.top, end, area.bottom};
-    position = end + effectiveGap;
-  }
+  SplitBandAlongAxis(area, axis, sizes, effectiveGap, outRects.data());
 }
 
 void LayoutMasterStackWeighted(
@@ -189,31 +216,10 @@ void LayoutMasterStackWeighted(
   std::vector<double> weights = stackWeights;
   if (weights.size() != stackCount) weights = DefaultWeights(stackCount);
 
-  if (alongY) {
-    outRects[0] = {area.left, area.top, area.right, area.top + masterSize};
-    LONG stackTop = area.top + masterSize + masterGap;
-    LONG stackGap = 0;
-    std::vector<LONG> sizes = ComputeWeightedSizes(
-        area.right - area.left, gap, weights, &stackGap);
-    LONG x = area.left;
-    for (size_t i = 0; i < stackCount; ++i) {
-      LONG end = (i == stackCount - 1) ? area.right : x + sizes[i];
-      outRects[i + 1] = {x, stackTop, end, area.bottom};
-      x = end + stackGap;
-    }
-  } else {
-    outRects[0] = {area.left, area.top, area.left + masterSize, area.bottom};
-    LONG stackLeft = area.left + masterSize + masterGap;
-    LONG stackGap = 0;
-    std::vector<LONG> sizes = ComputeWeightedSizes(
-        area.bottom - area.top, gap, weights, &stackGap);
-    LONG y = area.top;
-    for (size_t i = 0; i < stackCount; ++i) {
-      LONG end = (i == stackCount - 1) ? area.bottom : y + sizes[i];
-      outRects[i + 1] = {stackLeft, y, area.right, end};
-      y = end + stackGap;
-    }
-  }
+  LONG stackGap = 0;
+  const std::vector<LONG> sizes = ComputeWeightedSizes(
+      alongY ? area.right - area.left : area.bottom - area.top, gap, weights, &stackGap);
+  PlaceMasterStackRects(area, axis, masterSize, masterGap, sizes, stackGap, outRects.data());
 }
 
 struct DwindleSplit {
@@ -327,13 +333,7 @@ static bool ComputeConstrainedWeightedSizes(
   if (count == 0) return true;
   if (totalSize <= 0) return false;
 
-  LONG effectiveGap = 0;
-  if (count > 1 && totalSize > static_cast<LONG>(count)) {
-    const LONG maximumGap =
-        (totalSize - static_cast<LONG>(count)) /
-        static_cast<LONG>(count - 1);
-    effectiveGap = std::clamp<LONG>(gap, 0, maximumGap);
-  }
+  const LONG effectiveGap = WeightedLayoutGap(totalSize, gap, count);
   if (outEffectiveGap) *outEffectiveGap = effectiveGap;
 
   const long long available64 =
@@ -505,18 +505,7 @@ bool LayoutGridConstrained(
           outWeightPerPixel)) {
     return false;
   }
-
-  LONG position = alongY ? area.top : area.left;
-  for (size_t i = 0; i < count; ++i) {
-    const LONG end =
-        i + 1 == count
-            ? (alongY ? area.bottom : area.right)
-            : position + sizes[i];
-    (*outRects)[i] = alongY
-        ? RECT{area.left, position, area.right, end}
-        : RECT{position, area.top, end, area.bottom};
-    position = end + effectiveGap;
-  }
+  SplitBandAlongAxis(area, axis, sizes, effectiveGap, outRects->data());
   return true;
 }
 
@@ -585,30 +574,7 @@ bool LayoutMasterStackConstrained(
           &innerSizes, &stackGap, outStackWeightPerPixel)) {
     return false;
   }
-
-  if (alongY) {
-    (*outRects)[0] = {
-        area.left, area.top, area.right, area.top + masterSize};
-    const LONG stackTop = area.top + masterSize + masterGap;
-    LONG x = area.left;
-    for (size_t i = 0; i < innerSizes.size(); ++i) {
-      const LONG end =
-          i + 1 == innerSizes.size() ? area.right : x + innerSizes[i];
-      (*outRects)[i + 1] = {x, stackTop, end, area.bottom};
-      x = end + stackGap;
-    }
-  } else {
-    (*outRects)[0] = {
-        area.left, area.top, area.left + masterSize, area.bottom};
-    const LONG stackLeft = area.left + masterSize + masterGap;
-    LONG y = area.top;
-    for (size_t i = 0; i < innerSizes.size(); ++i) {
-      const LONG end =
-          i + 1 == innerSizes.size() ? area.bottom : y + innerSizes[i];
-      (*outRects)[i + 1] = {stackLeft, y, area.right, end};
-      y = end + stackGap;
-    }
-  }
+  PlaceMasterStackRects(area, axis, masterSize, masterGap, innerSizes, stackGap, outRects->data());
   return true;
 }
 
