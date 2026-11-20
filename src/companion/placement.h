@@ -39,17 +39,8 @@ static SetWindowPos_t g_setWindowPosForOwnMoves = SetWindowPos;
 // The process name of the current process: the companion only handles windows
 // of its own process, so it never needs OpenProcess.
 static std::wstring CurrentProcessName(HWND) {
-  // The same call and buffer size as MultiWM's GetWindowProcessName, so a
-  // process rule matches identically in both mods, even for paths longer than
-  // MAX_PATH (GetModuleFileNameW into a MAX_PATH buffer would truncate them).
-  static const std::wstring name = [] {
-    std::wstring path(32768, L'\0');
-    DWORD length = static_cast<DWORD>(path.size());
-    if (!QueryFullProcessImageNameW(GetCurrentProcess(), 0, path.data(), &length)) length = 0;
-    path.resize(length);
-    const size_t slash = path.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? path : path.substr(slash + 1);
-  }();
+  // Read as MultiWM reads other processes' names, so process rules match alike.
+  static const std::wstring name = SharedRules::ProcessImageFileName(GetCurrentProcess());
   return name;
 }
 
@@ -72,8 +63,8 @@ class PhysicalCoordinatesScope {
 
 // --- Geometry ------------------------------------------------------------------------
 
-static LONG Width(const RECT& rect) { return rect.right - rect.left; }
-static LONG Height(const RECT& rect) { return rect.bottom - rect.top; }
+using SharedGeometry::Height;
+using SharedGeometry::Width;
 
 // Use DWM's visible frame when available; hidden windows may have no frame yet.
 static RECT FrameOf(HWND hwnd, const RECT& windowRect) {
@@ -95,15 +86,11 @@ static const char* RejectStructurally(HWND hwnd, bool allowSuspended = false) {
   const DWORD threadId = GetWindowThreadProcessId(hwnd, &processId);
   // Moving another thread's window would wait on that thread mid-show.
   if (processId != GetCurrentProcessId() || threadId != GetCurrentThreadId()) return "not shown by its own thread";
-  if (GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindow(hwnd, GW_OWNER)) return "child or owned window";
-  const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-  if (style & WS_CHILD) return "child window";
-  if (!allowSuspended && (style & (WS_MINIMIZE | WS_MAXIMIZE))) return "minimized or maximized";
-  if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return "tool window";
-  wchar_t className[64];
-  if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) && SharedRules::IsIgnoredWindowClass(className)) {
-    return "shell window";
+  if (const char* reason = SharedRules::RejectNonTopLevel(hwnd)) return reason;
+  if (!allowSuspended && (GetWindowLongPtrW(hwnd, GWL_STYLE) & (WS_MINIMIZE | WS_MAXIMIZE))) {
+    return "minimized or maximized";
   }
+  if (const char* reason = SharedRules::RejectToolOrShellWindow(hwnd)) return reason;
   if (!IsWindowEnabled(hwnd)) return "disabled";
   return nullptr;
 }
@@ -227,15 +214,10 @@ static std::optional<RECT> CenteredFloatingFrame(const CompanionAbi::WorkspaceHi
     if (!workspace.hasFloatingFrame) return std::nullopt;
     return workspace.floatingFrame;
   }
-  LONG width = Width(frame);
-  LONG height = Height(frame);
-  if (!sizeRule->preserveFloatingSize) {
-    width = sizeRule->useWorkspaceSize ? Width(workspace.workArea)
-                                       : SharedGeometry::ScaleDip(sizeRule->floatingSizeDip.width, workspace.dpi);
-    height = sizeRule->useWorkspaceSize ? Height(workspace.workArea)
-                                        : SharedGeometry::ScaleDip(sizeRule->floatingSizeDip.height, workspace.dpi);
-  }
-  return SharedGeometry::ClampToArea(SharedGeometry::CenteredIn(workspace.workArea, width, height), workspace.workArea);
+  const SIZE size = sizeRule->preserveFloatingSize
+      ? SIZE{Width(frame), Height(frame)}
+      : SharedGeometry::RuleFloatingSize(*sizeRule, workspace.workArea, workspace.dpi);
+  return SharedGeometry::CenteredClampedIn(workspace.workArea, size.cx, size.cy);
 }
 
 // The frame MultiWM will give `hwnd` (currently at `frame`), using its restore
@@ -372,10 +354,8 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   RECT windowRect{};
   if (!GetWindowRect(hwnd, &windowRect)) return std::nullopt;
   const RECT currentFrame = FrameOf(hwnd, windowRect);
-  RECT margins{currentFrame.left - windowRect.left, currentFrame.top - windowRect.top,
-                windowRect.right - currentFrame.right, windowRect.bottom - currentFrame.bottom};
-  const RECT frame{proposed.left + margins.left, proposed.top + margins.top,
-                   proposed.right - margins.right, proposed.bottom - margins.bottom};
+  RECT margins = SharedGeometry::FrameMargins(windowRect, currentFrame);
+  const RECT frame = SharedGeometry::RemoveFrameMargins(proposed, margins);
 
   // The monitor MultiWM will assign: the one holding the frame (GetWindowPhysicalMonitor).
   HMONITOR monitor = MonitorFromRect(&frame, MONITOR_DEFAULTTONULL);
@@ -433,8 +413,7 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   if (reason) LogDecision(hwnd, path, reason);
   // The snapshot holds visible frames; SetWindowPos takes the window rectangle,
   // which includes the invisible resize borders.
-  const RECT placement{frameTarget.left - margins.left, frameTarget.top - margins.top,
-                       frameTarget.right + margins.right, frameTarget.bottom + margins.bottom};
+  const RECT placement = SharedGeometry::AddFrameMargins(frameTarget, margins);
   return PredictedPlacement{placement, kind == TargetKind::KeepSize,
                             inputs.tracked ? std::nullopt : std::optional<RECT>{frame}};
 }

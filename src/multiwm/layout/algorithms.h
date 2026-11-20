@@ -54,13 +54,8 @@ static inline long long RectAreaLL(const RECT& r) {
   return w * h;
 }
 
-static LONG RectWidth(const RECT& rect) {
-  return rect.right - rect.left;
-}
-
-static LONG RectHeight(const RECT& rect) {
-  return rect.bottom - rect.top;
-}
+static LONG RectWidth(const RECT& rect) { return SharedGeometry::Width(rect); }
+static LONG RectHeight(const RECT& rect) { return SharedGeometry::Height(rect); }
 
 static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPlacementTolerancePx) {
   return !Differs(a.left, b.left, tolerance) &&

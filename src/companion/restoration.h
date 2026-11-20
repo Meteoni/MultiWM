@@ -88,10 +88,7 @@ static bool AdjustRestorePlacement(HWND hwnd, WINDOWPLACEMENT* placement, const 
     if (!fitted) return false;
     target = *fitted;
   }
-  target.left -= margins.left;
-  target.top -= margins.top;
-  target.right += margins.right;
-  target.bottom += margins.bottom;
+  target = SharedGeometry::AddFrameMargins(target, margins);
   const auto logicalTarget = ConvertScreenRect(hwnd, target, PhysicalToLogicalPointForPerMonitorDPI);
   if (!logicalTarget || !GetMonitorInfoW(MonitorFromRect(&*logicalTarget, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
     return false;

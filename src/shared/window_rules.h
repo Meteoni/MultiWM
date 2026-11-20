@@ -45,6 +45,36 @@ inline bool IsIgnoredWindowClass(const wchar_t* className) {
   return false;
 }
 
+// Why `hwnd` can't be a managed top-level window, or nullptr: it isn't its own
+// root, is owned, or is a child. The first shape check in both mods.
+inline const char* RejectNonTopLevel(HWND hwnd) {
+  if (GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindow(hwnd, GW_OWNER)) return "child or owned window";
+  if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD) return "child window";
+  return nullptr;
+}
+
+// Why `hwnd` is a tool window or shell surface MultiWM never manages, or nullptr.
+inline const char* RejectToolOrShellWindow(HWND hwnd) {
+  if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return "tool window";
+  wchar_t className[64];
+  if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) && IsIgnoredWindowClass(className)) {
+    return "shell window";
+  }
+  return nullptr;
+}
+
+// The file name of `process`'s executable ("notepad.exe"), or empty when it
+// can't be read. Both mods read it this way, so a process rule matches the same
+// windows in each, even for paths longer than MAX_PATH.
+inline std::wstring ProcessImageFileName(HANDLE process) {
+  std::wstring path(32768, L'\0');
+  DWORD length = static_cast<DWORD>(path.size());
+  if (!QueryFullProcessImageNameW(process, 0, path.data(), &length)) return {};
+  path.resize(length);
+  const size_t slash = path.find_last_of(L"\\/");
+  return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
 inline bool EqualsInsensitive(const std::wstring& a, const std::wstring& b) {
   return _wcsicmp(a.c_str(), b.c_str()) == 0;
 }

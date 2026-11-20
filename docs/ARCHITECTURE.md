@@ -39,7 +39,7 @@ except the sibling `shared/` and `companion/` roots.
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |
 | `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot |
 | `windhawk/` | — | Windhawk's stock tool-mod launcher. Not MultiWM logic. |
-| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry`, `AppFrame` | Code compiled by both mods: window-rule matching, the companion snapshot layout, geometry/size-limit arithmetic, and the app-frame window properties. Windows and the standard library only. |
+| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry`, `AppFrame` | Code compiled by both mods, so both decide alike: window-rule matching, the window-shape checks and process-name read behind it, the companion snapshot layout, geometry/size-limit and frame-border arithmetic, and the app-frame window properties. Windows and the standard library only. |
 | `companion/` | `Companion` | The separate MultiWM Companion mod (`src/companion/multiwm-companion.cpp`). Never included by MultiWM. |
 
 ## The companion mod

@@ -71,8 +71,7 @@ static AdmissionPrediction PredictAutomaticAdmission(
 
   const LONG width = SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.width, metrics.dpi);
   const LONG height = SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.height, metrics.dpi);
-  prediction.floatingFrame = SharedGeometry::ClampToArea(
-      SharedGeometry::CenteredIn(metrics.workArea, width, height), metrics.workArea);
+  prediction.floatingFrame = SharedGeometry::CenteredClampedIn(metrics.workArea, width, height);
   if (workspace.Layout() == TileLayout::Floating) return prediction;
 
   if (windowLimitReached) {

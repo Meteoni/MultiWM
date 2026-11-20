@@ -19,6 +19,9 @@ struct FrameLimits {
   LONG maxHeight = 0;
 };
 
+inline LONG Width(const RECT& rect) { return rect.right - rect.left; }
+inline LONG Height(const RECT& rect) { return rect.bottom - rect.top; }
+
 inline POINT RectCenter(const RECT& rect) {
   return {rect.left + (rect.right - rect.left) / 2,
           rect.top + (rect.bottom - rect.top) / 2};
@@ -50,6 +53,41 @@ inline RECT ClampToArea(RECT rect, const RECT& area) {
 
 inline LONG ScaleDip(LONG value, UINT dpi) {
   return MulDiv(value, static_cast<int>(dpi ? dpi : 96), 96);
+}
+
+// A `width` x `height` frame centred in `area` and kept inside it: where a new
+// or overflowed floating window goes.
+inline RECT CenteredClampedIn(const RECT& area, LONG width, LONG height) {
+  return ClampToArea(CenteredIn(area, width, height), area);
+}
+
+// The size an override-size window rule gives a centred floating window: the
+// whole work area for "Workspace", else the rule's DIP size at `dpi`. `Rule` is
+// MultiWM's WindowRule or the snapshot's SnapshotRule; both have
+// `useWorkspaceSize` and `floatingSizeDip.width/height`.
+template <class Rule>
+SIZE RuleFloatingSize(const Rule& rule, const RECT& workArea, UINT dpi) {
+  if (rule.useWorkspaceSize) return {Width(workArea), Height(workArea)};
+  return {ScaleDip(rule.floatingSizeDip.width, dpi), ScaleDip(rule.floatingSizeDip.height, dpi)};
+}
+
+// A window's invisible resize borders: how far each edge of its visible (DWM)
+// frame lies inside its window rectangle. Physical pixels.
+inline RECT FrameMargins(const RECT& windowRect, const RECT& frame) {
+  return {frame.left - windowRect.left, frame.top - windowRect.top,
+          windowRect.right - frame.right, windowRect.bottom - frame.bottom};
+}
+
+// The window rectangle around visible frame `frame` with resize borders `margins`.
+inline RECT AddFrameMargins(const RECT& frame, const RECT& margins) {
+  return {frame.left - margins.left, frame.top - margins.top,
+          frame.right + margins.right, frame.bottom + margins.bottom};
+}
+
+// The visible frame inside window rectangle `windowRect` with resize borders `margins`.
+inline RECT RemoveFrameMargins(const RECT& windowRect, const RECT& margins) {
+  return {windowRect.left + margins.left, windowRect.top + margins.top,
+          windowRect.right - margins.right, windowRect.bottom - margins.bottom};
 }
 
 inline bool CoversMonitor(const RECT& windowRect, const RECT& monitorRect) {

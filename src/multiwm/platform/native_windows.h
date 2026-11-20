@@ -80,18 +80,9 @@ static void GetFrameDecorationSpan(
     return;
   }
 
-  if (outWidth) {
-    *outWidth = std::max<LONG>(
-        0,
-        (frame.left - windowRect.left) +
-        (windowRect.right - frame.right));
-  }
-  if (outHeight) {
-    *outHeight = std::max<LONG>(
-        0,
-        (frame.top - windowRect.top) +
-        (windowRect.bottom - frame.bottom));
-  }
+  const RECT margins = SharedGeometry::FrameMargins(windowRect, frame);
+  if (outWidth) *outWidth = std::max<LONG>(0, margins.left + margins.right);
+  if (outHeight) *outHeight = std::max<LONG>(0, margins.top + margins.bottom);
 }
 
 // WM_GETMINMAXINFO can execute target-process window procedure code. Bound the
@@ -423,17 +414,7 @@ static std::wstring GetWindowProcessName(HWND hwnd) {
 
   HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
   if (!process) return {};
-
-  wchar_t path[32768]{};
-  DWORD chars = ARRAYSIZE(path);
-  std::wstring result;
-  if (QueryFullProcessImageNameW(process, 0, path, &chars) && chars) {
-    const wchar_t* base = path;
-    for (DWORD i = 0; i < chars; ++i) {
-      if (path[i] == L'\\' || path[i] == L'/') base = path + i + 1;
-    }
-    result.assign(base, static_cast<size_t>((path + chars) - base));
-  }
+  std::wstring result = SharedRules::ProcessImageFileName(process);
   CloseHandle(process);
   return result;
 }
@@ -487,17 +468,14 @@ static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize) {
   // Reject structurally ineligible HWNDs before evaluating configurable exclusion
   // rules. Process-name exclusions can require OpenProcess/QueryFullProcessImageName,
   // so there is no reason to pay that cost for tool/owned/child windows.
-  if (GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindow(hwnd, GW_OWNER)) return false;
-
-  LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-  if (style & WS_CHILD) return false;
+  if (SharedRules::RejectNonTopLevel(hwnd)) return false;
 
   // window could temporarily lose its WS_SizeBox.
   // (example: Office save/discard dialog)
   // A Default-to-floating rule is also an explicit Automatic-mode admission
   // policy for naturally fixed-size top-level windows. Always-floating is also
   // eligible during explicit Manual admission; centering never resizes either.
-  if (!allowFixedSize && !(style & WS_SIZEBOX) &&
+  if (!allowFixedSize && !(GetWindowLongPtr(hwnd, GWL_STYLE) & WS_SIZEBOX) &&
       !IsWindowTrackedInAnyState(hwnd)) {
     bool alwaysFloating = false;
     const bool startsFloating =
@@ -505,15 +483,7 @@ static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize) {
     if (!alwaysFloating && !(RuntimeLifecycle::IsAutomaticMode() && startsFloating)) return false;
   }
 
-  LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-  if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return false;
-
-  wchar_t className[64];
-  if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) &&
-      SharedRules::IsIgnoredWindowClass(className)) {
-    return false;
-  }
-
+  if (SharedRules::RejectToolOrShellWindow(hwnd)) return false;
   return !IsWindowExcludedByRules(hwnd);
 }
 

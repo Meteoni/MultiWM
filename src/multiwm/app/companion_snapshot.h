@@ -106,8 +106,7 @@ static void RememberFrameMargins(const Workspace& workspace, UINT dpi) {
       if (cached != g_publisher.frameMargins.end()) g_publisher.frameMargins.erase(cached);
       continue;
     }
-    measured.margins = {frame.left - windowRect.left, frame.top - windowRect.top,
-                        windowRect.right - frame.right, windowRect.bottom - frame.bottom};
+    measured.margins = SharedGeometry::FrameMargins(windowRect, frame);
     const RECT& margins = measured.margins;
     if (margins.left < 0 || margins.top < 0 || margins.right < 0 || margins.bottom < 0) {
       if (cached != g_publisher.frameMargins.end()) g_publisher.frameMargins.erase(cached);

@@ -126,13 +126,9 @@ static bool RepairFloatingGeometry(
     width = current.right - current.left;
     height = current.bottom - current.top;
   } else if (useCustomSize) {
-    if (placementOverride->useWorkspaceSize) {
-      width = workArea.right - workArea.left;
-      height = workArea.bottom - workArea.top;
-    } else {
-      width = SharedGeometry::ScaleDip(placementOverride->floatingSizeDip.width, targetDpi);
-      height = SharedGeometry::ScaleDip(placementOverride->floatingSizeDip.height, targetDpi);
-    }
+    const SIZE size = SharedGeometry::RuleFloatingSize(*placementOverride, workArea, targetDpi);
+    width = size.cx;
+    height = size.cy;
   } else if (!useNewWindowSize && record->hasFloatingRect) {
     const UINT sourceDpi = record->floatingDpi ? record->floatingDpi : 96;
     width = MulDiv(
