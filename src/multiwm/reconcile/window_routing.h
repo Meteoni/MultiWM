@@ -7,6 +7,15 @@ namespace Reconcile {
 // destination desktop before the move is treated as failed and rolled back.
 constexpr ULONGLONG kOverflowFollowTimeoutMs = 2000;
 
+// Says that `hwnd`'s "Open on monitor / desktop" rule couldn't place it: its
+// `target` ("desktop", "monitor") isn't there, so the window opens where it is.
+static void ReportMissingRouteTarget(HWND hwnd, const wchar_t* target) {
+  std::wstring name = Placement::ProcessDisplayName(hwnd);
+  if (name.empty()) name = L"A window";
+  const std::wstring text = name + L": Open-on rule's " + target + L" not found";
+  TrayUi::ShowCommandFailureFlyout(text.c_str(), Platform::Windows::GetWindowPhysicalMonitor(hwnd));
+}
+
 // Freezes a matching initial-placement rule into a pending request. Native
 // calls may deliver events, so rule data is copied and HWND identity rechecked.
 // False can mean deferred observation or an evaluated rule with no destination;
@@ -48,6 +57,7 @@ static bool TryQueueInitialWindowRoute(HWND hwnd, DWORD processId, const GUID& s
   g_wm.routing.evaluated.insert(hwnd);
   if (IsEqualGUID(request.targetDesktop, GUID_NULL)) {
     Wh_Log(L"Initial placement desktop unavailable for HWND %p", hwnd);
+    ReportMissingRouteTarget(hwnd, L"desktop");
     return false;
   }
   g_wm.routing.pending.emplace(hwnd, std::move(request));
@@ -257,6 +267,7 @@ static std::optional<InitialRouteAttempt> BeginInitialRoute(HWND hwnd, std::vect
   route.targetMonitor = ResolveInitialRouteMonitor(route.request, route.sourceMonitor);
   if (!route.targetMonitor) {
     Wh_Log(L"Initial placement monitor unavailable for HWND %p", hwnd);
+    ReportMissingRouteTarget(hwnd, L"monitor");
     g_wm.routing.pending.erase(hwnd);
     return std::nullopt;
   }
