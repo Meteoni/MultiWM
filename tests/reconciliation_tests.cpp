@@ -1274,10 +1274,10 @@ static void RunDiagnosticReportShapeTest() {
     digest ^= static_cast<unsigned char>(ch);
     digest *= 1099511628211ull;
   }
-  // Recorded from the implementation as of 2026-11-18 (window-size command and
-  // floating-lease counters; "Conformance lease" setting line). Intentional
-  // report format changes must update this value.
-  if (digest != 0xe5cb31cb79e18861ull) {
+  // Recorded from the implementation as of 2026-11-20 (the always-zero
+  // "ignored" record counts removed; one Explorer shell binding line instead of
+  // two). Intentional report format changes must update this value.
+  if (digest != 0x670263f5aa825297ull) {
     std::fprintf(stderr, "FAILED: diagnostic report shape changed (%016llx)\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }

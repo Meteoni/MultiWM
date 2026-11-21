@@ -249,6 +249,52 @@ static bool EnsureDiagnosticDirectory(std::wstring path) {
          (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
+// Writes all `size` bytes, in chunks WriteFile accepts. False, with the reason
+// in `*outError`, on the first failed or empty write.
+static bool WriteAllBytes(HANDLE file, const void* data, size_t size, DWORD* outError) {
+  const BYTE* cursor = static_cast<const BYTE*>(data);
+  while (size > 0) {
+    const DWORD chunk = static_cast<DWORD>(std::min<size_t>(size, static_cast<size_t>(0x7ffff000)));
+    DWORD chunkWritten = 0;
+    if (!WriteFile(file, cursor, chunk, &chunkWritten, nullptr)) {
+      *outError = GetLastError();
+      if (*outError == ERROR_SUCCESS) *outError = ERROR_WRITE_FAULT;
+      return false;
+    }
+    if (chunkWritten == 0) {
+      *outError = ERROR_WRITE_FAULT;
+      return false;
+    }
+    cursor += chunkWritten;
+    size -= chunkWritten;
+  }
+  return true;
+}
+
+// `text` as UTF-8 in `*out` (empty for empty text). False, with the reason in
+// `*outError`, when Windows can't convert it.
+static bool WideToUtf8(const std::wstring& text, std::vector<char>* out, DWORD* outError) {
+  out->clear();
+  if (text.empty()) return true;
+  SetLastError(ERROR_SUCCESS);
+  const int byteCount = WideCharToMultiByte(
+      CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+  if (byteCount > 0) {
+    out->resize(static_cast<size_t>(byteCount));
+    SetLastError(ERROR_SUCCESS);
+    if (WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out->data(),
+                            byteCount, nullptr, nullptr) == byteCount) {
+      return true;
+    }
+  }
+  *outError = GetLastError();
+  if (*outError == ERROR_SUCCESS) *outError = ERROR_NO_UNICODE_TRANSLATION;
+  return false;
+}
+
+// Creates `path` (never replacing a file) holding `text` as UTF-8 with a byte
+// order mark. On failure the partial file is deleted and `*outError` (optional)
+// says why; ERROR_FILE_EXISTS means the name is taken.
 static bool WriteUtf8DiagnosticFile(
     const std::wstring& path, const std::wstring& text, DWORD* outError) {
   if (outError) *outError = ERROR_SUCCESS;
@@ -260,63 +306,13 @@ static bool WriteUtf8DiagnosticFile(
     return false;
   }
 
-  DWORD writeError = ERROR_SUCCESS;
-  auto writeAll = [&](const void* data, size_t size) {
-    const BYTE* cursor = static_cast<const BYTE*>(data);
-    while (size > 0) {
-      const DWORD chunk = static_cast<DWORD>(
-          std::min<size_t>(size, static_cast<size_t>(0x7ffff000)));
-      DWORD chunkWritten = 0;
-      if (!WriteFile(file, cursor, chunk, &chunkWritten, nullptr)) {
-        writeError = GetLastError();
-        if (writeError == ERROR_SUCCESS) writeError = ERROR_WRITE_FAULT;
-        return false;
-      }
-      if (chunkWritten == 0) {
-        writeError = ERROR_WRITE_FAULT;
-        return false;
-      }
-      cursor += chunkWritten;
-      size -= chunkWritten;
-    }
-    return true;
-  };
-
+  DWORD error = ERROR_SUCCESS;
   const BYTE bom[] = {0xEF, 0xBB, 0xBF};
-  bool success = writeAll(bom, sizeof(bom));
-
-  if (success && !text.empty()) {
-    SetLastError(ERROR_SUCCESS);
-    int byteCount = WideCharToMultiByte(
-        CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0,
-        nullptr, nullptr);
-    if (byteCount <= 0) {
-      writeError = GetLastError();
-      if (writeError == ERROR_SUCCESS) {
-        writeError = ERROR_NO_UNICODE_TRANSLATION;
-      }
-      success = false;
-    } else {
-      std::vector<char> utf8(static_cast<size_t>(byteCount));
-      SetLastError(ERROR_SUCCESS);
-      int converted = WideCharToMultiByte(
-          CP_UTF8, 0, text.data(), static_cast<int>(text.size()), utf8.data(),
-          byteCount, nullptr, nullptr);
-      if (converted != byteCount) {
-        writeError = GetLastError();
-        if (writeError == ERROR_SUCCESS) {
-          writeError = ERROR_NO_UNICODE_TRANSLATION;
-        }
-        success = false;
-      } else {
-        success = writeAll(utf8.data(), utf8.size());
-      }
-    }
-  }
-
-  if (!success && outError) {
-    *outError = writeError != ERROR_SUCCESS ? writeError : ERROR_WRITE_FAULT;
-  }
+  std::vector<char> utf8;
+  const bool success = WriteAllBytes(file, bom, sizeof(bom), &error) &&
+                       WideToUtf8(text, &utf8, &error) &&
+                       WriteAllBytes(file, utf8.data(), utf8.size(), &error);
+  if (!success && outError) *outError = error != ERROR_SUCCESS ? error : ERROR_WRITE_FAULT;
   CloseHandle(file);
   if (!success) DeleteFileW(path.c_str());
   return success;
@@ -939,16 +935,11 @@ static void DumpPlatformHealth(ReportBuilder& report) {
       g_vd.initialized ? 1 : 0, g_vd.abiResolved ? 1 : 0,
       g_vd.explorerBuild, g_vd.explorerRevision,
       g_vd.abi.usesHMonitor ? 1 : 0);
-  DWORD currentShellPid = Platform::VirtualDesktop::CurrentShellProcessId();
+  const DWORD currentShellPid = Platform::VirtualDesktop::CurrentShellProcessId();
   report.Line(
-      L"Explorer shell identity: boundPid=%lu currentPid=%lu match=%d",
+      L"Explorer shell binding: boundPid=%lu currentPid=%lu match=%d",
       g_vd.shellPid, currentShellPid,
       g_vd.shellPid && currentShellPid && g_vd.shellPid == currentShellPid ? 1 : 0);
-  currentShellPid = Platform::VirtualDesktop::CurrentShellProcessId();
-  report.Line(
-      L"Explorer shell binding: currentPid=%lu boundPid=%lu match=%d",
-      currentShellPid, g_vd.shellPid,
-      currentShellPid && g_vd.shellPid && currentShellPid == g_vd.shellPid ? 1 : 0);
   report.Line(
       L"VD notifications: registered=%d cookie=%lu methods=%d currentChangedIndex=%d changeQueued=%ld lastHr=0x%08X",
       g_vd.notificationsRegistered ? 1 : 0, g_vd.notificationCookie,
@@ -1137,9 +1128,8 @@ static void DumpRuntimeSummary(
     const ReportOwnershipSummary& summary, const Counters& counters) {
   report.Section(L"Current runtime summary");
   report.Line(L"Management mode: %ls", RuntimeLifecycle::IsAutomaticMode() ? L"Automatic" : L"Manual");
-  // "ignored=0" keeps the report format stable; no window state is ignored any more.
   report.Line(
-      L"Workspaces=%zu records=%zu tiled=%zu suspended=%zu perWindowFloating=%zu ignored=0",
+      L"Workspaces=%zu records=%zu tiled=%zu suspended=%zu perWindowFloating=%zu",
       workspaceCount, summary.totalRecords, summary.tiled, summary.suspended, summary.floating);
   report.Line(
       L"Pending lifecycle HWNDs=%zu pending workspace reinforcements=%zu duplicate-owned HWNDs=%zu",
@@ -1281,9 +1271,8 @@ static void DumpWorkspace(
   report.Line(
       L"layout=%ls (%d) masterRatio=%.9g",
       DiagnosticLayoutName(state.Layout()), static_cast<int>(state.Layout()), state.MasterRatio());
-  // "ignored=0" keeps the report format stable; no window state is ignored any more.
   report.Line(
-      L"counts: active=%zu records=%zu tiled=%zu suspended=%zu floating=%zu ignored=0",
+      L"counts: active=%zu records=%zu tiled=%zu suspended=%zu floating=%zu",
       state.ActiveCount(), state.Records().size(), workspaceTiled,
       workspaceSuspended, workspaceFloating);
   report.Line(L"overflow: visibleTiled=%zu limit=%zu",
