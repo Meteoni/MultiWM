@@ -91,12 +91,32 @@ inline RECT RemoveFrameMargins(const RECT& windowRect, const RECT& margins) {
           windowRect.right - margins.right, windowRect.bottom - margins.bottom};
 }
 
+// How close, in physical pixels, every edge of a window must be to its
+// monitor's for the window to count as covering it (CoversMonitor).
+inline constexpr LONG kCoversMonitorTolerance = 2;
+
+// True when `windowRect` covers `monitorRect`, every edge within the tolerance:
+// how an app in fullscreen without maximizing looks.
 inline bool CoversMonitor(const RECT& windowRect, const RECT& monitorRect) {
-  constexpr LONG tolerance = 2;
-  return std::abs(windowRect.left - monitorRect.left) <= tolerance &&
-         std::abs(windowRect.top - monitorRect.top) <= tolerance &&
-         std::abs(windowRect.right - monitorRect.right) <= tolerance &&
-         std::abs(windowRect.bottom - monitorRect.bottom) <= tolerance;
+  return std::abs(windowRect.left - monitorRect.left) <= kCoversMonitorTolerance &&
+         std::abs(windowRect.top - monitorRect.top) <= kCoversMonitorTolerance &&
+         std::abs(windowRect.right - monitorRect.right) <= kCoversMonitorTolerance &&
+         std::abs(windowRect.bottom - monitorRect.bottom) <= kCoversMonitorTolerance;
+}
+
+// The area to tile in, given `workArea` (the monitor's work area minus the
+// insets) on `monitorRect`. A tile filling a work area that covers the whole
+// monitor would look fullscreen (CoversMonitor), so then every edge closer than
+// the tolerance is moved in to one pixel past it, evenly. That only happens
+// with a hidden taskbar and insets of about zero; any other area is unchanged.
+inline RECT KeepTilesOffWholeMonitor(RECT workArea, const RECT& monitorRect) {
+  if (!CoversMonitor(workArea, monitorRect)) return workArea;
+  constexpr LONG margin = kCoversMonitorTolerance + 1;
+  workArea.left = std::max(workArea.left, monitorRect.left + margin);
+  workArea.top = std::max(workArea.top, monitorRect.top + margin);
+  workArea.right = std::min(workArea.right, monitorRect.right - margin);
+  workArea.bottom = std::min(workArea.bottom, monitorRect.bottom - margin);
+  return workArea;
 }
 
 // The track sizes Windows offers a window before it answers WM_GETMINMAXINFO,

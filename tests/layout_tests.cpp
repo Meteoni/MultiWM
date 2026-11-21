@@ -313,6 +313,19 @@ static void RunFloatingPlacementTests() {
   expected = {0, 0, 1200, 400};
   check(EqualRect(&moved, &expected), "an axis larger than the area starts at its left or top edge");
 
+  // A work area that covers the whole monitor (hidden taskbar, insets about 0)
+  // keeps 3 px on every edge; any other work area is left as it is.
+  const RECT monitorRect{0, 0, 1920, 1080};
+  RECT tileArea = SharedGeometry::KeepTilesOffWholeMonitor(monitorRect, monitorRect);
+  expected = {3, 3, 1917, 1077};
+  check(EqualRect(&tileArea, &expected), "zero insets on a whole-monitor work area keep 3 px on every edge");
+  tileArea = SharedGeometry::KeepTilesOffWholeMonitor({2, 1, 1919, 1078}, monitorRect);
+  check(EqualRect(&tileArea, &expected), "edges within the tolerance move to 3 px too, evenly");
+  check(!SharedGeometry::CoversMonitor(tileArea, monitorRect), "the result never covers the monitor");
+  tileArea = SharedGeometry::KeepTilesOffWholeMonitor({0, 0, 1920, 1022}, monitorRect);
+  expected = {0, 0, 1920, 1022};
+  check(EqualRect(&tileArea, &expected), "a visible taskbar or any larger inset leaves the work area alone");
+
   // The floating placement rule both mods share. A 1200x1000 work area.
   using SharedGeometry::FloatingSizeSource;
   const RECT area{0, 0, 1200, 1000};

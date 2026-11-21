@@ -191,7 +191,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     $description: Space between tiled windows (0-100).
   - WorkspaceInsets: "6, 6, 6, 6"
     $name: Insets (DPI-scaled pixels)
-    $description: Space at the left, top, right, and bottom edges. Enter four values from 0 to 500.
+    $description: Space at the left, top, right, and bottom edges. Enter four values from 0 to 500. With a hidden taskbar and all four insets near 0, 3 physical pixels are kept on every edge, so a lone window isn't taken for fullscreen.
   - MasterPercent: 50
     $name: Master Size (%)
     #! $min: 1

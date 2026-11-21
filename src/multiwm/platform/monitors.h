@@ -112,8 +112,9 @@ struct WorkspaceMetrics {
 static bool GetWorkspaceMetrics(HMONITOR monitor, WorkspaceMetrics* out) {
   if (!monitor || !out) return false;
 
-  RECT monitorWork{};
-  if (!GetMonitorWorkArea(monitor, &monitorWork)) return false;
+  MONITORINFO monitorInfo{sizeof(monitorInfo)};
+  if (!GetMonitorInfoW(monitor, &monitorInfo)) return false;
+  const RECT& monitorWork = monitorInfo.rcWork;
 
   const UINT dpi = GetMonitorEffectiveDpi(monitor);
   const WorkspaceInsets insets{
@@ -121,11 +122,11 @@ static bool GetWorkspaceMetrics(HMONITOR monitor, WorkspaceMetrics* out) {
         SharedGeometry::ScaleDip(g_settings.insetsDip.top, dpi),
         SharedGeometry::ScaleDip(g_settings.insetsDip.right, dpi),
         SharedGeometry::ScaleDip(g_settings.insetsDip.bottom, dpi)};
-  const RECT workArea{
-      monitorWork.left + insets.left,
-      monitorWork.top + insets.top,
-      monitorWork.right - insets.right,
-      monitorWork.bottom - insets.bottom};
+  // A lone tile must never look fullscreen (SharedGeometry::KeepTilesOffWholeMonitor).
+  const RECT workArea = SharedGeometry::KeepTilesOffWholeMonitor(
+      {monitorWork.left + insets.left, monitorWork.top + insets.top, monitorWork.right - insets.right,
+       monitorWork.bottom - insets.bottom},
+      monitorInfo.rcMonitor);
   if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) {
     return false;
   }
