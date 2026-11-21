@@ -64,7 +64,9 @@ static ConstraintProbeRefresh ProbeConstraintsAgainstCache(HWND hwnd, WindowCons
 // query in time, and is then tiled with no known minimum. Without a retry the
 // next query waits for an unrelated arrangement, so the layout reshuffles for
 // it when some other window opens. Instead it is asked again shortly, a bounded
-// number of times; each retry arranges its workspace, which queries it again.
+// number of times, each gap twice the last (with the default 250 ms: 250, 500,
+// 1000 and 2000 ms, inside the default Keep Windows in Place). Each retry
+// arranges its workspace, which queries it again.
 
 inline constexpr unsigned kMaxConstraintRetries = 4;
 
@@ -86,8 +88,9 @@ static void ArmConstraintRetryTimer() {
 }
 
 // `hwnd`, a tiled member, didn't report its size limits: ask again after the
-// New Window Retry Delay, unless a retry is already scheduled or it has had
-// kMaxConstraintRetries. A delay of 0 disables retries, as it does for new windows.
+// New Window Retry Delay, doubled for each retry already made, unless one is
+// already scheduled or it has had kMaxConstraintRetries. A delay of 0 disables
+// retries, as it does for new windows.
 static void ScheduleConstraintRetry(HWND hwnd, DWORD processId) {
   if (!hwnd || !g_settings.slowApplicationDelayMs) return;
   auto& retries = g_wm.lifecycle.constraintRetries;
@@ -100,8 +103,9 @@ static void ScheduleConstraintRetry(HWND hwnd, DWORD processId) {
     *it = {hwnd, processId, 0, 0};  // A reused HWND value: a new window.
   }
   if (it->dueTickMs || it->attempts >= kMaxConstraintRetries) return;
+  const ULONGLONG delayMs = static_cast<ULONGLONG>(g_settings.slowApplicationDelayMs) << it->attempts;
   ++it->attempts;
-  it->dueTickMs = GetTickCount64() + g_settings.slowApplicationDelayMs;
+  it->dueTickMs = GetTickCount64() + delayMs;
   Diagnostics::RecordEvent(L"size limits unknown; retry %u scheduled hwnd=%p", it->attempts, hwnd);
   ArmConstraintRetryTimer();
 }

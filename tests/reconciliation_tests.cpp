@@ -1187,20 +1187,31 @@ static void RunConstraintRetryTests() {
     return record && record->constraints.valid;
   };
 
+  // The gap before retry `attempt`: the delay, doubled for each retry before it.
+  // Placement and the timed-out query itself add up to a few hundred ms.
+  auto gapIs = [&](ULONGLONG before, unsigned attempt) {
+    const ULONGLONG expected = 250ull << (attempt - 1);
+    const ULONGLONG gap = retry() ? retry()->dueTickMs - before : 0;
+    return gap >= expected && gap <= expected + 1000;
+  };
+
   Workspace workspace;
   workspace.SetLayout(TileLayout::Columns);
   workspace.AdmitTiled(FloatingWindowFixture::Record(f.hwnd));
   workspace.AdmitTiled(FloatingWindowFixture::Record(slow.hwnd));
   g_workspaces.Save(f.key, workspace);
+  ULONGLONG before = GetTickCount64();
   Placement::ArrangeWorkspace(f.key);
-  check(!limitsKnown() && retry() && retry()->attempts == 1 && retry()->dueTickMs &&
+  check(!limitsKnown() && retry() && retry()->attempts == 1 && gapIs(before, 1) &&
             g_wm.timers.constraintRetry != 0,
-        "a window that doesn't answer is tiled, and asked again later");
+        "a window that doesn't answer is tiled, and asked again after the retry delay");
   check(f.Load().IsTiled(slow.hwnd), "it stays tiled meanwhile");
 
   for (unsigned attempt = 2; attempt <= Placement::kMaxConstraintRetries; ++attempt) {
+    before = GetTickCount64();
     runDueRetry();
-    check(retry() && retry()->attempts == attempt && retry()->dueTickMs, "each silent retry schedules the next");
+    check(retry() && retry()->attempts == attempt && gapIs(before, attempt),
+          "each silent retry schedules the next, twice as far off");
   }
   runDueRetry();
   check(!retry() && g_wm.timers.constraintRetry == 0 && !limitsKnown(),
