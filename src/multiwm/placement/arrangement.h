@@ -215,26 +215,21 @@ static std::vector<bool> FindConflictingWindows(const Workspace& workspace, cons
   return involved;
 }
 
+// The name a toast uses for `hwnd`: its process name without ".exe", or empty.
+static std::wstring ProcessDisplayName(HWND hwnd) {
+  std::wstring name = Platform::Windows::GetWindowProcessName(hwnd);
+  if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0) name.resize(name.size() - 4);
+  return name;
+}
+
 // "Firefox needs more space", "Firefox and Code need more space in this layout".
-// Names are process names without ".exe", once each; `fallback` names the window
-// to blame when none of `involved` can be named.
-static std::wstring ConstraintConflictMessage(
-    const Workspace& workspace, const std::vector<bool>& involved, HWND fallback) {
-  auto processDisplayName = [](HWND hwnd) {
-    std::wstring name = Platform::Windows::GetWindowProcessName(hwnd);
-    if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0) name.resize(name.size() - 4);
-    return name;
-  };
+// `windows` named once each; an unnamed one is "A window".
+static std::wstring NeedMoreSpaceMessage(const std::vector<HWND>& windows) {
   std::vector<std::wstring> names;
-  for (size_t i = 0; i < involved.size(); ++i) {
-    if (!involved[i]) continue;
-    std::wstring name = processDisplayName(workspace.TiledWindows()[i]);
+  for (HWND hwnd : windows) {
+    std::wstring name = ProcessDisplayName(hwnd);
     if (name.empty()) name = L"A window";
     if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(std::move(name));
-  }
-  if (names.empty() && fallback) {
-    std::wstring name = processDisplayName(fallback);
-    if (!name.empty()) names.push_back(std::move(name));
   }
   std::wstring message;
   for (size_t i = 0; i < names.size(); ++i) {
@@ -244,6 +239,18 @@ static std::wstring ConstraintConflictMessage(
   if (names.empty()) message = L"A window";
   message += names.size() > 1 ? L" need more space in this layout" : L" needs more space";
   return message;
+}
+
+// NeedMoreSpaceMessage for the tiled windows `involved` marks; `fallback` is the
+// window to blame when none is marked, if it can be named.
+static std::wstring ConstraintConflictMessage(
+    const Workspace& workspace, const std::vector<bool>& involved, HWND fallback) {
+  std::vector<HWND> windows;
+  for (size_t i = 0; i < involved.size(); ++i) {
+    if (involved[i]) windows.push_back(workspace.TiledWindows()[i]);
+  }
+  if (windows.empty() && fallback && !ProcessDisplayName(fallback).empty()) windows.push_back(fallback);
+  return NeedMoreSpaceMessage(windows);
 }
 
 // Tells the user which windows don't fit `rects`, the rejected plan.
@@ -405,6 +412,11 @@ static bool AutomaticOverflowRoutes() {
           (g_settings.overflowTryOtherMonitors && GetSystemMetrics(SM_CMONITORS) != 1));
 }
 
+// Why Automatic overflow releases a window (FloatAutomaticOverflowWindow's
+// `reason`). Compared by address.
+inline constexpr const wchar_t* kOverflowCountLimit = L"count limit";  // Past the Auto-tiling Limit.
+inline constexpr const wchar_t* kOverflowCannotFit = L"cannot fit";    // No room at its size limits.
+
 // Arrangement releases the slot first; physical routing runs after every source
 // workspace in the burst has been saved, so discovery snapshots cannot go stale
 // midway through admission. A failed route therefore already has a safe fallback.
@@ -427,6 +439,7 @@ static bool FloatAutomaticOverflowWindow(
     Reconcile::ScheduleLifecycleReconcile(nullptr);
   }
   Diagnostics::RecordEvent(L"automatic overflow hwnd=%p reason=%ls route=%d", hwnd, reason, route ? 1 : 0);
+  if (g_wm.commandReleases) g_wm.commandReleases->emplace_back(hwnd, reason);
   return true;
 }
 
@@ -509,7 +522,7 @@ static void EnforceAutomaticWindowLimit(
     ++retainedSlots;
     // Visible maximized members count, but are not restored just to move them.
     if (exceedsLimit && !Gestures::IsMoveSizeGestureInProgress(occupant.hwnd) &&
-        FloatAutomaticOverflowWindow(key, workspace, occupant.hwnd, L"count limit")) {
+        FloatAutomaticOverflowWindow(key, workspace, occupant.hwnd, kOverflowCountLimit)) {
       --retainedSlots;
     }
   }
@@ -779,7 +792,7 @@ static ArrangementStep ReleaseConstraintVictim(
   }
   DiscardPendingAdmissionRecovery(victim.hwnd);
   const bool floated = automaticOverflow
-      ? FloatAutomaticOverflowWindow(key, workspace, victim.hwnd, L"cannot fit")
+      ? FloatAutomaticOverflowWindow(key, workspace, victim.hwnd, kOverflowCannotFit)
       : FloatWindowAfterFailure(key, workspace, victim.hwnd);
   if (!floated) {
     g_workspaces.Save(key, workspace);

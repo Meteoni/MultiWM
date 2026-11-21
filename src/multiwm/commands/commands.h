@@ -374,8 +374,41 @@ void ResetFocusedWindowSize() {
   CommitWindowSizeChange(*focused, std::move(candidate), L"Reset window size");
 }
 
-// Manual tile: reconcile membership and explicitly adopt the user's current
-// geometry. Automatic events never call this with adoptCurrentGeometry=true.
+// Collects the windows Automatic overflow releases while it lives
+// (WmRuntime::commandReleases), so a user command can report them.
+class CommandReleaseScope {
+ public:
+  CommandReleaseScope() { g_wm.commandReleases = &released_; }
+  ~CommandReleaseScope() { g_wm.commandReleases = nullptr; }
+  CommandReleaseScope(const CommandReleaseScope&) = delete;
+  CommandReleaseScope& operator=(const CommandReleaseScope&) = delete;
+  const std::vector<std::pair<HWND, const wchar_t*>>& Released() const { return released_; }
+
+ private:
+  std::vector<std::pair<HWND, const wchar_t*>> released_;
+};
+
+// After a user command in Automatic mode (Tile Workspace, a layout change, a
+// reorder...): says why windows it tried to tile were floated instead. Overflow
+// keeps that quiet for automatic admission, and Manual mode's arrangement
+// already says which windows need more space.
+static void ReportCommandReleases(
+    const std::vector<std::pair<HWND, const wchar_t*>>& released, HMONITOR monitor) {
+  if (released.empty()) return;
+  std::vector<HWND> cannotFit;
+  bool limitReached = false;
+  for (const auto& [hwnd, reason] : released) {
+    if (reason == Placement::kOverflowCountLimit) limitReached = true;
+    else cannotFit.push_back(hwnd);
+  }
+  const std::wstring message = limitReached ? L"Auto-tiling limit reached" : Placement::NeedMoreSpaceMessage(cannotFit);
+  TrayUi::ShowCommandFailureFlyout(message.c_str(), monitor);
+}
+
+// Tile Workspace (hotkey or tray): reconcile membership and explicitly adopt the
+// user's current geometry. Automatic events never call this with
+// adoptCurrentGeometry=true. Like every user command, the WM thread reports any
+// window it tried to tile but had to float (ReportCommandReleases).
 void TileWindows(HMONITOR monitor = nullptr) {
   ++Diagnostics::g_runtime.counters.tileCommands;
   if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();

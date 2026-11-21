@@ -143,13 +143,17 @@ static bool DispatchActorTimer(UINT_PTR timerId) {
   return false;
 }
 
+// True for a management-mode change (hotkey or tray). Its own toast names the
+// new mode; what Automatic admission then does stays quiet, as it always does.
+static bool IsManagementModeMessage(const MSG& msg) {
+  return msg.message == WM_APP_MANAGEMENT_MODE_SET ||
+         (msg.message == WM_HOTKEY && msg.wParam == HK_MANAGEMENT_MODE_TOGGLE);
+}
+
 // Converts one serialized thread message into a domain command. Messages not
 // owned by the WM are explicitly returned to Windows so STA COM's hidden window
 // continues receiving cross-apartment calls.
-static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
-  // A new user command supersedes a pending "follow the overflowed window to its
-  // new desktop" switch; never yank the user away after they have acted.
-  if (IsUserCommandMessage(msg)) g_wm.overflow.follow = {};
+static WmMessageDisposition DispatchWmThreadMessage(const MSG& msg) {
   switch (msg.message) {
     case WM_APP_MOVE_SIZE_END:
       HandleMoveSizeEndMessage(reinterpret_cast<HWND>(msg.wParam));
@@ -260,6 +264,21 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
   }
 
   return WmMessageDisposition::DispatchToWindows;
+}
+
+// Handles one thread message. A user command first cancels a pending desktop
+// follow, and afterwards says why any window it tried to tile was floated
+// instead (Commands::ReportCommandReleases).
+static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
+  if (!IsUserCommandMessage(msg)) return DispatchWmThreadMessage(msg);
+  // A new user command supersedes a pending "follow the overflowed window to its
+  // new desktop" switch; never yank the user away after they have acted.
+  g_wm.overflow.follow = {};
+  if (IsManagementModeMessage(msg)) return DispatchWmThreadMessage(msg);
+  Commands::CommandReleaseScope releases;
+  const WmMessageDisposition disposition = DispatchWmThreadMessage(msg);
+  Commands::ReportCommandReleases(releases.Released(), nullptr);
+  return disposition;
 }
 
 static void RunWmMessageLoop() {

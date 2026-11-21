@@ -360,6 +360,11 @@ struct WmRuntime {
     PendingDesktopFollow follow{};          // "Follow window" desktop switch.
   } routing;
 
+  // While a user command runs (Commands::TileWindows): the windows Automatic
+  // overflow releases, each with its reason, so the command can say why they
+  // weren't tiled. Automatic admission stays quiet. Null otherwise.
+  std::vector<std::pair<HWND, const wchar_t*>>* commandReleases = nullptr;
+
   // True when `hwnd` has a queued overflow request that has not run yet.
   bool HasPendingOverflow(HWND hwnd) const {
     return std::any_of(overflow.queue.begin(), overflow.queue.end(),

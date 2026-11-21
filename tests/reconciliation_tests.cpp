@@ -1092,6 +1092,38 @@ static void RunFirstFloatingSizeTests() {
   std::printf("Passed %u first floating size checks.\n", check.passed);
 }
 
+// Tile Workspace hears which windows Automatic overflow released while it ran,
+// and why; outside a command nothing is collected.
+static void RunCommandReleaseTests() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  const HWND hwnd = f.hwnd;
+  g_wm.managementMode = ManagementMode::Automatic;
+  auto release = [&](const wchar_t* reason) {
+    f.Seed(TileLayout::Columns);
+    Workspace workspace = f.Load();
+    const bool floated = Placement::FloatAutomaticOverflowWindow(f.key, workspace, hwnd, reason);
+    g_workspaces.Save(f.key, workspace);
+    return floated;
+  };
+  check(g_wm.commandReleases == nullptr, "nothing collects releases outside a command");
+  check(release(Placement::kOverflowCannotFit), "an automatic release outside a command still floats");
+  {
+    Commands::CommandReleaseScope scope;
+    check(release(Placement::kOverflowCannotFit) && release(Placement::kOverflowCountLimit),
+          "release the window twice inside a command");
+    const auto& released = scope.Released();
+    check(released.size() == 2 && released[0].first == hwnd &&
+              released[0].second == Placement::kOverflowCannotFit &&
+              released[1].second == Placement::kOverflowCountLimit,
+          "a command hears each release and its reason");
+  }
+  check(g_wm.commandReleases == nullptr, "the command's scope stops collecting when it ends");
+  check(Placement::NeedMoreSpaceMessage({}) == L"A window needs more space",
+        "an unnamed release still gets a message");
+  std::printf("Passed %u command release checks.\n", check.passed);
+}
+
 // A window a floating rule admits is centered at its own size, unless an
 // override-size rule names another size (Automatic mode only).
 static void RunRuleFloatedSizeTests() {
@@ -1953,6 +1985,7 @@ int main() {
   RunHiddenArrivalTests();
   RunOverflowDestinationProbeTests();
   RunOverflowDestinationFitTests();
+  RunCommandReleaseTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
   RunOverflowFloatPredictionTests();
