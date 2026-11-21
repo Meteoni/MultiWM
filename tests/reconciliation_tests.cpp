@@ -784,6 +784,73 @@ static void RunOverflowDestinationProbeTests() {
   std::printf("Passed %u overflow destination probe checks.\n", check.passed);
 }
 
+// Overflow judges a destination as arrangement treats it once saved: a window
+// that fits only after admission recovery moves it, including Dwindle's
+// reassignment of siblings, is accepted. Searched over the minimum sizes of up
+// to five settled members and the incoming window (seeded, so repeatable), on
+// real invisible test windows, through the new-desktop path.
+static void RunOverflowDestinationFitTests() {
+  CheckCounter check;
+  FloatingWindowFixture fixture(check);
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+  std::vector<HWND> windows{fixture.hwnd};
+  for (int i = 0; i < 5; ++i) windows.push_back(fixture.CreateTestWindow(nullptr));
+  const HWND incomingWindow = windows.back();
+  const RECT& area = fixture.workArea;
+  const LONG gap = fixture.metrics.gap;
+  const LONG width = Layout::RectWidth(area);
+  const LONG height = Layout::RectHeight(area);
+  uint32_t seed = 0x5eed1234u;
+  auto next = [&](uint32_t bound) {
+    seed = seed * 1664525u + 1013904223u;
+    return (seed >> 8) % bound;
+  };
+  // A minimum span: none, or a share of the work area from 15% to 70%.
+  auto span = [&](LONG whole) { return next(3) == 0 ? 1L : whole * static_cast<LONG>(15 + next(56)) / 100; };
+  auto record = [&](HWND window, SIZE minimum) {
+    WindowRecord result = FloatingWindowFixture::Record(window);
+    result.constraints.valid = true;
+    result.constraints.dpi = fixture.metrics.dpi;
+    result.constraints.minWidth = minimum.cx;
+    result.constraints.minHeight = minimum.cy;
+    return result;
+  };
+
+  size_t reassigned = 0;
+  size_t compared = 0;
+  for (int attempt = 0; attempt < 20000 && reassigned < 20; ++attempt) {
+    Workspace initial;
+    initial.SetLayout(TileLayout::Dwindle);
+    const size_t memberCount = 2 + next(4);
+    for (size_t i = 0; i < memberCount; ++i) {
+      initial.AdmitTiled(record(windows[i], {span(width), span(height)}));
+      initial.ClearInsertionPlacement(windows[i]);
+    }
+    const WindowRecord incoming = record(incomingWindow, {span(width), span(height)});
+
+    // What arrangement does with the saved destination: plan it, else recover.
+    Workspace expected = initial;
+    expected.AdmitTiled(incoming);
+    std::vector<RECT> rects;
+    const bool fits = Layout::BuildWorkspaceLayoutPlan(expected, area, gap, &rects) == Layout::LayoutPlanStatus::Success;
+    Layout::AdmissionRecoveryPlan recovery;
+    const bool recovered = !fits && Layout::TryRecoverPendingAdmission(
+        expected, area, gap, Placement::OrderRemovalCandidates(expected, nullptr), nullptr, &recovery);
+    const bool needsReassignment = recovered && recovery.reassignedWindows > 0;
+    // Every case that needs reassignment, and a sample of the rest.
+    if (!needsReassignment && compared >= 300) continue;
+    ++compared;
+    reassigned += needsReassignment ? 1 : 0;
+    const auto destination = Reconcile::PlanOverflowDestination(
+        fixture.key, incoming, FloatingWindowFixture::Frame(incomingWindow), &initial);
+    check(destination.has_value() == (fits || recovered),
+          "overflow accepts a destination exactly when arrangement would tile the window there");
+  }
+  check(reassigned > 0, "some destinations fit only by reassigning Dwindle siblings");
+  std::printf("Passed %u overflow destination fit checks (%zu destinations, %zu needing reassignment).\n",
+              check.passed, compared, reassigned);
+}
+
 static bool IsCenteredIn(const RECT& rect, POINT center) {
   const POINT actual = SharedGeometry::RectCenter(rect);
   return std::abs(actual.x - center.x) <= 1 && std::abs(actual.y - center.y) <= 1;
@@ -1838,6 +1905,7 @@ int main() {
   RunFirstFloatingSizeTests();
   RunHiddenArrivalTests();
   RunOverflowDestinationProbeTests();
+  RunOverflowDestinationFitTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
   RunOverflowFloatPredictionTests();

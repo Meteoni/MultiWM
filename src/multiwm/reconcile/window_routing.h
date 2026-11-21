@@ -490,19 +490,23 @@ static bool RefreshOverflowTrialMembers(const DesktopMonitorKey& key, HMONITOR m
 }
 
 // Adds to a destination trial the manageable windows on `monitor` and the
-// destination desktop that no workspace knows yet, as discovery would admit them
-// (rule-floated ones floating). Skips `incoming`. False, with the trial partly
-// filled, when a window can't be judged: a failed cloak or desktop query, or a
-// window another workspace still claims or an initial-placement rule will move.
+// destination desktop that no workspace knows yet, admitted by discovery's own
+// Automatic admission (AdmitUntrackedSnapshot, AdmitUntrackedSuspendedSnapshot):
+// the trial is saved as the destination, so these become their real records.
+// Skips `incoming`. False, with the trial unchanged, when a window can't be
+// judged: a failed cloak or desktop query, or a window another workspace still
+// claims or an initial-placement rule will move.
 static bool ImportUntrackedDestinationWindows(
     const DesktopMonitorKey& key, HMONITOR monitor, HWND incoming, Workspace& trial) {
   struct CandidateEnumeration {
     const DesktopMonitorKey* key;
     HMONITOR monitor;
-    Workspace* trial;
+    const Workspace* trial;
     HWND incoming;
+    std::vector<HWND> active;     // Restored: discovery's active snapshot.
+    std::vector<HWND> suspended;  // Minimized or maximized: its suspended one.
     bool complete = true;
-  } context{&key, monitor, &trial, incoming};
+  } context{&key, monitor, &trial, incoming, {}, {}};
   const BOOL enumerated = EnumWindows([](HWND candidate, LPARAM parameter) WINAPI -> BOOL {
     ++Diagnostics::g_runtime.counters.enumWindowsVisited;
     auto& context = *reinterpret_cast<CandidateEnumeration*>(parameter);
@@ -528,17 +532,18 @@ static bool ImportUntrackedDestinationWindows(
       context.complete = false;
       return TRUE;
     }
-    bool alwaysFloating = false;
-    if (Platform::Windows::ShouldWindowStartFloating(candidate, &alwaysFloating)) {
-      WindowRecord record = Platform::Windows::MakeWindowRecord(candidate, ManageState::Floating);
-      record.alwaysFloating = alwaysFloating;
-      context.trial->AdmitFloating(std::move(record));
-    } else {
-      context.trial->AdmitInitial(Platform::Windows::MakeWindowRecord(candidate), Platform::Windows::GetPhysicalSuspensionReason(candidate));
+    const SuspensionReason reason = Platform::Windows::GetPhysicalSuspensionReason(candidate);
+    if (reason == SuspensionReason::None) {
+      context.active.push_back(candidate);
+    } else if (reason != SuspensionReason::Hidden) {
+      context.suspended.push_back(candidate);
     }
     return TRUE;
   }, reinterpret_cast<LPARAM>(&context));
-  return enumerated && context.complete;
+  if (!enumerated || !context.complete) return false;
+  AdmitUntrackedSnapshot(trial, context.active, true, true);
+  AdmitUntrackedSuspendedSnapshot(trial, context.suspended, true, true);
+  return true;
 }
 
 // Builds a trial destination using live observations on the WM thread.
@@ -575,8 +580,7 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
   WindowRecord record = incoming;
   // Predict monitor-DPI constraints, then probe again after a physical move.
   record.constraints = Model::RescaleConstraintsToDpi(record.constraints, metrics.dpi);
-  const HWND anchor = g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused
-      ? trial.LastFocusedTiledWindow() : nullptr;
+  const HWND anchor = InsertsAfterFocusedWindow(true) ? trial.LastFocusedTiledWindow() : nullptr;
   if (anchor) trial.AdmitTiledAfter(std::move(record), anchor);
   else trial.AdmitTiled(std::move(record));
   // Members' size limits, by the rule arrangement uses: the cached report,
@@ -606,16 +610,19 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
     return true;
   };
   if (fits(trial)) return destination;
-  // Otherwise the nearest slot that fits, as admission recovery searches.
-  const Workspace preferred = trial;
-  const bool moved = Layout::TryNearbyIndices(preferred.TiledIndex(hwnd), preferred.ActiveCount(), [&](size_t index) {
-    Workspace alternative = preferred;
-    if (!alternative.MovePendingAdmissionToIndex(hwnd, index) || !fits(alternative)) return false;
-    trial = std::move(alternative);
-    return true;
-  });
-  if (moved) return destination;
-  return std::nullopt;
+  // Otherwise what arrangement's recovery does with the saved destination
+  // (RecoverUnsatisfiableLayout): move a pending admission, this one or a newer
+  // one, to a slot where everyone fits, in Dwindle also reassigning siblings.
+  // Its later steps aren't modelled: when this fails, the incoming window is
+  // normally the admission that introduced the conflict, and would be floated.
+  Layout::AdmissionRecoveryPlan recovery;
+  if (!Layout::TryRecoverPendingAdmission(trial, metrics.workArea, metrics.gap,
+                                          Placement::OrderRemovalCandidates(trial, nullptr), nullptr, &recovery) ||
+      !fits(recovery.workspace)) {
+    return std::nullopt;
+  }
+  trial = std::move(recovery.workspace);
+  return destination;
 }
 
 // Results distinguish a retryable observation from a failed native mutation.
