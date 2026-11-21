@@ -340,6 +340,7 @@ struct WmRuntime {
   struct Maintenance {
     UINT attempts = 0;
     bool running = false;
+    bool failureReported = false;  // Warned once; cleared when recovery succeeds.
   } maintenance;
 
   // Automatic overflow: windows that exceeded a limit and are waiting to move.

@@ -21,6 +21,16 @@ static void ArmMaintenanceTimer() {
   }
 }
 
+// After a retry burst fails: tells the user once per failure, not once per
+// burst, when tiling is impaired. Missing desktop-change notifications alone
+// are covered by the settled pass's fallback, so they stay quiet.
+static void ReportPlatformFailureOnce(bool hooksReady, bool vdCoreReady) {
+  if (g_wm.maintenance.failureReported || (hooksReady && vdCoreReady)) return;
+  g_wm.maintenance.failureReported = true;
+  TrayUi::ShowCommandFailureFlyout(!vdCoreReady ? L"Virtual desktop support unavailable"
+                                                : L"Can't watch windows; tiling may not react");
+}
+
 void RequestMaintenance(bool resetAttempts) {
   AssertWmThread(L"RuntimeLifecycle::RequestMaintenance");
 
@@ -54,6 +64,7 @@ void RunMaintenanceNow() {
     const bool recoveredDeferredWork =
         g_wm.lifecycle.retryAfterPlatformRecovery;
     g_wm.maintenance.attempts = 0;
+    g_wm.maintenance.failureReported = false;
     g_wm.lifecycle.retryAfterPlatformRecovery = false;
 
     if (recoveredDeferredWork) {
@@ -84,6 +95,7 @@ void RunMaintenanceNow() {
         L"Runtime maintenance retry burst exhausted (hooks=%d vdCore=%d notifications=%d)",
         hooksReady ? 1 : 0, vdCoreReady ? 1 : 0,
         notificationsReady ? 1 : 0);
+    ReportPlatformFailureOnce(hooksReady, vdCoreReady);
   }
   g_wm.maintenance.running = false;
 }

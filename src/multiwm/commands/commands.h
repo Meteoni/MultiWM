@@ -116,22 +116,39 @@ static std::optional<ForegroundWorkspace> LoadForegroundWorkspace() {
   return current;
 }
 
+// A window command that does nothing says why, rather than failing silently
+// (Show Toasts permitting). On the focused window's monitor when known.
+static void ReportCommandRefused(const wchar_t* text, const std::optional<ForegroundWorkspace>& current) {
+  TrayUi::ShowCommandFailureFlyout(text, current ? current->monitor : nullptr);
+}
+
+// The command found no window to act on: MultiWM doesn't manage the focused
+// window, or knows it but doesn't tile it (floating, minimized or maximized).
+static void ReportNoTargetWindow(const std::optional<ForegroundWorkspace>& current) {
+  const bool known = current && current->workspace.HasRecord(current->foreground);
+  ReportCommandRefused(known ? L"This window isn't tiled" : L"This window isn't managed", current);
+}
+
+static constexpr const wchar_t* kNotInFloatingLayout = L"Not available in the Floating layout";
+
 // Promotes the foreground window, or its tiled owner, to the master slot, then
 // clears stale gesture samples for both windows and reflows the workspace.
 void SwapMaster() {
   ++Diagnostics::g_runtime.counters.swapMasterCommands;
   auto current = LoadForegroundWorkspace();
-  if (!current || current->workspace.ActiveCount() < 2 ||
-      current->workspace.Layout() == TileLayout::Floating) {
-    return;
-  }
+  if (!current) return ReportNoTargetWindow(current);
+  if (current->workspace.Layout() == TileLayout::Floating) return ReportCommandRefused(kNotInFloatingLayout, current);
   const DesktopMonitorKey& key = current->key;
   const Workspace& workspace = current->workspace;
 
   HWND resolved = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
+  if (!resolved) return ReportNoTargetWindow(current);
+  if (resolved == workspace.TiledWindows().front()) {
+    return ReportCommandRefused(L"Already the master window", current);
+  }
   Workspace candidate = workspace;
   HWND oldMaster = nullptr;
-  if (!resolved || !candidate.MakeMaster(resolved, &oldMaster)) return;
+  if (!candidate.MakeMaster(resolved, &oldMaster)) return;
   if (!AcceptUserLayoutMutation(key, current->monitor, workspace, candidate, resolved,
                                 Placement::UserLayoutMutationKind::Order, L"Set master")) {
     return;
@@ -155,23 +172,20 @@ static void MoveFocusedWindowOneSlot(bool promote) {
   }
 
   auto current = LoadForegroundWorkspace();
-  if (!current || current->workspace.ActiveCount() < 2 ||
-      current->workspace.Layout() == TileLayout::Floating) {
-    return;
-  }
+  if (!current) return ReportNoTargetWindow(current);
+  if (current->workspace.Layout() == TileLayout::Floating) return ReportCommandRefused(kNotInFloatingLayout, current);
   const DesktopMonitorKey& key = current->key;
   const Workspace& workspace = current->workspace;
 
   HWND resolved = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
-  if (!resolved) return;
+  if (!resolved) return ReportNoTargetWindow(current);
 
   const size_t index = workspace.TiledIndex(resolved);
   const size_t count = workspace.ActiveCount();
   if (index >= count) return;
 
-  if ((promote && index == 0) || (!promote && index + 1 >= count)) {
-    return;
-  }
+  if (promote && index == 0) return ReportCommandRefused(L"Already first", current);
+  if (!promote && index + 1 >= count) return ReportCommandRefused(L"Already last", current);
 
   const size_t otherIndex = promote ? index - 1 : index + 1;
   HWND other = workspace.TiledWindows()[otherIndex];
@@ -204,14 +218,18 @@ void DemoteFocusedWindow() {
 void FloatFocusedWindow() {
   ++Diagnostics::g_runtime.counters.floatFocusedCommands;
   auto current = LoadForegroundWorkspace();
-  if (!current) return;
+  if (!current) return ReportNoTargetWindow(current);
   const DesktopMonitorKey& key = current->key;
   Workspace& workspace = current->workspace;
 
   // Explicit floating also cancels a queued overflow of this focused HWND.
   g_wm.CancelPendingOverflow(current->foreground);
   HWND tiled = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
-  if (!tiled) return;
+  if (!tiled) {
+    const WindowRecord* record = workspace.Find(current->foreground);
+    if (record && record->state == ManageState::Floating) return ReportCommandRefused(L"Already floating", current);
+    return ReportNoTargetWindow(current);
+  }
 
   Placement::FloatingPlacementHint hint;
   hint.intent = Placement::FloatingPlacementIntent::CenterWithFloatingSize;
@@ -282,7 +300,7 @@ void StepFocusedWindowSize(bool grow) {
     ++Diagnostics::g_runtime.counters.shrinkWindowCommands;
   }
   auto focused = LoadFocusedMember();
-  if (!focused) return;
+  if (!focused) return ReportNoTargetWindow(LoadForegroundWorkspace());
   const wchar_t* action = grow ? L"Grow window" : L"Shrink window";
   // A press that can't move the window says why, rather than doing nothing
   // silently. Rejections by the layout check report their own message.
@@ -303,7 +321,10 @@ void StepFocusedWindowSize(bool grow) {
     }
     return;
   }
-  if (focused->workspace.Layout() == TileLayout::Monocle) return;  // Nothing to size.
+  if (focused->workspace.Layout() == TileLayout::Monocle) {
+    TrayUi::ShowCommandFailureFlyout(L"Nothing to resize in Monocle", focused->monitor);
+    return;
+  }
 
   Platform::Monitors::WorkspaceMetrics metrics;
   if (!Platform::Monitors::GetWorkspaceMetrics(focused->monitor, &metrics)) return;
@@ -324,7 +345,7 @@ void StepFocusedWindowSize(bool grow) {
 void ResetFocusedWindowSize() {
   ++Diagnostics::g_runtime.counters.resetWindowSizeCommands;
   auto focused = LoadFocusedMember();
-  if (!focused) return;
+  if (!focused) return ReportNoTargetWindow(LoadForegroundWorkspace());
 
   if (focused->floating) {
     Placement::FloatingPlacementHint hint;
@@ -336,12 +357,18 @@ void ResetFocusedWindowSize() {
     return;
   }
 
+  if (focused->workspace.Layout() == TileLayout::Monocle) {
+    TrayUi::ShowCommandFailureFlyout(L"Nothing to resize in Monocle", focused->monitor);
+    return;
+  }
   Platform::Monitors::WorkspaceMetrics metrics;
   if (!Platform::Monitors::GetWorkspaceMetrics(focused->monitor, &metrics)) return;
   Workspace candidate = focused->workspace;
   if (!candidate.ResetTiledSize(
           metrics.workArea, metrics.gap, candidate.TiledIndex(focused->hwnd),
           g_settings.masterPercent / 100.0)) {
+    // Nothing to reset: already at the layout's default, or the only window.
+    TrayUi::ShowCommandFailureFlyout(L"Already at its default size", focused->monitor);
     return;
   }
   CommitWindowSizeChange(*focused, std::move(candidate), L"Reset window size");

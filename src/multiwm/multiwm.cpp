@@ -49,7 +49,8 @@ Move a tiled window to **float it** or **swap it with the window underneath**.
 By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
 moving windows through the logical order (Alt+, / .), resizing the focused window (Alt+= / - / 0),
 floating a window (Alt+F), and switching between Automatic and Manual management (Alt+R).
-If another program already uses one of these shortcuts, a toast names it.
+If another program already uses one of these shortcuts, a toast names it. A hotkey that can't act,
+such as promoting the first window, says why in a toast.
 
 A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
 
@@ -217,7 +218,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 - appearance:
   - ShowToasts: true
     $name: Show Toasts
-    $description: Show layout, mode, and error toasts.
+    $description: Show layout, mode and error toasts, and say why a hotkey did nothing.
   - FlyoutPosition: top
     $name: Toast Position
     #! $showIf: {ShowToasts: true}
