@@ -185,10 +185,10 @@ struct WindowRecord {
   RECT lastRequestedRect{};
   RECT lastObservedRect{};
 
-  // Last meaningful floating frame in physical screen pixels. The capture DPI
-  // and monitor let migration restore size sensibly across per-monitor scaling.
+  // Last meaningful floating frame in physical screen pixels. Its monitor is
+  // the one holding the rectangle; the capture DPI lets migration restore its
+  // size sensibly across per-monitor scaling.
   RECT floatingRect{};
-  HMONITOR floatingMonitor = nullptr;
   UINT floatingDpi = 96;
   bool hasFloatingRect = false;
 
@@ -314,10 +314,9 @@ class Workspace {
   // previous one. Also assigns a tiling generation to a non-floating record that
   // had none, even when it returns false.
   bool UpdateConstraints(HWND hwnd, const WindowConstraints& constraints);
-  // Stores the floating frame (physical pixels) to restore when floated again.
-  // Returns false for an empty frame, null monitor, or an unchanged value.
-  bool RememberFloatingGeometry(
-      HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi);
+  // Stores the floating frame (physical pixels, captured at `dpi`) to restore
+  // when floated again. Returns false for an empty frame or an unchanged value.
+  bool RememberFloatingGeometry(HWND hwnd, const RECT& frame, UINT dpi);
   // Records the outcome of a placement attempt and says what to do next:
   // Float on access denied, Forget for a dead or unknown window, else None.
   PlacementAction ApplyPlacementObservation(HWND hwnd, const PlacementObservation& observation);

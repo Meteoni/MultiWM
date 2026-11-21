@@ -515,7 +515,7 @@ static DiagnosticRecordAudit DiagnosticDumpWindowRecord(
     report.Line(
         L"      floatingGeometry=%ls dpi=%u monitor=%p",
         DiagnosticRectString(record.floatingRect).c_str(), record.floatingDpi,
-        reinterpret_cast<void*>(record.floatingMonitor));
+        reinterpret_cast<void*>(MonitorFromRect(&record.floatingRect, MONITOR_DEFAULTTONULL)));
   } else {
     report.Line(L"      floatingGeometry=none");
   }

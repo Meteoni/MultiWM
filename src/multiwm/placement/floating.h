@@ -20,27 +20,13 @@ static FloatingPlacementHint MakeFloatingPlacementHintFromGesture(
   return hint;
 }
 
-static HMONITOR ResolveRememberedFloatingMonitor(
-    const WindowRecord& record) {
-  if (!record.hasFloatingRect) return nullptr;
-  if (Platform::Monitors::IsLiveMonitorHandle(record.floatingMonitor)) {
-    return record.floatingMonitor;
-  }
-
-  // HMONITOR can be invalidated by a live display-topology rebuild. The remembered
-  // physical rectangle is still a useful best-effort hint inside the same session;
-  // if it maps to a current monitor, treat that as the remembered boundary.
-  return MonitorFromRect(
-      &record.floatingRect, MONITOR_DEFAULTTONULL);
-}
-
-// Places a floating window at `target` and remembers the frame it ends up with.
-// A Floating-layout member placed exactly where asked gets a floating lease, so
-// an app that snaps back right afterwards is put back (placement/conformance.h).
-// False when the placement failed; nothing is remembered then.
+// Places a floating window at `target` and remembers the frame it ends up with,
+// captured at `dpi`. A Floating-layout member placed exactly where asked gets a
+// floating lease, so an app that snaps back right afterwards is put back
+// (placement/conformance.h). False when the placement failed; nothing is
+// remembered then.
 static bool PlaceFloatingWindow(
-    Workspace& workspace, HWND hwnd, HMONITOR monitor, UINT dpi,
-    const RECT& target, bool positionOnly) {
+    Workspace& workspace, HWND hwnd, UINT dpi, const RECT& target, bool positionOnly) {
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record) return false;
   const bool floatingLayoutMember =
@@ -57,7 +43,7 @@ static bool PlaceFloatingWindow(
               observation.observed.bottom > observation.observed.top
           ? observation.observed
           : target;
-  workspace.RememberFloatingGeometry(hwnd, remembered, monitor, dpi);
+  workspace.RememberFloatingGeometry(hwnd, remembered, dpi);
   ++Diagnostics::g_runtime.counters.floatingGeometryRepairs;
   if (floatingLayoutMember && observation.result == PlacementResult::Success &&
       observation.placementIssued) {
@@ -170,7 +156,7 @@ static bool RepairFloatingGeometry(
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     center = hint.anchor;
   } else if (!centerInWorkspace && record->hasFloatingRect &&
-             ResolveRememberedFloatingMonitor(*record) == monitor) {
+             MonitorFromRect(&record->floatingRect, MONITOR_DEFAULTTONULL) == monitor) {
     center = SharedGeometry::RectCenter(record->floatingRect);
   } else {
     center = SharedGeometry::RectCenter(workArea);
@@ -193,7 +179,7 @@ static bool RepairFloatingGeometry(
   if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     return false;
   }
-  return PlaceFloatingWindow(workspace, hwnd, monitor, targetDpi, target, centerWithoutResize);
+  return PlaceFloatingWindow(workspace, hwnd, targetDpi, target, centerWithoutResize);
 }
 
 // Grows (direction > 0) or shrinks a floating window (a Floating-layout member
@@ -234,7 +220,7 @@ static bool StepFloatingWindowSize(
 
   const RECT target = SharedGeometry::ClampToArea(
       SharedGeometry::CenteredRect(SharedGeometry::RectCenter(current), newWidth, newHeight), workArea);
-  return PlaceFloatingWindow(workspace, hwnd, monitor, metrics.dpi, target, false);
+  return PlaceFloatingWindow(workspace, hwnd, metrics.dpi, target, false);
 }
 
 static bool RememberCurrentFloatingGeometry(
@@ -254,8 +240,7 @@ static bool RememberCurrentFloatingGeometry(
       frame.bottom <= frame.top) {
     return false;
   }
-  return workspace.RememberFloatingGeometry(
-      hwnd, frame, monitor, Platform::Monitors::GetMonitorEffectiveDpi(monitor));
+  return workspace.RememberFloatingGeometry(hwnd, frame, Platform::Monitors::GetMonitorEffectiveDpi(monitor));
 }
 
 // Entering the workspace-level Floating layout is a state restoration, not a

@@ -67,8 +67,7 @@ bool Workspace::Validate(
     }
     if (record.hasFloatingRect &&
         (record.floatingRect.right <= record.floatingRect.left ||
-         record.floatingRect.bottom <= record.floatingRect.top ||
-         !record.floatingMonitor || !record.floatingDpi)) {
+         record.floatingRect.bottom <= record.floatingRect.top || !record.floatingDpi)) {
       fail(L"remembered floating geometry is invalid", hwnd);
     }
     if (record.alwaysFloating && record.state != ManageState::Floating) {
@@ -332,7 +331,6 @@ WindowRecord& Workspace::UpsertRecord(WindowRecord record) {
   }
   if (!existing.hasFloatingRect) {
     existing.floatingRect = record.floatingRect;
-    existing.floatingMonitor = record.floatingMonitor;
     existing.floatingDpi = record.floatingDpi;
     existing.hasFloatingRect = record.hasFloatingRect;
   }
@@ -457,25 +455,18 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
   return true;
 }
 
-bool Workspace::RememberFloatingGeometry(
-    HWND hwnd, const RECT& frame, HMONITOR monitor, UINT dpi) {
+bool Workspace::RememberFloatingGeometry(HWND hwnd, const RECT& frame, UINT dpi) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::RememberFloatingGeometry");
   WindowRecord* record = FindMutable(hwnd);
-  if (!record || !monitor || frame.right <= frame.left ||
-      frame.bottom <= frame.top) {
-    return false;
-  }
+  if (!record || frame.right <= frame.left || frame.bottom <= frame.top) return false;
 
   const UINT normalizedDpi = dpi ? dpi : 96;
-  if (record->hasFloatingRect &&
-      EqualRect(&record->floatingRect, &frame) &&
-      record->floatingMonitor == monitor &&
+  if (record->hasFloatingRect && EqualRect(&record->floatingRect, &frame) &&
       record->floatingDpi == normalizedDpi) {
     return false;
   }
 
   record->floatingRect = frame;
-  record->floatingMonitor = monitor;
   record->floatingDpi = normalizedDpi;
   record->hasFloatingRect = true;
   DebugValidateMutation(L"Workspace::RememberFloatingGeometry");
@@ -967,7 +958,6 @@ void Workspace::MergeRememberedFloatingGeometryFrom(const Workspace& source) {
     WindowRecord* targetRecord = FindMutable(kv.first);
     if (!targetRecord) continue;
     targetRecord->floatingRect = sourceRecord.floatingRect;
-    targetRecord->floatingMonitor = sourceRecord.floatingMonitor;
     targetRecord->floatingDpi = sourceRecord.floatingDpi;
     targetRecord->hasFloatingRect = true;
   }
