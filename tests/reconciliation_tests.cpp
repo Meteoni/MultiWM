@@ -701,6 +701,58 @@ class FloatingWindowFixture {
   std::vector<HWND> created_;
 };
 
+// The overflow planner judges a destination by each member's cached size
+// limits and probes only the windows it has no usable report for: none cached,
+// cached at another DPI, or still settling into its slot. Real invisible test
+// windows on a fake desktop, planned through the new-desktop path so no other
+// window in the session is enumerated or probed. Nothing is placed or saved.
+static void RunOverflowDestinationProbeTests() {
+  CheckCounter check;
+  FloatingWindowFixture fixture(check);
+  const HWND cachedMember = fixture.hwnd;
+  const HWND unknownMember = fixture.CreateTestWindow(nullptr);
+  const HWND incomingWindow = fixture.CreateTestWindow(nullptr);
+  const UINT dpi = fixture.metrics.dpi;
+  auto record = [](HWND window, LONG minWidth, UINT constraintDpi, bool valid) {
+    WindowRecord result = FloatingWindowFixture::Record(window);
+    result.constraints.valid = valid;
+    result.constraints.minWidth = minWidth;
+    result.constraints.minHeight = 1;
+    result.constraints.dpi = constraintDpi;
+    return result;
+  };
+  const WindowRecord incoming = record(incomingWindow, 1, dpi, true);
+  // Plans `incoming` into a Columns workspace of two members: cachedMember,
+  // whose cached report says `cachedMinimum` wide at `cachedDpi` (the window
+  // itself accepts any reasonable width), and unknownMember with no report.
+  auto plan = [&](LONG cachedMinimum, UINT cachedDpi, bool settled, uint64_t* probes) {
+    Workspace initial;
+    initial.SetLayout(TileLayout::Columns);
+    initial.AdmitTiled(record(cachedMember, cachedMinimum, cachedDpi, true));
+    if (settled) initial.ClearInsertionPlacement(cachedMember);
+    initial.AdmitTiled(record(unknownMember, 1, dpi, false));
+    initial.ClearInsertionPlacement(unknownMember);
+    const uint64_t before = Diagnostics::g_runtime.counters.constraintProbeAttempts;
+    const auto destination = Reconcile::PlanOverflowDestination(
+        fixture.key, incoming, FloatingWindowFixture::Frame(incomingWindow), &initial);
+    *probes = Diagnostics::g_runtime.counters.constraintProbeAttempts - before;
+    return destination.has_value();
+  };
+
+  uint64_t probes = 0;
+  check(plan(1, dpi, true, &probes) && probes == 1,
+        "a settled member's cached limits are used; only the member without a report is probed");
+  check(plan(1, dpi, false, &probes) && probes == 2, "a member still settling into its slot is probed");
+  check(plan(1, dpi * 2, true, &probes) && probes == 2, "a report cached at another DPI is probed");
+  // A cached minimum as wide as the work area leaves no room for two more columns.
+  const LONG workAreaWide = Layout::RectWidth(fixture.workArea);
+  check(!plan(workAreaWide, dpi, true, &probes) && probes == 1,
+        "the destination is judged by the cached minimum, not a fresh probe");
+  check(plan(workAreaWide, dpi * 2, true, &probes) && probes == 2,
+        "a fresh probe replaces a minimum cached at another DPI");
+  std::printf("Passed %u overflow destination probe checks.\n", check.passed);
+}
+
 static bool IsCenteredIn(const RECT& rect, POINT center) {
   const POINT actual = SharedGeometry::RectCenter(rect);
   return std::abs(actual.x - center.x) <= 1 && std::abs(actual.y - center.y) <= 1;
@@ -1707,6 +1759,7 @@ int main() {
   RunRuleFloatedSizeTests();
   RunAppFrameRecordTests();
   RunHiddenArrivalTests();
+  RunOverflowDestinationProbeTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
   RunOverflowFloatPredictionTests();

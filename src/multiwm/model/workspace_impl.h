@@ -176,6 +176,19 @@ static WindowConstraints MergeConstraintProbeWithCache(
   return observed;
 }
 
+// `constraints` as reported at `dpi`: sizes scale with the DPI, minimums stay at
+// least 1 and maximums at least the minimum. Unchanged when already at `dpi`.
+static WindowConstraints RescaleConstraintsToDpi(WindowConstraints constraints, UINT dpi) {
+  if (constraints.dpi == dpi) return constraints;
+  const auto scale = [&](LONG value) { return MulDiv(value, dpi, constraints.dpi); };
+  constraints.minWidth = std::max<LONG>(1, scale(constraints.minWidth));
+  constraints.minHeight = std::max<LONG>(1, scale(constraints.minHeight));
+  if (constraints.maxWidth) constraints.maxWidth = std::max<LONG>(constraints.minWidth, scale(constraints.maxWidth));
+  if (constraints.maxHeight) constraints.maxHeight = std::max<LONG>(constraints.minHeight, scale(constraints.maxHeight));
+  constraints.dpi = dpi;
+  return constraints;
+}
+
 Workspace::PlacementAction Workspace::ApplyPlacementObservation(
     HWND hwnd, const PlacementObservation& observation) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::ApplyPlacementObservation");

@@ -205,43 +205,51 @@ static void PrepareRouteDestination(const InitialRouteAttempt& route, HWND foreg
   ScheduleLifecycleReconcile(nullptr);
 }
 
-// Processes one observed HWND: matches an initial-placement rule (once), then
-// moves the window to the rule's monitor and/or desktop. Updates the
-// pending/evaluated routing sets and may move the native window. Admission is
-// left to ordinary discovery at the destination. WM thread only.
-static void ProcessInitialWindowRoute(
-    HWND hwnd, HWND foregroundWindow, std::vector<HMONITOR>& monitors) {
+// Observes `hwnd` and finds (or creates, by matching rules) its pending
+// request, then decides where it goes. No value when there is nothing to do
+// now; the request is dropped when it no longer applies, or kept when the window
+// only has to settle first (not yet visible or restored). Adds the window's
+// monitors to `monitors`. Never moves a window. WM thread only.
+static std::optional<InitialRouteAttempt> BeginInitialRoute(HWND hwnd, std::vector<HMONITOR>& monitors) {
   // Explicit admission and user gestures override pending initial placement.
   if (Platform::Windows::IsWindowTrackedInAnyState(hwnd) || Gestures::IsMoveSizeGestureInProgress(hwnd)) {
     g_wm.routing.evaluated.insert(hwnd);
     g_wm.routing.pending.erase(hwnd);
-    return;
+    return std::nullopt;
   }
-  if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || !IsWindowEnabled(hwnd) || IsHungAppWindow(hwnd)) return;
+  if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || !IsWindowEnabled(hwnd) || IsHungAppWindow(hwnd)) {
+    return std::nullopt;
+  }
   if (!Platform::Windows::WindowCanBeManaged(hwnd, true)) {
     // Exclusion wins. Ineligible framework HWNDs may become eligible later.
     g_wm.routing.pending.erase(hwnd);
-    return;
+    return std::nullopt;
   }
   DWORD processId = 0;
   GUID sourceDesktop{};
   GetWindowThreadProcessId(hwnd, &processId);
   if (!processId || !Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &sourceDesktop) ||
-      IsEqualGUID(sourceDesktop, GUID_NULL)) return;
+      IsEqualGUID(sourceDesktop, GUID_NULL)) {
+    return std::nullopt;
+  }
 
   // 1. Find (or create, by matching rules) the pending request.
   if (!g_wm.routing.pending.count(hwnd) &&
-      !TryQueueInitialWindowRoute(hwnd, processId, sourceDesktop)) return;
+      !TryQueueInitialWindowRoute(hwnd, processId, sourceDesktop)) {
+    return std::nullopt;
+  }
   // Never retain map iterators or references across native calls.
   const auto pending = g_wm.routing.pending.find(hwnd);
-  if (pending == g_wm.routing.pending.end()) return;
+  if (pending == g_wm.routing.pending.end()) return std::nullopt;
   InitialRouteAttempt route{hwnd, processId, sourceDesktop, pending->second};
   if (route.request.processId != processId || !IsEqualGUID(route.request.sourceDesktop, sourceDesktop)) {
     g_wm.routing.pending.erase(hwnd);  // The app or user relocated it.
-    return;
+    return std::nullopt;
   }
   if (!Platform::VirtualDesktop::IsCurrentDesktop(sourceDesktop) ||
-      Platform::Windows::IsWindowCloaked(hwnd)) return;
+      Platform::Windows::IsWindowCloaked(hwnd)) {
+    return std::nullopt;
+  }
 
   // 2. Decide where it goes.
   route.sourceMonitor = Platform::Windows::GetWindowPhysicalMonitor(hwnd);
@@ -250,34 +258,45 @@ static void ProcessInitialWindowRoute(
   if (!route.targetMonitor) {
     Wh_Log(L"Initial placement monitor unavailable for HWND %p", hwnd);
     g_wm.routing.pending.erase(hwnd);
-    return;
+    return std::nullopt;
   }
   if (!route.ChangesDesktop() && !route.ChangesMonitor()) {
     // Already at its destination: normal suspended admission must still count
     // maximized windows, without waiting for an unnecessary physical move.
     g_wm.routing.pending.erase(hwnd);
-    return;
+    return std::nullopt;
   }
   const SuspensionReason suspensionReason = Platform::Windows::GetPhysicalSuspensionReason(hwnd);
   if (suspensionReason != SuspensionReason::None) {
     DeferSuspendedInitialRoute(route, suspensionReason);
-    return;
+    return std::nullopt;
   }
-  if (route.ChangesDesktop()) {
-    const RouteStep step = CheckRouteDesktopExists(route);
+  return route;
+}
+
+// Processes one observed HWND: matches an initial-placement rule (once), then
+// moves the window to the rule's monitor and/or desktop. Updates the
+// pending/evaluated routing sets and may move the native window. Admission is
+// left to ordinary discovery at the destination. WM thread only.
+static void ProcessInitialWindowRoute(
+    HWND hwnd, HWND foregroundWindow, std::vector<HMONITOR>& monitors) {
+  const std::optional<InitialRouteAttempt> begun = BeginInitialRoute(hwnd, monitors);
+  if (!begun) return;
+  const InitialRouteAttempt& route = *begun;
+  const DWORD processId = route.processId;
+  const GUID sourceDesktop = route.sourceDesktop;
+  // Continue keeps going; Retry keeps the request for a later pass; Abandon drops it.
+  auto proceed = [&](RouteStep step) {
     if (step == RouteStep::Abandon) g_wm.routing.pending.erase(hwnd);
-    if (step != RouteStep::Continue) return;
-  }
+    return step == RouteStep::Continue;
+  };
+  if (route.ChangesDesktop() && !proceed(CheckRouteDesktopExists(route))) return;
 
   // 3. Move it: monitor first (while still visible), then desktop.
   const std::optional<DWORD> inputTick = Platform::Input::LastInputTick();
   if (!inputTick || !IsInitialRouteStillValid(route)) return;
   RECT sourceFrame{};
-  if (route.ChangesMonitor()) {
-    const RouteStep step = MoveToRouteMonitor(route, &sourceFrame, monitors);
-    if (step == RouteStep::Abandon) g_wm.routing.pending.erase(hwnd);
-    if (step != RouteStep::Continue) return;
-  }
+  if (route.ChangesMonitor() && !proceed(MoveToRouteMonitor(route, &sourceFrame, monitors))) return;
   if (!IsInitialRouteStillValid(route)) return;
   if (route.ChangesDesktop() && !Platform::VirtualDesktop::MoveWindowToDesktop(
           hwnd, processId, sourceDesktop, route.request.targetDesktop,
@@ -421,55 +440,44 @@ static bool UpdateOverflowDesktopFollow(
   return waitForSwitch;
 }
 
+// The workspace a desktop that overflow created starts with on `key`: an
+// initialization rule's layout when one matches (`metadata` describes the new
+// desktop), else `inheritFrom`'s layout, master ratio and per-slot weights.
+static Workspace MakeOverflowDesktopWorkspace(
+    const DesktopMonitorKey& key, const Workspace& inheritFrom,
+    const Platform::VirtualDesktop::DesktopMetadata& metadata) {
+  int matchedRule = 0;
+  const TileLayout ruleLayout = ResolveInitialWorkspaceLayout(key, &matchedRule, &metadata);
+  if (!matchedRule) return inheritFrom.EmptyWithInheritedLayoutSettings();
+  Workspace selected;
+  selected.SetLayout(ruleLayout);
+  selected.SetMasterRatio(g_settings.masterPercent / 100.0);
+  return selected;
+}
+
 struct OverflowDestination {
   Workspace workspace;
   RECT frame{}; // Incoming window frame in physical screen pixels.
 };
 
-// Builds a trial destination using live observations on the WM thread.
-// Returns a complete candidate or no value; partial trials stay local. Native
-// queries may refresh platform caches, but never save or place windows. An
-// initial workspace denotes a new desktop; otherwise members are enumerated.
-static std::optional<OverflowDestination> PlanOverflowDestination(
-    const DesktopMonitorKey& key, const WindowRecord& incoming,
-    const RECT& sourceFrame, const Workspace* initial = nullptr) {
-  OverflowDestination destination;
-  const HWND hwnd = incoming.hwnd;
-  Workspace& trial = destination.workspace;
-  const HMONITOR monitor = key.ResolveMonitor();
-  Platform::Monitors::WorkspaceMetrics metrics;
-  if (!monitor || !Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) return std::nullopt;
-  if (initial) trial = *initial;
-  else if (!g_workspaces.Load(key, &trial)) trial = MakeDefaultWorkspace(key);
-  trial.Forget(hwnd);
-  if (trial.Layout() == TileLayout::Floating) {
-    if (!initial) return std::nullopt; // Another monitor must have room to tile.
-    WindowRecord record = incoming;
-    record.pendingInsertionPlacement = false;
-    trial.AdmitFloating(std::move(record));
-    destination.frame = sourceFrame;
-    return destination;
-  }
-  if (!incoming.constraints.valid || !incoming.constraints.dpi) return std::nullopt;
+// Brings a destination trial up to date with what its saved members are doing
+// now: forgets windows that are gone or have moved to another desktop or
+// monitor, and suspends or restores members as their physical state requires.
+// False when a desktop query fails, so the destination can't be judged.
+static bool RefreshOverflowTrialMembers(const DesktopMonitorKey& key, HMONITOR monitor, Workspace& trial) {
   const auto oldRecords = trial.Records();
   for (const auto& member : oldRecords) {
     GUID owner{};
     if (!Platform::Windows::IsSameLiveWindow(member.first, member.second.pid)) {
       trial.Forget(member.first);
     } else if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(member.first, &owner)) {
-      return std::nullopt;
+      return false;
     } else if (!IsEqualGUID(owner, key.desktopId) || Platform::Windows::GetWindowPhysicalMonitor(member.first) != monitor) {
       trial.Forget(member.first);
     } else {
-      SuspensionReason reason = Platform::Windows::GetPhysicalSuspensionReason(member.first);
-      if (reason == SuspensionReason::Maximized && !IsZoomed(member.first) &&
-          member.second.state == ManageState::Tiled) {
-        RECT authoritative{}, current{};
-        if (Placement::GetCurrentAuthoritativeTiledRect(key, trial, member.first, &authoritative) &&
-            Platform::Windows::GetWindowFrameRect(member.first, &current) && Layout::RectsNear(current, authoritative)) {
-          reason = SuspensionReason::None;
-        }
-      }
+      const SuspensionReason reason = EffectiveSuspensionReason(
+          key, trial, member.first, member.second.state,
+          Platform::Windows::GetPhysicalSuspensionReason(member.first));
       if (member.second.state == ManageState::Tiled && reason != SuspensionReason::None) {
         trial.Suspend(member.first, reason);
       } else if (member.second.state == ManageState::Suspended) {
@@ -478,15 +486,24 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
       }
     }
   }
+  return true;
+}
+
+// Adds to a destination trial the manageable windows on `monitor` and the
+// destination desktop that no workspace knows yet, as discovery would admit them
+// (rule-floated ones floating). Skips `incoming`. False, with the trial partly
+// filled, when a window can't be judged: a failed cloak or desktop query, or a
+// window another workspace still claims or an initial-placement rule will move.
+static bool ImportUntrackedDestinationWindows(
+    const DesktopMonitorKey& key, HMONITOR monitor, HWND incoming, Workspace& trial) {
   struct CandidateEnumeration {
     const DesktopMonitorKey* key;
     HMONITOR monitor;
     Workspace* trial;
     HWND incoming;
     bool complete = true;
-  } context{&key, monitor, &trial, hwnd};
-  ++Diagnostics::g_runtime.counters.enumWindowsPasses;
-  const BOOL enumerated = initial ? TRUE : EnumWindows([](HWND candidate, LPARAM parameter) WINAPI -> BOOL {
+  } context{&key, monitor, &trial, incoming};
+  const BOOL enumerated = EnumWindows([](HWND candidate, LPARAM parameter) WINAPI -> BOOL {
     ++Diagnostics::g_runtime.counters.enumWindowsVisited;
     auto& context = *reinterpret_cast<CandidateEnumeration*>(parameter);
     if (candidate == context.incoming || !IsWindowVisible(candidate) ||
@@ -521,31 +538,61 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
     }
     return TRUE;
   }, reinterpret_cast<LPARAM>(&context));
-  if (!enumerated || !context.complete) return std::nullopt;
+  return enumerated && context.complete;
+}
+
+// Builds a trial destination using live observations on the WM thread.
+// Returns a complete candidate or no value; partial trials stay local. Native
+// queries may refresh platform caches, but never save or place windows. An
+// initial workspace denotes a new desktop; otherwise members are enumerated.
+static std::optional<OverflowDestination> PlanOverflowDestination(
+    const DesktopMonitorKey& key, const WindowRecord& incoming,
+    const RECT& sourceFrame, const Workspace* initial = nullptr) {
+  OverflowDestination destination;
+  const HWND hwnd = incoming.hwnd;
+  Workspace& trial = destination.workspace;
+  const HMONITOR monitor = key.ResolveMonitor();
+  Platform::Monitors::WorkspaceMetrics metrics;
+  if (!monitor || !Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) return std::nullopt;
+  if (initial) trial = *initial;
+  else if (!g_workspaces.Load(key, &trial)) trial = MakeDefaultWorkspace(key);
+  trial.Forget(hwnd);
+  if (trial.Layout() == TileLayout::Floating) {
+    if (!initial) return std::nullopt; // Another monitor must have room to tile.
+    WindowRecord record = incoming;
+    record.pendingInsertionPlacement = false;
+    trial.AdmitFloating(std::move(record));
+    destination.frame = sourceFrame;
+    return destination;
+  }
+  if (!incoming.constraints.valid || !incoming.constraints.dpi) return std::nullopt;
+  if (!RefreshOverflowTrialMembers(key, monitor, trial)) return std::nullopt;
+  ++Diagnostics::g_runtime.counters.enumWindowsPasses;
+  if (!initial && !ImportUntrackedDestinationWindows(key, monitor, hwnd, trial)) return std::nullopt;
   trial.Forget(hwnd);
   const size_t limit = Placement::AutomaticWindowLimitForMonitor(key.monitor);
   if (limit && trial.VisibleWindowCount() >= limit) return std::nullopt;
   WindowRecord record = incoming;
   // Predict monitor-DPI constraints, then probe again after a physical move.
-  if (record.constraints.dpi != metrics.dpi) {
-    record.constraints.minWidth = std::max<LONG>(1, MulDiv(record.constraints.minWidth, metrics.dpi, record.constraints.dpi));
-    record.constraints.minHeight = std::max<LONG>(1, MulDiv(record.constraints.minHeight, metrics.dpi, record.constraints.dpi));
-    if (record.constraints.maxWidth) {
-      record.constraints.maxWidth = std::max<LONG>(
-          record.constraints.minWidth, MulDiv(record.constraints.maxWidth, metrics.dpi, record.constraints.dpi));
-    }
-    if (record.constraints.maxHeight) {
-      record.constraints.maxHeight = std::max<LONG>(
-          record.constraints.minHeight, MulDiv(record.constraints.maxHeight, metrics.dpi, record.constraints.dpi));
-    }
-    record.constraints.dpi = metrics.dpi;
-  }
+  record.constraints = Model::RescaleConstraintsToDpi(record.constraints, metrics.dpi);
   const HWND anchor = g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused
       ? trial.LastFocusedTiledWindow() : nullptr;
   if (anchor) trial.AdmitTiledAfter(std::move(record), anchor);
   else trial.AdmitTiled(std::move(record));
+  // Members' size limits, by the rule arrangement uses: the cached report,
+  // unless there is none, it was taken at another DPI, or the window is still
+  // settling into its slot. Windows imported above are unknown to MultiWM and
+  // always probed. A probe can wait up to 40 ms on a busy app, and this plan
+  // runs up to four times per destination. A minimum raised since it was cached
+  // shows up when the destination places the window, and constraint recovery
+  // then routes on whichever window no longer fits.
   for (HWND member : trial.TiledWindows()) {
     if (member == hwnd) continue;
+    const WindowRecord* cached = trial.Find(member);
+    if (cached && cached->constraints.valid && cached->constraints.dpi == metrics.dpi &&
+        !cached->pendingInsertionPlacement) {
+      continue;
+    }
     const WindowConstraints constraints = Platform::Windows::ProbeWindowConstraints(member);
     if (!constraints.valid) return std::nullopt;
     trial.UpdateConstraints(member, constraints);
@@ -559,19 +606,15 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
     return true;
   };
   if (fits(trial)) return destination;
+  // Otherwise the nearest slot that fits, as admission recovery searches.
   const Workspace preferred = trial;
-  const size_t preferredIndex = preferred.TiledIndex(hwnd);
-  for (size_t offset = 1; offset < preferred.ActiveCount(); ++offset) {
-    for (int direction : {-1, 1}) {
-      const long long index = static_cast<long long>(preferredIndex) + direction * static_cast<long long>(offset);
-      if (index < 0 || static_cast<size_t>(index) >= preferred.ActiveCount()) continue;
-      Workspace alternative = preferred;
-      if (alternative.MovePendingAdmissionToIndex(hwnd, static_cast<size_t>(index)) && fits(alternative)) {
-        trial = std::move(alternative);
-        return destination;
-      }
-    }
-  }
+  const bool moved = Layout::TryNearbyIndices(preferred.TiledIndex(hwnd), preferred.ActiveCount(), [&](size_t index) {
+    Workspace alternative = preferred;
+    if (!alternative.MovePendingAdmissionToIndex(hwnd, index) || !fits(alternative)) return false;
+    trial = std::move(alternative);
+    return true;
+  });
+  if (moved) return destination;
   return std::nullopt;
 }
 
@@ -583,7 +626,7 @@ struct OverflowBatch {
   GUID desktop{};
   bool desktopKnown = false;
   HWND foreground = nullptr;
-  LASTINPUTINFO input{sizeof(LASTINPUTINFO)};
+  DWORD inputTick = 0;  // Last user input when the batch started; 0 if unknown.
 };
 
 struct OverflowSource {
@@ -598,6 +641,44 @@ struct OverflowRequestResult {
   OverflowOutcome outcome;
   PendingDesktopFollow follow{};
 };
+
+// The last check before an overflow move is committed: the window is still the
+// same live, queued, restored window, now on `desktop` and `monitor`, and the
+// user is still on the source desktop. The user acting on the foreground window
+// since the batch started cancels its move; for other windows only a failed
+// input query does.
+static bool OverflowMoveStillWanted(const PendingWindowOverflow& request, const OverflowBatch& batch,
+                                    const GUID& desktop, HMONITOR monitor) {
+  const HWND hwnd = request.hwnd;
+  return Platform::Windows::IsSameLiveWindow(hwnd, request.processId) &&
+         g_wm.overflow.windows.count(hwnd) && !Gestures::IsMoveSizeGestureInProgress(hwnd) &&
+         Platform::Windows::GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
+         (hwnd == batch.foreground ? Platform::Input::NoInputSince(batch.inputTick)
+                                   : Platform::Input::LastInputTick().has_value()) &&
+         Platform::VirtualDesktop::IsCurrentDesktop(request.sourceDesktop) &&
+         Platform::VirtualDesktop::IsWindowOnDesktop(hwnd, desktop) &&
+         Platform::Windows::GetWindowPhysicalMonitor(hwnd) == monitor;
+}
+
+// A desktop overflow just created gets a workspace on each other connected
+// monitor that has none yet, inheriting that monitor's source-desktop layout
+// unless an initialization rule matches (`metadata` describes the new desktop).
+static void SeedOverflowDesktopOnOtherMonitors(
+    const GUID& desktop, const GUID& sourceDesktop, HMONITOR targetMonitor,
+    const Platform::VirtualDesktop::DesktopMetadata& metadata) {
+  std::vector<HMONITOR> connected;
+  EnumerateCurrentMonitors(connected);
+  for (HMONITOR otherMonitor : connected) {
+    DesktopMonitorKey otherKey{}, otherSourceKey{};
+    Workspace otherSource;
+    if (otherMonitor == targetMonitor ||
+        !DesktopMonitorKey::FromHMonitor(desktop, otherMonitor, &otherKey) ||
+        g_workspaces.Contains(otherKey) ||
+        !DesktopMonitorKey::FromHMonitor(sourceDesktop, otherMonitor, &otherSourceKey)) continue;
+    if (!g_workspaces.Load(otherSourceKey, &otherSource)) otherSource = MakeDefaultWorkspace(otherSourceKey);
+    g_workspaces.Save(otherKey, MakeOverflowDesktopWorkspace(otherKey, otherSource, metadata));
+  }
+}
 
 // WM thread only. Plans and commits one destination, with native checks repeated
 // after application/shell calls. Failed moves may repair ownership or roll back;
@@ -614,15 +695,7 @@ static OverflowRequestResult TryCommitOverflowDestination(
   Workspace initial;
   Platform::VirtualDesktop::DesktopMetadata metadata;
   auto resolveOverflowLayout = [&](const DesktopMonitorKey& key) {
-    int matchedRule = 0;
-    const TileLayout ruleLayout = ResolveInitialWorkspaceLayout(key, &matchedRule, &metadata);
-    if (matchedRule) {
-      Workspace selected;
-      selected.SetLayout(ruleLayout);
-      selected.SetMasterRatio(g_settings.masterPercent / 100.0);
-      return selected;
-    }
-    return source.workspace.EmptyWithInheritedLayoutSettings();
+    return MakeOverflowDesktopWorkspace(key, source.workspace, metadata);
   };
   if (createDesktop) {
     std::vector<GUID> order;
@@ -641,13 +714,25 @@ static OverflowRequestResult TryCommitOverflowDestination(
   auto canMoveIncoming = [&] {
     const std::optional<DWORD> liveTick = Platform::Input::LastInputTick();
     return liveTick &&
-        (hwnd != batch.foreground || (GetForegroundWindow() == hwnd && *liveTick == batch.input.dwTime)) &&
+        (hwnd != batch.foreground || (GetForegroundWindow() == hwnd && *liveTick == batch.inputTick)) &&
         Platform::Windows::IsSameLiveWindow(hwnd, processId) && g_wm.overflow.windows.count(hwnd) &&
         Platform::VirtualDesktop::IsCurrentDesktop(request.sourceDesktop) &&
         Platform::VirtualDesktop::IsWindowOnDesktop(hwnd, request.sourceDesktop) &&
         Platform::Windows::GetWindowPhysicalMonitor(hwnd) == source.monitor &&
         !Gestures::IsMoveSizeGestureInProgress(hwnd) && !Platform::Windows::IsWindowCloaked(hwnd) &&
         Platform::Windows::GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None;
+  };
+  // Failure exits once a native move may have started. Rolling back returns the
+  // window to its source desktop and monitor when the user hasn't acted since;
+  // repairing ownership instead follows wherever the window ended up.
+  auto rollBackAndFail = [&]() -> OverflowRequestResult {
+    RollbackOverflowMove({hwnd, processId, request.sourceDesktop, desktop, source.frame, 0, batch.inputTick});
+    return {OverflowOutcome::Failed};
+  };
+  auto repairOwnershipAndFail = [&]() -> OverflowRequestResult {
+    ReconcileOverflowWindowOwnership(hwnd);
+    if (createDesktop) Platform::VirtualDesktop::RemoveEmptyOverflowDesktop(createdDesktop, request.sourceDesktop);
+    return {OverflowOutcome::Failed};
   };
   if (!canMoveIncoming()) return {OverflowOutcome::Retry};
   if (createDesktop) {
@@ -686,29 +771,24 @@ static OverflowRequestResult TryCommitOverflowDestination(
       moveAccepted = destination.has_value();
     }
     if (!moveAccepted) {
-      RollbackOverflowMove({hwnd, processId, request.sourceDesktop, desktop, source.frame, 0, batch.input.dwTime});
-      return {OverflowOutcome::Failed};
+      return rollBackAndFail();
     }
   }
   const bool differentDesktop = !IsEqualGUID(desktop, request.sourceDesktop);
   if (differentDesktop && !Platform::VirtualDesktop::MoveWindowToDesktop(
           hwnd, processId, request.sourceDesktop, desktop)) {
-    RollbackOverflowMove({hwnd, processId, request.sourceDesktop, desktop, source.frame, 0, batch.input.dwTime});
-    return {OverflowOutcome::Failed};
+    return rollBackAndFail();
   }
   if (!Platform::VirtualDesktop::IsWindowOnDesktop(hwnd, desktop) ||
       Platform::Windows::GetWindowPhysicalMonitor(hwnd) != monitor) {
-    RollbackOverflowMove({hwnd, processId, request.sourceDesktop, desktop, source.frame, 0, batch.input.dwTime});
-    return {OverflowOutcome::Failed};
+    return rollBackAndFail();
   }
   const bool sourceLoaded = g_workspaces.Load(source.key, &source.workspace);
   const WindowRecord* liveRecord = sourceLoaded ? source.workspace.Find(hwnd) : nullptr;
   if (!liveRecord || liveRecord->pid != processId ||
       liveRecord->tilingGeneration != request.tilingGeneration ||
       !g_wm.overflow.windows.count(hwnd)) {
-    ReconcileOverflowWindowOwnership(hwnd);
-    if (createDesktop) Platform::VirtualDesktop::RemoveEmptyOverflowDesktop(createdDesktop, request.sourceDesktop);
-    return {OverflowOutcome::Failed};
+    return repairOwnershipAndFail();
   }
   // Destination membership can change during the native calls. Repeat the
   // proof after movement; a new conflict rolls back only this incoming HWND.
@@ -724,52 +804,18 @@ static OverflowRequestResult TryCommitOverflowDestination(
     destinationStillFits = destination.has_value();
   }
   if (!destinationStillFits) {
-    RollbackOverflowMove({hwnd, processId, request.sourceDesktop, desktop, source.frame, 0, batch.input.dwTime});
-    return {OverflowOutcome::Failed};
+    return rollBackAndFail();
   }
-  LASTINPUTINFO finalInput{sizeof(finalInput)};
-  if (!Platform::Windows::IsSameLiveWindow(hwnd, processId) ||
-      !g_wm.overflow.windows.count(hwnd) || Gestures::IsMoveSizeGestureInProgress(hwnd) ||
-      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      !GetLastInputInfo(&finalInput) ||
-      (hwnd == batch.foreground && finalInput.dwTime != batch.input.dwTime) ||
-      !Platform::VirtualDesktop::IsCurrentDesktop(request.sourceDesktop) ||
-      !Platform::VirtualDesktop::IsWindowOnDesktop(hwnd, desktop) ||
-      Platform::Windows::GetWindowPhysicalMonitor(hwnd) != monitor) {
-    ReconcileOverflowWindowOwnership(hwnd);
-    if (createDesktop) Platform::VirtualDesktop::RemoveEmptyOverflowDesktop(createdDesktop, request.sourceDesktop);
-    return {OverflowOutcome::Failed};
-  }
+  if (!OverflowMoveStillWanted(request, batch, desktop, monitor)) return repairOwnershipAndFail();
   source.workspace.Forget(hwnd);
   g_workspaces.Save(source.key, source.workspace);
   g_workspaces.Save(targetKey, destination->workspace);
-  if (createDesktop) {
-    std::vector<HMONITOR> connected;
-    EnumerateCurrentMonitors(connected);
-    for (HMONITOR otherMonitor : connected) {
-      DesktopMonitorKey otherKey{}, otherSourceKey{};
-      Workspace existing, otherSource;
-      if (otherMonitor == monitor ||
-          !DesktopMonitorKey::FromHMonitor(desktop, otherMonitor, &otherKey) ||
-          g_workspaces.Load(otherKey, &existing) ||
-          !DesktopMonitorKey::FromHMonitor(request.sourceDesktop, otherMonitor, &otherSourceKey)) continue;
-      if (!g_workspaces.Load(otherSourceKey, &otherSource)) otherSource = MakeDefaultWorkspace(otherSourceKey);
-      int matchedRule = 0;
-      const TileLayout ruleLayout = ResolveInitialWorkspaceLayout(otherKey, &matchedRule, &metadata);
-      Workspace inherited = otherSource.EmptyWithInheritedLayoutSettings();
-      if (matchedRule) {
-        inherited = Workspace{};
-        inherited.SetLayout(ruleLayout);
-        inherited.SetMasterRatio(g_settings.masterPercent / 100.0);
-      }
-      g_workspaces.Save(otherKey, inherited);
-    }
-  }
+  if (createDesktop) SeedOverflowDesktopOnOtherMonitors(desktop, request.sourceDesktop, monitor, metadata);
   AddPendingWorkspaceArrange(desktop, monitor);
   if (!differentDesktop) Placement::ArrangeWorkspace(targetKey);
   OverflowRequestResult result{OverflowOutcome::Placed};
   if (differentDesktop && hwnd == batch.foreground) {
-    result.follow = {hwnd, processId, request.sourceDesktop, desktop, source.frame, GetTickCount64() + kOverflowFollowTimeoutMs, batch.input.dwTime};
+    result.follow = {hwnd, processId, request.sourceDesktop, desktop, source.frame, GetTickCount64() + kOverflowFollowTimeoutMs, batch.inputTick};
   }
   Diagnostics::RecordEvent(L"overflow placed hwnd=%p targetDesktop=%08X monitorId=%ls", hwnd, desktop.Data1, targetKey.monitor.deviceId.c_str());
   return result;
@@ -897,7 +943,7 @@ static void ProcessWindowOverflow() {
   std::vector<PendingWindowOverflow> pending;
   pending.swap(g_wm.overflow.queue);
   batch.foreground = GetForegroundWindow();
-  GetLastInputInfo(&batch.input);
+  batch.inputTick = Platform::Input::LastInputTick().value_or(0);
   PendingDesktopFollow follow{};
   for (PendingWindowOverflow request : pending) {
     const auto result = ProcessOverflowRequest(request, batch);
@@ -908,9 +954,7 @@ static void ProcessWindowOverflow() {
   }
 
   if (follow.hwnd) {
-    LASTINPUTINFO liveInput{sizeof(liveInput)};
-    GetLastInputInfo(&liveInput);
-    if (liveInput.dwTime == follow.inputTickMs && IsWindow(follow.hwnd) &&
+    if (Platform::Input::NoInputSince(follow.inputTickMs) && IsWindow(follow.hwnd) &&
         g_wm.overflow.windows.count(follow.hwnd) &&
         Platform::VirtualDesktop::IsCurrentDesktop(follow.sourceDesktop)) {
       if (Platform::VirtualDesktop::SwitchToDesktop(follow.hwnd, follow.processId, follow.targetDesktop, follow.sourceDesktop, follow.inputTickMs)) {
@@ -920,8 +964,7 @@ static void ProcessWindowOverflow() {
         waitForSwitch = true;
         ScheduleLifecycleReconcile(nullptr);
       } else {
-        GetLastInputInfo(&liveInput);
-        if (liveInput.dwTime == follow.inputTickMs &&
+        if (Platform::Input::NoInputSince(follow.inputTickMs) &&
             Platform::VirtualDesktop::IsCurrentDesktop(follow.sourceDesktop)) RollbackOverflowMove(follow);
       }
     }
