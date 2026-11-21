@@ -380,13 +380,12 @@ static bool EnsureWorkspaceFromSnapshot(
   return true;
 }
 
+// Forgets a destroyed (or, in Manual mode, minimized) window in every workspace
+// that knows it, then arranges the workspaces it left.
 static void ForgetManagedWindow(HWND hwnd) {
-  Placement::CancelConformanceLease(hwnd);
-  g_workspaces.UpdateEach(
-      g_workspaces.OwnersOf(hwnd),
-      [&](const DesktopMonitorKey&, Workspace& workspace) { return workspace.Forget(hwnd); },
-      [](const DesktopMonitorKey& key) { Placement::ArrangeWorkspace(key); });
-  Gestures::ClearMoveSizeSamples(hwnd);
+  std::vector<DesktopMonitorKey> changedKeys;
+  ForgetWindowFromOwners(hwnd, g_workspaces.OwnersOf(hwnd), &changedKeys);
+  for (const auto& key : changedKeys) Placement::ArrangeWorkspace(key);
 }
 
 static void AddUniqueWorkspaceKey(
@@ -600,6 +599,26 @@ static bool AwaitsDesktopOwnership(HWND hwnd, const DesktopMonitorKey& ownerKey)
   return IsEqualGUID(desktopId, GUID_NULL) || !IsEqualGUID(desktopId, ownerKey.desktopId);
 }
 
+// The suspension reason that applies to `hwnd`, a member of `workspace` in
+// `state`, given its physical one. A borderless tile can legitimately cover the
+// monitor when the configured work area has no visible insets or gaps: a tiled
+// window that only looks fullscreen because it sits exactly on its own tile is
+// not maximized. Native queries; plans `workspace` without changing it.
+static SuspensionReason EffectiveSuspensionReason(
+    const DesktopMonitorKey& key, const Workspace& workspace, HWND hwnd, ManageState state,
+    SuspensionReason physicalReason) {
+  if (physicalReason != SuspensionReason::Maximized || IsZoomed(hwnd) || state != ManageState::Tiled) {
+    return physicalReason;
+  }
+  RECT authoritative{};
+  RECT current{};
+  if (Placement::GetCurrentAuthoritativeTiledRect(key, workspace, hwnd, &authoritative) &&
+      Platform::Windows::GetWindowFrameRect(hwnd, &current) && Layout::RectsNear(current, authoritative)) {
+    return SuspensionReason::None;
+  }
+  return physicalReason;
+}
+
 static void ReconcileWindowParticipation(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
@@ -621,21 +640,8 @@ static void ReconcileWindowParticipation(
     const WindowRecord* record = workspace.Find(hwnd);
     if (!record) continue;
 
-    SuspensionReason reason = physicalReason;
-    if (reason == SuspensionReason::Maximized && !IsZoomed(hwnd) &&
-        record->state == ManageState::Tiled) {
-      // A borderless tile can legitimately cover the monitor when the configured
-      // work area has no visible insets/gaps. If it already occupies its exact
-      // authoritative tile, don't mistake that geometry for fullscreen.
-      RECT authoritative{};
-      RECT current{};
-      if (Placement::GetCurrentAuthoritativeTiledRect(
-              ownerKey, workspace, hwnd, &authoritative) &&
-          Platform::Windows::GetWindowFrameRect(hwnd, &current) &&
-          Layout::RectsNear(current, authoritative)) {
-        reason = SuspensionReason::None;
-      }
-    }
+    const SuspensionReason reason =
+        EffectiveSuspensionReason(ownerKey, workspace, hwnd, record->state, physicalReason);
 
     bool changed = false;
     bool restoredIntoFloatingLayout = false;

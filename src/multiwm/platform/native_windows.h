@@ -53,17 +53,6 @@ static inline long long WindowAreaOnWorkArea(HWND hwnd, const RECT& workArea) {
 
 constexpr UINT kConstraintProbeTimeoutMs = 40;
 
-static int GetSystemMetricForDpiCompat(int index, UINT dpi) {
-  using GetSystemMetricsForDpiFn = int(WINAPI*)(int, UINT);
-  static GetSystemMetricsForDpiFn fn = [] {
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    return user32
-        ? reinterpret_cast<GetSystemMetricsForDpiFn>(
-              GetProcAddress(user32, "GetSystemMetricsForDpi"))
-        : nullptr;
-  }();
-  return fn ? fn(index, dpi ? dpi : 96) : GetSystemMetrics(index);
-}
 
 static void GetFrameDecorationSpan(
     HWND hwnd, LONG* outWidth, LONG* outHeight) {
@@ -116,20 +105,10 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
   // per-monitor-aware window both DPIs are equal and nothing is scaled.
   const UINT reportedWindowDpi = GetDpiForWindow(hwnd);
   const UINT windowDpi = reportedWindowDpi ? reportedWindowDpi : constraints.dpi;
-  const LONG defaultMinWidth = std::max<LONG>(
-      1, GetSystemMetricForDpiCompat(SM_CXMINTRACK, windowDpi));
-  const LONG defaultMinHeight = std::max<LONG>(
-      1, GetSystemMetricForDpiCompat(SM_CYMINTRACK, windowDpi));
-  const LONG defaultMaxWidth = std::max<LONG>(
-      defaultMinWidth,
-      GetSystemMetricForDpiCompat(SM_CXMAXTRACK, windowDpi));
-  const LONG defaultMaxHeight = std::max<LONG>(
-      defaultMinHeight,
-      GetSystemMetricForDpiCompat(SM_CYMAXTRACK, windowDpi));
-
+  const SharedGeometry::TrackingDefaults defaults = SharedGeometry::DefaultTrackingLimits(windowDpi);
   MINMAXINFO mmi{};
-  mmi.ptMinTrackSize = {defaultMinWidth, defaultMinHeight};
-  mmi.ptMaxTrackSize = {defaultMaxWidth, defaultMaxHeight};
+  mmi.ptMinTrackSize = defaults.minimum;
+  mmi.ptMaxTrackSize = defaults.maximum;
 
   DWORD_PTR result = 0;
   SetLastError(ERROR_SUCCESS);
@@ -162,8 +141,7 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
       hwnd, &decorationWidth, &decorationHeight);
 
   const auto frame = SharedGeometry::TrackingLimitsToFrame(
-      mmi, {defaultMinWidth, defaultMinHeight}, {defaultMaxWidth, defaultMaxHeight},
-      windowDpi, constraints.dpi, decorationWidth, decorationHeight);
+      mmi, defaults.minimum, defaults.maximum, windowDpi, constraints.dpi, decorationWidth, decorationHeight);
   constraints.minWidth = frame.minWidth;
   constraints.minHeight = frame.minHeight;
   constraints.maxWidth = frame.maxWidth;
@@ -422,11 +400,19 @@ static std::wstring GetWindowProcessName(HWND hwnd) {
 // The first configured rule with `treatment` that matches `hwnd`, or nullptr.
 // The matching itself is shared with the companion mod (shared/window_rules.h),
 // so both mods classify a window the same way.
+// This overload takes the window's facts: reuse one LazyWindowFacts for several
+// treatments of the same window so its class, title and process name (which can
+// cost an OpenProcess) are each read at most once.
+static const WindowRule* FindMatchingWindowRule(
+    SharedRules::LazyWindowFacts& facts, WindowRuleTreatment treatment) {
+  if (!facts.Window() || g_settings.windowRules.empty()) return nullptr;
+  return SharedRules::FindFirstMatchingRule(g_settings.windowRules, treatment, facts);
+}
+
 static const WindowRule* FindMatchingWindowRule(
     HWND hwnd, WindowRuleTreatment treatment) {
-  if (!hwnd || g_settings.windowRules.empty()) return nullptr;
   SharedRules::LazyWindowFacts facts(hwnd, GetWindowProcessName);
-  return SharedRules::FindFirstMatchingRule(g_settings.windowRules, treatment, facts);
+  return FindMatchingWindowRule(facts, treatment);
 }
 
 // Discovery waits for initial placement before assigning workspace ownership. Explicit
@@ -452,11 +438,15 @@ static bool ShouldWindowAlwaysFloat(HWND hwnd) {
              hwnd, WindowRuleTreatment::AlwaysFloating) != nullptr;
 }
 
-static bool ShouldWindowStartFloating(HWND hwnd, bool* alwaysFloating = nullptr) {
-  const bool always = ShouldWindowAlwaysFloat(hwnd);
+static bool ShouldWindowStartFloating(SharedRules::LazyWindowFacts& facts, bool* alwaysFloating) {
+  const bool always = FindMatchingWindowRule(facts, WindowRuleTreatment::AlwaysFloating) != nullptr;
   if (alwaysFloating) *alwaysFloating = always;
-  return always || FindMatchingWindowRule(
-                       hwnd, WindowRuleTreatment::DefaultToFloating) != nullptr;
+  return always || FindMatchingWindowRule(facts, WindowRuleTreatment::DefaultToFloating) != nullptr;
+}
+
+static bool ShouldWindowStartFloating(HWND hwnd, bool* alwaysFloating = nullptr) {
+  SharedRules::LazyWindowFacts facts(hwnd, GetWindowProcessName);
+  return ShouldWindowStartFloating(facts, alwaysFloating);
 }
 
 // Applies stable structural and exclusion policy only; visibility, show state,
@@ -469,6 +459,7 @@ static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize) {
   // rules. Process-name exclusions can require OpenProcess/QueryFullProcessImageName,
   // so there is no reason to pay that cost for tool/owned/child windows.
   if (SharedRules::RejectNonTopLevel(hwnd)) return false;
+  SharedRules::LazyWindowFacts facts(hwnd, GetWindowProcessName);
 
   // window could temporarily lose its WS_SizeBox.
   // (example: Office save/discard dialog)
@@ -478,13 +469,12 @@ static bool WindowCanBeManaged(HWND hwnd, bool allowFixedSize) {
   if (!allowFixedSize && !(GetWindowLongPtr(hwnd, GWL_STYLE) & WS_SIZEBOX) &&
       !IsWindowTrackedInAnyState(hwnd)) {
     bool alwaysFloating = false;
-    const bool startsFloating =
-        ShouldWindowStartFloating(hwnd, &alwaysFloating);
+    const bool startsFloating = ShouldWindowStartFloating(facts, &alwaysFloating);
     if (!alwaysFloating && !(RuntimeLifecycle::IsAutomaticMode() && startsFloating)) return false;
   }
 
   if (SharedRules::RejectToolOrShellWindow(hwnd)) return false;
-  return !IsWindowExcludedByRules(hwnd);
+  return !FindMatchingWindowRule(facts, WindowRuleTreatment::Exclude);
 }
 
 // Returns the monitor on which an HWND can actively participate right now.

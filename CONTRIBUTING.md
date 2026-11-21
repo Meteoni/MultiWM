@@ -133,9 +133,17 @@ complexity checks. A complexity score above 25, more than 120 lines, or nesting
 past 4 is a review prompt. Existing routines can exceed these values while a
 focused refactor is in progress. The checks introduce no naming or ABI rewrites.
 
-Enable clang-tidy diagnostics in clangd, or run `clang-tidy -p <build-directory>
-src/multiwm/multiwm.cpp` with a compilation database containing the Windhawk flags.
-WHAM's generated `.clangd` supplies the editor's compiler configuration.
+Enable clang-tidy diagnostics in clangd (WHAM's generated `.clangd` supplies the
+editor's compiler configuration), or list every function over the thresholds with:
+
+```powershell
+./tests/tidy.ps1 -CompilerRoot 'C:/path/to/Windhawk/Compiler'
+```
+
+The Windhawk compiler ships no clang-tidy; the script uses one from `PATH` or the
+one bundled with the VS Code C/C++ extension (or pass `-ClangTidy`), and parses
+both mods with the compiler's own headers. Use `-Mod multiwm` or `-Mod companion`
+for one mod.
 See the [clang-tidy check documentation](https://clang.llvm.org/extra/clang-tidy/checks/readability/function-cognitive-complexity.html)
 for how branching and nesting contribute to the score.
 

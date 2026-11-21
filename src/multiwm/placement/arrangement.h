@@ -177,52 +177,52 @@ static bool RestorePendingAdmissionRecoveryAfterSuspension(
   return true;
 }
 
-static void ShowWindowConstraintConflict(
-    const Workspace& workspace, const std::vector<RECT>& rects,
-    HWND fallback, HMONITOR monitor) {
+// The tiled windows (by index) a constraint conflict involves: those below their
+// minimum in `rects`. In Dwindle, when no assignment of windows to slots fits,
+// also every window competing for the slots an unmatched window could use, even
+// one that fits where it is (it may hold the only slot another window fits).
+static std::vector<bool> FindConflictingWindows(const Workspace& workspace, const std::vector<RECT>& rects) {
   const auto constraints = Layout::ActiveWindowConstraints(workspace);
-  const Layout::ConstraintSlotCompatibility compatibility =
-      Layout::BuildConstraintSlotCompatibility(constraints, rects, false);
   std::vector<bool> involved(constraints.size(), false);
   for (size_t i = 0; i < constraints.size(); ++i) {
-    involved[i] = i < rects.size() &&
-        !Layout::WindowConstraintFitsSlot(constraints[i], rects[i]);
+    involved[i] = i < rects.size() && !Layout::WindowConstraintFitsSlot(constraints[i], rects[i]);
   }
-  // A failed matching identifies groups competing for too few slots. Follow
-  // alternating paths from unmatched windows to include the other blockers,
-  // even when they currently fit (e.g. Pixeval already occupies the only slot).
-  if (workspace.Layout() == TileLayout::Dwindle &&
-      rects.size() == constraints.size()) {
-    std::vector<size_t> owner(rects.size(), Layout::kUnassignedSlot);
-    std::vector<bool> fixed(constraints.size(), false);
-    std::vector<size_t> unmatched;
-    for (size_t window = 0; window < constraints.size(); ++window) {
-      std::vector<bool> visited(rects.size(), false);
-      if (!Layout::TryAssignConstraintWindow(
-              window, compatibility, &owner, fixed, &visited, false)) {
-        unmatched.push_back(window);
-      }
-    }
-    if (!unmatched.empty()) {
-      involved.assign(constraints.size(), false);
-      auto include = [&](auto&& self, size_t member) -> void {
-        if (member >= involved.size() || involved[member]) return;
-        involved[member] = true;
-        for (size_t slot : compatibility.slotsByWindow[member]) {
-          if (slot < owner.size() && owner[slot] != Layout::kUnassignedSlot) {
-            self(self, owner[slot]);
-          }
-        }
-      };
-      for (size_t window : unmatched) include(include, window);
+  if (workspace.Layout() != TileLayout::Dwindle || rects.size() != constraints.size()) return involved;
+
+  const Layout::ConstraintSlotCompatibility compatibility =
+      Layout::BuildConstraintSlotCompatibility(constraints, rects, false);
+  std::vector<size_t> owner(rects.size(), Layout::kUnassignedSlot);
+  const std::vector<bool> fixed(constraints.size(), false);
+  std::vector<size_t> unmatched;
+  for (size_t window = 0; window < constraints.size(); ++window) {
+    std::vector<bool> visited(rects.size(), false);
+    if (!Layout::TryAssignConstraintWindow(window, compatibility, &owner, fixed, &visited, false)) {
+      unmatched.push_back(window);
     }
   }
-  // The process file name without ".exe", or empty when it can't be read.
+  if (unmatched.empty()) return involved;
+
+  // Follow alternating paths from the unmatched windows to the other blockers.
+  involved.assign(constraints.size(), false);
+  auto include = [&](auto&& self, size_t member) -> void {
+    if (member >= involved.size() || involved[member]) return;
+    involved[member] = true;
+    for (size_t slot : compatibility.slotsByWindow[member]) {
+      if (slot < owner.size() && owner[slot] != Layout::kUnassignedSlot) self(self, owner[slot]);
+    }
+  };
+  for (size_t window : unmatched) include(include, window);
+  return involved;
+}
+
+// "Firefox needs more space", "Firefox and Code need more space in this layout".
+// Names are process names without ".exe", once each; `fallback` names the window
+// to blame when none of `involved` can be named.
+static std::wstring ConstraintConflictMessage(
+    const Workspace& workspace, const std::vector<bool>& involved, HWND fallback) {
   auto processDisplayName = [](HWND hwnd) {
     std::wstring name = Platform::Windows::GetWindowProcessName(hwnd);
-    if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0) {
-      name.resize(name.size() - 4);
-    }
+    if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0) name.resize(name.size() - 4);
     return name;
   };
   std::vector<std::wstring> names;
@@ -230,8 +230,7 @@ static void ShowWindowConstraintConflict(
     if (!involved[i]) continue;
     std::wstring name = processDisplayName(workspace.TiledWindows()[i]);
     if (name.empty()) name = L"A window";
-    if (std::find(names.begin(), names.end(), name) == names.end())
-      names.push_back(std::move(name));
+    if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(std::move(name));
   }
   if (names.empty() && fallback) {
     std::wstring name = processDisplayName(fallback);
@@ -243,8 +242,16 @@ static void ShowWindowConstraintConflict(
     message += names[i];
   }
   if (names.empty()) message = L"A window";
-  message += names.size() > 1
-      ? L" need more space in this layout" : L" needs more space";
+  message += names.size() > 1 ? L" need more space in this layout" : L" needs more space";
+  return message;
+}
+
+// Tells the user which windows don't fit `rects`, the rejected plan.
+static void ShowWindowConstraintConflict(
+    const Workspace& workspace, const std::vector<RECT>& rects,
+    HWND fallback, HMONITOR monitor) {
+  const std::wstring message =
+      ConstraintConflictMessage(workspace, FindConflictingWindows(workspace, rects), fallback);
   TrayUi::ShowCommandFailureFlyout(message.c_str(), monitor);
 }
 
@@ -311,7 +318,6 @@ static bool TryRollbackPendingLayoutMutation(
     return false;
   }
   std::vector<RECT> restoredRects;
-  ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
   const Layout::LayoutPlanStatus restoredStatus = Layout::BuildWorkspaceLayoutPlan(
       restored, rollbackMetrics.workArea, rollbackMetrics.gap, &restoredRects);
   if (restoredStatus != Layout::LayoutPlanStatus::Success &&
@@ -691,7 +697,6 @@ static HWND FindIntroducingPendingAdmission(
     if (record && record->pendingInsertionPlacement) established.Float(candidate.hwnd);
   }
   std::vector<RECT> rects;
-  ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
   return Layout::BuildWorkspaceLayoutPlan(established, workArea, gap, &rects) ==
           Layout::LayoutPlanStatus::Unsatisfiable
       ? nullptr
@@ -717,7 +722,6 @@ static ConstraintVictim ChooseConstraintVictim(
     Workspace trial = workspace;
     if (!trial.Float(candidate.hwnd)) continue;
     std::vector<RECT> trialRects;
-    ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
     if (Layout::BuildWorkspaceLayoutPlan(trial, workArea, gap, &trialRects) == Layout::LayoutPlanStatus::Success) {
       const WindowRecord* record = workspace.Find(candidate.hwnd);
       const bool grew = record && !record->pendingInsertionPlacement &&
@@ -858,106 +862,94 @@ static ArrangementStep RecoverUnsatisfiableLayout(
   }
   return ReleaseConstraintVictim(workspace, context, rects, activeConstraints, victim, *victimRecord);
 }
+// What placing one tiled window means for the rest of the arrangement pass.
+struct TiledPlacementOutcome {
+  // What the model must do with the window once the pass has placed every one.
+  Workspace::PlacementAction action = Workspace::PlacementAction::None;
+  // Stop the pass and plan again: the window reported a new native minimum, or
+  // a pending user layout change was rolled back (which replaced `workspace`).
+  enum class Stop { No, NativeConstraints, LayoutRollback } stop = Stop::No;
+};
+
+// Places tiled window `hwnd` at `target` and starts, keeps or cancels its
+// conformance lease. A window that is gone or has no record is to be forgotten;
+// a minimized, maximized, hidden or cloaked one is left where it is. An app that
+// corrects a legal target is re-probed in case its own WM_GETMINMAXINFO contract
+// changed; an unchanged report leaves the correction to conformance handling
+// rather than inventing a second, empirical minimum-size policy. With leases
+// disabled, a refused placement may roll back a pending user layout change.
+// WM thread only; `rects` is the whole plan, physical screen pixels.
+static TiledPlacementOutcome PlaceTiledWindow(
+    Workspace& workspace, const ArrangementContext& context, const std::vector<RECT>& rects,
+    HWND hwnd, const RECT& target) {
+  using Stop = TiledPlacementOutcome::Stop;
+  const WindowRecord* record = IsWindow(hwnd) ? workspace.Find(hwnd) : nullptr;
+  if (!record) return {Workspace::PlacementAction::Forget};
+  if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      Platform::Windows::IsWindowCloaked(hwnd)) {
+    return {};
+  }
+
+  const PlacementObservation observation =
+      Platform::Windows::PlaceWindowChecked(hwnd, record->canMove, target);
+  TiledPlacementOutcome outcome{workspace.ApplyPlacementObservation(hwnd, observation)};
+  if (observation.result == PlacementResult::AdjustedByWindow) {
+    const ConstraintProbeRefresh refresh = ProbeConstraintsAgainstCache(hwnd, record->constraints);
+    workspace.UpdateConstraints(hwnd, refresh.merged);
+    if (refresh.reportChanged) {
+      CancelConformanceLease(hwnd);
+      Diagnostics::RecordEvent(
+          L"placement refreshed native constraints hwnd=%p min=%ldx%ld dpi=%u",
+          hwnd, refresh.merged.minWidth, refresh.merged.minHeight, refresh.merged.dpi);
+      return {Workspace::PlacementAction::None, Stop::NativeConstraints};
+    }
+  }
+
+  if (outcome.action != Workspace::PlacementAction::None) {
+    CancelConformanceLease(hwnd);
+    return outcome;
+  }
+  switch (observation.result) {
+    case PlacementResult::Success:
+      if (observation.placementIssued) BeginConformanceLease(hwnd, target, false, context.preferredTiledWindow);
+      break;
+    case PlacementResult::AdjustedByWindow:
+    case PlacementResult::Refused:
+      BeginConformanceLease(hwnd, target, true, context.preferredTiledWindow);
+      if (g_settings.conformanceLeaseMs == 0 &&
+          TryRollbackPendingLayoutMutation(context.key, context.monitor, &workspace, rects, hwnd)) {
+        outcome.stop = Stop::LayoutRollback;
+      }
+      break;
+    case PlacementResult::SuppressedByPhysicalState:
+    case PlacementResult::AccessDenied:
+    case PlacementResult::Dead:
+      break;
+  }
+  return outcome;
+}
+
 // Places current targets, observes the application's response, then commits
 // membership changes. A native constraint refresh or rollback requests another
 // pass. Replan after rollback deliberately does not save the rejected candidate.
 // WM thread only; rects are physical screen pixels in active-window order.
 static ArrangementStep ApplyWorkspacePlacements(
     Workspace& workspace, const ArrangementContext& context, const std::vector<RECT>& rects) {
+  using Stop = TiledPlacementOutcome::Stop;
   const auto& key = context.key;
-  const HMONITOR monitor = context.monitor;
-  const HWND preferredTiledWindow = context.preferredTiledWindow;
   std::vector<HWND> toFloat;
   std::vector<HWND> toForget;
-  enum class Reflow { None, NativeConstraints, LayoutRollback };
-  Reflow reflow = Reflow::None;
   const std::vector<HWND> active = workspace.TiledWindows();
   const size_t count = std::min(active.size(), rects.size());
   for (size_t i = 0; i < count; ++i) {
-    const HWND hwnd = active[i];
-    Workspace::PlacementAction action = Workspace::PlacementAction::None;
-
-    if (!IsWindow(hwnd)) {
-      action = Workspace::PlacementAction::Forget;
-    } else {
-      const WindowRecord* record = workspace.Find(hwnd);
-      if (!record) {
-        action = Workspace::PlacementAction::Forget;
-      } else if (
-          Platform::Windows::GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
-          !Platform::Windows::IsWindowCloaked(hwnd)) {
-        PlacementObservation observation =
-            Platform::Windows::PlaceWindowChecked(hwnd, record->canMove, rects[i]);
-        action = workspace.ApplyPlacementObservation(hwnd, observation);
-
-        // A native minimum report is authoritative as soon as it is available.
-        // If an application still corrects a legal target, re-probe in case its
-        // own WM_GETMINMAXINFO contract changed dynamically. If the report is
-        // unchanged, leave the event to conformance handling rather than
-        // inventing a second empirical minimum-size policy.
-        if (observation.result == PlacementResult::AdjustedByWindow) {
-          const ConstraintProbeRefresh refresh = ProbeConstraintsAgainstCache(hwnd, record->constraints);
-          workspace.UpdateConstraints(hwnd, refresh.merged);
-          if (refresh.reportChanged) {
-            action = Workspace::PlacementAction::None;
-            reflow = Reflow::NativeConstraints;
-            CancelConformanceLease(hwnd);
-            Diagnostics::RecordEvent(
-                L"placement refreshed native constraints hwnd=%p min=%ldx%ld dpi=%u",
-                hwnd, refresh.merged.minWidth, refresh.merged.minHeight, refresh.merged.dpi);
-          }
-        }
-
-        if (reflow != Reflow::NativeConstraints) {
-          if (action != Workspace::PlacementAction::None) {
-            CancelConformanceLease(hwnd);
-          } else {
-            switch (observation.result) {
-              case PlacementResult::Success:
-                if (observation.placementIssued) {
-                  BeginConformanceLease(
-                      hwnd, rects[i], false, preferredTiledWindow);
-                }
-                break;
-              case PlacementResult::SuppressedByPhysicalState:
-                break;
-              case PlacementResult::AdjustedByWindow:
-              case PlacementResult::Refused:
-                BeginConformanceLease(
-                    hwnd, rects[i], true, preferredTiledWindow);
-                if (g_settings.conformanceLeaseMs == 0 &&
-                    TryRollbackPendingLayoutMutation(
-                        key, monitor, &workspace, rects, hwnd)) {
-                  reflow = Reflow::LayoutRollback;
-                }
-                break;
-              case PlacementResult::AccessDenied:
-              case PlacementResult::Dead:
-                break;
-            }
-          }
-        }
-      }
+    const TiledPlacementOutcome outcome = PlaceTiledWindow(workspace, context, rects, active[i], rects[i]);
+    if (outcome.stop == Stop::LayoutRollback) return ArrangementStep::Replan;
+    if (outcome.stop == Stop::NativeConstraints) {
+      g_workspaces.Save(key, workspace);
+      return ArrangementStep::Replan;
     }
-
-    if (reflow == Reflow::LayoutRollback) break;
-    switch (action) {
-      case Workspace::PlacementAction::None:
-        break;
-      case Workspace::PlacementAction::Float:
-        toFloat.push_back(hwnd);
-        break;
-      case Workspace::PlacementAction::Forget:
-        toForget.push_back(hwnd);
-        break;
-    }
-    if (reflow == Reflow::NativeConstraints) break;
-  }
-
-  if (reflow == Reflow::LayoutRollback) return ArrangementStep::Replan;
-  if (reflow == Reflow::NativeConstraints) {
-    g_workspaces.Save(key, workspace);
-    return ArrangementStep::Replan;
+    if (outcome.action == Workspace::PlacementAction::Float) toFloat.push_back(active[i]);
+    if (outcome.action == Workspace::PlacementAction::Forget) toForget.push_back(active[i]);
   }
 
   bool participationChanged = false;
@@ -1043,7 +1035,6 @@ static void ArrangeWorkspace(
     }
 
     std::vector<RECT> rects;
-    ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
     Layout::LayoutPlanStatus planStatus =
         Layout::BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects);
     if (planStatus == Layout::LayoutPlanStatus::NotApplicable) {

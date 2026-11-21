@@ -1,6 +1,11 @@
 // Workspace model interface and invariants.
 // Part of MultiWM's single source file; see the include order in src/multiwm/multiwm.cpp.
 
+// Defined in layout/algorithms.h; named here by the window-size step helpers.
+namespace Layout {
+struct DwindleSplit;
+}  // namespace Layout
+
 namespace Model {
 
 // Canonicalizes stored identity text without querying native displays.
@@ -539,6 +544,11 @@ class Workspace {
   }
   bool AcceptShownDwindleLayout(const RECT& workArea, LONG gap);
   bool ApplyTiledStep(const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent);
+  // What a size step moves for the window at `index` (layout/resize_steps.h).
+  struct TiledStepTarget;
+  std::optional<TiledStepTarget> ChooseTiledStepTarget(
+      const RECT& workArea, LONG gap, size_t index, bool grow, const std::vector<RECT>& rects,
+      const std::vector<Layout::DwindleSplit>& splits, const std::vector<WindowConstraints>& constraints) const;
   bool ResetDwindleSplit(const RECT& workArea, LONG gap, size_t index);
   void RecordDwindlePushes(const std::vector<double>& before, size_t ownSplit);
   void KeepDwindleDivider(size_t split);

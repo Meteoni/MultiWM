@@ -98,6 +98,23 @@ inline bool CoversMonitor(const RECT& windowRect, const RECT& monitorRect) {
          std::abs(windowRect.bottom - monitorRect.bottom) <= tolerance;
 }
 
+// The track sizes Windows offers a window before it answers WM_GETMINMAXINFO,
+// in the window's own DPI units: the system minimum and maximum, the maximum
+// never below the minimum. Both mods' size-limit probes start from these.
+struct TrackingDefaults {
+  POINT minimum;
+  POINT maximum;
+};
+
+inline TrackingDefaults DefaultTrackingLimits(UINT windowDpi) {
+  const UINT dpi = windowDpi ? windowDpi : 96;
+  const LONG minWidth = std::max<LONG>(1, GetSystemMetricsForDpi(SM_CXMINTRACK, dpi));
+  const LONG minHeight = std::max<LONG>(1, GetSystemMetricsForDpi(SM_CYMINTRACK, dpi));
+  return {{minWidth, minHeight},
+          {std::max<LONG>(minWidth, GetSystemMetricsForDpi(SM_CXMAXTRACK, dpi)),
+           std::max<LONG>(minHeight, GetSystemMetricsForDpi(SM_CYMAXTRACK, dpi))}};
+}
+
 // Convert an application's WM_GETMINMAXINFO reply and the supplied defaults
 // from window-DPI units to physical frame sizes. Decoration spans are already
 // physical. Callers obtain the metrics and send the message using their own

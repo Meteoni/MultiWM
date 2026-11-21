@@ -127,14 +127,33 @@ static bool RefreshBodyLocked() {
   return true;
 }
 
+// Runs `read(body)` under the reader lock when a current snapshot is available.
+// False, without calling `read`, when there is none: MultiWM not running, an
+// unknown ABI, or a writer that stayed busy.
+template <typename Read>
+static bool ReadCurrentBody(Read&& read) {
+  AcquireSRWLockExclusive(&g_reader.lock);
+  const bool ok = !g_reader.unloading && EnsureMappedLocked() && IsMultiWmRunning() && RefreshBodyLocked();
+  if (ok) read(*g_reader.body);
+  ReleaseSRWLockExclusive(&g_reader.lock);
+  return ok;
+}
+
+// The tracked entry for `hwnd`, or nullptr. Entries are sorted by HWND value.
+static const CompanionAbi::TrackedWindowHint* FindTrackedWindow(const CompanionAbi::SnapshotBody& body, HWND hwnd) {
+  const uint32_t windowValue = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
+  const uint32_t trackedCount = std::min(body.trackedCount, CompanionAbi::kMaxTrackedWindows);
+  const auto* trackedEnd = body.trackedWindows + trackedCount;
+  const auto* window = std::lower_bound(body.trackedWindows, trackedEnd, windowValue,
+      [](const auto& entry, uint32_t value) { return entry.hwnd < value; });
+  return window != trackedEnd && window->hwnd == windowValue ? window : nullptr;
+}
+
 // Fills `*out` for a decision about `hwnd` on the monitor whose rectangle is
 // `monitorRect`. Returns false when there is no usable snapshot: MultiWM not
 // running, an unknown ABI, or a writer that stayed busy.
 static bool ReadHintInputs(HWND hwnd, const RECT& monitorRect, HintInputs* out) {
-  AcquireSRWLockExclusive(&g_reader.lock);
-  const bool ok = !g_reader.unloading && EnsureMappedLocked() && IsMultiWmRunning() && RefreshBodyLocked();
-  if (ok) {
-    const CompanionAbi::SnapshotBody& body = *g_reader.body;
+  return ReadCurrentBody([&](const CompanionAbi::SnapshotBody& body) {
     out->flags = body.flags;
     out->tracked = false;
     out->intent = PlacementIntent::Admission;
@@ -153,11 +172,7 @@ static bool ReadHintInputs(HWND hwnd, const RECT& monitorRect, HintInputs* out) 
       }
     }
     const uint32_t windowValue = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
-    const uint32_t trackedCount = std::min(body.trackedCount, CompanionAbi::kMaxTrackedWindows);
-    const auto* trackedEnd = body.trackedWindows + trackedCount;
-    const auto* window = std::lower_bound(body.trackedWindows, trackedEnd, windowValue,
-        [](const auto& entry, uint32_t value) { return entry.hwnd < value; });
-    if (window != trackedEnd && window->hwnd == windowValue) {
+    if (const auto* window = FindTrackedWindow(body, hwnd)) {
       out->tracked = true;
       out->intent = PlacementIntent::Unavailable;
       // A stale or ambiguous record must never fall back to new admission.
@@ -189,9 +204,7 @@ static bool ReadHintInputs(HWND hwnd, const RECT& monitorRect, HintInputs* out) 
         }
       }
     }
-  }
-  ReleaseSRWLockExclusive(&g_reader.lock);
-  return ok;
+  });
 }
 
 // What MultiWM's snapshot says about one window: its tracked entry (zero when
@@ -210,24 +223,15 @@ struct WindowFacts {
 
 // Fills `*out` for `hwnd`. Returns false when there is no usable snapshot.
 static bool ReadWindowFacts(HWND hwnd, WindowFacts* out) {
-  AcquireSRWLockExclusive(&g_reader.lock);
-  const bool ok = !g_reader.unloading && EnsureMappedLocked() && IsMultiWmRunning() && RefreshBodyLocked();
-  if (ok) {
-    const CompanionAbi::SnapshotBody& body = *g_reader.body;
+  return ReadCurrentBody([&](const CompanionAbi::SnapshotBody& body) {
     *out = {};
+    if (const auto* window = FindTrackedWindow(body, hwnd)) out->entry = *window;
     const uint32_t windowValue = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hwnd));
-    const uint32_t trackedCount = std::min(body.trackedCount, CompanionAbi::kMaxTrackedWindows);
-    const auto* trackedEnd = body.trackedWindows + trackedCount;
-    const auto* window = std::lower_bound(body.trackedWindows, trackedEnd, windowValue,
-        [](const auto& entry, uint32_t value) { return entry.hwnd < value; });
-    if (window != trackedEnd && window->hwnd == windowValue) out->entry = *window;
     const uint32_t restoreCount = std::min(body.restoreWindowCount, CompanionAbi::kMaxRestoreWindows);
     for (uint32_t i = 0; i < restoreCount && !out->restoreEntry; ++i) {
       out->restoreEntry = body.restoreWindows[i].hwnd == windowValue;
     }
-  }
-  ReleaseSRWLockExclusive(&g_reader.lock);
-  return ok;
+  });
 }
 
 // Unmaps the section. After this, ReadHintInputs always fails. Mod unload.

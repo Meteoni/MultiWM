@@ -255,6 +255,100 @@ bool Workspace::StepTiledSize(
   return false;
 }
 
+// What sizes the window a step acts on: which preference, along which axis, in
+// which direction, how far its span may go, and the range the preference may
+// take. Chosen by ChooseTiledStepTarget, used by ApplyTiledStep.
+struct Workspace::TiledStepTarget {
+  Layout::Axis axis = Layout::Axis::X;
+  std::function<double&(Workspace&)> preference;
+  bool increasing = true;  // Raising the preference enlarges the window.
+  bool geometric = false;  // A weight (interpolated geometrically), not a ratio.
+  double low = 0.1;        // Ratios share ClampSplitRatio's range.
+  double high = 0.9;
+  LONG minimum = 0;  // Span range the window may reach.
+  LONG maximum = 0;
+  // A ratio starts from its visible position, which minimums can hold away
+  // from the saved one, as a resize drag does.
+  std::optional<double> visibleStart;
+  // Dwindle: pushes deeper dividers as far as the growing window needs.
+  std::function<void(Workspace&)> fitDeeper;
+  std::optional<size_t> dwindleSplit;  // The split the step moves.
+};
+
+// No value when the layout has nothing that sizes the window (Monocle) or its
+// divider has no room to move. `rects`/`splits` are the visible cells.
+std::optional<Workspace::TiledStepTarget> Workspace::ChooseTiledStepTarget(
+    const RECT& workArea, LONG gap, size_t index, bool grow, const std::vector<RECT>& rects,
+    const std::vector<Layout::DwindleSplit>& splits, const std::vector<WindowConstraints>& constraints) const {
+  const size_t count = windows_.size();
+  TiledStepTarget target;
+  target.axis = Layout::LayoutAxis(layout_);
+  // Bounds and a weight range for the window among peers [first, count).
+  auto usePeers = [&](const std::vector<double>& weights, size_t first) {
+    LONG available = 0;
+    LONG othersMinimum = 0;
+    for (size_t i = first; i < count; ++i) {
+      available += SpanAlong(rects[i], target.axis);
+      if (i != index) othersMinimum += StepMinimum(constraints[i], target.axis);
+    }
+    target.minimum = StepMinimum(constraints[index], target.axis);
+    target.maximum = available - othersMinimum;
+    const double mean = MeanOfOtherWeights(weights, index - first).value_or(1.0);
+    target.low = mean * 1e-3;
+    target.high = mean * 1e3;
+    target.geometric = true;
+  };
+
+  if (IsGridLayout(layout_)) {
+    usePeers(gridWeights_, 0);
+    target.preference = [index](Workspace& w) -> double& { return w.gridWeights_[index]; };
+  } else if (IsMasterStackLayout(layout_) && index > 0 && count > 2) {
+    target.axis = target.axis == Layout::Axis::X ? Layout::Axis::Y : Layout::Axis::X;
+    usePeers(stackWeights_, 1);
+    target.preference = [index](Workspace& w) -> double& { return w.stackWeights_[index - 1]; };
+  } else if (IsMasterStackLayout(layout_)) {
+    // The master divider sizes the master and a lone stack window alike.
+    const LONG totalSpan = SpanAlong(workArea, target.axis);
+    if (totalSpan < 2) return std::nullopt;
+    const LONG usableSpan = totalSpan - std::clamp<LONG>(gap, 0, totalSpan - 2);
+    LONG stackMinimum = 0;
+    for (size_t i = 1; i < count; ++i) {
+      stackMinimum = std::max(stackMinimum, StepMinimum(constraints[i], target.axis));
+    }
+    const LONG masterMinimum = StepMinimum(constraints[0], target.axis);
+    target.increasing = index == 0;
+    target.minimum = target.increasing ? masterMinimum : stackMinimum;
+    target.maximum = usableSpan - (target.increasing ? stackMinimum : masterMinimum);
+    target.visibleStart = Layout::ClampSplitRatio(
+        static_cast<double>(SpanAlong(rects[0], target.axis)) / static_cast<double>(usableSpan));
+    target.preference = [](Workspace& w) -> double& { return w.masterRatio_; };
+  } else if (layout_ == TileLayout::Dwindle) {
+    // A window is the first side of its own split; the last one is the second
+    // side of the split before it.
+    target.increasing = index + 1 < count;
+    const size_t splitIndex = target.increasing ? index : count - 2;
+    target.dwindleSplit = splitIndex;
+    const Layout::DwindleSplit& split = splits[splitIndex];
+    if (split.usableSpan < 2) return std::nullopt;
+    target.axis = split.axis;
+    target.minimum = StepMinimum(constraints[index], target.axis);
+    // The other side may give way by pushing its own dividers, so the split's
+    // whole span is the bound; the solver finds how far the layout still fits.
+    target.maximum = split.usableSpan;
+    target.preference = [splitIndex](Workspace& w) -> double& { return w.dwindleRatios_[splitIndex]; };
+    // Only growing a first side squeezes the windows after it.
+    if (target.increasing && grow) {
+      target.fitDeeper = [splitIndex, constraints, flexible = FlexibleDwindleMinimums(constraints, gap),
+                          workArea, gap](Workspace& w) {
+        FitDeeperDwindleRatios(w.dwindleRatios_, splitIndex, constraints, flexible, workArea, gap);
+      };
+    }
+  } else {
+    return std::nullopt;  // Monocle.
+  }
+  return target;
+}
+
 // The step itself (see StepTiledSize). Changes nothing when it returns false.
 bool Workspace::ApplyTiledStep(
     const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent) {
@@ -265,99 +359,24 @@ bool Workspace::ApplyTiledStep(
   // Dwindle has no adaptive fitting here: its saved ratios are the layout.
   auto plan = [&](const Workspace& workspace, std::vector<RECT>* rects,
                   std::vector<Layout::DwindleSplit>* splits) {
-    if (IsGridLayout(layout_)) return PlanWeightedCells(workspace, workArea, gap, rects);
-    if (IsMasterStackLayout(layout_)) return PlanWeightedCells(workspace, workArea, gap, rects);
+    if (IsGridLayout(layout_) || IsMasterStackLayout(layout_)) return PlanWeightedCells(workspace, workArea, gap, rects);
     if (layout_ == TileLayout::Dwindle) return PlanSavedDwindleCells(workspace, workArea, gap, rects, splits);
     return false;
   };
   std::vector<RECT> rects;
   std::vector<Layout::DwindleSplit> splits;
   if (!plan(*this, &rects, &splits)) return false;
-  const std::vector<WindowConstraints> constraints = Layout::ActiveWindowConstraints(*this);
-
-  // What sizes the window: which preference, along which axis, in which
-  // direction, and how far its span may go.
-  Layout::Axis axis = Layout::LayoutAxis(layout_);
-  std::function<double&(Workspace&)> preference;
-  bool increasing = true;
-  bool geometric = false;
-  double low = 0.1;  // Ratios share ClampSplitRatio's range.
-  double high = 0.9;
-  LONG minimum = 0;
-  LONG maximum = 0;
-  // A ratio starts from its visible position, which minimums can hold away
-  // from the saved one, as a resize drag does.
-  std::optional<double> visibleStart;
-  // Dwindle: pushes deeper dividers as far as the growing window needs.
-  std::function<void(Workspace&)> fitDeeper;
-  std::optional<size_t> dwindleSplit;  // The split the step moves.
-  // Bounds and a weight range for the window among peers [first, count).
-  auto usePeers = [&](std::vector<double>& weights, size_t first) {
-    LONG available = 0;
-    LONG othersMinimum = 0;
-    for (size_t i = first; i < count; ++i) {
-      available += SpanAlong(rects[i], axis);
-      if (i != index) othersMinimum += StepMinimum(constraints[i], axis);
-    }
-    minimum = StepMinimum(constraints[index], axis);
-    maximum = available - othersMinimum;
-    const double mean = MeanOfOtherWeights(weights, index - first).value_or(1.0);
-    low = mean * 1e-3;
-    high = mean * 1e3;
-    geometric = true;
-  };
-
-  if (IsGridLayout(layout_)) {
-    usePeers(gridWeights_, 0);
-    preference = [index](Workspace& w) -> double& { return w.gridWeights_[index]; };
-  } else if (IsMasterStackLayout(layout_) && index > 0 && count > 2) {
-    axis = axis == Layout::Axis::X ? Layout::Axis::Y : Layout::Axis::X;
-    usePeers(stackWeights_, 1);
-    preference = [index](Workspace& w) -> double& { return w.stackWeights_[index - 1]; };
-  } else if (IsMasterStackLayout(layout_)) {
-    // The master divider sizes the master and a lone stack window alike.
-    const LONG totalSpan = SpanAlong(workArea, axis);
-    if (totalSpan < 2) return false;
-    const LONG usableSpan = totalSpan - std::clamp<LONG>(gap, 0, totalSpan - 2);
-    LONG stackMinimum = 0;
-    for (size_t i = 1; i < count; ++i) {
-      stackMinimum = std::max(stackMinimum, StepMinimum(constraints[i], axis));
-    }
-    const LONG masterMinimum = StepMinimum(constraints[0], axis);
-    increasing = index == 0;
-    minimum = increasing ? masterMinimum : stackMinimum;
-    maximum = usableSpan - (increasing ? stackMinimum : masterMinimum);
-    visibleStart = Layout::ClampSplitRatio(
-        static_cast<double>(SpanAlong(rects[0], axis)) / static_cast<double>(usableSpan));
-    preference = [](Workspace& w) -> double& { return w.masterRatio_; };
-  } else if (layout_ == TileLayout::Dwindle) {
-    // A window is the first side of its own split; the last one is the second
-    // side of the split before it.
-    increasing = index + 1 < count;
-    const size_t splitIndex = increasing ? index : count - 2;
-    dwindleSplit = splitIndex;
-    const Layout::DwindleSplit& split = splits[splitIndex];
-    if (split.usableSpan < 2) return false;
-    axis = split.axis;
-    minimum = StepMinimum(constraints[index], axis);
-    // The other side may give way by pushing its own dividers, so the split's
-    // whole span is the bound; the solver finds how far the layout still fits.
-    maximum = split.usableSpan;
-    preference = [splitIndex](Workspace& w) -> double& { return w.dwindleRatios_[splitIndex]; };
-    // Only growing a first side squeezes the windows after it.
-    if (increasing && grow) {
-      fitDeeper = [&, splitIndex, flexible = FlexibleDwindleMinimums(constraints, gap)](Workspace& w) {
-        FitDeeperDwindleRatios(w.dwindleRatios_, splitIndex, constraints, flexible, workArea, gap);
-      };
-    }
-  } else {
-    return false;  // Monocle.
-  }
+  const std::optional<TiledStepTarget> chosen = ChooseTiledStepTarget(
+      workArea, gap, index, grow, rects, splits, Layout::ActiveWindowConstraints(*this));
+  if (!chosen) return false;
+  const Layout::Axis axis = chosen->axis;
+  const auto& preference = chosen->preference;
+  const auto& fitDeeper = chosen->fitDeeper;
 
   const LONG span = SpanAlong(rects[index], axis);
   const LONG step = std::max<LONG>(
       1, MulDiv(SpanAlong(workArea, axis), static_cast<int>(stepPercent), 100));
-  const LONG target = StepSpan(span, grow ? step : -step, minimum, maximum);
+  const LONG target = StepSpan(span, grow ? step : -step, chosen->minimum, chosen->maximum);
   if (target == span) return false;
 
   Workspace probe = *this;
@@ -376,18 +395,18 @@ bool Workspace::ApplyTiledStep(
     return SpanAlong(probeRects[index], axis);
   };
   // Grow moves the preference the way that enlarges the window.
-  const double current = visibleStart ? *visibleStart
-                         : geometric  ? EffectiveWeight(preference(probe))
-                                      : preference(probe);
-  const double end = grow == increasing ? high : low;
-  const auto value = SolvePreference(current, end, geometric, grow, target, spanAt);
+  const double current = chosen->visibleStart ? *chosen->visibleStart
+                         : chosen->geometric  ? EffectiveWeight(preference(probe))
+                                              : preference(probe);
+  const double end = grow == chosen->increasing ? chosen->high : chosen->low;
+  const auto value = SolvePreference(current, end, chosen->geometric, grow, target, spanAt);
   if (!value || !std::isfinite(*value)) return false;
   const auto reached = spanAt(*value);
   if (!reached || (grow ? *reached <= span : *reached >= span)) return false;
   // Like a drag, the step saves the size it shows: a squeeze that held the
   // window elsewhere does not bring an older preference back when it ends.
   apply(*this, *value);
-  if (dwindleSplit) {
+  if (const std::optional<size_t> dwindleSplit = chosen->dwindleSplit) {
     // The stepped divider is the user's choice now. Growing remembers what it
     // pushed; shrinking frees room for pushed dividers after it.
     KeepDwindleDivider(*dwindleSplit);

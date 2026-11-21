@@ -38,6 +38,19 @@ static std::optional<RECT> ConvertScreenRect(
   return RECT{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
 }
 
+// WINDOWPLACEMENT keeps rcNormalPosition in workspace coordinates (relative to
+// the work area) for non-tool top-level windows. These convert to and from
+// screen coordinates on the monitor `info` describes.
+static RECT WorkspaceToScreen(RECT rect, const MONITORINFO& info) {
+  OffsetRect(&rect, info.rcWork.left - info.rcMonitor.left, info.rcWork.top - info.rcMonitor.top);
+  return rect;
+}
+
+static RECT ScreenToWorkspace(RECT rect, const MONITORINFO& info) {
+  OffsetRect(&rect, info.rcMonitor.left - info.rcWork.left, info.rcMonitor.top - info.rcWork.top);
+  return rect;
+}
+
 // Points the window's restore at the tile MultiWM will give it. MultiWM
 // publishes that tile for each suspended member by running its own Restore on a
 // copy of the workspace, so the hint is exact, not a guess. Caller holds
@@ -93,9 +106,7 @@ static bool AdjustRestorePlacement(HWND hwnd, WINDOWPLACEMENT* placement, const 
   if (!logicalTarget || !GetMonitorInfoW(MonitorFromRect(&*logicalTarget, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
     return false;
   }
-  placement->rcNormalPosition = *logicalTarget;
-  OffsetRect(&placement->rcNormalPosition, monitorInfo.rcMonitor.left - monitorInfo.rcWork.left,
-              monitorInfo.rcMonitor.top - monitorInfo.rcWork.top);
+  placement->rcNormalPosition = ScreenToWorkspace(*logicalTarget, monitorInfo);
   LogDecision(hwnd, path, reason);
   return true;
 }

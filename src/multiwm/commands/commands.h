@@ -34,7 +34,6 @@ static bool ValidateUserLayoutMutation(
   std::vector<RECT> rects;
   Layout::LayoutPlanStatus status = Layout::LayoutPlanStatus::Unsatisfiable;
   if (Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) {
-    ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
     status = Layout::BuildWorkspaceLayoutPlan(
         candidate, metrics.workArea, metrics.gap, &rects);
     if (status == Layout::LayoutPlanStatus::Unsatisfiable &&
@@ -69,7 +68,6 @@ static bool ValidateUserLayoutMutation(
     Platform::Monitors::WorkspaceMetrics committedMetrics;
     std::vector<RECT> committedRects;
     if (Platform::Monitors::GetWorkspaceMetrics(monitor, &committedMetrics)) {
-      ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
       if (Layout::BuildWorkspaceLayoutPlan(
               current, committedMetrics.workArea, committedMetrics.gap,
               &committedRects) == Layout::LayoutPlanStatus::Unsatisfiable) {

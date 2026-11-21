@@ -260,6 +260,29 @@ bool Workspace::LearnGridResize(
   return changed;
 }
 
+// How far a drag of the window at `resizedIndex` (visible cell `resizedRect`)
+// moved the leading side of Dwindle split `splitIndex`, along the split's axis:
+// positive when the leading side grows, 0 when the window's dragged edge isn't
+// this split's divider. The window at `splitIndex` is the split's leading side
+// and drags its far edge; a later window touches the divider with its near edge
+// when it starts where the split's remainder does. `reverse` mirrors both.
+static LONG DwindleSplitDragDelta(
+    const Layout::DwindleSplit& split, size_t splitIndex, size_t resizedIndex,
+    const RECT& resizedRect, const MoveSizeGesture& gesture, bool reverse) {
+  const bool alongX = split.axis == Layout::Axis::X;
+  auto nearEdge = [alongX](const RECT& rect) { return alongX ? rect.left : rect.top; };
+  auto farEdge = [alongX](const RECT& rect) { return alongX ? rect.right : rect.bottom; };
+  if (resizedIndex == splitIndex) {
+    return reverse ? -(nearEdge(gesture.end) - nearEdge(gesture.start))
+                   : farEdge(gesture.end) - farEdge(gesture.start);
+  }
+  const bool touchesDivider = reverse ? farEdge(resizedRect) == farEdge(split.remaining)
+                                      : nearEdge(resizedRect) == nearEdge(split.remaining);
+  if (!touchesDivider) return 0;
+  return reverse ? -(farEdge(gesture.end) - farEdge(gesture.start))
+                 : nearEdge(gesture.end) - nearEdge(gesture.start);
+}
+
 bool Workspace::LearnDwindleResize(
     const RECT& workArea, LONG gap, size_t resizedIndex,
     const MoveSizeGesture& gesture) {
@@ -291,34 +314,8 @@ bool Workspace::LearnDwindleResize(
        splitIndex < splits.size() && splitIndex <= resizedIndex;
        ++splitIndex) {
     const Layout::DwindleSplit& split = splits[splitIndex];
-    LONG firstSpanDelta = 0;
-    if (split.axis == Layout::Axis::X) {
-      if (resizedIndex == splitIndex) {
-        firstSpanDelta = g_settings.reverseDwindle
-            ? -(gesture.end.left - gesture.start.left)
-            : gesture.end.right - gesture.start.right;
-      } else if ((!g_settings.reverseDwindle &&
-                  resizedRect.left == split.remaining.left) ||
-                 (g_settings.reverseDwindle &&
-                  resizedRect.right == split.remaining.right)) {
-        firstSpanDelta = g_settings.reverseDwindle
-            ? -(gesture.end.right - gesture.start.right)
-            : gesture.end.left - gesture.start.left;
-      }
-    } else {
-      if (resizedIndex == splitIndex) {
-        firstSpanDelta = g_settings.reverseDwindle
-            ? -(gesture.end.top - gesture.start.top)
-            : gesture.end.bottom - gesture.start.bottom;
-      } else if ((!g_settings.reverseDwindle &&
-                  resizedRect.top == split.remaining.top) ||
-                 (g_settings.reverseDwindle &&
-                  resizedRect.bottom == split.remaining.bottom)) {
-        firstSpanDelta = g_settings.reverseDwindle
-            ? -(gesture.end.bottom - gesture.start.bottom)
-            : gesture.end.top - gesture.start.top;
-      }
-    }
+    const LONG firstSpanDelta = DwindleSplitDragDelta(
+        split, splitIndex, resizedIndex, resizedRect, gesture, g_settings.reverseDwindle);
     if (!IsMeaningfulResizeDelta(firstSpanDelta) || split.usableSpan < 2) {
       continue;
     }

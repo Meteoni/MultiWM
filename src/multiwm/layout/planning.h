@@ -286,10 +286,12 @@ static bool PlanConstrainedCells(
 
 // Uses cached constraints to calculate physical screen rectangles without native
 // window queries or workspace mutation. Output is usable only on Success; other
-// outcomes may leave partial geometry, which callers must discard.
+// outcomes may leave partial geometry, which callers must discard. Every call
+// counts toward the layoutPlansBuilt diagnostic.
 static LayoutPlanStatus BuildWorkspaceLayoutPlan(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     std::vector<RECT>* outRects) {
+  ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
   if (!outRects) return LayoutPlanStatus::Unsatisfiable;
   const TileLayout layout = workspace.Layout();
   if (layout == TileLayout::Floating || layout == TileLayout::COUNT) {
@@ -676,7 +678,6 @@ static bool ReassignDwindleLayoutConversionForConstraints(
   Workspace trial = workspace;
   if (!ApplyTiledWindowOrder(trial, desiredOrder)) return false;
   std::vector<RECT> rects;
-  ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
   if (BuildWorkspaceLayoutPlan(
           trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
     return false;
@@ -717,7 +718,6 @@ static bool TryReorderForConstraints(
       Workspace trial = workspace;
       if (!trial.MakeMaster(windows[index])) continue;
       std::vector<RECT> rects;
-      ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
       if (BuildWorkspaceLayoutPlan(trial, workArea, gap, &rects) ==
           LayoutPlanStatus::Success) {
         if (outMovedWindowCount) *outMovedWindowCount = 2;
@@ -812,6 +812,18 @@ static bool ReassignPendingDwindleAdmissionForConstraints(
   return movedWindowCount > 0;
 }
 
+// Calls `tryIndex` with each index in [0, count) other than `origin`, nearest
+// first and the later one first at equal distance, until it returns true. True
+// when one did. Used to move a window as little as possible.
+template <typename TryIndex>
+static bool TryNearbyIndices(size_t origin, size_t count, TryIndex&& tryIndex) {
+  for (size_t distance = 1; distance < count; ++distance) {
+    if (origin + distance < count && tryIndex(origin + distance)) return true;
+    if (origin >= distance && tryIndex(origin - distance)) return true;
+  }
+  return false;
+}
+
 // Precondition: the current order already failed its ordinary layout plan.
 // Search caller-prioritized candidates without changing the input workspace or
 // querying/placing windows. Failure also leaves outPlan untouched. Successful
@@ -857,7 +869,6 @@ static bool TryRecoverPendingAdmission(
           }
 
           std::vector<RECT> trialRects;
-          ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
           LayoutPlanStatus trialStatus = BuildWorkspaceLayoutPlan(
               trial, workArea, gap, &trialRects);
           size_t movedWindowCount = 0;
@@ -868,7 +879,6 @@ static bool TryRecoverPendingAdmission(
                     preferredTiledWindow, &movedWindowCount)) {
               return false;
             }
-            ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
             trialStatus = BuildWorkspaceLayoutPlan(
                 trial, workArea, gap, &trialRects);
             if (trialStatus != LayoutPlanStatus::Success) return false;
@@ -881,14 +891,7 @@ static bool TryRecoverPendingAdmission(
           return true;
         };
 
-        for (size_t distance = 1;
-             distance < workspace.ActiveCount() && !plan.window;
-             ++distance) {
-          if (currentIndex + distance < workspace.ActiveCount() &&
-              tryInsertionIndex(currentIndex + distance)) break;
-          if (currentIndex >= distance &&
-              tryInsertionIndex(currentIndex - distance)) break;
-        }
+        TryNearbyIndices(currentIndex, workspace.ActiveCount(), tryInsertionIndex);
         if (!plan.window && reassignSiblings) {
           tryInsertionIndex(currentIndex);
         }

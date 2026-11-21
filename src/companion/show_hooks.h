@@ -107,51 +107,54 @@ static void SteerSettlingWindow(HWND hwnd, UINT message, LPARAM lparam) {
   LogDecision(hwnd, "WM_WINDOWPOSCHANGING", "held at the companion's frame until MultiWM takes the window");
 }
 
-static BOOL WINAPI ShowWindowHook(HWND hwnd, int command) {
-  if (PrepareRestorePlacement(hwnd, command, "ShowWindow restore")) {
+// ShowWindow and ShowWindowAsync: a restore of a minimized or maximized member
+// is prepared first; a hidden window being shown restored is placed while still
+// hidden. `show` is the original entry point, read at call time because Windhawk
+// fills it in after the hooks are applied. `path` names the call in logs.
+// Structural eligibility rejects cross-thread windows (an async show from another
+// thread) before any native probe.
+static BOOL ShowWithHint(NtUserShowWindow_t show, HWND hwnd, int command, const char* path,
+                         const char* restorePath) {
+  if (PrepareRestorePlacement(hwnd, command, restorePath)) {
     PlacementScope placing;
-    return g_unhookedShowWindow(hwnd, command);
+    return show(hwnd, command);
   }
-  if (hwnd && IsRestoredShowCommand(command) && !IsWindowVisible(hwnd)) PlaceAtPredictedFrame(hwnd, "ShowWindow");
-  return g_unhookedShowWindow(hwnd, command);
+  if (hwnd && IsRestoredShowCommand(command) && !IsWindowVisible(hwnd)) PlaceAtPredictedFrame(hwnd, path);
+  return show(hwnd, command);
+}
+
+static BOOL WINAPI ShowWindowHook(HWND hwnd, int command) {
+  return ShowWithHint(g_unhookedShowWindow, hwnd, command, "ShowWindow", "ShowWindow restore");
 }
 
 static BOOL WINAPI ShowWindowAsyncHook(HWND hwnd, int command) {
-  if (PrepareRestorePlacement(hwnd, command, "ShowWindowAsync restore")) {
+  return ShowWithHint(g_unhookedShowWindowAsync, hwnd, command, "ShowWindowAsync", "ShowWindowAsync restore");
+}
+
+// DefWindowProcW and DefWindowProcA: default SC_RESTORE handling restores a
+// member into its tile; every message passes through the settling and UWP-frame
+// checks. `defWindowProc` is the original, read at call time.
+static LRESULT DefWindowProcWithHint(
+    decltype(&DefWindowProcW) defWindowProc, HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (message == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_RESTORE &&
+      PrepareRestorePlacement(hwnd, SW_RESTORE, "SC_RESTORE")) {
     PlacementScope placing;
-    return g_unhookedShowWindowAsync(hwnd, command);
+    return defWindowProc(hwnd, message, wparam, lparam);
   }
-  // Structural eligibility rejects cross-thread windows before any native probe.
-  if (hwnd && IsRestoredShowCommand(command) && !IsWindowVisible(hwnd)) PlaceAtPredictedFrame(hwnd, "ShowWindowAsync");
-  return g_unhookedShowWindowAsync(hwnd, command);
+  SteerSettlingWindow(hwnd, message, lparam);
+  if (message == WM_NCDESTROY) AppFrame::Forget(hwnd);
+  const bool attaching = MayAttachUwpFrame(hwnd, message);
+  const LRESULT result = defWindowProc(hwnd, message, wparam, lparam);
+  if (attaching) PlaceAttachingUwpFrame(hwnd);
+  return result;
 }
 
 static LRESULT WINAPI DefWindowProcWHook(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
-  if (message == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_RESTORE &&
-      PrepareRestorePlacement(hwnd, SW_RESTORE, "SC_RESTORE")) {
-    PlacementScope placing;
-    return g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
-  }
-  SteerSettlingWindow(hwnd, message, lparam);
-  if (message == WM_NCDESTROY) AppFrame::Forget(hwnd);
-  const bool attaching = MayAttachUwpFrame(hwnd, message);
-  const LRESULT result = g_unhookedDefWindowProcW(hwnd, message, wparam, lparam);
-  if (attaching) PlaceAttachingUwpFrame(hwnd);
-  return result;
+  return DefWindowProcWithHint(g_unhookedDefWindowProcW, hwnd, message, wparam, lparam);
 }
 
 static LRESULT WINAPI DefWindowProcAHook(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
-  if (message == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_RESTORE &&
-      PrepareRestorePlacement(hwnd, SW_RESTORE, "SC_RESTORE")) {
-    PlacementScope placing;
-    return g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
-  }
-  SteerSettlingWindow(hwnd, message, lparam);
-  if (message == WM_NCDESTROY) AppFrame::Forget(hwnd);
-  const bool attaching = MayAttachUwpFrame(hwnd, message);
-  const LRESULT result = g_unhookedDefWindowProcA(hwnd, message, wparam, lparam);
-  if (attaching) PlaceAttachingUwpFrame(hwnd);
-  return result;
+  return DefWindowProcWithHint(g_unhookedDefWindowProcA, hwnd, message, wparam, lparam);
 }
 
 // Both immediate and deferred placement take the same geometry. Rewrite it
@@ -241,20 +244,16 @@ static BOOL WINAPI SetWindowPlacementHook(HWND hwnd, const WINDOWPLACEMENT* plac
     // Non-tool top-level windows store rcNormalPosition in workspace coordinates.
     // Convert to screen coordinates before prediction and back at its destination.
     MONITORINFO monitorInfo{sizeof(monitorInfo)};
-    RECT proposedScreen = placement->rcNormalPosition;
     std::optional<WINDOWPLACEMENT> adjusted;
-    if (GetMonitorInfoW(MonitorFromRect(&proposedScreen, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
-      OffsetRect(&proposedScreen, monitorInfo.rcWork.left - monitorInfo.rcMonitor.left,
-                  monitorInfo.rcWork.top - monitorInfo.rcMonitor.top);
+    if (GetMonitorInfoW(MonitorFromRect(&placement->rcNormalPosition, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
+      const RECT proposedScreen = WorkspaceToScreen(placement->rcNormalPosition, monitorInfo);
       const auto proposed = ConvertScreenRect(hwnd, proposedScreen, LogicalToPhysicalPointForPerMonitorDPI);
       const auto prediction = proposed ? PredictWindowPlacement(hwnd, *proposed, "SetWindowPlacement") : std::nullopt;
       const auto target = prediction ? ConvertScreenRect(hwnd, prediction->windowRect,
                                                          PhysicalToLogicalPointForPerMonitorDPI) : std::nullopt;
       if (target && GetMonitorInfoW(MonitorFromRect(&*target, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
         adjusted = *placement;
-        adjusted->rcNormalPosition = *target;
-        OffsetRect(&adjusted->rcNormalPosition, monitorInfo.rcMonitor.left - monitorInfo.rcWork.left,
-                    monitorInfo.rcMonitor.top - monitorInfo.rcWork.top);
+        adjusted->rcNormalPosition = ScreenToWorkspace(*target, monitorInfo);
         LogDecision(hwnd, "SetWindowPlacement", "using MultiWM's predicted placement");
         RememberAppFrame(hwnd, *prediction);
         if (!prediction->keepSize) settleAt = prediction->windowRect;

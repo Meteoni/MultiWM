@@ -1,5 +1,6 @@
 #include "../src/multiwm/multiwm.cpp"
 #include <cstdio>
+#include <cstring>
 #include <random>
 
 // Exercise real model/planner behavior without creating or moving native windows.
@@ -718,6 +719,100 @@ static void RunDwindlePlannerDigest() {
               static_cast<unsigned long long>(digest), cases, planned, reassigned);
 }
 
+// Characterizes the whole planner over random workspaces: every layout but
+// Floating, random minimum and maximum sizes, gaps, work areas and adaptive
+// Dwindle settings. The digest pins each plan's status and every rectangle,
+// including what a failed plan leaves behind (conflict reporting and admission
+// recovery read those), plus the grow, shrink and reset size steps.
+static void RunPlanningTraceDigest() {
+  constexpr uint64_t kExpectedDigest = 0xc6167a36528490e1ull;
+  const SettingsState savedSettings = g_settings;
+  uint64_t digest = 1469598103934665603ull;
+  auto mix = [&](uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      digest ^= (value >> (i * 8)) & 0xff;
+      digest *= 1099511628211ull;
+    }
+  };
+  auto mixDouble = [&](double value) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    mix(bits);
+  };
+  std::mt19937 rng(424242);
+  auto pick = [&](int low, int high) { return std::uniform_int_distribution<int>(low, high)(rng); };
+  const TileLayout layouts[] = {TileLayout::MasterStack, TileLayout::Columns, TileLayout::Rows,
+                                TileLayout::MasterStackH, TileLayout::Dwindle, TileLayout::Monocle};
+  size_t plans = 0;
+  size_t unsatisfiable = 0;
+  size_t changedSteps = 0;
+  for (int run = 0; run < 10000; ++run) {
+    g_settings = SettingsState{};
+    g_settings.reverseDwindle = pick(0, 1);
+    g_settings.adaptiveDwindleSlots = static_cast<size_t>(pick(0, 4));
+    g_settings.adaptiveDwindlePercentage = pick(0, 40);
+    Workspace workspace;
+    workspace.SetLayout(layouts[pick(0, 5)]);
+    const int count = pick(1, 7);
+    for (int i = 1; i <= count; ++i) {
+      WindowRecord record;
+      record.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(i));
+      record.pid = 1;
+      record.constraints.valid = pick(0, 2) != 0;
+      record.constraints.minWidth = pick(1, 1400);
+      record.constraints.minHeight = pick(1, 900);
+      record.constraints.maxWidth = pick(0, 3) == 0 ? pick(record.constraints.minWidth, 2000) : 0;
+      record.constraints.maxHeight = pick(0, 3) == 0 ? pick(record.constraints.minHeight, 1400) : 0;
+      workspace.AdmitTiled(record);
+    }
+    workspace.SetMasterRatio(pick(10, 90) / 100.0);
+    RECT area{pick(-20, 20), pick(-20, 20), 0, 0};
+    area.right = area.left + pick(300, 3000);
+    area.bottom = area.top + pick(300, 1800);
+    const LONG gap = pick(0, 40);
+    for (int step = 0; step < 6; ++step) {
+      std::vector<RECT> rects{RECT{1, 2, 3, 4}};
+      const auto status = Layout::BuildWorkspaceLayoutPlan(workspace, area, gap, &rects);
+      mix(static_cast<uint64_t>(status));
+      mix(rects.size());
+      for (const RECT& rect : rects) {
+        mix(rect.left);
+        mix(rect.top);
+        mix(rect.right);
+        mix(rect.bottom);
+      }
+      ++plans;
+      if (status == Layout::LayoutPlanStatus::Unsatisfiable) ++unsatisfiable;
+      const size_t index = static_cast<size_t>(pick(0, count - 1));
+      const int operation = pick(0, 2);
+      Workspace candidate = workspace;
+      const bool changed = operation == 2 ? candidate.ResetTiledSize(area, gap, index, 0.5)
+                                          : candidate.StepTiledSize(area, gap, index, operation == 0, pick(1, 30));
+      mix(changed);
+      if (changed) ++changedSteps;
+      mix(candidate.StackWeights().size());
+      for (double weight : candidate.StackWeights()) mixDouble(weight);
+      for (double weight : candidate.GridWeights()) mixDouble(weight);
+      for (double ratio : candidate.DwindleRatios()) mixDouble(ratio);
+      mixDouble(candidate.MasterRatio());
+      if (pick(0, 1)) workspace = candidate;
+    }
+  }
+  g_settings = savedSettings;
+
+  if (unsatisfiable == 0 || unsatisfiable == plans || changedSteps == 0) {
+    std::fprintf(stderr, "FAILED: planning trace inputs do not exercise all planner outcomes\n");
+    std::exit(1);
+  }
+  if (kExpectedDigest && digest != kExpectedDigest) {
+    std::fprintf(stderr, "FAILED: planning trace digest %016llx != expected %016llx\n",
+                 static_cast<unsigned long long>(digest), static_cast<unsigned long long>(kExpectedDigest));
+    std::exit(1);
+  }
+  std::printf("Planning trace digest %016llx over %zu plans (%zu unsatisfiable, %zu size steps).\n",
+              static_cast<unsigned long long>(digest), plans, unsatisfiable, changedSteps);
+}
+
 // Characterizes the pure settings parsers over awkward inputs (spacing, bounds,
 // separators, case, junk). The digest pins accepted values and rejections.
 static void RunSettingsParserDigest() {
@@ -1305,6 +1400,7 @@ int main() {
   RunWindowSizePropertyTests();
   RunDwindleResizeScenarioTests();
   RunDwindlePlannerDigest();
+  RunPlanningTraceDigest();
   RunAdmissionPredictionTests();
   RunCompanionRuleEncodingTests();
   RunRestorePublicationTests();

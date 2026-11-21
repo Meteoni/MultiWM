@@ -111,13 +111,10 @@ static std::optional<SharedGeometry::FrameLimits> QueryFrameLimits(HWND hwnd, UI
   // `dpi`, the monitor's physical DPI, exactly as MultiWM's probe does.
   const UINT reportedWindowDpi = GetDpiForWindow(hwnd);
   const UINT windowDpi = reportedWindowDpi ? reportedWindowDpi : dpi;
+  const SharedGeometry::TrackingDefaults defaults = SharedGeometry::DefaultTrackingLimits(windowDpi);
   MINMAXINFO limits{};
-  limits.ptMinTrackSize = {GetSystemMetricsForDpi(SM_CXMINTRACK, windowDpi),
-                           GetSystemMetricsForDpi(SM_CYMINTRACK, windowDpi)};
-  limits.ptMaxTrackSize = {GetSystemMetricsForDpi(SM_CXMAXTRACK, windowDpi),
-                           GetSystemMetricsForDpi(SM_CYMAXTRACK, windowDpi)};
-  const POINT systemMinimum = limits.ptMinTrackSize;
-  const POINT systemMaximum = limits.ptMaxTrackSize;
+  limits.ptMinTrackSize = defaults.minimum;
+  limits.ptMaxTrackSize = defaults.maximum;
   SendMessageW(hwnd, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&limits));
   RECT after{};
   if (RejectStructurally(hwnd, true) || !GetWindowRect(hwnd, &after) || !EqualRect(&before, &after) ||
@@ -125,7 +122,7 @@ static std::optional<SharedGeometry::FrameLimits> QueryFrameLimits(HWND hwnd, UI
       (GetWindowLongPtrW(hwnd, GWL_STYLE) & (WS_MINIMIZE | WS_MAXIMIZE)) != showState) {
     return std::nullopt;
   }
-  return SharedGeometry::TrackingLimitsToFrame(limits, systemMinimum, systemMaximum,
+  return SharedGeometry::TrackingLimitsToFrame(limits, defaults.minimum, defaults.maximum,
       windowDpi, dpi, margins.left + margins.right, margins.top + margins.bottom);
 }
 

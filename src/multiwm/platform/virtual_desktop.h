@@ -266,8 +266,8 @@ static bool SelectVirtualDesktopAbiProfile(
 // Builds from 22621 try the 24H2 manager interface before their own profile's:
 // 23H2 builds that answer to it number its slots one lower from the desktop
 // switch (MScholtes' separate 23H2/24H2 definitions; 24H2 inserts
-// SwitchDesktopAndMoveForegroundView at slot 10). On 24H2 this is the base
-// profile again. The notification ABI stays the base profile's.
+// SwitchDesktopAndMoveForegroundView at slot 10). On 24H2 this equals the base
+// profile. The notification ABI stays the base profile's.
 static std::optional<VirtualDesktopAbiProfile> PreferredManagerProfile(
     const VirtualDesktopAbiProfile& base, DWORD build) {
   if (build < 22621) return std::nullopt;
@@ -577,6 +577,17 @@ bool RegisterVirtualDesktopNotifications() {
   return true;
 }
 
+// A failed InitializeVirtualDesktopAPIOnce step: logs it, releases whatever was
+// acquired (pointers not acquired yet are null) and counts the failure. False.
+static bool FailVirtualDesktopInitialization(const wchar_t* step, HRESULT hr) {
+  Wh_Log(L"Failed to %s: 0x%08X", step, hr);
+  SAFE_RELEASE(g_vd.desktopManager);
+  SAFE_RELEASE(g_vd.managerInternal);
+  SAFE_RELEASE(g_vd.serviceProvider);
+  ++Diagnostics::g_runtime.counters.vdApiInitFailures;
+  return false;
+}
+
 // Acquires the COM interfaces needed for virtual-desktop queries. Notification
 // subscription is deliberately owned by the centralized runtime-maintenance path.
 bool InitializeVirtualDesktopAPIOnce() {
@@ -590,16 +601,15 @@ bool InitializeVirtualDesktopAPIOnce() {
       CLSID_ImmersiveShell, nullptr,
       CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
       reinterpret_cast<void**>(&g_vd.serviceProvider));
-  if (FAILED(hr) || !g_vd.serviceProvider) {
-    SAFE_RELEASE(g_vd.serviceProvider);
-    Wh_Log(L"Failed to create ImmersiveShell: 0x%08X", hr);
-    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
-    return false;
-  }
+  if (FAILED(hr) || !g_vd.serviceProvider) return FailVirtualDesktopInitialization(L"create ImmersiveShell", hr);
 
-  // The first manager interface that answers selects the profile.
+  // The first manager interface that answers selects the profile. On 24H2 the
+  // preferred interface is the build's own, so it is queried once.
   std::vector<VirtualDesktopAbiProfile> candidates;
-  if (auto preferred = PreferredManagerProfile(g_vd.abi, g_vd.explorerBuild)) candidates.push_back(*preferred);
+  if (auto preferred = PreferredManagerProfile(g_vd.abi, g_vd.explorerBuild);
+      preferred && !IsEqualGUID(preferred->managerInternal, g_vd.abi.managerInternal)) {
+    candidates.push_back(*preferred);
+  }
   candidates.push_back(g_vd.abi);
   for (const VirtualDesktopAbiProfile& candidate : candidates) {
     hr = g_vd.serviceProvider->QueryService(
@@ -610,25 +620,14 @@ bool InitializeVirtualDesktopAPIOnce() {
     break;
   }
   if (FAILED(hr) || !g_vd.managerInternal) {
-    Wh_Log(L"Failed to get VirtualDesktopManagerInternal: 0x%08X", hr);
-    SAFE_RELEASE(g_vd.managerInternal);
-    SAFE_RELEASE(g_vd.serviceProvider);
-    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
-    return false;
+    return FailVirtualDesktopInitialization(L"get VirtualDesktopManagerInternal", hr);
   }
 
   hr = CoCreateInstance(
       CLSID_VirtualDesktopManager, nullptr, CLSCTX_INPROC_SERVER,
       IID_IVirtualDesktopManager,
       reinterpret_cast<void**>(&g_vd.desktopManager));
-  if (FAILED(hr) || !g_vd.desktopManager) {
-    Wh_Log(L"Failed to create VirtualDesktopManager: 0x%08X", hr);
-    SAFE_RELEASE(g_vd.desktopManager);
-    SAFE_RELEASE(g_vd.managerInternal);
-    SAFE_RELEASE(g_vd.serviceProvider);
-    ++Diagnostics::g_runtime.counters.vdApiInitFailures;
-    return false;
-  }
+  if (FAILED(hr) || !g_vd.desktopManager) return FailVirtualDesktopInitialization(L"create VirtualDesktopManager", hr);
 
   g_vd.shellPid = CurrentShellProcessId();
 
