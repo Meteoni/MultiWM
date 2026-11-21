@@ -176,9 +176,7 @@ static void OnLifecycleEvent(DWORD event, HWND hwnd) {
     // Older notification ABIs rely on the settled cloak/uncloak fallback to
     // discover desktop switches. Until that pass completes, make active-desktop
     // checks query Explorer directly.
-    if (g_wm.desktop.state != ReconciledDesktopState::Unknown) {
-      g_wm.desktop.state = ReconciledDesktopState::TransitionPending;
-    }
+    RuntimeLifecycle::MarkDesktopTransitionPending();
   }
   QueueWindowEvent(event, hwnd);
 }

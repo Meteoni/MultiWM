@@ -224,6 +224,37 @@ static void RunDesktopReconciliationTests() {
   g_wm.timers.lifecycle = g_wm.timers.maintenance = 0;
   g_vd.desktopManager = nullptr;
   g_vd.initialized = false;
+
+  // Both switch paths decide "was this a switch" by one rule.
+  {
+    const HWND leased = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x5e11));
+    auto observe = [&](const GUID& desktop, bool notified) {
+      g_wm.desktop.pendingSwitchFlyouts = false;
+      TestLeases()[leased] = Placement::ConformanceLease{};
+      return Reconcile::ObserveCurrentDesktop(desktop, notified);
+    };
+    auto sideEffects = [&](bool expected) {
+      return g_wm.desktop.pendingSwitchFlyouts == expected && TestLeases().count(leased) == (expected ? 0u : 1u) &&
+             g_wm.desktop.state == ReconciledDesktopState::Settled;
+    };
+    RuntimeLifecycle::ForgetReconciledDesktop();
+    RuntimeLifecycle::MarkDesktopTransitionPending();
+    check(g_wm.desktop.state == ReconciledDesktopState::Unknown, "nothing goes stale before a first observation");
+    check(!observe(source.desktopId, false) && sideEffects(false), "a settled pass's first observation is no switch");
+    RuntimeLifecycle::ForgetReconciledDesktop();
+    check(observe(source.desktopId, true) && sideEffects(true), "a native notification's first observation is a switch");
+    check(!observe(source.desktopId, true) && sideEffects(false), "a duplicate notification is no switch");
+    RuntimeLifecycle::MarkDesktopTransitionPending();
+    check(g_wm.desktop.state == ReconciledDesktopState::TransitionPending, "a possible switch makes the desktop stale");
+    check(!observe(source.desktopId, false) && sideEffects(false), "a settled pass on the same desktop is no switch");
+    check(observe(target.desktopId, false) && sideEffects(true) &&
+              IsEqualGUID(g_wm.desktop.reconciled, target.desktopId),
+          "a settled pass on another desktop is a switch");
+    check(observe(source.desktopId, true) && sideEffects(true), "a notification of another desktop is a switch");
+    TestLeases().clear();
+    g_wm.desktop.pendingSwitchFlyouts = false;
+    RuntimeLifecycle::ForgetReconciledDesktop();
+  }
   std::printf("Passed %d desktop reconciliation checks.\n", checks);
 }
 

@@ -113,8 +113,7 @@ void NotifyShellRestarted() {
 
   if (shellReplaced) {
     Platform::VirtualDesktop::AbandonVirtualDesktopAPIForShellRestart();
-    g_wm.desktop.reconciled = {};
-    g_wm.desktop.state = ReconciledDesktopState::Unknown;
+    RuntimeLifecycle::ForgetReconciledDesktop();
   }
 
   // A shell replacement can move/recreate windows asynchronously. Never let a

@@ -46,14 +46,32 @@ static bool ValidateSnapshotDesktop(const GUID& expectedDesktop) {
       IsEqualGUID(currentDesktop, expectedDesktop)) {
     return true;
   }
-  if (g_wm.desktop.state != ReconciledDesktopState::Unknown) {
-    g_wm.desktop.state = ReconciledDesktopState::TransitionPending;
-  }
+  RuntimeLifecycle::MarkDesktopTransitionPending();
   Diagnostics::RecordEvent(
       L"desktop snapshot deferred expected=%08X observed=%08X",
       expectedDesktop.Data1, currentDesktop.Data1);
   ScheduleLifecycleReconcile(nullptr);
   return false;
+}
+
+// Where a desktop switch takes effect, whether a native notification or a
+// settled pass noticed it. Records `currentDesktop` as the reconciled active
+// desktop and says whether that was a switch: a desktop other than the one last
+// reconciled or, before any was, a native notification (only it proves a switch
+// happened). On a switch, drops the old desktop's pending proofs, since a lease
+// never carries across DWM's cloak/uncloak transition, and queues the switch
+// flyouts for the end of the next settled pass.
+static bool ObserveCurrentDesktop(const GUID& currentDesktop, bool notified) {
+  const bool switched = g_wm.desktop.state == ReconciledDesktopState::Unknown
+                            ? notified
+                            : !IsEqualGUID(g_wm.desktop.reconciled, currentDesktop);
+  if (switched) {
+    Placement::DiscardAllPendingProofs();
+    g_wm.desktop.pendingSwitchFlyouts = true;
+  }
+  g_wm.desktop.reconciled = currentDesktop;
+  g_wm.desktop.state = ReconciledDesktopState::Settled;
+  return switched;
 }
 
 static TileLayout ResolveInitialWorkspaceLayout(
@@ -1041,22 +1059,10 @@ static void HandleVirtualDesktopChanged() {
 
   Diagnostics::RecordEvent(
       L"virtual desktop changed currentDesktop=%08X", currentDesktop.Data1);
-  const bool desktopActuallyChanged =
-      g_wm.desktop.state == ReconciledDesktopState::Unknown ||
-      !IsEqualGUID(g_wm.desktop.reconciled, currentDesktop);
-  if (desktopActuallyChanged) {
-    // A lease describes post-placement behavior on one active desktop. Never carry
-    // it across DWM's cloak/uncloak transition; the incoming settled arrange pass
-    // will establish fresh leases for any placements it actually has to issue.
-    Placement::DiscardAllPendingProofs();
-  }
-  g_wm.desktop.reconciled = currentDesktop;
-  g_wm.desktop.state = ReconciledDesktopState::Settled;
-  // The visual transition belongs to the settled desktop state, not the raw COM
-  // callback. Coalesce rapid switches and emit one monitor-local OSD per connected
-  // display after reconciliation has finished. Duplicate callbacks for the already
-  // represented desktop do not generate another visual transition.
-  if (desktopActuallyChanged) g_wm.desktop.pendingSwitchFlyouts = true;
+  // Duplicate callbacks for the desktop already reconciled are not a switch, so
+  // they queue no second flyout. The incoming settled pass establishes fresh
+  // leases for any placements it has to issue.
+  ObserveCurrentDesktop(currentDesktop, true);
 
   // A native VD transition is an authoritative reason to repair desktop ownership.
   // Do not infer monitor migration here; defer visibility/window-state participation
@@ -1193,11 +1199,9 @@ static void RequeueDirtyWindows(const std::vector<HWND>& dirtyWindows) {
 }
 
 // Native notifications are primary, but a settled cloak/uncloak burst can
-// independently detect a missed subscription/callback. This is the first point
-// where the WM can prove the active desktop changed, so discard leases created
-// on the old desktop before ownership repair and incoming-workspace work.
-static void HandleMissedDesktopSwitch(const GUID& currentDesktop) {
-  Placement::DiscardAllPendingProofs();
+// independently detect a missed subscription/callback. ObserveCurrentDesktop has
+// already made the switch take effect; this records that the notification missed it.
+static void RecordMissedDesktopSwitch(const GUID& currentDesktop) {
   ++Diagnostics::g_runtime.counters.virtualDesktopFallbackChanges;
   Diagnostics::RecordEvent(
       L"virtual desktop change recovered from settled WinEvents currentDesktop=%08X",
@@ -1207,7 +1211,6 @@ static void HandleMissedDesktopSwitch(const GUID& currentDesktop) {
   if (g_vd.abi.notification.methodCount > 0 && !g_vd.notificationsRegistered) {
     RuntimeLifecycle::RequestMaintenance(true);
   }
-  g_wm.desktop.pendingSwitchFlyouts = true;
 }
 
 // Chooses the monitors this pass must discover on. After a desktop switch or a
@@ -1353,12 +1356,11 @@ static void ReconcileDeferredLifecycle() {
   }
   Diagnostics::g_runtime.counters.lifecycleDirtyWindowsProcessed += dirtyWindows.size();
 
-  const bool missedDesktopSwitch =
-      g_wm.desktop.state != ReconciledDesktopState::Unknown &&
-      !IsEqualGUID(g_wm.desktop.reconciled, currentDesktop);
-  if (missedDesktopSwitch) HandleMissedDesktopSwitch(currentDesktop);
-  g_wm.desktop.reconciled = currentDesktop;
-  g_wm.desktop.state = ReconciledDesktopState::Settled;
+  // A switch the native notification already observed is not seen again here.
+  // Leases created on the old desktop are dropped before ownership repair and
+  // incoming-workspace work.
+  const bool missedDesktopSwitch = ObserveCurrentDesktop(currentDesktop, false);
+  if (missedDesktopSwitch) RecordMissedDesktopSwitch(currentDesktop);
 
   // 2. Repair ownership, liveness/exclusions and participation globally before
   // doing current-desktop discovery.

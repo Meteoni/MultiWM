@@ -345,7 +345,7 @@ static void FollowInitiallyPlacedWindow() {
   if (Platform::VirtualDesktop::SwitchToDesktop(
           pending.hwnd, pending.processId, pending.targetDesktop, pending.sourceDesktop, pending.inputTickMs,
           Platform::VirtualDesktop::WindowMovePurpose::InitialPlacement)) {
-    g_wm.desktop.state = ReconciledDesktopState::TransitionPending;
+    RuntimeLifecycle::MarkDesktopTransitionPending();
     ScheduleLifecycleReconcile(nullptr);
   }
   g_wm.routing.follow = {};
@@ -960,7 +960,7 @@ static void ProcessWindowOverflow() {
       if (Platform::VirtualDesktop::SwitchToDesktop(follow.hwnd, follow.processId, follow.targetDesktop, follow.sourceDesktop, follow.inputTickMs)) {
         follow.deadlineTickMs = GetTickCount64() + kOverflowFollowTimeoutMs;
         g_wm.overflow.follow = follow;
-        g_wm.desktop.state = ReconciledDesktopState::TransitionPending;
+        RuntimeLifecycle::MarkDesktopTransitionPending();
         waitForSwitch = true;
         ScheduleLifecycleReconcile(nullptr);
       } else {

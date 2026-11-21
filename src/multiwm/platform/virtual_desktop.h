@@ -360,10 +360,7 @@ static void QueueVirtualDesktopChangedNotification() {
 
   // The callback is the transition boundary. Keep using the live shell query until
   // the queued handler has reconciled the new desktop into actor-owned state.
-  if (g_wm.desktop.state != ReconciledDesktopState::Unknown) {
-    g_wm.desktop.state =
-        ReconciledDesktopState::TransitionPending;
-  }
+  RuntimeLifecycle::MarkDesktopTransitionPending();
 
   // COM can emit redundant desktop notifications. Collapse them before they
   // reach the WM core, just as FancyWM coalesces layout invalidations.

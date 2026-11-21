@@ -419,6 +419,25 @@ static bool GetActiveDesktopId(GUID* outDesktop) {
   return Platform::VirtualDesktop::GetCurrentDesktopId(outDesktop);
 }
 
+// The reconciled desktop is the one place a desktop switch takes effect: only
+// these two functions and Reconcile::ObserveCurrentDesktop write it.
+
+// The active desktop may have changed since it was last reconciled, so
+// active-desktop checks query the shell until the next observation. Does
+// nothing before the first observation, which has nothing to go stale.
+static void MarkDesktopTransitionPending() {
+  if (g_wm.desktop.state != ReconciledDesktopState::Unknown) {
+    g_wm.desktop.state = ReconciledDesktopState::TransitionPending;
+  }
+}
+
+// Forgets the reconciled desktop (the shell restarted), so the next
+// observation is a first one rather than a switch.
+static void ForgetReconciledDesktop() {
+  g_wm.desktop.reconciled = {};
+  g_wm.desktop.state = ReconciledDesktopState::Unknown;
+}
+
 static void AssertWmThread(const wchar_t* operation) {
   const DWORD expectedThread = g_wm.threadId.load(std::memory_order_acquire);
   if (!expectedThread) return;
