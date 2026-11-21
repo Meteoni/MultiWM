@@ -861,7 +861,7 @@ static OverflowRequestResult ProcessOverflowRequest(
       source.workspace.Layout() == TileLayout::Floating || Platform::Windows::IsWindowExcludedByRules(hwnd) ||
       Platform::Windows::ShouldWindowAlwaysFloat(hwnd)) return {OverflowOutcome::Ignored};
   if (!IsEqualGUID(batch.desktop, request.sourceDesktop) ||
-      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None || Platform::Windows::IsWindowCloaked(hwnd)) {
+      Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     // Wait for desktop arrival or restoration rather than polling hidden apps.
     return {OverflowOutcome::Retry};
   }
@@ -912,8 +912,7 @@ static OverflowRequestResult ProcessOverflowRequest(
   }
 
   if (result.outcome != OverflowOutcome::Placed && IsWindow(hwnd) && g_wm.overflow.windows.count(hwnd) &&
-      (result.outcome == OverflowOutcome::Retry || Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-       Platform::Windows::IsWindowCloaked(hwnd))) {
+      (result.outcome == OverflowOutcome::Retry || Platform::Windows::IsSuspendedOrCloaked(hwnd))) {
     return {OverflowOutcome::Retry};
   }
   if (result.outcome == OverflowOutcome::NoDestination) {

@@ -231,8 +231,7 @@ static bool RememberCurrentFloatingGeometry(
 static void RememberFloatingLayoutFrames(Workspace& workspace, UINT dpi) {
   for (HWND hwnd : workspace.TiledWindows()) {
     RECT frame{};
-    if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-        Platform::Windows::IsWindowCloaked(hwnd) || !Platform::Windows::GetWindowFrameRect(hwnd, &frame)) {
+    if (Platform::Windows::IsSuspendedOrCloaked(hwnd) || !Platform::Windows::GetWindowFrameRect(hwnd, &frame)) {
       continue;
     }
     workspace.RememberFloatingGeometry(hwnd, frame, dpi);

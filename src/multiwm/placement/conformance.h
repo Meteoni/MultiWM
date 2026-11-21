@@ -360,8 +360,7 @@ static bool ClearSettledInsertionPlacements(
   for (HWND hwnd : workspace.TiledWindows()) {
     const WindowRecord* record = workspace.Find(hwnd);
     if (!record || !record->pendingInsertionPlacement ||
-        Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-        Platform::Windows::IsWindowCloaked(hwnd)) {
+        Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
       continue;
     }
 
@@ -408,8 +407,7 @@ static ConformanceConstraintRefresh RefreshConformanceConstraints(
     HWND hwnd, Workspace& workspace, const WindowRecord& record) {
   const ConstraintProbeRefresh refresh = ProbeConstraintsAgainstCache(hwnd, record.constraints);
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, record) ||
-      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      Platform::Windows::IsWindowCloaked(hwnd)) {
+      Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     return ConformanceConstraintRefresh::Stale;
   }
   workspace.UpdateConstraints(hwnd, refresh.merged);
@@ -430,8 +428,7 @@ static void FinalizeExpiredConformanceLease(
   };
 
   if (!IsWindow(hwnd) ||
-      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      Platform::Windows::IsWindowCloaked(hwnd) ||
+      Platform::Windows::IsSuspendedOrCloaked(hwnd) ||
       Gestures::IsMoveSizeGestureInProgress(hwnd)) {
     stale();
     return;
@@ -542,8 +539,7 @@ struct TiledLocationObservation {
 // HWND reused by another process, or no tile can be planned).
 static std::optional<TiledLocationObservation> ObserveTiledWindowLocation(HWND hwnd) {
   if (!IsWindow(hwnd) ||
-      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      Platform::Windows::IsWindowCloaked(hwnd)) {
+      Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     return std::nullopt;
   }
 
@@ -608,8 +604,7 @@ static bool ReinforceConformanceTile(
   // Re-check at the mutation boundary: Chromium can finish entering fullscreen
   // while the ownership/layout queries above are in progress.
   if (!ConformanceWindowMatchesRecordIdentity(hwnd, *record) ||
-      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      Platform::Windows::IsWindowCloaked(hwnd)) {
+      Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;
   }
@@ -699,8 +694,7 @@ static bool ReinforceConformanceTile(
 static std::optional<ConformanceWorkspace> LoadFloatingLeaseWorkspace(
     HWND hwnd, const ConformanceLease& lease) {
   if (!IsWindow(hwnd) ||
-      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      Platform::Windows::IsWindowCloaked(hwnd)) {
+      Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     return std::nullopt;
   }
   auto owner = LoadConformanceWorkspace(hwnd);

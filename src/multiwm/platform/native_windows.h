@@ -150,6 +150,17 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
   return constraints;
 }
 
+// True when `hwnd`'s window rectangle covers its whole monitor: how Chromium and
+// similar apps look in fullscreen while Windows still reports them as restored.
+static bool CoversItsMonitor(HWND hwnd) {
+  RECT windowRect{};
+  if (!GetWindowRect(hwnd, &windowRect)) return false;
+  HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONULL);
+  MONITORINFO monitorInfo{sizeof(monitorInfo)};
+  return monitor && GetMonitorInfoW(monitor, &monitorInfo) &&
+         SharedGeometry::CoversMonitor(windowRect, monitorInfo.rcMonitor);
+}
+
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
   if (IsIconic(hwnd)) return SuspensionReason::Minimized;
@@ -168,19 +179,21 @@ static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (cloaked & DWM_CLOAKED_APP) return SuspensionReason::Hidden;
   if (IsZoomed(hwnd)) return SuspensionReason::Maximized;
 
-  // Chromium and similar apps can cover the full monitor while Windows still
-  // reports the HWND as restored. Fullscreen and native maximize have identical
-  // suspend/save-slot/restore semantics here.
-  RECT windowRect{};
-  if (GetWindowRect(hwnd, &windowRect)) {
-    HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONULL);
-    MONITORINFO monitorInfo{sizeof(monitorInfo)};
-    if (monitor && GetMonitorInfoW(monitor, &monitorInfo) &&
-        SharedGeometry::CoversMonitor(windowRect, monitorInfo.rcMonitor)) {
-      return SuspensionReason::Maximized;
-    }
-  }
-  return SuspensionReason::None;
+  // Fullscreen and native maximize have identical suspend/save-slot/restore
+  // semantics here.
+  return CoversItsMonitor(hwnd) ? SuspensionReason::Maximized : SuspensionReason::None;
+}
+
+// True when `hwnd` can't take part in a layout right now: it is minimized,
+// hidden, maximized or fullscreen (GetPhysicalSuspensionReason), or cloaked for
+// any reason, which is how windows on other desktops look. One cloak query; a
+// failed one reads as not cloaked, as in GetPhysicalSuspensionReason.
+static bool IsSuspendedOrCloaked(HWND hwnd) {
+  if (!hwnd || !IsWindow(hwnd)) return false;
+  if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) return true;
+  DWORD cloaked = 0;
+  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+  return cloaked || IsZoomed(hwnd) || CoversItsMonitor(hwnd);
 }
 
 // Workspace initialization needs a broader physical snapshot than normal layout
@@ -576,8 +589,7 @@ static PlacementObservation PlaceWindowChecked(
   // application can maximize/fullscreen/minimize itself after arrangement's
   // earlier eligibility check but before this SetWindowPos. Treat that transition
   // as a benign suppressed placement, never as refusal/nonconformance.
-  if (GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      IsWindowCloaked(hwnd)) {
+  if (IsSuspendedOrCloaked(hwnd)) {
     ++Diagnostics::g_runtime.counters.placementPreflightStops;
     return finish(PlacementResult::SuppressedByPhysicalState);
   }

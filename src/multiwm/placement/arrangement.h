@@ -145,8 +145,7 @@ static bool RefreshWorkspaceNativeConstraints(
   for (HWND hwnd : workspace.TiledWindows()) {
     const WindowRecord* record = workspace.Find(hwnd);
     if (!record ||
-        Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-        Platform::Windows::IsWindowCloaked(hwnd)) {
+        Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
       continue;
     }
 
@@ -976,8 +975,7 @@ static TiledPlacementOutcome PlaceTiledWindow(
   using Stop = TiledPlacementOutcome::Stop;
   const WindowRecord* record = IsWindow(hwnd) ? workspace.Find(hwnd) : nullptr;
   if (!record) return {Workspace::PlacementAction::Forget};
-  if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
-      Platform::Windows::IsWindowCloaked(hwnd)) {
+  if (Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     return {};
   }
 
