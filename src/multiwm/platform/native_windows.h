@@ -285,33 +285,6 @@ HWND ResolveToTiledWindow(HWND hwnd, const std::vector<HWND>& candidates) {
   return nullptr;
 }
 
-std::vector<HWND> CollectTileWindows(HMONITOR monitor, const GUID& desktopId) {
-  std::vector<HWND> windows;
-  if (!monitor) return windows;
-
-  struct EnumContext {
-    HMONITOR targetMonitor;
-    GUID desktopId;
-    std::vector<HWND>* windowList;
-  } context = {monitor, desktopId, &windows};
-
-  ++Diagnostics::g_runtime.counters.enumWindowsPasses;
-  EnumWindows(
-      [](HWND hwnd, LPARAM lParam) WINAPI -> BOOL {
-        ++Diagnostics::g_runtime.counters.enumWindowsVisited;
-        auto* ctx = reinterpret_cast<EnumContext*>(lParam);
-        if (GetCurrentManagedWindowMonitor(hwnd, &ctx->desktopId) ==
-            ctx->targetMonitor) {
-          ctx->windowList->push_back(hwnd);
-          ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
-        }
-        return TRUE;
-      },
-      reinterpret_cast<LPARAM>(&context));
-
-  return windows;
-}
-
 // Deferred reconciliation often needs snapshots for several monitors at once.
 // Enumerate top-level HWNDs once and bucket each eligible window by monitor instead
 // of repeating EnumWindows (and its DWM/VD checks) once per monitor.
@@ -346,6 +319,12 @@ static std::vector<std::vector<HWND>> CollectTileWindowsForMonitors(
       reinterpret_cast<LPARAM>(&context));
 
   return snapshots;
+}
+
+// CollectTileWindowsForMonitors for one monitor.
+static std::vector<HWND> CollectTileWindows(HMONITOR monitor, const GUID& desktopId) {
+  if (!monitor) return {};
+  return std::move(CollectTileWindowsForMonitors({monitor}, desktopId).front());
 }
 
 // Captures Win32 geometry/capability observations before the pure Workspace

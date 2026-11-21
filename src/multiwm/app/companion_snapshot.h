@@ -143,8 +143,8 @@ static CompanionAbi::TrackedWindowHint MakeTrackedWindowHint(
 static void AppendWorkspaceHints(const GUID& desktop, CompanionAbi::SnapshotBody* body) {
   std::vector<HMONITOR> monitors;
   Reconcile::EnumerateCurrentMonitors(monitors);
-  const bool insertAfterFocused =
-      g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused;
+  // Where Automatic discovery puts a new window (Reconcile::InsertsAfterFocusedWindow).
+  const bool insertAfterFocused = Reconcile::InsertsAfterFocusedWindow(true);
 
   for (HMONITOR monitor : monitors) {
     if (body->workspaceCount == CompanionAbi::kMaxWorkspaces) break;
