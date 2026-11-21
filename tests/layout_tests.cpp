@@ -283,32 +283,35 @@ static void RunWeightedResizeTests() {
   std::printf("Passed %d weighted resize checks.\n", checks);
 }
 
-// The floating placement rule both mods share (shared/geometry.h), so the
-// companion's predicted float is MultiWM's placement. Frames take a window's
-// size limits the way Windows applies them to a positioning call: the size is
-// clamped and the top-left corner stays.
+// The floating placement rule both mods share (shared/geometry.h): MultiWM
+// places floating windows with it and the companion predicts them with it.
+// A window's size limits are fitted around the planned centre, inside the work
+// area.
 static void RunFloatingPlacementTests() {
   int checks = 0;
   auto check = [&](bool passed, const char* message) {
     if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
     ++checks;
   };
-  auto clamp = [](RECT frame, SharedGeometry::FrameLimits limits) {
-    return SharedGeometry::ClampSizeKeepingOrigin(frame, limits);
-  };
-  const RECT frame{100, 200, 1200, 935};
-  RECT expected = frame;
-  RECT clamped = clamp(frame, {1, 1, 0, 0});
-  check(EqualRect(&clamped, &expected), "limits the frame already satisfies change nothing");
-  clamped = clamp(frame, {1, 1, 500, 400});
-  expected = {100, 200, 600, 600};
-  check(EqualRect(&clamped, &expected), "a maximum shrinks the frame toward its top-left corner");
-  clamped = clamp(frame, {1300, 900, 0, 0});
-  expected = {100, 200, 1400, 1100};
-  check(EqualRect(&clamped, &expected), "a minimum grows the frame from its top-left corner");
-  clamped = clamp(frame, {1, 900, 500, 0});
-  expected = {100, 200, 600, 1100};
-  check(EqualRect(&clamped, &expected), "each axis takes its own limit");
+  auto sizeIs = [](SIZE size, LONG width, LONG height) { return size.cx == width && size.cy == height; };
+  const SIZE size{1100, 735};
+  check(sizeIs(SharedGeometry::ClampSizeToLimits(size, {1, 1, 0, 0}), 1100, 735),
+        "limits the size already satisfies change nothing");
+  check(sizeIs(SharedGeometry::ClampSizeToLimits(size, {1, 1, 500, 400}), 500, 400), "a maximum shrinks the size");
+  check(sizeIs(SharedGeometry::ClampSizeToLimits(size, {1300, 900, 0, 0}), 1300, 900), "a minimum grows the size");
+  check(sizeIs(SharedGeometry::ClampSizeToLimits(size, {1, 900, 500, 0}), 500, 900), "each axis takes its own limit");
+
+  const RECT box{0, 0, 1000, 800};
+  RECT expected{};
+  RECT moved = SharedGeometry::MoveInsideArea({100, 100, 400, 300}, box);
+  expected = {100, 100, 400, 300};
+  check(EqualRect(&moved, &expected), "a frame inside the area stays put");
+  moved = SharedGeometry::MoveInsideArea({-50, 700, 250, 900}, box);
+  expected = {0, 600, 300, 800};
+  check(EqualRect(&moved, &expected), "a frame across an edge moves inside, keeping its size");
+  moved = SharedGeometry::MoveInsideArea({-100, -100, 1100, 300}, box);
+  expected = {0, 0, 1200, 400};
+  check(EqualRect(&moved, &expected), "an axis larger than the area starts at its left or top edge");
 
   // The floating placement rule both mods share. A 1200x1000 work area.
   using SharedGeometry::FloatingSizeSource;
@@ -324,6 +327,9 @@ static void RunFloatingPlacementTests() {
   auto plan = [](const SharedGeometry::FloatingRequest& r) { return SharedGeometry::PlanFloatingPlacement(r); };
   auto is = [](const std::optional<SharedGeometry::FloatingPlacement>& p, RECT rect, bool moveOnly) {
     return p && EqualRect(&p->frame, &rect) && p->moveOnly == moveOnly;
+  };
+  auto appliesLimits = [](const std::optional<SharedGeometry::FloatingPlacement>& p) {
+    return p && p->appliesLimits;
   };
   const SharedGeometry::FloatingSizeRule sizeRule{false, {800, 500}};
   const SharedGeometry::FloatingSizeRule preserveRule{true, {}};
@@ -349,28 +355,54 @@ static void RunFloatingPlacementTests() {
 
   r = request(FloatingSizeSource::Own);
   r.current = SIZE{1400, 300};
-  check(is(plan(r), {-100, 350, 1300, 650}, true), "own: the window's size, only moved, past the work area");
+  check(is(plan(r), {-100, 350, 1300, 650}, true) && !appliesLimits(plan(r)),
+        "own: the window's size, only moved, past the work area");
   r.rule = sizeRule;
-  check(is(plan(r), {200, 250, 1000, 750}, false), "own: a size rule resizes a resizable window");
+  check(is(plan(r), {200, 250, 1000, 750}, false) && appliesLimits(plan(r)),
+        "own: a size rule resizes a resizable window");
   r.canResize = false;
-  check(is(plan(r), {-100, 350, 1300, 650}, true), "own: a window that can't resize is only moved");
+  check(is(plan(r), {-100, 350, 1300, 650}, true) && !appliesLimits(plan(r)),
+        "own: a window that can't resize is only moved");
   r.current.reset();
   check(!plan(r), "own: an unknown frame gives no placement");
 
   r = request(FloatingSizeSource::Fallback);
   r.canResize = false;
   r.center = POINT{100, 100};
-  check(is(plan(r), {0, 0, 300, 200}, false), "a window that can't resize keeps its size, inside the work area");
+  check(is(plan(r), {0, 0, 300, 200}, false) && !appliesLimits(plan(r)),
+        "a window that can't resize keeps its size, inside the work area, without limits");
 
-  const SharedGeometry::FrameLimits limits{1, 1, 250, 150};
-  SharedGeometry::FloatingPlacement placement{{100, 100, 500, 400}, true};
-  RECT fitted = SharedGeometry::FitFloatingPlacementToLimits(placement, limits);
-  expected = placement.frame;
+  // Size limits: fitted around the planned centre, inside the work area.
+  auto fit = [&](const SharedGeometry::FloatingRequest& req, SharedGeometry::FrameLimits limits) {
+    return SharedGeometry::FitFloatingPlacementToLimits(*plan(req), limits);
+  };
+  r = request(FloatingSizeSource::Fallback);  // 600x400 centred: {300, 300, 900, 700}
+  RECT fitted = fit(r, {1, 1, 0, 0});
+  expected = {300, 300, 900, 700};
+  check(EqualRect(&fitted, &expected), "limits the planned size satisfies change nothing");
+  fitted = fit(r, {1, 1, 400, 200});
+  expected = {400, 400, 800, 600};
+  check(EqualRect(&fitted, &expected), "a maximum shrinks the frame around its centre");
+  fitted = fit(r, {800, 600, 0, 0});
+  expected = {200, 200, 1000, 800};
+  check(EqualRect(&fitted, &expected), "a minimum grows the frame around its centre");
+  r.center = POINT{1100, 900};
+  fitted = fit(r, {800, 600, 0, 0});
+  expected = {400, 400, 1200, 1000};
+  check(EqualRect(&fitted, &expected), "a grown frame stays inside the work area");
+  r.center.reset();
+  fitted = fit(r, {1400, 600, 0, 0});
+  expected = {0, 200, 1400, 800};
+  check(EqualRect(&fitted, &expected), "a minimum wider than the work area starts at its left edge");
+  r = request(FloatingSizeSource::Own);
+  fitted = fit(r, {800, 600, 0, 0});
+  expected = {450, 400, 750, 600};
   check(EqualRect(&fitted, &expected), "a window that is only moved keeps its size despite its limits");
-  placement.moveOnly = false;
-  fitted = SharedGeometry::FitFloatingPlacementToLimits(placement, limits);
-  expected = {100, 100, 350, 250};
-  check(EqualRect(&fitted, &expected), "a placed window takes its limits at its top-left corner");
+  r = request(FloatingSizeSource::Fallback);
+  r.canResize = false;
+  fitted = fit(r, {800, 600, 0, 0});
+  expected = {450, 400, 750, 600};
+  check(EqualRect(&fitted, &expected), "a window that can't resize keeps its size despite its limits");
   std::printf("Passed %d floating placement checks.\n", checks);
 }
 

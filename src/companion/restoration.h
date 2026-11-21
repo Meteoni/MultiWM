@@ -71,11 +71,11 @@ static bool AdjustRestorePlacement(HWND hwnd, WINDOWPLACEMENT* placement, const 
   HintInputs inputs;
   if (!ReadHintInputs(hwnd, monitorRect, &inputs) || !inputs.tracked) return false;
   TargetKind kind;
-  std::optional<RECT> overflowFrame;
+  std::optional<SharedGeometry::FloatingPlacement> floating;
   const char* reason = nullptr;
   // Known transitions ignore the proposed rectangle. Both hidden-normal shows
   // and min/max restores select the same model-owned restore or arrival intent.
-  const auto frame = PredictFrame(hwnd, placement->rcNormalPosition, inputs, &kind, &overflowFrame, &reason);
+  const auto frame = PredictFrame(hwnd, placement->rcNormalPosition, inputs, &kind, &floating, &reason);
   if (!frame) {
     LogDecision(hwnd, path, reason);
     return false;

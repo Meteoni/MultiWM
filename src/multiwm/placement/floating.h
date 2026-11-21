@@ -145,10 +145,10 @@ static bool RepairFloatingGeometry(
   const std::optional<SharedGeometry::FloatingPlacement> placement =
       SharedGeometry::PlanFloatingPlacement(request);
   if (!placement) return false;
-  // Apply the app's size limits as Windows would: SWP_NOSENDCHANGING skips that,
-  // so without this the window is forced past its own limits.
+  // Fit the app's size limits: SWP_NOSENDCHANGING skips Windows' own clamp, so
+  // without this the window is forced past them. Only probed when they apply.
   RECT target = placement->frame;
-  if (!placement->moveOnly && record->canResize) {
+  if (placement->appliesLimits) {
     if (const auto limits = FloatingSizeLimits(workspace, hwnd, targetDpi)) {
       target = SharedGeometry::FitFloatingPlacementToLimits(*placement, *limits);
     }

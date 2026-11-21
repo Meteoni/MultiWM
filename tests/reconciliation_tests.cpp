@@ -902,8 +902,8 @@ static void RunFloatingSizeCommandTests() {
 // A window's first floating size never comes from the frame it had when it was
 // first recorded (often a placeholder, or with the companion already its tile):
 // it is an override-size rule's size or the configured default. Floating frames
-// then take the window's size limits keeping their top-left corner, as Windows
-// would, because MultiWM's SWP_NOSENDCHANGING placement skips Windows' clamp.
+// then take the window's size limits around their centre, because MultiWM's
+// SWP_NOSENDCHANGING placement skips Windows' own clamp.
 static void RunFirstFloatingSizeTests() {
   CheckCounter check;
   FloatingWindowFixture f(check);
@@ -941,18 +941,21 @@ static void RunFirstFloatingSizeTests() {
     current.UpdateConstraints(hwnd, limits);
     g_workspaces.Save(f.key, current);
   };
+  auto centeredAt = [&](LONG width, LONG height) {
+    return SharedGeometry::CenteredClampedIn(f.metrics.workArea, width, height);
+  };
   withLimits(1, 1, 300, 200);
-  check(f.Place(hwnd, Placement::FloatingPlacementIntent::NewWindowCenter) && frame().left == defaultFrame.left &&
-            frame().top == defaultFrame.top && Layout::RectWidth(frame()) == 300 &&
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::NewWindowCenter) &&
+            Layout::RectsNear(frame(), centeredAt(300, 200), 1) && Layout::RectWidth(frame()) == 300 &&
             Layout::RectHeight(frame()) == 200,
-        "a maximum shrinks the default frame toward its top-left corner");
+        "a maximum shrinks the default frame around its centre");
   const LONG wider = Layout::RectWidth(defaultFrame) + 40;
   const LONG taller = Layout::RectHeight(defaultFrame) + 30;
   withLimits(wider, taller, 0, 0);
-  check(f.Place(hwnd, Placement::FloatingPlacementIntent::NewWindowCenter) && frame().left == defaultFrame.left &&
-            frame().top == defaultFrame.top && Layout::RectWidth(frame()) == wider &&
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::NewWindowCenter) &&
+            Layout::RectsNear(frame(), centeredAt(wider, taller), 1) && Layout::RectWidth(frame()) == wider &&
             Layout::RectHeight(frame()) == taller,
-        "a minimum grows the default frame from its top-left corner");
+        "a minimum grows the default frame around its centre");
   withLimits(1, 1, 0, 0);
 
   // An override-size rule names the first floating size instead (Automatic mode).

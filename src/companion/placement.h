@@ -180,15 +180,11 @@ static std::optional<RECT> FitSlotToLimits(
   return fitted;
 }
 
-// A floating window placed by MultiWM keeps its requested top-left corner while
-// its size limits are applied; both mods share the rule.
-using SharedGeometry::ClampSizeKeepingOrigin;
-
 // How MultiWM treats the frame PredictFrame returns once it reads the window's
 // size limits.
 enum class TargetKind {
   Tile,      // A tiled slot, fitted to the limits as FitSlotToLimits does.
-  Float,     // A floating frame: Windows applies the limits at its top-left corner.
+  Float,     // A floating frame, fitted by SharedGeometry::FitFloatingPlacementToLimits.
   KeepSize,  // Only moved; the app keeps its size.
 };
 
@@ -217,16 +213,18 @@ static std::optional<SharedGeometry::FloatingPlacement> PredictFloatingPlacement
 
 // The frame MultiWM will give `hwnd` (currently at `frame`), using its restore
 // hint when known or Automatic discovery otherwise, and how MultiWM applies the
-// window's size limits to it (`*kind`). For a tiled slot, `*overflowFrame` is
-// where overflow would centre the window if its minimum turns out larger than
-// the work area (MultiWM then floats it); nothing when overflow routes such a
-// window instead. Returns nothing, with `*reason` set, when MultiWM won't
-// manage it or the snapshot can't say where it goes.
+// window's size limits to it (`*kind`). `*floating` is the floating placement
+// behind a floating frame, which the limits are fitted to. For a tiled slot it
+// is where overflow would centre the window if its minimum turns out larger
+// than the work area (MultiWM then floats it); nothing when overflow routes
+// such a window instead. Returns nothing, with `*reason` set, when MultiWM
+// won't manage it or the snapshot can't say where it goes.
 static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const HintInputs& inputs, TargetKind* kind,
-                                        std::optional<RECT>* overflowFrame, const char** reason) {
+                                        std::optional<SharedGeometry::FloatingPlacement>* floating,
+                                        const char** reason) {
   using namespace CompanionAbi;
   *kind = TargetKind::Tile;
-  overflowFrame->reset();
+  floating->reset();
   auto reject = [&](const char* why) -> std::optional<RECT> {
     *reason = why;
     return std::nullopt;
@@ -280,37 +278,32 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
   using SharedGeometry::FloatingSizeSource;
   const SnapshotRule* sizeRule = matches(WindowRuleTreatment::FloatingPlacementOverride);
   if (floatingRule) {
-    const auto placement =
-        PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Own, false);
-    if (!placement) return reject("no frame to centre");
-    *kind = placement->moveOnly ? TargetKind::KeepSize : TargetKind::Float;
-    if (!placement->moveOnly) *reason = "rule-floated at its size rule's size";
-    return placement->frame;
+    *floating = PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Own, false);
+    if (!*floating) return reject("no frame to centre");
+    *kind = (*floating)->moveOnly ? TargetKind::KeepSize : TargetKind::Float;
+    if (!(*floating)->moveOnly) *reason = "rule-floated at its size rule's size";
+    return (*floating)->frame;
   }
 
   if (workspace.floatingLayout) {
     // NewWindowCenter: the default size unless a size rule says otherwise.
     *kind = TargetKind::Float;
-    const auto placement =
-        PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, false);
-    if (!placement) return reject("no floating default");
-    return placement->frame;
+    *floating = PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, false);
+    if (!*floating) return reject("no floating default");
+    return (*floating)->frame;
   }
 
   // Automatic overflow floats a window it can't tile and, unless it routes the
   // window elsewhere, centres it (FailureCenter).
   if (inputs.flags & kFlagOverflowCentersFloat) {
-    if (const auto placement =
-            PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, true)) {
-      *overflowFrame = placement->frame;
-    }
+    *floating = PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, true);
   }
   if (!workspace.hasTiledFrame) {
     if (!workspace.newWindowFloats) return reject("no free tiled slot");
-    if (!*overflowFrame) return reject("overflow routes the window");
+    if (!*floating) return reject("overflow routes the window");
     *kind = TargetKind::Float;
     *reason = "overflow floats it";
-    return *overflowFrame;
+    return (*floating)->frame;
   }
   return workspace.tiledFrame;
 }
@@ -369,9 +362,9 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   // a hidden window's current DWM bounds can be missing or stale.
   if (inputs.tracked && inputs.restoreFrameMargins) margins = *inputs.restoreFrameMargins;
   TargetKind kind = TargetKind::Tile;
-  std::optional<RECT> overflowFrame;
+  std::optional<SharedGeometry::FloatingPlacement> floating;
   const char* reason = nullptr;
-  const std::optional<RECT> target = PredictFrame(hwnd, frame, inputs, &kind, &overflowFrame, &reason);
+  const std::optional<RECT> target = PredictFrame(hwnd, frame, inputs, &kind, &floating, &reason);
   if (!target) {
     LogDecision(hwnd, path, reason);
     return std::nullopt;
@@ -379,20 +372,20 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
 
   // MultiWM predicted the slot without knowing this window's size limits. Apply
   // them the way MultiWM will once it reads them: tiles by FitSlotToLimits,
-  // floating frames by keeping the top-left corner.
+  // floating frames by the rule both mods share.
   RECT frameTarget = *target;
   if (kind != TargetKind::KeepSize) {
     const UINT dpi = inputs.workspace->dpi ? inputs.workspace->dpi : 96;
     const auto limits = QueryFrameLimits(hwnd, dpi, margins);
     if (!limits) return std::nullopt;
     if (kind == TargetKind::Float) {
-      frameTarget = ClampSizeKeepingOrigin(frameTarget, *limits);
+      frameTarget = SharedGeometry::FitFloatingPlacementToLimits(*floating, *limits);
     } else if (const auto fitted = FitSlotToLimits(frameTarget, inputs.workspace->workArea, *limits)) {
       frameTarget = *fitted;
-    } else if (overflowFrame) {
+    } else if (floating) {
       // A minimum larger than the work area: MultiWM floats the window
       // (IntrinsicMinimum) and overflow centres it.
-      frameTarget = ClampSizeKeepingOrigin(*overflowFrame, *limits);
+      frameTarget = SharedGeometry::FitFloatingPlacementToLimits(*floating, *limits);
       reason = "minimum larger than the work area: overflow floats it";
     } else {
       LogDecision(hwnd, path, "minimum larger than the work area; overflow routes it");

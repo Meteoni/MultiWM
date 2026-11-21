@@ -261,6 +261,8 @@ int main() {
     workspace.hasFloatingFrame = 1;
     limits.minimum = {100, 100};
     limits.maximum = {2000, 2000};
+    // A hinted window is centred in the work area at its fitted size and kept
+    // inside it (SharedGeometry::FitFloatingPlacementToLimits).
     auto hinted = [&](const char* description, bool expectHint, LONG expectedWidth, LONG expectedHeight) {
       ++body.generation;
       positionCalls.clear();
@@ -268,7 +270,11 @@ int main() {
       check(positionCalls.size() == 1, description);
       const auto& call = positionCalls[0];
       if (expectHint) {
-        check(call.x == floatFrame.left - testMargins.left && call.y == floatFrame.top - testMargins.top &&
+        const RECT visible = SharedGeometry::MoveInsideArea(
+            SharedGeometry::CenteredIn(work, expectedWidth - testMargins.left - testMargins.right,
+                                       expectedHeight - testMargins.top - testMargins.bottom),
+            work);
+        check(call.x == visible.left - testMargins.left && call.y == visible.top - testMargins.top &&
                   call.width == expectedWidth && call.height == expectedHeight && call.flags == showFlags,
               description);
       } else {
@@ -289,11 +295,11 @@ int main() {
     body.flags = completeFlags | CompanionAbi::kFlagOverflowCentersFloat;
     hinted("no slot and no predicted float gives no hint", false, 0, 0);
 
-    // A minimum wider than the work area: MultiWM floats the window; Windows
-    // keeps the centred frame's top-left corner and applies the minimum.
+    // A minimum wider than the work area: MultiWM floats the window, centred at
+    // its minimum height and starting at the work area's left edge.
     workspace.hasTiledFrame = 1;
     limits.minimum = {Width(work) + 200, 600};
-    hinted("a minimum wider than the work area is floated at the centred frame", true, Width(work) + 200,
+    hinted("a minimum wider than the work area is floated, centred, from the left edge", true, Width(work) + 200,
            std::max<LONG>(600, floatHeight));
     body.flags = completeFlags;
     hinted("a minimum wider than the work area gives no hint while overflow routes", false, 0, 0);
@@ -319,9 +325,9 @@ int main() {
     inputs.rules = rules;
     const RECT frame{work.left + 10, work.top + 10, work.left + 410, work.top + 310};
     auto predict = [&](Companion::TargetKind* kind) {
-      std::optional<RECT> overflow;
+      std::optional<SharedGeometry::FloatingPlacement> floating;
       const char* reason = nullptr;
-      return Companion::PredictFrame(hwnd, frame, inputs, kind, &overflow, &reason);
+      return Companion::PredictFrame(hwnd, frame, inputs, kind, &floating, &reason);
     };
     const POINT workCenter = SharedGeometry::RectCenter(work);
     Companion::TargetKind kind{};
@@ -497,9 +503,6 @@ int main() {
           "a capped height is centred on the cross axis");
     check(equals(fit({0, 0, 600, 1000}, {1, 1, 600, 1000}), {0, 0, 600, 1000}),
           "limits the slot already satisfies change nothing");
-    const RECT floating = Companion::ClampSizeKeepingOrigin({10, 10, 510, 410}, {1, 1, 300, 200});
-    const RECT expectedFloating{10, 10, 310, 210};
-    check(EqualRect(&floating, &expectedFloating), "floating frames keep their top-left corner");
   }
 
   // A DPI-unaware window reports its limits in its own 96-DPI units, unconverted

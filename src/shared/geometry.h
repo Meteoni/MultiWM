@@ -141,23 +141,35 @@ inline FrameLimits TrackingLimitsToFrame(
   return frame;
 }
 
-// A floating frame with its size clamped to `limits` and its top-left corner
-// kept, which is how Windows applies a window's size limits to a positioning
-// call. MultiWM places with SWP_NOSENDCHANGING, which skips that clamp, so it
-// applies this itself; the companion predicts its floating placements with it.
-inline RECT ClampSizeKeepingOrigin(RECT frame, const FrameLimits& limits) {
-  const LONG width = std::max(Width(frame), limits.minWidth);
-  const LONG height = std::max(Height(frame), limits.minHeight);
-  frame.right = frame.left + (limits.maxWidth > 0 ? std::min(width, limits.maxWidth) : width);
-  frame.bottom = frame.top + (limits.maxHeight > 0 ? std::min(height, limits.maxHeight) : height);
-  return frame;
+// The size within `limits` nearest to `size`.
+inline SIZE ClampSizeToLimits(SIZE size, const FrameLimits& limits) {
+  LONG width = std::max(size.cx, limits.minWidth);
+  LONG height = std::max(size.cy, limits.minHeight);
+  if (limits.maxWidth > 0) width = std::min(width, limits.maxWidth);
+  if (limits.maxHeight > 0) height = std::min(height, limits.maxHeight);
+  return {width, height};
+}
+
+// `frame` moved, not resized, to lie inside `area`. Along an axis where it is
+// larger than `area`, it starts at the area's left or top edge, so a window's
+// caption stays on screen.
+inline RECT MoveInsideArea(const RECT& frame, const RECT& area) {
+  auto start = [](LONG from, LONG span, LONG low, LONG high) {
+    return span >= high - low ? low : std::clamp(from, low, high - span);
+  };
+  const LONG width = Width(frame);
+  const LONG height = Height(frame);
+  const LONG left = start(frame.left, width, area.left, area.right);
+  const LONG top = start(frame.top, height, area.top, area.bottom);
+  return {left, top, left + width, top + height};
 }
 
 // --- Floating placement -------------------------------------------------------
 //
 // Where a floating window goes. One rule for both mods: MultiWM places windows
 // with it (RepairFloatingGeometry) and the companion predicts where MultiWM will
-// put a new window with it (PredictFrame), so the two can't drift apart.
+// put a new window with it (PredictWindowPlacement). Each mod reads the size
+// limits its own way (docs/ARCHITECTURE.md).
 
 // What sizes a floating placement.
 enum class FloatingSizeSource {
@@ -196,12 +208,18 @@ struct FloatingRequest {
 
 struct FloatingPlacement {
   RECT frame{};
-  bool moveOnly = false;  // Keeps its own size, unclamped; only moved.
+  bool moveOnly = false;       // Keeps its own size, unclamped; only moved.
+  bool appliesLimits = false;  // Its size still has to fit the window's size
+                               // limits (FitFloatingPlacementToLimits).
+  POINT center{};              // Where it is centred, and the work area it is
+  RECT workArea{};             // kept inside, for fitting it to those limits.
 };
 
 // The frame for `request`, before the window's size limits
 // (FitFloatingPlacementToLimits). Centered on `center`; a frame that is resized
 // is kept inside the work area. No value when the size it needs is unknown.
+// Whether the limits apply is decided here: never to a window that is only
+// moved or can't resize.
 inline std::optional<FloatingPlacement> PlanFloatingPlacement(const FloatingRequest& request) {
   std::optional<FloatingSizeRule> rule = request.rule;
   if (rule && rule->preserveSize && !request.honorPreserveSize) rule.reset();
@@ -223,16 +241,24 @@ inline std::optional<FloatingPlacement> PlanFloatingPlacement(const FloatingRequ
   if (!request.canResize && request.current) size = request.current;
   if (!size) return std::nullopt;
 
-  const POINT center = request.center ? *request.center : RectCenter(request.workArea);
-  placement.frame = CenteredRect(center, size->cx, size->cy);
+  placement.appliesLimits = !placement.moveOnly && request.canResize;
+  placement.center = request.center ? *request.center : RectCenter(request.workArea);
+  placement.workArea = request.workArea;
+  placement.frame = CenteredRect(placement.center, size->cx, size->cy);
   if (!placement.moveOnly) placement.frame = ClampToArea(placement.frame, request.workArea);
   return placement;
 }
 
-// `placement`'s frame with the window's size limits applied; a window that is
-// only moved keeps its own size.
+// `placement`'s frame with its size fitted to the window's size `limits`, still
+// centred where it was planned and kept inside the work area; a minimum larger
+// than the work area overhangs its right or bottom edge (MoveInsideArea).
+// Unchanged when the limits don't apply or the planned size already fits them.
 inline RECT FitFloatingPlacementToLimits(const FloatingPlacement& placement, const FrameLimits& limits) {
-  return placement.moveOnly ? placement.frame : ClampSizeKeepingOrigin(placement.frame, limits);
+  if (!placement.appliesLimits) return placement.frame;
+  const SIZE planned{Width(placement.frame), Height(placement.frame)};
+  const SIZE size = ClampSizeToLimits(planned, limits);
+  if (size.cx == planned.cx && size.cy == planned.cy) return placement.frame;
+  return MoveInsideArea(CenteredRect(placement.center, size.cx, size.cy), placement.workArea);
 }
 
 // Centre one axis inside its cell when a maximum caps it. Returns whether the
