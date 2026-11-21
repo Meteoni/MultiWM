@@ -1042,6 +1042,53 @@ static void RunFirstFloatingSizeTests() {
   check(f.Place(hwnd, Placement::FloatingPlacementIntent::CenterWithFloatingSize) &&
             Layout::RectsNear(frame(), f.Centered(489, 384), 1),
         "with an override-size rule, a never-floated window floats at the rule's size");
+
+  // A failed tile (FailureCenter): a new window floats at the rule's or the
+  // default size, centred; a window with a remembered frame goes back to it.
+  auto floatFresh = [&] {
+    Workspace again;
+    again.SetLayout(TileLayout::Columns);
+    again.AdmitTiled(FloatingWindowFixture::Record(hwnd));
+    again.Float(hwnd);
+    g_workspaces.Save(f.key, again);
+  };
+  floatFresh();
+  FloatingWindowFixture::AppMove(hwnd, f.workArea.left + 30, f.workArea.top + 40, 700, 500);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::FailureCenter) &&
+            Layout::RectsNear(frame(), f.Centered(489, 384), 1),
+        "a new window that can't be tiled floats at the rule's size, centred");
+  g_settings.windowRules.clear();
+  floatFresh();
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::FailureCenter) &&
+            Layout::RectsNear(frame(), defaultFrame, 1),
+        "without a rule, at the default size");
+  // The user resizes the floating window (a drag end remembers the frame), then
+  // a failed tile floats it again from wherever its tile put it.
+  FloatingWindowFixture::AppMove(hwnd, f.workArea.left + 30, f.workArea.top + 40, 700, 500);
+  const RECT userFrame = frame();
+  {
+    Workspace current = f.Load();
+    check(Placement::RememberCurrentFloatingGeometry(f.key, current, hwnd), "remember the user's frame");
+    g_workspaces.Save(f.key, current);
+  }
+  FloatingWindowFixture::AppMove(hwnd, f.workArea.left, f.workArea.top, 300, 200);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::FailureCenter) &&
+            Layout::RectsNear(frame(), userFrame, 1),
+        "a window with a remembered frame that can't be tiled goes back to it");
+
+  // Tile Workspace remembers a floating window's current frame, however it got
+  // it, before re-tiling it.
+  FloatingWindowFixture::AppMove(hwnd, f.workArea.left + 60, f.workArea.top + 50, 640, 420);
+  const RECT appFrame = frame();
+  {
+    Workspace current = f.Load();
+    check(Reconcile::ReadoptFloatingSnapshot(current, {hwnd}, f.metrics.dpi) && current.IsTiled(hwnd),
+          "Tile Workspace re-tiles the floating window");
+    const WindowRecord* readopted = current.Find(hwnd);
+    check(readopted && readopted->hasFloatingRect && EqualRect(&readopted->floatingRect, &appFrame) &&
+              readopted->floatingDpi == f.metrics.dpi,
+          "Tile Workspace remembers the frame the app gave the window, not only a dragged one");
+  }
   std::printf("Passed %u first floating size checks.\n", check.passed);
 }
 

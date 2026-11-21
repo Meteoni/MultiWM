@@ -18,8 +18,9 @@ enum class FloatingPlacementIntent {
   RuleFloatedCenter,       // A window a floating rule admitted: centered at its own size, or
                            // at the size its override_size rule names (Automatic mode).
                            // Does nothing if the frame is unknown.
-  FailureCenter,           // Fallback after a failed tile: like NewWindowCenter, but rules
-                           // that preserve the app's size are ignored.
+  FailureCenter,           // Fallback after a failed tile: back to the remembered floating
+                           // frame, as PassiveRestore; without one (a new window), like
+                           // NewWindowCenter, but rules that preserve the app's size are ignored.
 };
 struct FloatingPlacementHint {
   FloatingPlacementIntent intent = FloatingPlacementIntent::PassiveRestore;

@@ -320,7 +320,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       - swap: Swap with tiled window under pointer
   - FloatingDefaultSize: "960, 640"
     $name: Floating Default Size (DPI-scaled pixels)
-    $description: Starting size in Floating layouts. Enter width, height (100-4000). Automatic mode only.
+    $description: Size of a window the first time it floats (Float Focused, a drag, the Floating layout) and of a new window that can't be tiled. Override-size rules replace it in Automatic mode. Enter width, height (100-4000).
   $name: Window Behavior
 
 - windowRules:

@@ -294,7 +294,8 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
   }
 
   // Automatic overflow floats a window it can't tile and, unless it routes the
-  // window elsewhere, centres it (FailureCenter).
+  // window elsewhere, centres it (FailureCenter). A new window has no remembered
+  // floating frame, so FailureCenter sizes it as Fallback does.
   if (inputs.flags & kFlagOverflowCentersFloat) {
     *floating = PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, true);
   }

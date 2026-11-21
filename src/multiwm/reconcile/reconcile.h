@@ -239,12 +239,20 @@ static bool RestoreSuspendedSnapshot(
   return changed;
 }
 
+// Tile Workspace: re-tiles the floating windows in `snapshot` (restored windows
+// on this monitor, captured at `dpi`). Each one's current frame is remembered
+// first, however it got there (the app or a keyboard snap is never recorded
+// otherwise), so a window that then can't fit floats back exactly where it was.
 static bool ReadoptFloatingSnapshot(
-    Workspace& workspace, const std::vector<HWND>& snapshot) {
+    Workspace& workspace, const std::vector<HWND>& snapshot, UINT dpi) {
   bool changed = false;
   for (HWND hwnd : snapshot) {
     const WindowRecord* record = workspace.Find(hwnd);
     if (record && record->state == ManageState::Floating) {
+      RECT frame{};
+      if (Platform::Windows::GetWindowFrameRect(hwnd, &frame)) {
+        workspace.RememberFloatingGeometry(hwnd, frame, dpi);
+      }
       changed |= workspace.ActivateTiled(hwnd);
     }
   }
@@ -384,7 +392,7 @@ static bool EnsureWorkspaceFromSnapshot(
   // not in the tiling solver.
 
   RestoreSuspendedSnapshot(workspace, snapshot);
-  if (adoptCurrentGeometry) ReadoptFloatingSnapshot(workspace, snapshot);
+  if (adoptCurrentGeometry) ReadoptFloatingSnapshot(workspace, snapshot, metrics.dpi);
   AdmitUntrackedSnapshot(workspace, snapshot, true, false);
 
   if (adoptCurrentGeometry) {

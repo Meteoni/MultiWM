@@ -75,13 +75,13 @@ static std::optional<SharedGeometry::FrameLimits> FloatingSizeLimits(
 static SharedGeometry::FloatingSizeSource FloatingSizeSourceFor(FloatingPlacementIntent intent) {
   switch (intent) {
     case FloatingPlacementIntent::NewWindowCenter:
-    case FloatingPlacementIntent::FailureCenter:
       return SharedGeometry::FloatingSizeSource::Fallback;
     case FloatingPlacementIntent::RuleFloatedCenter:
       return SharedGeometry::FloatingSizeSource::Own;
     case FloatingPlacementIntent::PassiveRestore:
     case FloatingPlacementIntent::PreserveAnchor:
     case FloatingPlacementIntent::CenterWithFloatingSize:
+    case FloatingPlacementIntent::FailureCenter:
       break;
   }
   return SharedGeometry::FloatingSizeSource::Remembered;
@@ -89,8 +89,8 @@ static SharedGeometry::FloatingSizeSource FloatingSizeSourceFor(FloatingPlacemen
 
 // Places a floating window as `hint` asks, by the rule both mods share
 // (SharedGeometry::PlanFloatingPlacement). A drag keeps the user's drop point;
-// a passive restore keeps a remembered frame's center on its own monitor; every
-// other placement is centered on the work area.
+// a passive restore or a failed tile keeps a remembered frame's center on its
+// own monitor; every other placement is centered on the work area.
 static bool RepairFloatingGeometry(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const FloatingPlacementHint& hint) {
@@ -137,7 +137,9 @@ static bool RepairFloatingGeometry(
   }
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
     request.center = hint.anchor;
-  } else if (hint.intent == FloatingPlacementIntent::PassiveRestore && record->hasFloatingRect &&
+  } else if ((hint.intent == FloatingPlacementIntent::PassiveRestore ||
+              hint.intent == FloatingPlacementIntent::FailureCenter) &&
+             record->hasFloatingRect &&
              MonitorFromRect(&record->floatingRect, MONITOR_DEFAULTTONULL) == monitor) {
     request.center = SharedGeometry::RectCenter(record->floatingRect);
   }
