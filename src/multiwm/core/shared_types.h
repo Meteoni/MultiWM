@@ -366,6 +366,10 @@ struct SettingsState {
   };
   std::vector<MonitorWindowLimit> monitorWindowLimits;
   std::wstring diagnosticsOutputPath = kDefaultDiagnosticsOutputPath;
+
+  // Settings the last load couldn't use, each as a short toast line ("Window
+  // rule 3 ignored: invalid size"). The WM thread shows them once it starts.
+  std::vector<std::wstring> problems;
 };
 
 // One configurable hotkey: its message ID, the Windhawk setting naming its key,

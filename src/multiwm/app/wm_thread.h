@@ -22,16 +22,33 @@ static std::vector<const wchar_t*> RegisterConfiguredHotkeys() {
   return unavailable;
 }
 
-// One toast naming the hotkeys that could not be registered, so a conflict is
-// not only in the log. Needs the tray UI (toasts) to be initialized.
-static void ReportUnavailableHotkeys(const std::vector<const wchar_t*>& unavailable) {
-  if (unavailable.empty()) return;
-  std::wstring text = unavailable.size() == 1 ? L"Hotkey in use: " : L"Hotkeys in use: ";
-  for (size_t i = 0; i < unavailable.size(); ++i) {
-    if (i) text += L", ";
-    text += unavailable[i];
+// The toast text for what didn't take effect: hotkeys another program already
+// uses, and settings the load couldn't use (`problems`: the first, and how many
+// more are in the log). Empty when everything did.
+static std::wstring StartupProblemsText(const std::vector<const wchar_t*>& unavailableHotkeys,
+                                        const std::vector<std::wstring>& problems) {
+  std::wstring text;
+  if (!unavailableHotkeys.empty()) {
+    text = unavailableHotkeys.size() == 1 ? L"Hotkey in use: " : L"Hotkeys in use: ";
+    for (size_t i = 0; i < unavailableHotkeys.size(); ++i) {
+      if (i) text += L", ";
+      text += unavailableHotkeys[i];
+    }
   }
-  TrayUi::ShowCommandFailureFlyout(text.c_str());
+  if (!problems.empty()) {
+    if (!text.empty()) text += L"; ";
+    text += problems.front();
+    if (problems.size() > 1) text += L" (+" + std::to_wstring(problems.size() - 1) + L" more in the log)";
+  }
+  return text;
+}
+
+// One toast, at startup and after every settings change, for what didn't take
+// effect (StartupProblemsText). One, because a second would replace the first.
+// Needs the tray UI.
+static void ReportStartupProblems(const std::vector<const wchar_t*>& unavailableHotkeys) {
+  const std::wstring text = StartupProblemsText(unavailableHotkeys, g_settings.problems);
+  if (!text.empty()) TrayUi::ShowCommandFailureFlyout(text.c_str());
 }
 
 static void UnregisterConfiguredHotkeys() {
@@ -399,7 +416,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   if (!TrayUi::Initialize()) {
     Wh_Log(L"Tiling layout tray icon unavailable; window management remains active");
   }
-  ReportUnavailableHotkeys(unavailableHotkeys);
+  ReportStartupProblems(unavailableHotkeys);
 
   CompanionSnapshot::PublishIfChanged();
   RunWmMessageLoop();

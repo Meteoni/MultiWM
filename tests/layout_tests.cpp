@@ -958,6 +958,23 @@ static void RunRuleFieldParserTests() {
     ++checks;
   };
   using Configuration::MonitorIdParse;
+
+  // What didn't take effect is reported in one toast.
+  const SettingsState savedSettings = g_settings;
+  g_settings.problems.clear();
+  Configuration::NoteSettingProblem(L"Window rule %d ignored: invalid size", 3);
+  Configuration::NoteSettingProblem(L"%ls must be %d-%d; using %d", L"Window Gap", 0, 100, 6);
+  check(g_settings.problems.size() == 2 && g_settings.problems[0] == L"Window rule 3 ignored: invalid size" &&
+            g_settings.problems[1] == L"Window Gap must be 0-100; using 6",
+        "each unusable setting is noted as one line");
+  check(RuntimeLifecycle::StartupProblemsText({}, {}).empty(), "no toast when everything took effect");
+  check(RuntimeLifecycle::StartupProblemsText({}, {g_settings.problems[0]}) == L"Window rule 3 ignored: invalid size",
+        "one problem is shown as noted");
+  check(RuntimeLifecycle::StartupProblemsText({L"Tile Workspace"}, g_settings.problems) ==
+            L"Hotkey in use: Tile Workspace; Window rule 3 ignored: invalid size (+1 more in the log)",
+        "hotkeys and settings share one toast, and further problems are counted");
+  g_settings = savedSettings;
+
   check(Configuration::ParseRuleMonitor(L"Primary", false) == RuleMonitor::Primary, "selector ignores case");
   check(Configuration::ParseRuleMonitor(L"non_primary", false) == RuleMonitor::NonPrimary, "non-primary selector");
   check(Configuration::ParseRuleMonitor(L"specific", false) == RuleMonitor::Specific, "specific selector");

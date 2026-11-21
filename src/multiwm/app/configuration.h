@@ -3,6 +3,17 @@
 
 namespace Configuration {
 
+// Records a setting this load couldn't use, as one short toast line
+// (SettingsState::problems). The detail is logged where it was found.
+static void NoteSettingProblem(PCWSTR format, ...) {
+  wchar_t text[160]{};
+  va_list args;
+  va_start(args, format);
+  const int written = vswprintf(text, ARRAYSIZE(text), format, args);
+  va_end(args);
+  if (written > 0) g_settings.problems.emplace_back(text);
+}
+
 UINT ParseModifiers(PCWSTR str) {
   UINT modifiers = 0;
   if (wcsstr(str, L"alt")) modifiers |= MOD_ALT;
@@ -33,8 +44,9 @@ TileLayout ParseLayoutSetting(PCWSTR str) {
   return layout;
 }
 
+// `label` names the hotkey in the toast for an invalid key.
 template <typename T, typename Parser>
-T ReadHotkeySetting(PCWSTR name, Parser parser) {
+T ReadHotkeySetting(PCWSTR name, PCWSTR label, Parser parser) {
   auto value = WindhawkUtils::StringSetting::make(name);
   if (!*value.get()) return T{};  // Blank hotkey = unused.
 
@@ -43,6 +55,7 @@ T ReadHotkeySetting(PCWSTR name, Parser parser) {
     Wh_Log(
         L"Invalid %ls hotkey setting '%ls'; hotkey disabled", name,
         value.get());
+    NoteSettingProblem(L"%ls hotkey off: \"%ls\" isn't a key", label, value.get());
   }
   return result;
 }
@@ -54,9 +67,13 @@ UINT ReadModifierSetting(PCWSTR name, UINT defaultVal) {
 }
 
 // Invalid values use the documented default; they are deliberately not clamped.
-static int ReadBoundedIntSetting(PCWSTR name, int minimum, int maximum, int fallback) {
+// `label` names the setting in the toast for an out-of-range value.
+static int ReadBoundedIntSetting(PCWSTR name, PCWSTR label, int minimum, int maximum, int fallback) {
   const int value = Wh_GetIntSetting(name);
-  return value < minimum || value > maximum ? fallback : value;
+  if (value >= minimum && value <= maximum) return value;
+  Wh_Log(L"%ls setting %d is outside %d-%d; using %d", name, value, minimum, maximum, fallback);
+  NoteSettingProblem(L"%ls must be %d-%d; using %d", label, minimum, maximum, fallback);
+  return fallback;
 }
 
 // `text` without leading or trailing whitespace (as iswspace classifies it).
@@ -233,12 +250,14 @@ static void LoadMonitorWindowLimits() {
     if (!*monitor.get() || _wcsicmp(monitor.get(), L"disabled") == 0) continue;
     if (limit < 0) {
       Wh_Log(L"Ignoring negative per-monitor limit at rule %d", i + 1);
+      NoteSettingProblem(L"Per-monitor limit %d ignored: negative limit", i + 1);
       continue;
     }
     SettingsState::MonitorWindowLimit rule;
     const auto selector = ParseRuleMonitor(monitor.get(), /*allowAny=*/false);
     if (!selector) {
       Wh_Log(L"Ignoring invalid monitor selector at limit rule %d", i + 1);
+      NoteSettingProblem(L"Per-monitor limit %d ignored: invalid monitor", i + 1);
       continue;
     }
     rule.monitor = *selector;
@@ -247,6 +266,7 @@ static void LoadMonitorWindowLimits() {
       if (id == MonitorIdParse::Empty) continue;  // Not filled in yet: skip quietly.
       if (id == MonitorIdParse::Invalid) {
         Wh_Log(L"Ignoring invalid monitor ID at limit rule %d", i + 1);
+        NoteSettingProblem(L"Per-monitor limit %d ignored: invalid monitor ID", i + 1);
         continue;
       }
     }
@@ -278,11 +298,13 @@ static void LoadWorkspaceInitializationRules() {
     rule.desktopNumber = desktopNumber;
     if (rule.desktopNumber < 0 || !TryParseLayoutSetting(ruleLayout.get(), &rule.layout)) {
       Wh_Log(L"Ignoring invalid workspace initialization rule %d", i + 1);
+      NoteSettingProblem(L"Initialization rule %d ignored: invalid layout or desktop number", i + 1);
       continue;
     }
     const auto selector = ParseRuleMonitor(monitor.get(), /*allowAny=*/true);
     if (!selector) {
       Wh_Log(L"Ignoring invalid monitor selector at workspace rule %d", i + 1);
+      NoteSettingProblem(L"Initialization rule %d ignored: invalid monitor", i + 1);
       continue;
     }
     rule.monitor = *selector;
@@ -293,6 +315,7 @@ static void LoadWorkspaceInitializationRules() {
     if (rule.monitor == RuleMonitor::Specific &&
         ParseMonitorIdSetting(monitorId.get(), &rule.monitorId) != MonitorIdParse::Valid) {
       Wh_Log(L"Ignoring invalid monitor ID at workspace rule %d", i + 1);
+      NoteSettingProblem(L"Initialization rule %d ignored: invalid monitor ID", i + 1);
       continue;
     }
     // A rule with no condition at all would match everything; ignore it.
@@ -317,18 +340,21 @@ static bool ParseInitialPlacementRule(int i, PCWSTR monitor, PCWSTR monitorId,
   const auto selector = ParseRuleMonitor(monitor, /*allowAny=*/true);
   if (!selector) {
     Wh_Log(L"Ignoring invalid monitor selector at window rule %d", i + 1);
+    NoteSettingProblem(L"Window rule %d ignored: invalid monitor", i + 1);
     return false;
   }
   rule->monitor = *selector;
   if (rule->monitor == RuleMonitor::Specific &&
       ParseMonitorIdSetting(monitorId, &rule->monitorId) != MonitorIdParse::Valid) {
     Wh_Log(L"Ignoring invalid monitor target at window rule %d", i + 1);
+    NoteSettingProblem(L"Window rule %d ignored: invalid monitor ID", i + 1);
     return false;
   }
   rule->desktopNumber = desktopNumber;
   rule->desktopNameContains = TrimSettingText(desktopName);
   if (desktopNumber < 0) {
     Wh_Log(L"Ignoring invalid desktop number at window rule %d", i + 1);
+    NoteSettingProblem(L"Window rule %d ignored: invalid desktop number", i + 1);
     return false;
   }
   rule->followWindow = Wh_GetIntSetting(L"windowRules.Rules[%d].FollowWindow", i) != 0;
@@ -358,6 +384,7 @@ static bool ParseWindowRuleTreatment(int i, PCWSTR kind, PCWSTR size, PCWSTR mon
       rule->useWorkspaceSize = true;
     } else if (!ParseFloatingDefaultSizeSetting(size, &rule->floatingSizeDip)) {
       Wh_Log(L"Ignoring invalid centered size override at rule %d: %s", i + 1, size);
+      NoteSettingProblem(L"Window rule %d ignored: invalid size", i + 1);
       return false;
     }
     rule->preserveFloatingSize = false;
@@ -402,6 +429,7 @@ static void LoadWindowRules() {
     rule.titleFragments = ParseWindowRuleList(titleContains.get());
     if (rule.processNames.empty() && rule.classNames.empty() && rule.titleFragments.empty()) {
       Wh_Log(L"Ignoring window rule %d with no usable match values", i + 1);
+      NoteSettingProblem(L"Window rule %d ignored: no app, class or title", i + 1);
       continue;
     }
     g_settings.windowRules.push_back(std::move(rule));
@@ -424,6 +452,7 @@ static std::vector<TileLayout> ReadLayoutCycleSetting() {
     TileLayout layout{};
     if (!TryParseLayoutSetting(entry.get(), &layout)) {
       Wh_Log(L"Ignoring invalid LayoutCycle[%d] entry: %s", i, entry.get());
+      NoteSettingProblem(L"Layout Cycle entry %d ignored: unknown layout", i + 1);
       continue;
     }
     if (std::find(cycle.begin(), cycle.end(), layout) == cycle.end()) cycle.push_back(layout);
@@ -439,6 +468,7 @@ static std::vector<TileLayout> ReadLayoutCycleSetting() {
 // Invalid numbers use the documented default; they are not clamped unless noted.
 void LoadSettings() {
   using WindhawkUtils::StringSetting;
+  g_settings.problems.clear();
 
   g_settings.tilingModifiers = ReadModifierSetting(L"hotkeys.TilingModifier", MOD_ALT);
 
@@ -447,16 +477,18 @@ void LoadSettings() {
   if (!ParseWorkspaceInsetsSetting(insets.get(), &g_settings.insetsDip)) {
     g_settings.insetsDip = {};
     Wh_Log(L"Invalid WorkspaceInsets setting; using 6, 6, 6, 6");
+    NoteSettingProblem(L"Insets need four values from 0 to 500; using 6, 6, 6, 6");
   }
-  g_settings.gapDip = ReadBoundedIntSetting(L"workspace.TileGap", 0, 100, 6);
+  g_settings.gapDip = ReadBoundedIntSetting(L"workspace.TileGap", L"Window Gap", 0, 100, 6);
   auto floatingSize = StringSetting::make(L"windowBehavior.FloatingDefaultSize");
   if (!ParseFloatingDefaultSizeSetting(floatingSize.get(), &g_settings.floatingDefaultSizeDip)) {
     g_settings.floatingDefaultSizeDip = {};
     Wh_Log(L"Invalid FloatingDefaultSize setting; using 960, 640");
+    NoteSettingProblem(L"Floating Default Size needs width, height (100-4000); using 960, 640");
   }
 
   // Layouts.
-  g_settings.masterPercent = ReadBoundedIntSetting(L"workspace.MasterPercent", 1, 99, 50);
+  g_settings.masterPercent = ReadBoundedIntSetting(L"workspace.MasterPercent", L"Master Size", 1, 99, 50);
   g_settings.reverseDwindle = Wh_GetIntSetting(L"workspace.ReverseDwindle") != 0;
   // These two are clamped rather than reset to a default.
   g_settings.adaptiveDwindleSlots =
@@ -484,19 +516,19 @@ void LoadSettings() {
       ? ManagementMode::Manual : ManagementMode::Automatic;
 
   // Timing.
-  g_settings.conformanceLeaseMs = ReadBoundedIntSetting(L"advanced.ConformanceLeaseMs", 0, 10000, 3000);
+  g_settings.conformanceLeaseMs = ReadBoundedIntSetting(L"advanced.ConformanceLeaseMs", L"Keep Windows in Place", 0, 10000, 3000);
   g_settings.conformanceRepairIntervalMs =
-      ReadBoundedIntSetting(L"advanced.ConformanceRepairIntervalMs", 20, 2000, 75);
-  g_settings.reconcileDelayMs = ReadBoundedIntSetting(L"advanced.ReconcileDelayMs", 20, 2000, 50);
-  g_settings.slowApplicationDelayMs = ReadBoundedIntSetting(L"advanced.SlowApplicationDelayMs", 0, 2000, 250);
+      ReadBoundedIntSetting(L"advanced.ConformanceRepairIntervalMs", L"Position Repair Interval", 20, 2000, 75);
+  g_settings.reconcileDelayMs = ReadBoundedIntSetting(L"advanced.ReconcileDelayMs", L"Window Change Delay", 20, 2000, 50);
+  g_settings.slowApplicationDelayMs = ReadBoundedIntSetting(L"advanced.SlowApplicationDelayMs", L"New Window Retry Delay", 0, 2000, 250);
 
   LoadWindowRules();
 
   // Hotkeys. Blank disables a hotkey; an unparseable key is logged and disabled.
   for (const HotkeyBinding& hotkey : kHotkeyBindings) {
-    g_settings.*hotkey.key = ReadHotkeySetting<UINT>(hotkey.setting, ParseHotkeyKey);
+    g_settings.*hotkey.key = ReadHotkeySetting<UINT>(hotkey.setting, hotkey.name, ParseHotkeyKey);
   }
-  g_settings.resizeStepPercent = ReadBoundedIntSetting(L"hotkeys.WindowSize.StepPercent", 1, 50, 5);
+  g_settings.resizeStepPercent = ReadBoundedIntSetting(L"hotkeys.WindowSize.StepPercent", L"Step Size", 1, 50, 5);
 
   auto diagnosticsPath = StringSetting::make(L"diagnostics.DiagnosticsOutputPath");
   g_settings.diagnosticsOutputPath =
