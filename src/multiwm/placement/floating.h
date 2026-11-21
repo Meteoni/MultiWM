@@ -224,6 +224,21 @@ static bool RememberCurrentFloatingGeometry(
   return workspace.RememberFloatingGeometry(hwnd, frame, Platform::Monitors::GetMonitorEffectiveDpi(monitor));
 }
 
+// Leaving the Floating layout: remembers each active member's current frame,
+// captured at `dpi`, so returning to the layout restores where the windows
+// really were. A frame the app chose, or a keyboard snap, is not recorded
+// otherwise. Minimized, maximized, hidden and cloaked members keep theirs.
+static void RememberFloatingLayoutFrames(Workspace& workspace, UINT dpi) {
+  for (HWND hwnd : workspace.TiledWindows()) {
+    RECT frame{};
+    if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+        Platform::Windows::IsWindowCloaked(hwnd) || !Platform::Windows::GetWindowFrameRect(hwnd, &frame)) {
+      continue;
+    }
+    workspace.RememberFloatingGeometry(hwnd, frame, dpi);
+  }
+}
+
 // Entering the workspace-level Floating layout is a state restoration, not a
 // per-window drag/float command. Restore each active tiled member's complete
 // remembered floating rectangle; windows without memory use the configured

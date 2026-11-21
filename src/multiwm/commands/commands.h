@@ -443,6 +443,9 @@ static bool CommitWorkspaceLayoutChange(
                                 Placement::UserLayoutMutationKind::LayoutChange, L"Change layout")) {
     return false;
   }
+  if (previousLayout == TileLayout::Floating && candidate.Layout() != TileLayout::Floating) {
+    Placement::RememberFloatingLayoutFrames(candidate, Platform::Monitors::GetMonitorEffectiveDpi(monitor));
+  }
   workspace = std::move(candidate);
   if (previousLayout != TileLayout::Floating &&
       workspace.Layout() == TileLayout::Floating) {

@@ -1089,6 +1089,20 @@ static void RunFirstFloatingSizeTests() {
               readopted->floatingDpi == f.metrics.dpi,
           "Tile Workspace remembers the frame the app gave the window, not only a dragged one");
   }
+
+  // Leaving the Floating layout remembers each member's frame the same way.
+  f.Seed(TileLayout::Floating);
+  FloatingWindowFixture::AppMove(hwnd, f.workArea.left + 80, f.workArea.top + 70, 520, 360);
+  const RECT floatingLayoutFrame = frame();
+  Commands::SetCurrentWorkspaceLayout(TileLayout::Columns, f.key.ResolveMonitor());
+  {
+    const Workspace left = f.Load();
+    const WindowRecord* member = left.Find(hwnd);
+    check(left.Layout() == TileLayout::Columns && member && member->hasFloatingRect &&
+              EqualRect(&member->floatingRect, &floatingLayoutFrame),
+          "leaving the Floating layout remembers where the app had put the window");
+  }
+  FloatingWindowFixture::ClearLeases();
   std::printf("Passed %u first floating size checks.\n", check.passed);
 }
 
