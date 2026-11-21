@@ -88,10 +88,40 @@ static HWND ResolveMoveSizeTarget(DWORD event, HWND hwnd) {
   return rootOwner && Platform::Windows::IsWindowTrackedInAnyState(rootOwner) ? rootOwner : hwnd;
 }
 
+// --- Ghosts of hung windows ---------------------------------------------------
+//
+// An event on a ghost is about the hung window it stands in for, whose state is
+// read from the ghost (Platform::Windows::GhostWindowOf). Known ghosts are
+// remembered; a new one is recognized when it is shown, takes the foreground,
+// or is minimized or restored, one of which a ghost always does first.
+
+static bool CanIntroduceGhost(DWORD event) {
+  return event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_FOREGROUND ||
+         event == EVENT_OBJECT_STATECHANGE || event == EVENT_SYSTEM_MINIMIZESTART ||
+         event == EVENT_SYSTEM_MINIMIZEEND;
+}
+
+// The managed hung window `hwnd` is the ghost of, or nullptr. A known ghost is
+// forgotten when it is destroyed, which happens when its app recovers.
+static HWND ResolveGhost(DWORD event, HWND hwnd) {
+  const auto known = g_wm.ghosts.find(hwnd);
+  if (known != g_wm.ghosts.end()) {
+    const HWND hung = known->second;
+    if (event == EVENT_OBJECT_DESTROY) g_wm.ghosts.erase(known);
+    return hung;
+  }
+  if (!hwnd || !CanIntroduceGhost(event) || Platform::Windows::IsWindowTrackedInAnyState(hwnd)) return nullptr;
+  const HWND hung = Platform::Windows::HungWindowOfGhost(hwnd);
+  if (!hung || !Platform::Windows::IsWindowTrackedInAnyState(hung)) return nullptr;
+  g_wm.ghosts.emplace(hwnd, hung);
+  return hung;
+}
+
 // Retires per-HWND bookkeeping as soon as destruction is observed, before a
 // delayed message could mistake a reused HWND value for the old window.
 static void OnWindowDestroyed(HWND hwnd, bool tracked) {
   g_wm.CancelPendingWindowMoves(hwnd);
+  std::erase_if(g_wm.ghosts, [hwnd](const auto& ghost) { return ghost.second == hwnd; });
   const bool routingKnown = g_wm.routing.evaluated.erase(hwnd) != 0;
   const bool routingPending = g_wm.routing.pending.erase(hwnd) != 0;
   if (tracked || routingKnown || routingPending) QueueWindowEvent(EVENT_OBJECT_DESTROY, hwnd);
@@ -185,11 +215,20 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   RuntimeLifecycle::AssertWmThread(L"WinEventProc");
   if (!IsSubscribedWinEvent(event)) return;
   if (event == EVENT_SYSTEM_FOREGROUND) {
-    PostForegroundChanged(hwnd);
+    // A ghost in front means its hung window is.
+    const HWND hung = ResolveGhost(event, hwnd);
+    PostForegroundChanged(hung ? hung : hwnd);
     return;
   }
   // Only whole top-level-window events; ignore child objects such as scroll bars.
   if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+
+  // Anything that happens to a ghost may change its hung window's state: have the
+  // WM thread look again. Its destroy, when the app recovers, is not the window's.
+  if (const HWND hung = ResolveGhost(event, hwnd)) {
+    QueueWindowEvent(EVENT_OBJECT_STATECHANGE, hung);
+    return;
+  }
 
   hwnd = ResolveMoveSizeTarget(event, hwnd);
   const bool tracked = Platform::Windows::IsWindowTrackedInAnyState(hwnd);

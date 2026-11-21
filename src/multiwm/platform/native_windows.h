@@ -161,12 +161,65 @@ static bool CoversItsMonitor(HWND hwnd) {
          SharedGeometry::CoversMonitor(windowRect, monitorInfo.rcMonitor);
 }
 
+// --- Ghost windows -------------------------------------------------------------
+//
+// About 5 s into an app's hang, DWM covers its window with a "ghost" (class Ghost,
+// owned by dwm.exe) that the user can minimize, maximize, move or close. The app's
+// own window doesn't change meanwhile: it still reads as visible and restored.
+// When the app recovers, Windows destroys the ghost and copies its state to the
+// window (measured on 26100: a ghost minimized while hung leaves the window
+// restored until then). So while there is a ghost, the window's state is the
+// ghost's. user32 exports the pairing by name; without the exports there is no
+// ghost to follow and MultiWM behaves as before.
+
+using GhostLookup = HWND(WINAPI*)(HWND);
+struct GhostApi {
+  GhostLookup ghostFromHung = nullptr;  // user32 GhostWindowFromHungWindow.
+  GhostLookup hungFromGhost = nullptr;  // user32 HungWindowFromGhostWindow.
+};
+
+// The user32 exports, loaded once. Tests replace them.
+static GhostApi& Ghosts() {
+  static GhostApi api = [] {
+    GhostApi loaded;
+    if (const HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+      loaded.ghostFromHung = reinterpret_cast<GhostLookup>(GetProcAddress(user32, "GhostWindowFromHungWindow"));
+      loaded.hungFromGhost = reinterpret_cast<GhostLookup>(GetProcAddress(user32, "HungWindowFromGhostWindow"));
+    }
+    return loaded;
+  }();
+  return api;
+}
+
+// The ghost standing in for `hwnd` while its app is hung, or nullptr.
+static HWND GhostWindowOf(HWND hwnd) {
+  const GhostLookup lookup = Ghosts().ghostFromHung;
+  const HWND ghost = lookup && hwnd ? lookup(hwnd) : nullptr;
+  return ghost && ghost != hwnd && IsWindow(ghost) ? ghost : nullptr;
+}
+
+// The hung window `ghost` stands in for, or nullptr when it is no ghost.
+static HWND HungWindowOfGhost(HWND ghost) {
+  const GhostLookup lookup = Ghosts().hungFromGhost;
+  const HWND hung = lookup && ghost ? lookup(ghost) : nullptr;
+  return hung && hung != ghost && IsWindow(hung) ? hung : nullptr;
+}
+
+// A ghost's state, read as GetPhysicalSuspensionReason reads a window's.
+static SuspensionReason GhostSuspensionReason(HWND ghost) {
+  if (IsIconic(ghost)) return SuspensionReason::Minimized;
+  if (!IsWindowVisible(ghost)) return SuspensionReason::Hidden;
+  return IsZoomed(ghost) || CoversItsMonitor(ghost) ? SuspensionReason::Maximized : SuspensionReason::None;
+}
+
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
   if (IsIconic(hwnd)) return SuspensionReason::Minimized;
   // IsWindowVisible reads user-mode state; check it before the DWM cloak query so
   // the many invisible top-level HWNDs seen during EnumWindows skip that call.
   if (!IsWindowVisible(hwnd)) return SuspensionReason::Hidden;
+  // While its app is hung, the window the user sees and acts on is its ghost.
+  if (const HWND ghost = GhostWindowOf(hwnd)) return GhostSuspensionReason(ghost);
   // Fail open on purpose: a failed query (DWM restarting, or the window being
   // destroyed right now) reads as "not app-cloaked". Treating failure as Hidden
   // would suspend every tiled window while DWM is unavailable and collapse each
@@ -193,7 +246,9 @@ static bool IsSuspendedOrCloaked(HWND hwnd) {
   if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) return true;
   DWORD cloaked = 0;
   DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-  return cloaked || IsZoomed(hwnd) || CoversItsMonitor(hwnd);
+  if (cloaked) return true;
+  if (const HWND ghost = GhostWindowOf(hwnd)) return GhostSuspensionReason(ghost) != SuspensionReason::None;
+  return IsZoomed(hwnd) || CoversItsMonitor(hwnd);
 }
 
 // Workspace initialization needs a broader physical snapshot than normal layout

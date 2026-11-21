@@ -1106,6 +1106,103 @@ static void RunFirstFloatingSizeTests() {
   std::printf("Passed %u first floating size checks.\n", check.passed);
 }
 
+// Stand-ins for user32's ghost pairing: `g_testGhost` is the ghost of `g_testHung`.
+static HWND g_testHung = nullptr;
+static HWND g_testGhost = nullptr;
+static HWND WINAPI TestGhostFromHung(HWND hwnd) { return hwnd && hwnd == g_testHung ? g_testGhost : nullptr; }
+static HWND WINAPI TestHungFromGhost(HWND hwnd) { return hwnd && hwnd == g_testGhost ? g_testHung : nullptr; }
+
+// While an app is hung, MultiWM reads its window's state from the ghost DWM shows
+// for it, and the ghost's events reach the WM thread as the window's. Real
+// visible test windows; the ghost pairing is faked.
+static void RunGhostWindowTests() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  const HWND hung = f.hwnd;
+  const HWND ghost = f.CreateTestWindow(nullptr);
+  const HWND other = f.CreateTestWindow(nullptr);
+  Platform::Windows::GhostApi& api = Platform::Windows::Ghosts();
+  const Platform::Windows::GhostApi saved = api;
+  api = {TestGhostFromHung, TestHungFromGhost};
+  g_testHung = hung;
+  g_testGhost = ghost;
+  using Platform::Windows::GetPhysicalSuspensionReason;
+  using Platform::Windows::IsSuspendedOrCloaked;
+
+  check(GetPhysicalSuspensionReason(hung) == SuspensionReason::None && !IsSuspendedOrCloaked(hung),
+        "a hung window whose ghost is restored reads as restored");
+  ShowWindow(ghost, SW_MINIMIZE);
+  check(!IsIconic(hung) && GetPhysicalSuspensionReason(hung) == SuspensionReason::Minimized &&
+            IsSuspendedOrCloaked(hung),
+        "minimizing the ghost minimizes the hung window, which Windows itself still shows as restored");
+
+  // The model follows: suspended with its slot kept, then tiled again (Automatic
+  // mode; in Manual mode a minimize leaves the group, ghost or not).
+  g_wm.managementMode = ManagementMode::Automatic;
+  f.Seed(TileLayout::Columns);
+  std::vector<DesktopMonitorKey> changed;
+  Reconcile::ReconcileKnownWindows(Reconcile::ReconcileScope::Participation, &changed, hung);
+  const WindowRecord* record = f.Load().Find(hung);
+  check(record && record->state == ManageState::Suspended && record->suspensionReason == SuspensionReason::Minimized &&
+            record->hasSavedSlot,
+        "a hung window minimized through its ghost is suspended and keeps its slot");
+  ShowWindow(ghost, SW_RESTORE);
+  Reconcile::ReconcileKnownWindows(Reconcile::ReconcileScope::Participation, &changed, hung);
+  check(f.Load().IsTiled(hung), "restoring the ghost tiles the hung window again");
+
+  // Events: a ghost's events are its hung window's; its destroy is not.
+  struct Posted { UINT message; WPARAM wParam; LPARAM lParam; };
+  auto drain = [] {
+    std::vector<Posted> posted;
+    MSG msg{};
+    while (PeekMessageW(&msg, reinterpret_cast<HWND>(-1), WM_APP, WM_APP + 64, PM_REMOVE)) {
+      posted.push_back({msg.message, msg.wParam, msg.lParam});
+    }
+    return posted;
+  };
+  auto postedOnly = [&](UINT message, WPARAM wParam, LPARAM lParam) {
+    const auto posted = drain();
+    return posted.size() == 1 && posted[0].message == message && posted[0].wParam == wParam &&
+           posted[0].lParam == lParam;
+  };
+  auto stateChangeOf = [&](HWND hwnd) {
+    return postedOnly(WM_APP_WINDOW_EVENT, EVENT_OBJECT_STATECHANGE, reinterpret_cast<LPARAM>(hwnd));
+  };
+  auto send = [](DWORD event, HWND hwnd) {
+    Platform::WindowEvents::WinEventProc(nullptr, event, hwnd, OBJID_WINDOW, CHILDID_SELF, 0, 0);
+  };
+  g_wm.threadId.store(GetCurrentThreadId(), std::memory_order_release);
+  drain();
+  send(EVENT_OBJECT_LOCATIONCHANGE, ghost);
+  check(drain().empty() && g_wm.ghosts.empty(), "a ghost isn't recognized from a location change alone");
+  send(EVENT_SYSTEM_MINIMIZESTART, ghost);
+  check(stateChangeOf(hung) && g_wm.ghosts.count(ghost) == 1,
+        "minimizing a ghost has the WM thread look at its hung window again");
+  send(EVENT_OBJECT_LOCATIONCHANGE, ghost);
+  check(stateChangeOf(hung), "a known ghost's other events count for its hung window too");
+  send(EVENT_SYSTEM_FOREGROUND, ghost);
+  check(postedOnly(WM_APP_FOREGROUND_CHANGED, reinterpret_cast<WPARAM>(hung), 0),
+        "a ghost in front means its hung window is");
+  send(EVENT_OBJECT_DESTROY, ghost);
+  check(stateChangeOf(hung) && g_wm.ghosts.empty(),
+        "a ghost's destroy, when the app recovers, is a state change, never the window's destroy");
+  send(EVENT_SYSTEM_MINIMIZESTART, other);
+  check(drain().size() == 1 && g_wm.ghosts.empty(), "an untracked window that is no ghost is handled as before");
+
+  // Without the user32 exports there is no ghost to follow.
+  api = {};
+  ShowWindow(ghost, SW_MINIMIZE);
+  check(GetPhysicalSuspensionReason(hung) == SuspensionReason::None, "without the exports, the window's own state counts");
+
+  api = saved;
+  g_testHung = g_testGhost = nullptr;
+  g_wm.ghosts.clear();
+  drain();
+  g_wm.threadId.store(0, std::memory_order_release);
+  FloatingWindowFixture::ClearLeases();
+  std::printf("Passed %u ghost window checks.\n", check.passed);
+}
+
 // A real window on its own thread that is too busy to answer WM_GETMINMAXINFO
 // while `slow` is set, as an app just after it appears can be.
 struct SlowLimitsWindow {
@@ -2137,6 +2234,7 @@ int main() {
   RunOverflowDestinationFitTests();
   RunCommandReleaseTests();
   RunConstraintRetryTests();
+  RunGhostWindowTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
   RunOverflowFloatPredictionTests();

@@ -372,6 +372,10 @@ struct WmRuntime {
     PendingDesktopFollow follow{};          // "Follow window" desktop switch.
   } routing;
 
+  // Ghosts DWM shows for hung managed windows, mapped to the window each stands
+  // in for (Platform::Windows::GhostWindowOf). Their events are the window's.
+  std::unordered_map<HWND, HWND> ghosts;
+
   // While a user command runs (Commands::TileWindows): the windows Automatic
   // overflow releases, each with its reason, so the command can say why they
   // weren't tiled. Automatic admission stays quiet. Null otherwise.
@@ -411,6 +415,7 @@ struct WmRuntime {
     maintenance = {};
     overflow = {};
     routing = {};
+    ghosts.clear();
   }
 };
 static SettingsState g_settings;

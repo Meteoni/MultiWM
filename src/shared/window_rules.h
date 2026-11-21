@@ -35,6 +35,9 @@ inline constexpr const wchar_t* kIgnoredWindowClasses[] = {
     L"Shell_SecondaryTrayWnd",
     L"Windows.UI.Core.CoreWindow",
     L"OperationStatusWindow",
+    // DWM's stand-in for a hung app's window. MultiWM follows it through the
+    // hung window instead (Platform::Windows::GhostWindowOf).
+    L"Ghost",
 };
 
 inline bool IsIgnoredWindowClass(const wchar_t* className) {
