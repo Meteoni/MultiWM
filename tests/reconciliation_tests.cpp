@@ -1209,6 +1209,9 @@ static void RunConstraintRetryTests() {
   Placement::ArrangeWorkspace(f.key);
   check(retry() && retry()->attempts == 1, "a later arrangement that still gets no answer starts again");
   slow.slow = false;
+  // Its thread may still be asleep from an earlier query; wait until it is idle.
+  DWORD_PTR ignored = 0;
+  SendMessageTimeoutW(slow.hwnd, WM_NULL, 0, 0, SMTO_BLOCK, 5000, &ignored);
   runDueRetry();
   check(limitsKnown() && !retry() && g_wm.timers.constraintRetry == 0,
         "the retry that gets an answer records it and ends");
