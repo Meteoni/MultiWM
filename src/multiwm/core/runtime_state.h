@@ -249,6 +249,16 @@ struct PendingDiscoveryRetry {
   ULONGLONG dueTickMs = 0;
 };
 
+// A tiled window whose size limits are unknown because its query timed out or
+// failed (a busy app, right after it appears). Asked again at `dueTickMs`; 0
+// while that retry runs. `attempts` counts the retries scheduled so far.
+struct PendingConstraintRetry {
+  HWND hwnd = nullptr;
+  DWORD processId = 0;
+  unsigned attempts = 0;
+  ULONGLONG dueTickMs = 0;
+};
+
 // Private virtual-desktop COM state. This entire object belongs to the STA WM
 // thread; callback entry points only post work back to that same thread.
 struct VirtualDesktopRuntime {
@@ -319,6 +329,7 @@ struct WmRuntime {
     UINT_PTR overflow = 0;        // Checks desktop arrival, without activating HWNDs.
     UINT_PTR maintenance = 0;     // Retries virtual-desktop COM / notification setup.
     UINT_PTR conformance = 0;     // Next conformance-lease repair or deadline.
+    UINT_PTR constraintRetry = 0; // Re-asks windows for size limits they didn't report.
   } timers;
 
   // Work collected from window events, processed by the settled lifecycle pass.
@@ -326,6 +337,7 @@ struct WmRuntime {
     std::vector<HWND> dirtyWindows;
     std::vector<PendingWorkspaceArrange> pendingArranges;
     std::vector<PendingDiscoveryRetry> discoveryRetries;
+    std::vector<PendingConstraintRetry> constraintRetries;
     bool retryAfterPlatformRecovery = false;  // Last pass was deferred until COM recovers.
     bool forceMonitorReconcile = false;       // Display topology changed.
   } lifecycle;
@@ -391,7 +403,7 @@ struct WmRuntime {
   // which outlive a settings reload.
   void ResetSession() {
     for (UINT_PTR* timer : {&timers.lifecycle, &timers.discoveryRetry, &timers.overflow,
-                            &timers.maintenance, &timers.conformance}) {
+                            &timers.maintenance, &timers.conformance, &timers.constraintRetry}) {
       RuntimeLifecycle::CancelActorTimer(*timer);
     }
     lifecycle = {};

@@ -1092,6 +1092,128 @@ static void RunFirstFloatingSizeTests() {
   std::printf("Passed %u first floating size checks.\n", check.passed);
 }
 
+// A real window on its own thread that is too busy to answer WM_GETMINMAXINFO
+// while `slow` is set, as an app just after it appears can be.
+struct SlowLimitsWindow {
+  std::atomic<bool> slow{true};
+  HWND hwnd = nullptr;
+  HANDLE thread = nullptr;
+  HANDLE ready = nullptr;
+  RECT frame{};
+
+  static LRESULT CALLBACK Proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    auto* self = reinterpret_cast<SlowLimitsWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_GETMINMAXINFO && self && self->slow) {
+      Sleep(3 * Platform::Windows::kConstraintProbeTimeoutMs);  // Longer than the query waits.
+      return 0;
+    }
+    if (message == WM_DESTROY) PostQuitMessage(0);
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+  }
+
+  static DWORD WINAPI Thread(LPVOID parameter) {
+    auto* self = static_cast<SlowLimitsWindow*>(parameter);
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = Proc;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = L"MultiWMSlowLimitsTest";
+    RegisterClassW(&windowClass);
+    self->hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                                 windowClass.lpszClassName, L"MultiWM slow limits test", WS_POPUP,
+                                 self->frame.left, self->frame.top, 400, 300, nullptr, nullptr,
+                                 windowClass.hInstance, nullptr);
+    if (self->hwnd) {
+      SetWindowLongPtrW(self->hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+      SetLayeredWindowAttributes(self->hwnd, 0, 0, LWA_ALPHA);
+      ShowWindow(self->hwnd, SW_SHOWNOACTIVATE);
+    }
+    SetEvent(self->ready);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
+    return 0;
+  }
+
+  explicit SlowLimitsWindow(const RECT& workArea) {
+    frame = {workArea.left + 40, workArea.top + 40, 0, 0};
+    ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    thread = CreateThread(nullptr, 0, Thread, this, 0, nullptr);
+    WaitForSingleObject(ready, 5000);
+  }
+  ~SlowLimitsWindow() {
+    slow = false;
+    if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    if (thread) WaitForSingleObject(thread, 5000);
+    if (thread) CloseHandle(thread);
+    if (ready) CloseHandle(ready);
+  }
+};
+
+// A tiled window whose size-limit query times out is asked again after the New
+// Window Retry Delay, at most kMaxConstraintRetries times, rather than waiting
+// for an unrelated arrangement; the answer, once it comes, is used at once.
+static void RunConstraintRetryTests() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  g_settings.slowApplicationDelayMs = 250;
+  SlowLimitsWindow slow(f.workArea);
+  check(slow.hwnd != nullptr, "create the slow window");
+  auto& retries = g_wm.lifecycle.constraintRetries;
+  auto retry = [&]() -> PendingConstraintRetry* {
+    for (auto& entry : retries) {
+      if (entry.hwnd == slow.hwnd) return &entry;
+    }
+    return nullptr;
+  };
+  auto runDueRetry = [&] {
+    if (PendingConstraintRetry* entry = retry()) entry->dueTickMs = 1;
+    Placement::ProcessConstraintRetryTimer();
+  };
+  auto limitsKnown = [&] {
+    const WindowRecord* record = f.Load().Find(slow.hwnd);
+    return record && record->constraints.valid;
+  };
+
+  Workspace workspace;
+  workspace.SetLayout(TileLayout::Columns);
+  workspace.AdmitTiled(FloatingWindowFixture::Record(f.hwnd));
+  workspace.AdmitTiled(FloatingWindowFixture::Record(slow.hwnd));
+  g_workspaces.Save(f.key, workspace);
+  Placement::ArrangeWorkspace(f.key);
+  check(!limitsKnown() && retry() && retry()->attempts == 1 && retry()->dueTickMs &&
+            g_wm.timers.constraintRetry != 0,
+        "a window that doesn't answer is tiled, and asked again later");
+  check(f.Load().IsTiled(slow.hwnd), "it stays tiled meanwhile");
+
+  for (unsigned attempt = 2; attempt <= Placement::kMaxConstraintRetries; ++attempt) {
+    runDueRetry();
+    check(retry() && retry()->attempts == attempt && retry()->dueTickMs, "each silent retry schedules the next");
+  }
+  runDueRetry();
+  check(!retry() && g_wm.timers.constraintRetry == 0 && !limitsKnown(),
+        "retries stop after kMaxConstraintRetries");
+
+  Placement::ArrangeWorkspace(f.key);
+  check(retry() && retry()->attempts == 1, "a later arrangement that still gets no answer starts again");
+  slow.slow = false;
+  runDueRetry();
+  check(limitsKnown() && !retry() && g_wm.timers.constraintRetry == 0,
+        "the retry that gets an answer records it and ends");
+
+  g_settings.slowApplicationDelayMs = 0;
+  slow.slow = true;
+  {
+    Workspace current = f.Load();
+    current.UpdateConstraints(slow.hwnd, WindowConstraints{});
+    g_workspaces.Save(f.key, current);
+  }
+  Placement::ArrangeWorkspace(f.key);
+  check(!retry(), "a New Window Retry Delay of 0 disables the retry");
+
+  Reconcile::ForgetManagedWindow(slow.hwnd);
+  FloatingWindowFixture::ClearLeases();
+  std::printf("Passed %u size-limit retry checks.\n", check.passed);
+}
+
 // Tile Workspace hears which windows Automatic overflow released while it ran,
 // and why; outside a command nothing is collected.
 static void RunCommandReleaseTests() {
@@ -1986,6 +2108,7 @@ int main() {
   RunOverflowDestinationProbeTests();
   RunOverflowDestinationFitTests();
   RunCommandReleaseTests();
+  RunConstraintRetryTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();
   RunOverflowFloatPredictionTests();

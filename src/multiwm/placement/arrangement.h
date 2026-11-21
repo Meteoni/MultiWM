@@ -58,6 +58,82 @@ static ConstraintProbeRefresh ProbeConstraintsAgainstCache(HWND hwnd, WindowCons
   return refresh;
 }
 
+// --- Retrying size limits a window didn't report ------------------------------
+//
+// A busy app (often one that has just appeared) may not answer the size-limit
+// query in time, and is then tiled with no known minimum. Without a retry the
+// next query waits for an unrelated arrangement, so the layout reshuffles for
+// it when some other window opens. Instead it is asked again shortly, a bounded
+// number of times; each retry arranges its workspace, which queries it again.
+
+inline constexpr unsigned kMaxConstraintRetries = 4;
+
+static void ArmConstraintRetryTimer() {
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.constraintRetry);
+  auto& retries = g_wm.lifecycle.constraintRetries;
+  ULONGLONG earliest = 0;
+  for (const PendingConstraintRetry& retry : retries) {
+    if (retry.dueTickMs && (!earliest || retry.dueTickMs < earliest)) earliest = retry.dueTickMs;
+  }
+  if (!earliest) return;
+  const ULONGLONG now = GetTickCount64();
+  const UINT delayMs = earliest > now ? static_cast<UINT>(earliest - now) : 1;
+  g_wm.timers.constraintRetry = SetTimer(nullptr, 0, delayMs, nullptr);
+  if (!g_wm.timers.constraintRetry) {
+    Wh_Log(L"Failed to schedule a size-limit retry");
+    retries.clear();
+  }
+}
+
+// `hwnd`, a tiled member, didn't report its size limits: ask again after the
+// New Window Retry Delay, unless a retry is already scheduled or it has had
+// kMaxConstraintRetries. A delay of 0 disables retries, as it does for new windows.
+static void ScheduleConstraintRetry(HWND hwnd, DWORD processId) {
+  if (!hwnd || !g_settings.slowApplicationDelayMs) return;
+  auto& retries = g_wm.lifecycle.constraintRetries;
+  auto it = std::find_if(retries.begin(), retries.end(),
+                         [&](const PendingConstraintRetry& retry) { return retry.hwnd == hwnd; });
+  if (it == retries.end()) {
+    retries.push_back({hwnd, processId, 0, 0});
+    it = retries.end() - 1;
+  } else if (it->processId != processId) {
+    *it = {hwnd, processId, 0, 0};  // A reused HWND value: a new window.
+  }
+  if (it->dueTickMs || it->attempts >= kMaxConstraintRetries) return;
+  ++it->attempts;
+  it->dueTickMs = GetTickCount64() + g_settings.slowApplicationDelayMs;
+  Diagnostics::RecordEvent(L"size limits unknown; retry %u scheduled hwnd=%p", it->attempts, hwnd);
+  ArmConstraintRetryTimer();
+}
+
+// Runs the due retries: arranges each window's workspace, which queries it
+// again. A retry the arrangement doesn't reschedule (the window answered, or
+// is gone or no longer tiled) is finished.
+static void ProcessConstraintRetryTimer() {
+  RuntimeLifecycle::AssertWmThread(L"ProcessConstraintRetryTimer");
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.constraintRetry);
+  const ULONGLONG now = GetTickCount64();
+  std::vector<PendingConstraintRetry> due;
+  for (PendingConstraintRetry& retry : g_wm.lifecycle.constraintRetries) {
+    if (retry.dueTickMs && retry.dueTickMs <= now) {
+      retry.dueTickMs = 0;
+      due.push_back(retry);
+    }
+  }
+  std::vector<DesktopMonitorKey> arranged;
+  for (const PendingConstraintRetry& retry : due) {
+    if (!Platform::Windows::IsSameLiveWindow(retry.hwnd, retry.processId)) continue;
+    for (const DesktopMonitorKey& key : g_workspaces.OwnersOf(retry.hwnd)) {
+      if (std::find(arranged.begin(), arranged.end(), key) != arranged.end()) continue;
+      arranged.push_back(key);
+      ArrangeWorkspace(key);
+    }
+  }
+  std::erase_if(g_wm.lifecycle.constraintRetries,
+                [](const PendingConstraintRetry& retry) { return !retry.dueTickMs; });
+  ArmConstraintRetryTimer();
+}
+
 // Refreshes the application-owned native minimum contract without introducing a
 // second solver notion of "proof". Normal arrangement probes only records that
 // are missing, stale-DPI, or still resolving an admission/restore. User-authored
@@ -86,6 +162,8 @@ static bool RefreshWorkspaceNativeConstraints(
 
     const ConstraintProbeRefresh refresh = ProbeConstraintsAgainstCache(hwnd, record->constraints);
     changed |= workspace.UpdateConstraints(hwnd, refresh.merged);
+    // No answer and nothing cached: the window is tiled without a known minimum.
+    if (!refresh.merged.valid) ScheduleConstraintRetry(hwnd, record->pid);
     if (refresh.reportChanged) {
       Diagnostics::RecordEvent(
           L"native constraint report refreshed reason=%ls hwnd=%p min=%ldx%ld dpi=%u",

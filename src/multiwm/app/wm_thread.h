@@ -150,6 +150,7 @@ static bool DispatchActorTimer(UINT_PTR timerId) {
       {g_wm.timers.overflow, Reconcile::ProcessWindowOverflow},
       {g_wm.timers.maintenance, RunMaintenanceNow},
       {g_wm.timers.conformance, Placement::ProcessConformanceTimer},
+      {g_wm.timers.constraintRetry, Placement::ProcessConstraintRetryTimer},
   };
   for (const auto& timer : actorTimers) {
     if (timer.id && timer.id == timerId) {
