@@ -71,10 +71,26 @@ static std::optional<SharedGeometry::FrameLimits> FloatingSizeLimits(
       constraints.minWidth, constraints.minHeight, constraints.maxWidth, constraints.maxHeight};
 }
 
-// Converts remembered floating geometry into a destination-monitor rectangle.
-// Passive migration restores the full rectangle on the same monitor and centers
-// remembered/default size on a different monitor. Drag intent preserves the
-// user's anchor; explicit centering can retain either floating or current size.
+// What `intent` sizes a floating window by (SharedGeometry::FloatingSizeSource).
+static SharedGeometry::FloatingSizeSource FloatingSizeSourceFor(FloatingPlacementIntent intent) {
+  switch (intent) {
+    case FloatingPlacementIntent::NewWindowCenter:
+    case FloatingPlacementIntent::FailureCenter:
+      return SharedGeometry::FloatingSizeSource::Fallback;
+    case FloatingPlacementIntent::RuleFloatedCenter:
+      return SharedGeometry::FloatingSizeSource::Own;
+    case FloatingPlacementIntent::PassiveRestore:
+    case FloatingPlacementIntent::PreserveAnchor:
+    case FloatingPlacementIntent::CenterWithFloatingSize:
+      break;
+  }
+  return SharedGeometry::FloatingSizeSource::Remembered;
+}
+
+// Places a floating window as `hint` asks, by the rule both mods share
+// (SharedGeometry::PlanFloatingPlacement). A drag keeps the user's drop point;
+// a passive restore keeps a remembered frame's center on its own monitor; every
+// other placement is centered on the work area.
 static bool RepairFloatingGeometry(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const FloatingPlacementHint& hint) {
@@ -92,86 +108,49 @@ static bool RepairFloatingGeometry(
   const RECT& workArea = metrics.workArea;
   const UINT targetDpi = metrics.dpi;
 
+  SharedGeometry::FloatingRequest request;
+  request.source = FloatingSizeSourceFor(hint.intent);
+  request.workArea = workArea;
+  request.canResize = record->canResize;
+  request.honorPreserveSize = hint.intent != FloatingPlacementIntent::FailureCenter;
+  request.defaultSize = SIZE{SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.width, targetDpi),
+                             SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.height, targetDpi)};
   RECT current{};
-  const bool haveCurrent = Platform::Windows::GetWindowFrameRect(hwnd, &current) &&
-                           current.right > current.left &&
-                           current.bottom > current.top;
-
-  const bool ruleFloatedCenter =
-      hint.intent == FloatingPlacementIntent::RuleFloatedCenter;
-  if (ruleFloatedCenter && !haveCurrent) return false;
-  const bool useNewWindowSize =
-      hint.intent == FloatingPlacementIntent::NewWindowCenter ||
-      hint.intent == FloatingPlacementIntent::FailureCenter;
-  const bool centerInWorkspace =
-      hint.intent == FloatingPlacementIntent::CenterWithFloatingSize ||
-      useNewWindowSize || ruleFloatedCenter;
-
-  const bool needsFallbackSize =
-      useNewWindowSize || ruleFloatedCenter || !record->hasFloatingRect;
-  const WindowRule* placementOverride =
-      RuntimeLifecycle::IsAutomaticMode() && needsFallbackSize
-          ? Platform::Windows::FindMatchingWindowRule(
-                hwnd, WindowRuleTreatment::FloatingPlacementOverride)
-          : nullptr;
-  const bool preserveCurrentSize =
-      hint.intent != FloatingPlacementIntent::FailureCenter &&
-      placementOverride && placementOverride->preserveFloatingSize;
-  const bool useCustomSize =
-      placementOverride && !placementOverride->preserveFloatingSize;
-  // A rule-floated window kept at its own size is only moved, and may extend
-  // past the work area. A size rule makes it an ordinary clamped placement,
-  // unless the window can't be resized anyway.
-  const bool centerWithoutResize =
-      ruleFloatedCenter && (!useCustomSize || !record->canResize);
-
-  LONG width = 0;
-  LONG height = 0;
-  if (centerWithoutResize || (preserveCurrentSize && haveCurrent)) {
-    width = current.right - current.left;
-    height = current.bottom - current.top;
-  } else if (useCustomSize) {
-    const SIZE size = SharedGeometry::RuleFloatingSize(*placementOverride, workArea, targetDpi);
-    width = size.cx;
-    height = size.cy;
-  } else if (!useNewWindowSize && record->hasFloatingRect) {
-    const UINT sourceDpi = record->floatingDpi ? record->floatingDpi : 96;
-    width = MulDiv(
-        record->floatingRect.right - record->floatingRect.left,
-        static_cast<int>(targetDpi), static_cast<int>(sourceDpi));
-    height = MulDiv(
-        record->floatingRect.bottom - record->floatingRect.top,
-        static_cast<int>(targetDpi), static_cast<int>(sourceDpi));
-  } else {
-    width = SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.width, targetDpi);
-    height = SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.height, targetDpi);
+  if (Platform::Windows::GetWindowFrameRect(hwnd, &current) && current.right > current.left &&
+      current.bottom > current.top) {
+    request.current = SIZE{SharedGeometry::Width(current), SharedGeometry::Height(current)};
   }
-
-  if (!record->canResize && haveCurrent) {
-    width = current.right - current.left;
-    height = current.bottom - current.top;
+  if (record->hasFloatingRect) {
+    const int sourceDpi = static_cast<int>(record->floatingDpi ? record->floatingDpi : 96);
+    const int dpi = static_cast<int>(targetDpi);
+    request.remembered = SIZE{MulDiv(SharedGeometry::Width(record->floatingRect), dpi, sourceDpi),
+                              MulDiv(SharedGeometry::Height(record->floatingRect), dpi, sourceDpi)};
   }
-
-  POINT center{};
+  // A remembered size wins over rules, so they are only looked up when needed.
+  const bool usesRules =
+      request.source != SharedGeometry::FloatingSizeSource::Remembered || !record->hasFloatingRect;
+  if (usesRules && RuntimeLifecycle::IsAutomaticMode()) {
+    if (const WindowRule* rule =
+            Platform::Windows::FindMatchingWindowRule(hwnd, WindowRuleTreatment::FloatingPlacementOverride)) {
+      request.rule = SharedGeometry::ResolveFloatingSizeRule(*rule, workArea, targetDpi);
+    }
+  }
   if (hint.intent == FloatingPlacementIntent::PreserveAnchor) {
-    center = hint.anchor;
-  } else if (!centerInWorkspace && record->hasFloatingRect &&
+    request.center = hint.anchor;
+  } else if (hint.intent == FloatingPlacementIntent::PassiveRestore && record->hasFloatingRect &&
              MonitorFromRect(&record->floatingRect, MONITOR_DEFAULTTONULL) == monitor) {
-    center = SharedGeometry::RectCenter(record->floatingRect);
-  } else {
-    center = SharedGeometry::RectCenter(workArea);
+    request.center = SharedGeometry::RectCenter(record->floatingRect);
   }
 
-  RECT target = SharedGeometry::CenteredRect(center, width, height);
-  if (!centerWithoutResize) {
-    target = SharedGeometry::ClampToArea(target, workArea);
-  }
+  const std::optional<SharedGeometry::FloatingPlacement> placement =
+      SharedGeometry::PlanFloatingPlacement(request);
+  if (!placement) return false;
   // Apply the app's size limits as Windows would: SWP_NOSENDCHANGING skips that,
-  // so without this the window is forced past its own limits. The companion
-  // predicts the same frame (ClampSizeKeepingOrigin).
-  if (!centerWithoutResize && record->canResize) {
+  // so without this the window is forced past its own limits.
+  RECT target = placement->frame;
+  if (!placement->moveOnly && record->canResize) {
     if (const auto limits = FloatingSizeLimits(workspace, hwnd, targetDpi)) {
-      target = SharedGeometry::ClampSizeKeepingOrigin(target, *limits);
+      target = SharedGeometry::FitFloatingPlacementToLimits(*placement, *limits);
     }
   }
   // The window can enter a non-participating physical state while the placement
@@ -179,7 +158,7 @@ static bool RepairFloatingGeometry(
   if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     return false;
   }
-  return PlaceFloatingWindow(workspace, hwnd, targetDpi, target, centerWithoutResize);
+  return PlaceFloatingWindow(workspace, hwnd, targetDpi, target, placement->moveOnly);
 }
 
 // Grows (direction > 0) or shrinks a floating window (a Floating-layout member

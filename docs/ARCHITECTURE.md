@@ -59,9 +59,11 @@ a running writer from a section kept alive only by readers.
 Nothing travels the other way. MultiWM records no floating frame when it first
 records a window (`MakeWindowRecord`), because the frame a window has then is often
 a placeholder or, with the companion, already its tile. A window's first float uses
-an override-size rule or the configured default size, which both mods compute alike
-(`SharedGeometry::RuleFloatingSize`). Both then apply the window's size limits
-keeping the frame's top-left corner (`SharedGeometry::ClampSizeKeepingOrigin`).
+an override-size rule or the configured default size. Both mods size and centre a
+floating window by the same function, `SharedGeometry::PlanFloatingPlacement`, then
+apply its size limits keeping the frame's top-left corner
+(`SharedGeometry::ClampSizeKeepingOrigin`), so the companion's prediction is
+MultiWM's placement.
 
 The snapshot holds each current-desktop workspace's next-admission tile and default
 floating frame, definite overflow-float predictions, known window ownership/treatment, rules and per-window

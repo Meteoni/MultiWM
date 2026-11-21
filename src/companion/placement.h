@@ -192,23 +192,27 @@ enum class TargetKind {
   KeepSize,  // Only moved; the app keeps its size.
 };
 
-// The frame RepairFloatingGeometry centres a new floating window at: the
-// workspace's default floating frame, or the size of the window's matching size
-// rule (`sizeRule`, may be null). A preserve-size rule keeps `frame`'s size,
-// unless `ignorePreserveSize` (FailureCenter, for a window overflow floats).
-// Nothing when the snapshot has no default frame.
-static std::optional<RECT> CenteredFloatingFrame(const CompanionAbi::WorkspaceHint& workspace,
-                                                 const CompanionAbi::SnapshotRule* sizeRule, const RECT& frame,
-                                                 bool ignorePreserveSize) {
-  if (sizeRule && sizeRule->preserveFloatingSize && ignorePreserveSize) sizeRule = nullptr;
-  if (!sizeRule) {
-    if (!workspace.hasFloatingFrame) return std::nullopt;
-    return workspace.floatingFrame;
+// Where MultiWM will centre a new floating window, by the rule both mods share
+// (SharedGeometry::PlanFloatingPlacement, as RepairFloatingGeometry uses it):
+// sized by `source` from the window's matching size rule (`sizeRule`, may be
+// null), its own frame `frame`, and the workspace's default floating frame. A
+// preserve-size rule is ignored when `ignorePreserveSize` (FailureCenter, for a
+// window overflow floats). Nothing when the size it needs is unknown.
+static std::optional<SharedGeometry::FloatingPlacement> PredictFloatingPlacement(
+    const CompanionAbi::WorkspaceHint& workspace, const CompanionAbi::SnapshotRule* sizeRule, const RECT& frame,
+    bool resizable, SharedGeometry::FloatingSizeSource source, bool ignorePreserveSize) {
+  SharedGeometry::FloatingRequest request;
+  request.source = source;
+  request.workArea = workspace.workArea;
+  // The published frame is the default size centred and clamped in the work area.
+  if (workspace.hasFloatingFrame) {
+    request.defaultSize = SIZE{Width(workspace.floatingFrame), Height(workspace.floatingFrame)};
   }
-  const SIZE size = sizeRule->preserveFloatingSize
-      ? SIZE{Width(frame), Height(frame)}
-      : SharedGeometry::RuleFloatingSize(*sizeRule, workspace.workArea, workspace.dpi);
-  return SharedGeometry::CenteredClampedIn(workspace.workArea, size.cx, size.cy);
+  request.current = SIZE{Width(frame), Height(frame)};
+  request.canResize = resizable;
+  if (sizeRule) request.rule = SharedGeometry::ResolveFloatingSizeRule(*sizeRule, workspace.workArea, workspace.dpi);
+  request.honorPreserveSize = !ignorePreserveSize;
+  return SharedGeometry::PlanFloatingPlacement(request);
 }
 
 // The frame MultiWM will give `hwnd` (currently at `frame`), using its restore
@@ -273,29 +277,33 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
   // Rule-floated windows are centered (RuleFloatedCenter), in every layout: at
   // the size a matching override-size rule names, else at the app's own size
   // without clamping. A window that can't resize keeps its size either way.
+  using SharedGeometry::FloatingSizeSource;
   const SnapshotRule* sizeRule = matches(WindowRuleTreatment::FloatingPlacementOverride);
   if (floatingRule) {
-    if (sizeRule && !sizeRule->preserveFloatingSize && resizable) {
-      *kind = TargetKind::Float;
-      *reason = "rule-floated at its size rule's size";
-      return CenteredFloatingFrame(workspace, sizeRule, frame, false);
-    }
-    *kind = TargetKind::KeepSize;
-    return SharedGeometry::CenteredIn(workspace.workArea, Width(frame), Height(frame));
+    const auto placement =
+        PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Own, false);
+    if (!placement) return reject("no frame to centre");
+    *kind = placement->moveOnly ? TargetKind::KeepSize : TargetKind::Float;
+    if (!placement->moveOnly) *reason = "rule-floated at its size rule's size";
+    return placement->frame;
   }
 
   if (workspace.floatingLayout) {
     // NewWindowCenter: the default size unless a size rule says otherwise.
     *kind = TargetKind::Float;
-    const auto floating = CenteredFloatingFrame(workspace, sizeRule, frame, false);
-    if (!floating) return reject("no floating default");
-    return floating;
+    const auto placement =
+        PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, false);
+    if (!placement) return reject("no floating default");
+    return placement->frame;
   }
 
   // Automatic overflow floats a window it can't tile and, unless it routes the
   // window elsewhere, centres it (FailureCenter).
   if (inputs.flags & kFlagOverflowCentersFloat) {
-    *overflowFrame = CenteredFloatingFrame(workspace, sizeRule, frame, true);
+    if (const auto placement =
+            PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, true)) {
+      *overflowFrame = placement->frame;
+    }
   }
   if (!workspace.hasTiledFrame) {
     if (!workspace.newWindowFloats) return reject("no free tiled slot");

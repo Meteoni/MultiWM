@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 
 namespace SharedGeometry {
 
@@ -150,6 +151,88 @@ inline RECT ClampSizeKeepingOrigin(RECT frame, const FrameLimits& limits) {
   frame.right = frame.left + (limits.maxWidth > 0 ? std::min(width, limits.maxWidth) : width);
   frame.bottom = frame.top + (limits.maxHeight > 0 ? std::min(height, limits.maxHeight) : height);
   return frame;
+}
+
+// --- Floating placement -------------------------------------------------------
+//
+// Where a floating window goes. One rule for both mods: MultiWM places windows
+// with it (RepairFloatingGeometry) and the companion predicts where MultiWM will
+// put a new window with it (PredictFrame), so the two can't drift apart.
+
+// What sizes a floating placement.
+enum class FloatingSizeSource {
+  Remembered,  // The window's remembered floating size; without one, as Fallback.
+  Fallback,    // An override-size rule's size, else the default floating size.
+  Own,         // The window's current size, unless an override-size rule names
+               // another and the window can resize. At its own size it is only
+               // moved, and may extend past the work area.
+};
+
+// An override-size rule as it applies to one placement.
+struct FloatingSizeRule {
+  bool preserveSize = false;  // Keep the window's current size.
+  SIZE size{};                // Otherwise this size (physical pixels).
+};
+
+// `rule` (MultiWM's WindowRule or the snapshot's SnapshotRule) at `dpi`.
+template <class Rule>
+FloatingSizeRule ResolveFloatingSizeRule(const Rule& rule, const RECT& workArea, UINT dpi) {
+  if (rule.preserveFloatingSize) return {true, {}};
+  return {false, RuleFloatingSize(rule, workArea, dpi)};
+}
+
+// Everything a floating placement depends on. Sizes and points are physical.
+struct FloatingRequest {
+  FloatingSizeSource source = FloatingSizeSource::Fallback;
+  RECT workArea{};
+  std::optional<SIZE> defaultSize;       // Floating Default Size at this DPI.
+  std::optional<SIZE> remembered;        // The remembered size, at this DPI.
+  std::optional<SIZE> current;           // The window's current size.
+  bool canResize = true;
+  std::optional<FloatingSizeRule> rule;  // A matching override-size rule.
+  bool honorPreserveSize = true;         // False: a preserve-size rule is ignored.
+  std::optional<POINT> center;           // Default: the work area's center.
+};
+
+struct FloatingPlacement {
+  RECT frame{};
+  bool moveOnly = false;  // Keeps its own size, unclamped; only moved.
+};
+
+// The frame for `request`, before the window's size limits
+// (FitFloatingPlacementToLimits). Centered on `center`; a frame that is resized
+// is kept inside the work area. No value when the size it needs is unknown.
+inline std::optional<FloatingPlacement> PlanFloatingPlacement(const FloatingRequest& request) {
+  std::optional<FloatingSizeRule> rule = request.rule;
+  if (rule && rule->preserveSize && !request.honorPreserveSize) rule.reset();
+  const bool ruleNamesSize = rule && !rule->preserveSize;
+
+  FloatingPlacement placement;
+  std::optional<SIZE> size;
+  if (request.source == FloatingSizeSource::Own) {
+    if (!request.current) return std::nullopt;
+    placement.moveOnly = !ruleNamesSize || !request.canResize;
+    size = placement.moveOnly ? *request.current : rule->size;
+  } else if (request.source == FloatingSizeSource::Remembered && request.remembered) {
+    size = request.remembered;
+  } else if (rule && rule->preserveSize && request.current) {
+    size = request.current;
+  } else {
+    size = ruleNamesSize ? std::optional<SIZE>{rule->size} : request.defaultSize;
+  }
+  if (!request.canResize && request.current) size = request.current;
+  if (!size) return std::nullopt;
+
+  const POINT center = request.center ? *request.center : RectCenter(request.workArea);
+  placement.frame = CenteredRect(center, size->cx, size->cy);
+  if (!placement.moveOnly) placement.frame = ClampToArea(placement.frame, request.workArea);
+  return placement;
+}
+
+// `placement`'s frame with the window's size limits applied; a window that is
+// only moved keeps its own size.
+inline RECT FitFloatingPlacementToLimits(const FloatingPlacement& placement, const FrameLimits& limits) {
+  return placement.moveOnly ? placement.frame : ClampSizeKeepingOrigin(placement.frame, limits);
 }
 
 // Centre one axis inside its cell when a maximum caps it. Returns whether the

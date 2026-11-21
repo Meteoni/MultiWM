@@ -255,7 +255,8 @@ int main() {
     using Companion::Width;
     using Companion::Height;
     const RECT& work = monitorInfo.rcWork;
-    const RECT floatFrame{work.left + 300, work.top + 200, work.left + 900, work.top + 600};
+    // MultiWM publishes the default floating size centred in the work area.
+    const RECT floatFrame = SharedGeometry::CenteredClampedIn(work, 600, 400);
     workspace.floatingFrame = floatFrame;
     workspace.hasFloatingFrame = 1;
     limits.minimum = {100, 100};
