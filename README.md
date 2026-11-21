@@ -64,8 +64,9 @@ glossary, and testing.
 Move a tiled window to **float it** or **swap it with the window underneath**. 
 
 By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
-moving windows through the logical order (Alt+, / .), floating a window (Alt+F), and switching between Automatic
-and Manual management (Alt+R).
+moving windows through the logical order (Alt+, / .), resizing the focused window (Alt+= / - / 0), floating a
+window (Alt+F), and switching between Automatic and Manual management (Alt+R). If another program already uses
+one of these shortcuts, a toast names it; choose a different key or modifier in the hotkey settings.
 
 A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
 

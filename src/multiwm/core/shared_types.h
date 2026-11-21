@@ -345,6 +345,10 @@ struct SettingsState {
   size_t adaptiveDwindleSlots = 2;
   LONG adaptiveDwindlePercentage = 40;
 
+  // The mode MultiWM starts in. The current mode lives in WmRuntime: the
+  // management-mode hotkey and tray menu change it, and a settings reload keeps
+  // it unless this default itself changed.
+  ManagementMode defaultManagementMode = ManagementMode::Automatic;
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
   AutomaticNewWindowPosition automaticNewWindowPosition =
       AutomaticNewWindowPosition::LastSlot;
@@ -365,10 +369,11 @@ struct SettingsState {
 };
 
 // One configurable hotkey: its message ID, the Windhawk setting naming its key,
-// where the parsed key is kept, a name for logs, and whether holding the key
-// repeats it. Every hotkey uses SettingsState::tilingModifiers. Listed in
-// registration order, which matters: when two hotkeys share a key, the earlier
-// one gets it. The command each ID runs is chosen in HandleWmThreadMessage.
+// where the parsed key is kept, its name as the settings show it (for logs and
+// the "unavailable" toast), and whether holding the key repeats it. Every hotkey
+// uses SettingsState::tilingModifiers. Listed, and registered, in the settings'
+// order, so when two hotkeys share a key the one listed first gets it. The
+// command each ID runs is chosen in HandleWmThreadMessage.
 struct HotkeyBinding {
   HotkeyIds id;
   PCWSTR setting;
@@ -378,19 +383,22 @@ struct HotkeyBinding {
 };
 
 inline constexpr HotkeyBinding kHotkeyBindings[] = {
-    {HK_TILE, L"hotkeys.TileKey", &SettingsState::tileKey, L"Tile", false},
-    {HK_SWAP_MASTER, L"hotkeys.SwapMasterKey", &SettingsState::swapMasterKey, L"Swap master", false},
-    {HK_PROMOTE_WINDOW, L"hotkeys.PromoteWindowKey", &SettingsState::promoteWindowKey, L"Promote window", true},
-    {HK_DEMOTE_WINDOW, L"hotkeys.DemoteWindowKey", &SettingsState::demoteWindowKey, L"Demote window", true},
+    {HK_TILE, L"hotkeys.TileKey", &SettingsState::tileKey, L"Tile Workspace", false},
+    {HK_LAYOUT, L"hotkeys.LayoutKey", &SettingsState::layoutKey, L"Cycle Layout", false},
+    {HK_SWAP_MASTER, L"hotkeys.SwapMasterKey", &SettingsState::swapMasterKey, L"Set Master Window", false},
+    {HK_PROMOTE_WINDOW, L"hotkeys.PromoteWindowKey", &SettingsState::promoteWindowKey, L"Promote Focused Window",
+     true},
+    {HK_DEMOTE_WINDOW, L"hotkeys.DemoteWindowKey", &SettingsState::demoteWindowKey, L"Demote Focused Window", true},
     {HK_MANAGEMENT_MODE_TOGGLE, L"hotkeys.ManagementModeToggleKey", &SettingsState::managementModeToggleKey,
-     L"Management mode", false},
-    {HK_FLOAT_FOCUSED, L"hotkeys.FloatFocusedKey", &SettingsState::floatFocusedKey, L"Float focused", false},
-    {HK_GROW_WINDOW, L"hotkeys.WindowSize.GrowKey", &SettingsState::growWindowKey, L"Grow window", true},
-    {HK_SHRINK_WINDOW, L"hotkeys.WindowSize.ShrinkKey", &SettingsState::shrinkWindowKey, L"Shrink window", true},
-    {HK_RESET_WINDOW_SIZE, L"hotkeys.WindowSize.ResetKey", &SettingsState::resetWindowSizeKey, L"Reset window size",
+     L"Toggle Window Management Mode", false},
+    {HK_FLOAT_FOCUSED, L"hotkeys.FloatFocusedKey", &SettingsState::floatFocusedKey, L"Float Focused Window", false},
+    {HK_GROW_WINDOW, L"hotkeys.WindowSize.GrowKey", &SettingsState::growWindowKey, L"Grow Focused Window", true},
+    {HK_SHRINK_WINDOW, L"hotkeys.WindowSize.ShrinkKey", &SettingsState::shrinkWindowKey, L"Shrink Focused Window",
+     true},
+    {HK_RESET_WINDOW_SIZE, L"hotkeys.WindowSize.ResetKey", &SettingsState::resetWindowSizeKey,
+     L"Reset Focused Window Size", false},
+    {HK_DIAGNOSTIC_DUMP, L"hotkeys.DiagnosticDumpKey", &SettingsState::diagnosticDumpKey, L"Write Diagnostic Report",
      false},
-    {HK_LAYOUT, L"hotkeys.LayoutKey", &SettingsState::layoutKey, L"Layout cycle", false},
-    {HK_DIAGNOSTIC_DUMP, L"hotkeys.DiagnosticDumpKey", &SettingsState::diagnosticDumpKey, L"Diagnostic dump", false},
 };
 
 struct MoveSizeGesture;

@@ -3,8 +3,11 @@
 
 namespace RuntimeLifecycle {
 
-// Registers every hotkey with a key set, in kHotkeyBindings order.
-static void RegisterConfiguredHotkeys() {
+// Registers every hotkey with a key set, in kHotkeyBindings order. Returns the
+// names of those Windows refused: another program, or an earlier MultiWM
+// hotkey, already uses the key combination.
+static std::vector<const wchar_t*> RegisterConfiguredHotkeys() {
+  std::vector<const wchar_t*> unavailable;
   for (const HotkeyBinding& hotkey : kHotkeyBindings) {
     const UINT key = g_settings.*hotkey.key;
     if (!key) continue;
@@ -13,8 +16,22 @@ static void RegisterConfiguredHotkeys() {
     if (!RegisterHotKey(nullptr, hotkey.id, modifiers, key)) {
       Wh_Log(L"Failed to register %s hotkey (id=%d error=%lu)",
              hotkey.name, static_cast<int>(hotkey.id), GetLastError());
+      unavailable.push_back(hotkey.name);
     }
   }
+  return unavailable;
+}
+
+// One toast naming the hotkeys that could not be registered, so a conflict is
+// not only in the log. Needs the tray UI (toasts) to be initialized.
+static void ReportUnavailableHotkeys(const std::vector<const wchar_t*>& unavailable) {
+  if (unavailable.empty()) return;
+  std::wstring text = unavailable.size() == 1 ? L"Hotkey in use: " : L"Hotkeys in use: ";
+  for (size_t i = 0; i < unavailable.size(); ++i) {
+    if (i) text += L", ";
+    text += unavailable[i];
+  }
+  TrayUi::ShowCommandFailureFlyout(text.c_str());
 }
 
 static void UnregisterConfiguredHotkeys() {
@@ -357,12 +374,13 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   }
 
   Reconcile::ScheduleLifecycleReconcile(nullptr);
-  RegisterConfiguredHotkeys();
+  const std::vector<const wchar_t*> unavailableHotkeys = RegisterConfiguredHotkeys();
   InitializeCurrentDesktopWorkspaces();
 
   if (!TrayUi::Initialize()) {
     Wh_Log(L"Tiling layout tray icon unavailable; window management remains active");
   }
+  ReportUnavailableHotkeys(unavailableHotkeys);
 
   CompanionSnapshot::PublishIfChanged();
   RunWmMessageLoop();

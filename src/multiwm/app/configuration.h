@@ -59,12 +59,14 @@ static int ReadBoundedIntSetting(PCWSTR name, int minimum, int maximum, int fall
   return value < minimum || value > maximum ? fallback : value;
 }
 
-// Settings strings are non-null. Match the rule format's ASCII whitespace only.
-static std::wstring TrimSettingText(PCWSTR text) {
-  const std::wstring value = text;
-  const size_t first = value.find_first_not_of(L" \t\r\n");
-  return first == std::wstring::npos ? std::wstring{}
-      : value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
+// `text` without leading or trailing whitespace (as iswspace classifies it).
+// Every text setting and rule-list value is trimmed this way.
+static std::wstring TrimSettingText(std::wstring_view text) {
+  size_t first = 0;
+  while (first < text.size() && std::iswspace(text[first])) ++first;
+  size_t last = text.size();
+  while (last > first && std::iswspace(text[last - 1])) --last;
+  return std::wstring(text.substr(first, last - first));
 }
 
 UINT ParseHotkeyKey(PCWSTR str) {
@@ -106,36 +108,26 @@ UINT ParseHotkeyKey(PCWSTR str) {
   }
 
   if (str[1] != L'\0') return 0;
-  wchar_t c = str[0];
+  const wchar_t c = str[0];
 
   if (c >= L'A' && c <= L'Z') return c;
   if (c >= L'a' && c <= L'z') return c - L'a' + L'A';
   if (c >= L'0' && c <= L'9') return c;
 
-  if (c == L'!') return '1';
-  if (c == L'@') return '2';
-  if (c == L'#') return '3';
-  if (c == L'$') return '4';
-  if (c == L'%') return '5';
-  if (c == L'^') return '6';
-  if (c == L'&') return '7';
-  if (c == L'*') return '8';
-  if (c == L'(') return '9';
-  if (c == L')') return '0';
-
-  if (c == L'`' || c == L'~') return VK_OEM_3;
-  if (c == L'-' || c == L'_') return VK_OEM_MINUS;
-  if (c == L'=' || c == L'+') return VK_OEM_PLUS;
-  if (c == L'[' || c == L'{') return VK_OEM_4;
-  if (c == L']' || c == L'}') return VK_OEM_6;
-  if (c == L'\\' || c == L'|') return VK_OEM_5;
-  if (c == L';' || c == L':') return VK_OEM_1;
-  if (c == L'\'' || c == L'"') return VK_OEM_7;
-  if (c == L',' || c == L'<') return VK_OEM_COMMA;
-  if (c == L'.' || c == L'>') return VK_OEM_PERIOD;
-  if (c == L'/' || c == L'?') return VK_OEM_2;
-  if (c == L' ') return VK_SPACE;
-
+  // Symbols, typed or shifted, on a US keyboard layout.
+  static const std::pair<wchar_t, UINT> kSymbolKeys[] = {
+      {L'!', '1'}, {L'@', '2'}, {L'#', '3'}, {L'$', '4'}, {L'%', '5'},
+      {L'^', '6'}, {L'&', '7'}, {L'*', '8'}, {L'(', '9'}, {L')', '0'},
+      {L'`', VK_OEM_3}, {L'~', VK_OEM_3}, {L'-', VK_OEM_MINUS}, {L'_', VK_OEM_MINUS},
+      {L'=', VK_OEM_PLUS}, {L'+', VK_OEM_PLUS}, {L'[', VK_OEM_4}, {L'{', VK_OEM_4},
+      {L']', VK_OEM_6}, {L'}', VK_OEM_6}, {L'\\', VK_OEM_5}, {L'|', VK_OEM_5},
+      {L';', VK_OEM_1}, {L':', VK_OEM_1}, {L'\'', VK_OEM_7}, {L'"', VK_OEM_7},
+      {L',', VK_OEM_COMMA}, {L'<', VK_OEM_COMMA}, {L'.', VK_OEM_PERIOD}, {L'>', VK_OEM_PERIOD},
+      {L'/', VK_OEM_2}, {L'?', VK_OEM_2}, {L' ', VK_SPACE},
+  };
+  for (const auto& [symbol, key] : kSymbolKeys) {
+    if (c == symbol) return key;
+  }
   return 0;
 }
 
@@ -220,11 +212,7 @@ static std::vector<std::wstring> ParseWindowRuleList(const wchar_t* text) {
       continue;
     }
 
-    size_t first = 0;
-    while (first < value.size() && std::iswspace(value[first])) ++first;
-    size_t last = value.size();
-    while (last > first && std::iswspace(value[last - 1])) --last;
-    if (first < last) values.emplace_back(value.substr(first, last - first));
+    if (std::wstring trimmed = TrimSettingText(value); !trimmed.empty()) values.push_back(std::move(trimmed));
 
     value.clear();
     if (*cursor == L'\0') break;
@@ -347,8 +335,41 @@ static bool ParseInitialPlacementRule(int i, PCWSTR monitor, PCWSTR monitorId,
   return !(rule->monitor == RuleMonitor::Any && !desktopNumber && rule->desktopNameContains.empty());
 }
 
-// Window rules in settings order. A row with no match fields ends the list.
-// WM thread only.
+// Fills the treatment of window rule `i` from its Treatment value (`kind`) and
+// the fields that treatment uses. Unknown or blank values mean Exclude. False
+// (after logging, unless the row names no destination) when the row is invalid.
+static bool ParseWindowRuleTreatment(int i, PCWSTR kind, PCWSTR size, PCWSTR monitor, PCWSTR monitorId,
+                                     PCWSTR desktopName, int desktopNumber, WindowRule* rule) {
+  if (_wcsicmp(kind, L"default_to_floating") == 0) {
+    rule->treatment = WindowRuleTreatment::DefaultToFloating;
+  } else if (_wcsicmp(kind, L"always_floating") == 0) {
+    rule->treatment = WindowRuleTreatment::AlwaysFloating;
+  } else if (_wcsicmp(kind, L"trace_to_owner") == 0) {
+    rule->treatment = WindowRuleTreatment::TraceToOwner;
+  } else if (_wcsicmp(kind, L"open_on_monitor") == 0) {
+    rule->treatment = WindowRuleTreatment::InitialPlacement;
+    return ParseInitialPlacementRule(i, monitor, monitorId, desktopName, desktopNumber, rule);
+  } else if (_wcsicmp(kind, L"preserve_size_when_centering") == 0) {
+    rule->treatment = WindowRuleTreatment::FloatingPlacementOverride;
+    rule->preserveFloatingSize = true;
+  } else if (_wcsicmp(kind, L"override_size_when_centering") == 0) {
+    rule->treatment = WindowRuleTreatment::FloatingPlacementOverride;
+    if (_wcsicmp(size, L"Workspace") == 0) {
+      rule->useWorkspaceSize = true;
+    } else if (!ParseFloatingDefaultSizeSetting(size, &rule->floatingSizeDip)) {
+      Wh_Log(L"Ignoring invalid centered size override at rule %d: %s", i + 1, size);
+      return false;
+    }
+    rule->preserveFloatingSize = false;
+  } else {
+    rule->treatment = WindowRuleTreatment::Exclude;
+  }
+  return true;
+}
+
+// Window rules in settings order. Like the initialization rules, the whole row
+// is read before detecting the end: only a completely empty row ends the list,
+// and a row whose match fields were cleared is skipped. WM thread only.
 static void LoadWindowRules() {
   using WindhawkUtils::StringSetting;
   g_settings.windowRules.clear();
@@ -363,38 +384,18 @@ static void LoadWindowRules() {
     auto desktopName = StringSetting::make(L"windowRules.Rules[%d].DesktopNameContains", i);
     const int desktopNumber = Wh_GetIntSetting(L"windowRules.Rules[%d].DesktopNumber", i);
     if (!*process.get() && !*className.get() && !*titleContains.get()) {
-      Wh_Log(L"Window rule %d is blank; later rules will not be loaded", i + 1);
-      break;
+      if (!*treatment.get() && !*size.get() && !*monitor.get() && !*monitorId.get() &&
+          !*desktopName.get() && desktopNumber == 0) {
+        break;
+      }
+      Wh_Log(L"Window rule %d has no match fields; skipping it", i + 1);
+      continue;
     }
 
     WindowRule rule;
-    const PCWSTR kind = treatment.get();
-    if (_wcsicmp(kind, L"default_to_floating") == 0) {
-      rule.treatment = WindowRuleTreatment::DefaultToFloating;
-    } else if (_wcsicmp(kind, L"always_floating") == 0) {
-      rule.treatment = WindowRuleTreatment::AlwaysFloating;
-    } else if (_wcsicmp(kind, L"trace_to_owner") == 0) {
-      rule.treatment = WindowRuleTreatment::TraceToOwner;
-    } else if (_wcsicmp(kind, L"open_on_monitor") == 0) {
-      rule.treatment = WindowRuleTreatment::InitialPlacement;
-      if (!ParseInitialPlacementRule(i, monitor.get(), monitorId.get(), desktopName.get(),
-                                     desktopNumber, &rule)) {
-        continue;
-      }
-    } else if (_wcsicmp(kind, L"preserve_size_when_centering") == 0) {
-      rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
-      rule.preserveFloatingSize = true;
-    } else if (_wcsicmp(kind, L"override_size_when_centering") == 0) {
-      rule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
-      if (_wcsicmp(size.get(), L"Workspace") == 0) {
-        rule.useWorkspaceSize = true;
-      } else if (!ParseFloatingDefaultSizeSetting(size.get(), &rule.floatingSizeDip)) {
-        Wh_Log(L"Ignoring invalid centered size override at rule %d: %s", i + 1, size.get());
-        continue;
-      }
-      rule.preserveFloatingSize = false;
-    } else {
-      rule.treatment = WindowRuleTreatment::Exclude;
+    if (!ParseWindowRuleTreatment(i, treatment.get(), size.get(), monitor.get(), monitorId.get(),
+                                  desktopName.get(), desktopNumber, &rule)) {
+      continue;
     }
     rule.processNames = ParseWindowRuleList(process.get());
     rule.classNames = ParseWindowRuleList(className.get());
@@ -479,7 +480,7 @@ void LoadSettings() {
   g_settings.automaticNewWindowPosition =
       StringSettingIs(L"general.AutomaticNewWindowPosition", L"after_focused")
       ? AutomaticNewWindowPosition::AfterFocused : AutomaticNewWindowPosition::LastSlot;
-  g_wm.managementMode = StringSettingIs(L"general.DefaultWindowManagementMode", L"manual")
+  g_settings.defaultManagementMode = StringSettingIs(L"general.DefaultWindowManagementMode", L"manual")
       ? ManagementMode::Manual : ManagementMode::Automatic;
 
   // Timing.

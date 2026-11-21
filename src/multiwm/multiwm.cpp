@@ -2,7 +2,7 @@
 // @id              multiwm
 // @name            MultiWM
 // @description     Lightweight, low-cortisol window manager with true per-virtual-desktop layouts. 
-// @version         1.16.0
+// @version         1.16.1
 // @author          meteoni
 // @github          https://github.com/Meteoni
 // @license         MIT
@@ -49,6 +49,7 @@ Move a tiled window to **float it** or **swap it with the window underneath**.
 By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
 moving windows through the logical order (Alt+, / .), resizing the focused window (Alt+= / - / 0),
 floating a window (Alt+F), and switching between Automatic and Manual management (Alt+R).
+If another program already uses one of these shortcuts, a toast names it.
 
 A small tray indicator shows the active workspace layout and provides quick access to layouts and management mode.
 
@@ -69,7 +70,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 - general:
   - DefaultWindowManagementMode: automatic
     $name: Default Window Management Mode
-    $description: Automatic adds windows as they appear. Manual adds them when you choose Tile Workspace.
+    $description: Automatic adds windows as they appear. Manual adds them when you choose Tile Workspace. Applies when MultiWM starts; a mode chosen with the hotkey or tray menu stays until MultiWM restarts or this setting changes.
     $options:
       - manual: Manual
       - automatic: Automatic
@@ -473,6 +474,7 @@ BOOL WhTool_ModInit() {
   Diagnostics::InitializeProcessRuntime();
   Wh_Log(L"MultiWM mod initializing...");
   Configuration::LoadSettings();
+  g_wm.managementMode = g_settings.defaultManagementMode;
   // Optional: without it the companion mod gives no hints; MultiWM is unaffected.
   CompanionSnapshot::Open();
   if (!RuntimeLifecycle::StartHotkeyThread()) {
@@ -512,8 +514,13 @@ void WhTool_ModSettingsChanged() {
   Diagnostics::RecordEvent(L"settings reload requested");
 
   // Settings reload changes defaults/policies but does not destroy per-desktop
-  // workspace identity, layout mode, ordering, or learned ratios.
+  // workspace identity, layout mode, ordering, or learned ratios. The current
+  // management mode is kept too, unless its default setting is what changed.
+  const ManagementMode previousDefaultMode = g_settings.defaultManagementMode;
   Configuration::LoadSettings();
+  if (g_settings.defaultManagementMode != previousDefaultMode) {
+    g_wm.managementMode = g_settings.defaultManagementMode;
+  }
   if (!RuntimeLifecycle::StartHotkeyThread()) {
     Wh_Log(L"Failed to restart WM worker after settings change");
   }
