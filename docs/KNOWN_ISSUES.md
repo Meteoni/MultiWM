@@ -62,8 +62,15 @@ Expected from the code, not tested:
   predicted tile, the whole monitor, and is then admitted as suspended-maximized
   instead of tiled. Each following window would get the whole monitor too.
 
-Possible resolution: for managed windows, apply the on-its-own-tile exception in
-every state check through one shared check. New windows have no tile yet to
-compare against; one option is the next-admission tile MultiWM already publishes
-to the companion. Treating every borderless window that covers the work area as
-not fullscreen would also miss borderless F11 apps, which this rule exists for.
+Chosen direction, not yet done: limit the insets so a tile can't cover the
+monitor. Only when all four insets would be 2 px or less, raise them to 3 and say
+so in the settings toast; every other setup is left alone.
+
+Considered and set aside:
+
+- Applying the on-its-own-tile exception in every state check. That fixes
+  managed windows, but a new window has no tile yet to compare against.
+- GlazeWM's rule: fullscreen only when the visible frame extends past the area
+  the WM tiles into, so its own tiles can never match. With zero insets and a
+  hidden taskbar, that area is the monitor, and a real fullscreen app is then not
+  detected at all.
