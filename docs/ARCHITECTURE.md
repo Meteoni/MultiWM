@@ -39,7 +39,7 @@ except the sibling `shared/` and `companion/` roots.
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |
 | `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot |
 | `windhawk/` | — | Windhawk's stock tool-mod launcher. Not MultiWM logic. |
-| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry`, `AppFrame` | Code compiled by both mods, so both decide alike: window-rule matching, the window-shape checks and process-name read behind it, the companion snapshot layout, geometry/size-limit and frame-border arithmetic, and the app-frame window properties. Windows and the standard library only. |
+| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry` | Code compiled by both mods, so both decide alike: window-rule matching, the window-shape checks and process-name read behind it, the companion snapshot layout, and geometry/size-limit and frame-border arithmetic. Windows and the standard library only. |
 | `companion/` | `Companion` | The separate MultiWM Companion mod (`src/companion/multiwm-companion.cpp`). Never included by MultiWM. |
 
 ## The companion mod
@@ -56,14 +56,12 @@ changed contents are written with a seqlock. Unchanged contents skip the write.
 There is no polling or request back to MultiWM. A named liveness event distinguishes
 a running writer from a section kept alive only by readers.
 
-One thing travels the other way, on the window itself. When the companion moves a
-new window onto its tile before showing it, the app's own frame would be lost, and
-MultiWM would take the tile for the window's natural floating frame. So the
-companion leaves the app's frame on the window as two window properties
-(`shared/app_frame.h`), which MultiWM reads when it first records the window
-(`MakeWindowRecord`) and the companion removes when the window is destroyed.
-Without the properties MultiWM uses the window's current frame, as without the
-companion.
+Nothing travels the other way. MultiWM records no floating frame when it first
+records a window (`MakeWindowRecord`), because the frame a window has then is often
+a placeholder or, with the companion, already its tile. A window's first float uses
+an override-size rule or the configured default size, which both mods compute alike
+(`SharedGeometry::RuleFloatingSize`). Both then apply the window's size limits
+keeping the frame's top-left corner (`SharedGeometry::ClampSizeKeepingOrigin`).
 
 The snapshot holds each current-desktop workspace's next-admission tile and default
 floating frame, definite overflow-float predictions, known window ownership/treatment, rules and per-window

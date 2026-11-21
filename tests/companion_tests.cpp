@@ -357,28 +357,6 @@ int main() {
           "a window that can't resize keeps its size despite a size rule");
   }
 
-  // A new window the companion moves onto its tile carries the frame the app
-  // asked for (shared/app_frame.h), so MultiWM floats it at that size later
-  // rather than at the tile. The first frame recorded wins.
-  {
-    AppFrame::Forget(hwnd);
-    limits.minimum = {100, 100};
-    limits.maximum = {2000, 2000};
-    ++body.generation;
-    positionCalls.clear();
-    Companion::SetWindowPosHook(hwnd, nullptr, 210, 220, 710, 510, showFlags);
-    const RECT requested{210 + testMargins.left, 220 + testMargins.top, 920 - testMargins.right,
-                         730 - testMargins.bottom};
-    auto recorded = AppFrame::Read(hwnd);
-    check(positionCalls.size() == 1 && positionCalls[0].x != 210 && recorded && EqualRect(&*recorded, &requested),
-          "a hinted new window carries the app's own frame");
-    Companion::SetWindowPosHook(hwnd, nullptr, 300, 300, 500, 400, showFlags);
-    recorded = AppFrame::Read(hwnd);
-    check(recorded && EqualRect(&*recorded, &requested), "a later show doesn't replace the app's first frame");
-    AppFrame::Forget(hwnd);
-    check(!AppFrame::Read(hwnd), "Forget removes the properties");
-  }
-
   // Settling: after the companion places a window at its show, the app's own
   // moves are held at that frame until MultiWM takes the window over (its
   // snapshot entry changes, or its own SWP_NOSENDCHANGING placement arrives).

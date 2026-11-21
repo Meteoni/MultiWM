@@ -140,6 +140,18 @@ inline FrameLimits TrackingLimitsToFrame(
   return frame;
 }
 
+// A floating frame with its size clamped to `limits` and its top-left corner
+// kept, which is how Windows applies a window's size limits to a positioning
+// call. MultiWM places with SWP_NOSENDCHANGING, which skips that clamp, so it
+// applies this itself; the companion predicts its floating placements with it.
+inline RECT ClampSizeKeepingOrigin(RECT frame, const FrameLimits& limits) {
+  const LONG width = std::max(Width(frame), limits.minWidth);
+  const LONG height = std::max(Height(frame), limits.minHeight);
+  frame.right = frame.left + (limits.maxWidth > 0 ? std::min(width, limits.maxWidth) : width);
+  frame.bottom = frame.top + (limits.maxHeight > 0 ? std::min(height, limits.maxHeight) : height);
+  return frame;
+}
+
 // Centre one axis inside its cell when a maximum caps it. Returns whether the
 // axis changed; integer rounding deliberately matches the layout planner.
 inline bool CenterWithinMaximumSize(LONG& start, LONG& end, LONG maximum) {

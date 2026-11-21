@@ -181,14 +181,8 @@ static std::optional<RECT> FitSlotToLimits(
 }
 
 // A floating window placed by MultiWM keeps its requested top-left corner while
-// Windows applies its size limits, so clamp the size the same way. Pure.
-static RECT ClampSizeKeepingOrigin(RECT frame, const SharedGeometry::FrameLimits& limits) {
-  const LONG width = std::max(Width(frame), limits.minWidth);
-  const LONG height = std::max(Height(frame), limits.minHeight);
-  frame.right = frame.left + (limits.maxWidth > 0 ? std::min(width, limits.maxWidth) : width);
-  frame.bottom = frame.top + (limits.maxHeight > 0 ? std::min(height, limits.maxHeight) : height);
-  return frame;
-}
+// its size limits are applied; both mods share the rule.
+using SharedGeometry::ClampSizeKeepingOrigin;
 
 // How MultiWM treats the frame PredictFrame returns once it reads the window's
 // size limits.
@@ -328,17 +322,7 @@ static void LogDecision(HWND hwnd, const char* path, const char* outcome) {
 struct PredictedPlacement {
   RECT windowRect;
   bool keepSize;
-  // The app's own visible frame (physical pixels), for a window MultiWM doesn't
-  // track yet: what MultiWM should float it at later (shared/app_frame.h).
-  std::optional<RECT> appFrame;
 };
-
-// Leaves the app's own frame on a new window the companion is moving, so
-// MultiWM doesn't take the tile for the window's natural floating frame. Call
-// where the prediction is applied.
-static void RememberAppFrame(HWND hwnd, const PredictedPlacement& prediction) {
-  if (prediction.appFrame) AppFrame::Remember(hwnd, *prediction.appFrame);
-}
 
 // Calculates without placing. `proposed` is the app's intended window rectangle
 // in physical screen pixels, including resize borders. DWM margins translate
@@ -411,8 +395,7 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   // The snapshot holds visible frames; SetWindowPos takes the window rectangle,
   // which includes the invisible resize borders.
   const RECT placement = SharedGeometry::AddFrameMargins(frameTarget, margins);
-  return PredictedPlacement{placement, kind == TargetKind::KeepSize,
-                            inputs.tracked ? std::nullopt : std::optional<RECT>{frame}};
+  return PredictedPlacement{placement, kind == TargetKind::KeepSize};
 }
 
 // --- Settling ----------------------------------------------------------------------
@@ -475,7 +458,6 @@ static bool PlaceAtPredictedFrame(HWND hwnd, const char* path) {
   const BOOL moved = g_setWindowPosForOwnMoves(hwnd, nullptr, placement.left, placement.top,
                                                Width(placement), Height(placement), flags);
   LogDecision(hwnd, path, moved ? "placed at MultiWM's frame" : "SetWindowPos failed");
-  if (moved) RememberAppFrame(hwnd, *prediction);
   // A window MultiWM only centres (keepSize) has no exact frame to hold.
   if (moved && !prediction->keepSize) BeginSettling(hwnd, placement);
   return moved != FALSE;

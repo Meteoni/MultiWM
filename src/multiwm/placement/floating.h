@@ -66,6 +66,25 @@ static bool PlaceFloatingWindow(
   return true;
 }
 
+// `hwnd`'s size limits as visible-frame sizes at `dpi`: its cached report, or a
+// fresh one (stored in `workspace`) when none was taken at that DPI. No value
+// when the window has never answered. The probe runs application code.
+static std::optional<SharedGeometry::FrameLimits> FloatingSizeLimits(
+    Workspace& workspace, HWND hwnd, UINT dpi) {
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record) return std::nullopt;
+  WindowConstraints constraints = record->constraints;
+  if (!constraints.valid || constraints.dpi != dpi) {
+    constraints = Model::MergeConstraintProbeWithCache(
+        constraints, Platform::Windows::ProbeWindowConstraints(hwnd));
+    workspace.UpdateConstraints(hwnd, constraints);
+  }
+  if (!constraints.valid || !constraints.dpi) return std::nullopt;
+  constraints = Model::RescaleConstraintsToDpi(constraints, dpi);
+  return SharedGeometry::FrameLimits{
+      constraints.minWidth, constraints.minHeight, constraints.maxWidth, constraints.maxHeight};
+}
+
 // Converts remembered floating geometry into a destination-monitor rectangle.
 // Passive migration restores the full rectangle on the same monitor and centers
 // remembered/default size on a different monitor. Drag intent preserves the
@@ -160,6 +179,14 @@ static bool RepairFloatingGeometry(
   RECT target = SharedGeometry::CenteredRect(center, width, height);
   if (!centerWithoutResize) {
     target = SharedGeometry::ClampToArea(target, workArea);
+  }
+  // Apply the app's size limits as Windows would: SWP_NOSENDCHANGING skips that,
+  // so without this the window is forced past its own limits. The companion
+  // predicts the same frame (ClampSizeKeepingOrigin).
+  if (!centerWithoutResize && record->canResize) {
+    if (const auto limits = FloatingSizeLimits(workspace, hwnd, targetDpi)) {
+      target = SharedGeometry::ClampSizeKeepingOrigin(target, *limits);
+    }
   }
   // The window can enter a non-participating physical state while the placement
   // target is being calculated. Never overwrite it.

@@ -2,7 +2,7 @@
 // @id              multiwm-companion
 // @name            MultiWM Companion
 // @description     Opens new windows directly in the slot MultiWM will give them, so they don't appear elsewhere first and jump.
-// @version         0.3.1
+// @version         0.3.2
 // @author          meteoni
 // @github          https://github.com/Meteoni
 // @license         MIT
@@ -78,7 +78,6 @@ Enable logging for this mod in Windhawk to see each placement decision.
 #include "../shared/window_rules.h"
 #include "../shared/companion_snapshot.h"
 #include "../shared/geometry.h"
-#include "../shared/app_frame.h"
 
 #include "snapshot_reader.h"
 #include "placement.h"

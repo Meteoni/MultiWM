@@ -283,28 +283,32 @@ static void RunWeightedResizeTests() {
   std::printf("Passed %d weighted resize checks.\n", checks);
 }
 
-// The companion's app-frame window properties (shared/app_frame.h) hold one
-// 32-bit value each, so a frame round-trips only within 16-bit coordinates.
-static void RunAppFramePackingTests() {
+// Floating frames take a window's size limits the way Windows applies them to a
+// positioning call: the size is clamped and the top-left corner stays. Both mods
+// use this rule, so the companion's predicted float is MultiWM's placement.
+static void RunFloatingLimitTests() {
   int checks = 0;
   auto check = [&](bool passed, const char* message) {
     if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
     ++checks;
   };
-  auto roundTrips = [](const RECT& frame) {
-    const auto packed = AppFrame::Pack(frame);
-    const auto unpacked = packed ? AppFrame::Unpack(*packed) : std::nullopt;
-    return unpacked && EqualRect(&*unpacked, &frame);
+  auto clamp = [](RECT frame, SharedGeometry::FrameLimits limits) {
+    return SharedGeometry::ClampSizeKeepingOrigin(frame, limits);
   };
-  check(roundTrips({100, 200, 1060, 840}), "an ordinary frame round-trips");
-  check(roundTrips({0, 0, 800, 600}), "an origin of 0,0 round-trips (size marks presence)");
-  check(roundTrips({-2560, -300, -1600, 340}), "a frame on a monitor left of the primary round-trips");
-  check(roundTrips({INT16_MIN, INT16_MAX, INT16_MIN + 0xFFFF, INT16_MAX + 1}), "the extremes round-trip");
-  check(!AppFrame::Pack({0, 0, 0, 600}) && !AppFrame::Pack({10, 10, 5, 600}), "an empty frame is not recorded");
-  check(!AppFrame::Pack({INT16_MAX + 1, 0, INT16_MAX + 101, 100}) && !AppFrame::Pack({0, 0, 0x10000, 100}),
-        "a frame that doesn't fit 16 bits is not recorded");
-  check(!AppFrame::Unpack({0x00640064, 0}), "no size means no recorded frame");
-  std::printf("Passed %d app-frame packing checks.\n", checks);
+  const RECT frame{100, 200, 1200, 935};
+  RECT expected = frame;
+  RECT clamped = clamp(frame, {1, 1, 0, 0});
+  check(EqualRect(&clamped, &expected), "limits the frame already satisfies change nothing");
+  clamped = clamp(frame, {1, 1, 500, 400});
+  expected = {100, 200, 600, 600};
+  check(EqualRect(&clamped, &expected), "a maximum shrinks the frame toward its top-left corner");
+  clamped = clamp(frame, {1300, 900, 0, 0});
+  expected = {100, 200, 1400, 1100};
+  check(EqualRect(&clamped, &expected), "a minimum grows the frame from its top-left corner");
+  clamped = clamp(frame, {1, 900, 500, 0});
+  expected = {100, 200, 600, 1100};
+  check(EqualRect(&clamped, &expected), "each axis takes its own limit");
+  std::printf("Passed %d floating limit checks.\n", checks);
 }
 
 // A tiled workspace of `layout` with one window per minimum size (physical
@@ -1395,7 +1399,7 @@ int main() {
   RunRuleFieldParserTests();
   RunAdaptiveDwindleTests();
   RunWeightedResizeTests();
-  RunAppFramePackingTests();
+  RunFloatingLimitTests();
   RunWindowSizeStepTests();
   RunWindowSizePropertyTests();
   RunDwindleResizeScenarioTests();

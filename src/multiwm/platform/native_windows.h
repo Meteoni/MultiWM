@@ -238,27 +238,10 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
     record.canMove = (GetAncestor(hwnd, GA_ROOT) == hwnd) && !(style & WS_CHILD);
     record.canResize = (style & WS_SIZEBOX) != 0;
     record.topmost = (exStyle & WS_EX_TOPMOST) != 0;
-
-    // The window's natural frame, which it floats at later. If the companion
-    // moved a new window onto its tile before showing it, the app's own frame
-    // is left on the window (shared/app_frame.h); otherwise only a
-    // participating restored window's current frame is meaningful, and a
-    // suspended admission falls back to the configured size.
-    RECT frame{};
-    HMONITOR monitor = nullptr;
-    if (const auto appFrame = AppFrame::Read(hwnd)) {
-      frame = *appFrame;
-      monitor = MonitorFromRect(&frame, MONITOR_DEFAULTTONULL);
-    } else if (GetPhysicalSuspensionReason(hwnd) == SuspensionReason::None &&
-               GetWindowFrameRect(hwnd, &frame) && frame.right > frame.left && frame.bottom > frame.top) {
-      monitor = GetWindowPhysicalMonitor(hwnd);
-    }
-    if (monitor) {
-      record.floatingRect = frame;
-      record.floatingMonitor = monitor;
-      record.floatingDpi = Platform::Monitors::GetMonitorEffectiveDpi(monitor);
-      record.hasFloatingRect = true;
-    }
+    // No floating frame yet. The frame a window has when it is first recorded
+    // is often a placeholder (shown at the system minimum, sized afterwards) or,
+    // with the companion, already its tile. Its first float uses an
+    // override-size rule or the configured default (RepairFloatingGeometry).
   }
 
   return record;

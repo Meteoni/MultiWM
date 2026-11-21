@@ -419,12 +419,11 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 // Read docs/ARCHITECTURE.md for what each folder owns and how an event flows.
 
 // Shared with the MultiWM Companion mod (src/companion/multiwm-companion.cpp): rule
-// matching, the snapshot ABI and the app-frame window property. Self-contained;
-// no MultiWM chapter needed.
+// matching, the snapshot ABI and geometry. Self-contained; no MultiWM chapter
+// needed.
 #include "../shared/window_rules.h"
 #include "../shared/companion_snapshot.h"
 #include "../shared/geometry.h"
-#include "../shared/app_frame.h"
 
 // Shared vocabulary: platform declarations, settings, messages, model types, actor state.
 #include "core/shared_types.h"

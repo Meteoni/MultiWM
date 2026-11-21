@@ -868,36 +868,80 @@ static void RunFloatingSizeCommandTests() {
   std::printf("Passed %u floating size command checks.\n", check.passed);
 }
 
-// A new window's natural floating frame: the companion's app-frame properties
-// when present (the companion already moved the window onto its tile), else
-// its current frame. Float Focused floats a tiled window at that natural size.
-static void RunAppFrameRecordTests() {
+// A window's first floating size never comes from the frame it had when it was
+// first recorded (often a placeholder, or with the companion already its tile):
+// it is an override-size rule's size or the configured default. Floating frames
+// then take the window's size limits keeping their top-left corner, as Windows
+// would, because MultiWM's SWP_NOSENDCHANGING placement skips Windows' clamp.
+static void RunFirstFloatingSizeTests() {
   CheckCounter check;
   FloatingWindowFixture f(check);
   const HWND hwnd = f.hwnd;
-  const RECT current = FloatingWindowFixture::Frame(hwnd);
-  const WindowRecord plain = Platform::Windows::MakeWindowRecord(hwnd);
-  check(plain.hasFloatingRect && EqualRect(&plain.floatingRect, &current),
-        "without the companion's properties the current frame is the natural one");
+  auto frame = [&] { return FloatingWindowFixture::Frame(hwnd); };
+  const LONG defaultWidthDip = g_settings.floatingDefaultSizeDip.width;
+  const LONG defaultHeightDip = g_settings.floatingDefaultSizeDip.height;
+  const RECT defaultFrame = f.Centered(defaultWidthDip, defaultHeightDip);
 
-  const RECT appFrame{f.workArea.left + 100, f.workArea.top + 80, f.workArea.left + 740, f.workArea.top + 560};
-  AppFrame::Remember(hwnd, appFrame);
   WindowRecord record = Platform::Windows::MakeWindowRecord(hwnd);
-  check(record.hasFloatingRect && EqualRect(&record.floatingRect, &appFrame),
-        "the companion's app frame is the natural one, not the window's current (tile) frame");
-
+  check(!record.hasFloatingRect, "a newly recorded window has no floating frame");
   record.canResize = true;  // The invisible test window has no sizing border.
   Workspace workspace;
   workspace.SetLayout(TileLayout::Columns);
   workspace.AdmitTiled(record);
   check(workspace.Float(hwnd), "float the tiled window");
   g_workspaces.Save(f.key, workspace);
-  check(f.Place(hwnd, Placement::FloatingPlacementIntent::CenterWithFloatingSize), "Float Focused places it");
-  const RECT floated = FloatingWindowFixture::Frame(hwnd);
-  check(Layout::RectWidth(floated) == 640 && Layout::RectHeight(floated) == 480 && IsCenteredIn(floated, f.center),
-        "Float Focused floats it at the app's own size, centered");
-  AppFrame::Forget(hwnd);
-  std::printf("Passed %u app-frame record checks.\n", check.passed);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::CenterWithFloatingSize) &&
+            Layout::RectsNear(frame(), defaultFrame, 1),
+        "Float Focused floats a never-floated window at the default size, centered");
+  const WindowRecord* placed = f.Load().Find(hwnd);
+  check(placed && placed->constraints.valid && placed->constraints.dpi == f.metrics.dpi,
+        "the window's size limits are probed when none are cached at the target DPI");
+
+  // Cached limits, as the window reported them at this DPI.
+  auto withLimits = [&](LONG minWidth, LONG minHeight, LONG maxWidth, LONG maxHeight) {
+    Workspace current = f.Load();
+    WindowConstraints limits;
+    limits.valid = true;
+    limits.dpi = f.metrics.dpi;
+    limits.minWidth = minWidth;
+    limits.minHeight = minHeight;
+    limits.maxWidth = maxWidth;
+    limits.maxHeight = maxHeight;
+    current.UpdateConstraints(hwnd, limits);
+    g_workspaces.Save(f.key, current);
+  };
+  withLimits(1, 1, 300, 200);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::NewWindowCenter) && frame().left == defaultFrame.left &&
+            frame().top == defaultFrame.top && Layout::RectWidth(frame()) == 300 &&
+            Layout::RectHeight(frame()) == 200,
+        "a maximum shrinks the default frame toward its top-left corner");
+  const LONG wider = Layout::RectWidth(defaultFrame) + 40;
+  const LONG taller = Layout::RectHeight(defaultFrame) + 30;
+  withLimits(wider, taller, 0, 0);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::NewWindowCenter) && frame().left == defaultFrame.left &&
+            frame().top == defaultFrame.top && Layout::RectWidth(frame()) == wider &&
+            Layout::RectHeight(frame()) == taller,
+        "a minimum grows the default frame from its top-left corner");
+  withLimits(1, 1, 0, 0);
+
+  // An override-size rule names the first floating size instead (Automatic mode).
+  WindowRule sizeRule;
+  sizeRule.treatment = WindowRuleTreatment::FloatingPlacementOverride;
+  sizeRule.classNames = {L"Static"};
+  sizeRule.preserveFloatingSize = false;
+  sizeRule.floatingSizeDip = {489, 384};
+  g_settings.windowRules = {sizeRule};
+  g_wm.managementMode = ManagementMode::Automatic;
+  // A fresh record: the placements above remembered a floating frame.
+  Workspace fresh;
+  fresh.SetLayout(TileLayout::Columns);
+  fresh.AdmitTiled(FloatingWindowFixture::Record(hwnd));
+  check(fresh.Float(hwnd), "float a fresh record of the window");
+  g_workspaces.Save(f.key, fresh);
+  check(f.Place(hwnd, Placement::FloatingPlacementIntent::CenterWithFloatingSize) &&
+            Layout::RectsNear(frame(), f.Centered(489, 384), 1),
+        "with an override-size rule, a never-floated window floats at the rule's size");
+  std::printf("Passed %u first floating size checks.\n", check.passed);
 }
 
 // A window a floating rule admits is centered at its own size, unless an
@@ -1757,7 +1801,7 @@ int main() {
   RunFloatingLeaseTests();
   RunFloatingSizeCommandTests();
   RunRuleFloatedSizeTests();
-  RunAppFrameRecordTests();
+  RunFirstFloatingSizeTests();
   RunHiddenArrivalTests();
   RunOverflowDestinationProbeTests();
   RunSettledWindowRecoveryTests();
