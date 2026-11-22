@@ -261,6 +261,11 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       #! $min: 0
       #! $max: 32
       $description: Outer corner radius (0-32). The inner radius is reduced by the outline width. Set to 0 for square corners.
+    - AppIconSize: 32
+      $name: App Icon Size (DPI-scaled pixels)
+      #! $min: 0
+      #! $max: 64
+      $description: Size of the app icons centered in the preview tiles (0-64). Set to 0 to hide the icons.
     - FadeDurationMs: 96
       $name: Fade Duration (ms)
       #! $min: 0

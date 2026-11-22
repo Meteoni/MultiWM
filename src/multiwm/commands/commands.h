@@ -713,6 +713,8 @@ static std::optional<Placement::UserLayoutMutationKind> PrepareTiledDrop(
 struct TiledDropPreview {
   RECT dragged;
   RECT affected;
+  HWND draggedWindow = nullptr;
+  HWND affectedWindow = nullptr;
 };
 
 // Uses cached constraints while the pointer is moving. A drop refreshes native limits.
@@ -734,7 +736,7 @@ static std::optional<TiledDropPreview> PlanTiledDropPreview(
       FindGhostAUserChangeWouldMove(&workspace, candidate, rects, metrics)) {
     return std::nullopt;
   }
-  return TiledDropPreview{rects[sourceIndex], rects[targetIndex]};
+  return TiledDropPreview{rects[sourceIndex], rects[targetIndex], source, target.window};
 }
 
 static void HandleUserMove(

@@ -219,9 +219,16 @@ static void OnLifecycleEvent(DWORD event, HWND hwnd) {
   QueueWindowEvent(event, hwnd);
 }
 
+// The tray, toasts and drag preview all belong to the WM thread.
+static bool IsOwnWindow(HWND hwnd) {
+  const DWORD wmThread = g_wm.threadId.load(std::memory_order_acquire);
+  return wmThread && GetWindowThreadProcessId(hwnd, nullptr) == wmThread;
+}
+
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
   RuntimeLifecycle::AssertWmThread(L"WinEventProc");
   if (!IsSubscribedWinEvent(event)) return;
+  if (hwnd && IsOwnWindow(hwnd)) return;
   if (event == EVENT_SYSTEM_FOREGROUND) {
     // A ghost in front means its hung window is.
     const HWND hung = ResolveGhost(event, hwnd);

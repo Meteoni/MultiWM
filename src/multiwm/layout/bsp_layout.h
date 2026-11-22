@@ -35,8 +35,24 @@ class BspPlacement {
  public:
   BspPlacement(const BspTree& tree, const std::vector<HWND>& tiled, const RECT& area, LONG gap)
       : tree_(tree), nodes_(tree.Nodes()), gap_(gap), firstAxis_(FirstSplitAxis(area)),
-        maximumSpan_(std::max(RectWidth(area), RectHeight(area))) {
-    for (size_t i = 0; i < tiled.size(); ++i) tiledIndex_.emplace(tiled[i], i);
+        maximumSpan_(std::max(RectWidth(area), RectHeight(area))), topology_(nodes_.size()) {
+    if (nodes_.empty()) return;
+
+    // Workspace supplies tiled windows in leaf order, skipping suspended
+    // leaves. Match those directly and keep arbitrary caller order supported.
+    size_t next = 0;
+    Measure(0, [&](HWND window) {
+      return next < tiled.size() && tiled[next] == window ? next++ : BspTree::kNotFound;
+    });
+    if (next == tiled.size()) return;
+
+    std::unordered_map<HWND, size_t> tiledIndices;
+    tiledIndices.reserve(tiled.size());
+    for (size_t i = 0; i < tiled.size(); ++i) tiledIndices.emplace(tiled[i], i);
+    Measure(0, [&](HWND window) {
+      const auto found = tiledIndices.find(window);
+      return found == tiledIndices.end() ? BspTree::kNotFound : found->second;
+    });
   }
 
   // Makes Place fit `constraints` (one per tiled window) with `adaptation`:
@@ -52,9 +68,9 @@ class BspPlacement {
 
   bool Place(size_t node, size_t depth, const RECT& region, BspLayoutResult* out) const {
     const BspNode& current = nodes_[node];
-    if (!BspTree::IsSplit(current)) return PlaceLeaf(current.window, region, out);
+    if (!BspTree::IsSplit(current)) return PlaceLeaf(topology_[node].tiledIndex, region, out);
     const size_t a = node + 1;
-    const size_t b = tree_.SecondChild(node);
+    const size_t b = topology_[node].secondChild;
     const bool aShown = Shown(a);
     const bool bShown = Shown(b);
     if (!aShown || !bShown) return !(aShown || bShown) || Place(aShown ? a : b, depth + 1, region, out);
@@ -91,7 +107,7 @@ class BspPlacement {
     size_t node = 0;
     for (size_t depth = 0; leaf != BspTree::kNotFound && node != leaf; ++depth) {
       const size_t a = node + 1;
-      const size_t b = tree_.SecondChild(node);
+      const size_t b = topology_[node].secondChild;
       const bool windowFirst = leaf < b;
       const size_t other = windowFirst ? b : a;
       if (Shown(other)) {
@@ -106,16 +122,35 @@ class BspPlacement {
   }
 
  private:
-  bool Shown(size_t node) const {
-    return tree_.AnyLeaf(node, [this](HWND window) { return tiledIndex_.count(window) != 0; });
+  struct NodeTopology {
+    size_t secondChild = 0;
+    size_t shown = 0;
+    size_t tiledIndex = BspTree::kNotFound;
+  };
+
+  // Return the next node after the subtree. For the first child that is the
+  // second child's index, so we can collect both children in one traversal.
+  template <class FindTiledIndex>
+  size_t Measure(size_t node, const FindTiledIndex& findTiledIndex) {
+    auto& info = topology_[node];
+    if (!BspTree::IsSplit(nodes_[node])) {
+      info.tiledIndex = findTiledIndex(nodes_[node].window);
+      info.shown = info.tiledIndex != BspTree::kNotFound;
+      return node + 1;
+    }
+    info.secondChild = Measure(node + 1, findTiledIndex);
+    const size_t end = Measure(info.secondChild, findTiledIndex);
+    info.shown = topology_[node + 1].shown + topology_[info.secondChild].shown;
+    return end;
   }
+
+  bool Shown(size_t node) const { return topology_[node].shown != 0; }
   bool Adaptive(size_t depth) const { return depth < adaptation_.depth; }
 
-  bool PlaceLeaf(HWND window, const RECT& region, BspLayoutResult* out) const {
-    const auto found = tiledIndex_.find(window);
-    if (found == tiledIndex_.end()) return true;
-    out->rects[found->second] = region;
-    return !constraints_ || ConstraintAreaFits(region, ToConstraintExtent((*constraints_)[found->second]));
+  bool PlaceLeaf(size_t index, const RECT& region, BspLayoutResult* out) const {
+    if (index == BspTree::kNotFound) return true;
+    out->rects[index] = region;
+    return !constraints_ || ConstraintAreaFits(region, ToConstraintExtent((*constraints_)[index]));
   }
 
   SharedSplits::SplitFit FitOf(const BspNode& split, size_t depth) const {
@@ -136,13 +171,13 @@ class BspPlacement {
   // when adaptive) leaves both sides their minimums.
   SIZE MeasureMinimum(size_t node, size_t depth) {
     if (!BspTree::IsSplit(nodes_[node])) {
-      const auto found = tiledIndex_.find(nodes_[node].window);
+      const size_t index = topology_[node].tiledIndex;
       const ConstraintExtent extent =
-          found != tiledIndex_.end() ? ToConstraintExtent((*constraints_)[found->second]) : ConstraintExtent{};
+          index != BspTree::kNotFound ? ToConstraintExtent((*constraints_)[index]) : ConstraintExtent{};
       return minimum_[node] = SIZE{extent.minWidth, extent.minHeight};
     }
     const size_t a = node + 1;
-    const size_t b = tree_.SecondChild(node);
+    const size_t b = topology_[node].secondChild;
     const SIZE first = MeasureMinimum(a, depth + 1);
     const SIZE second = MeasureMinimum(b, depth + 1);
     if (!Shown(a)) return minimum_[node] = second;
@@ -160,7 +195,7 @@ class BspPlacement {
   const LONG gap_;
   const Axis firstAxis_;
   const LONG maximumSpan_;
-  std::unordered_map<HWND, size_t> tiledIndex_;
+  std::vector<NodeTopology> topology_;
   const std::vector<WindowConstraints>* constraints_ = nullptr;
   BspAdaptation adaptation_{};
   std::vector<SIZE> minimum_;  // Fitted runs only: see MeasureMinimum.

@@ -1,5 +1,7 @@
 #include "../src/multiwm/multiwm.cpp"
 #include <cstdio>
+#include <future>
+#include <thread>
 
 // Conformance tests drive lease timing directly (friend of PendingProofs).
 namespace Placement {
@@ -258,6 +260,33 @@ static void RunDesktopReconciliationTests() {
   std::printf("Passed %d desktop reconciliation checks.\n", checks);
 }
 
+// Test callbacks run on the WM thread; app and ghost windows need a
+// different owner thread with a message pump.
+class WinEventTestThread {
+ public:
+  explicit WinEventTestThread(std::function<void()> createWindows) {
+    std::promise<DWORD> ready;
+    auto threadId = ready.get_future();
+    thread_ = std::thread([create = std::move(createWindows), ready = std::move(ready)]() mutable {
+      MSG message{};
+      PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
+      create();
+      ready.set_value(GetCurrentThreadId());
+      while (GetMessageW(&message, nullptr, 0, 0) > 0) DispatchMessageW(&message);
+    });
+    threadId_ = threadId.get();
+  }
+
+  ~WinEventTestThread() {
+    PostThreadMessageW(threadId_, WM_QUIT, 0, 0);
+    thread_.join();
+  }
+
+ private:
+  DWORD threadId_ = 0;
+  std::thread thread_;
+};
+
 // WinEventProc must only observe and post. These checks pin which events reach
 // the WM thread, as which message, and which per-window bookkeeping is cleared.
 // Uses hidden windows owned by this test; no hooks are installed.
@@ -292,12 +321,26 @@ static void RunWinEventRoutingTests() {
                            parent, nullptr, GetModuleHandleW(nullptr), nullptr);
   };
 
-  g_wm.threadId.store(GetCurrentThreadId(), std::memory_order_release);
+  const DWORD previousThread = g_wm.threadId.exchange(GetCurrentThreadId(), std::memory_order_acq_rel);
   drain();
-  const HWND tracked = makeWindow(WS_OVERLAPPEDWINDOW, nullptr);
-  const HWND untracked = makeWindow(WS_OVERLAPPEDWINDOW, nullptr);
-  const HWND child = makeWindow(WS_CHILD, untracked);
-  check(tracked && untracked && child, "create WinEvent test windows");
+  const HWND ownWindow = CreateWindowExW(
+      WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT, L"STATIC", L"",
+      WS_POPUP, 0, 0, 300, 300, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  check(ownWindow != nullptr, "create an own drag-preview window");
+  send(EVENT_OBJECT_SHOW, ownWindow);
+  send(EVENT_OBJECT_LOCATIONCHANGE, ownWindow);
+  send(EVENT_SYSTEM_FOREGROUND, ownWindow);
+  check(g_wm.lifecycle.dirtyWindows.empty() && !g_wm.timers.lifecycle && drain().empty(),
+        "own preview events queue no lifecycle pass or foreground message");
+  DestroyWindow(ownWindow);
+
+  HWND tracked = nullptr, untracked = nullptr, child = nullptr;
+  WinEventTestThread appThread([&] {
+    tracked = makeWindow(WS_OVERLAPPEDWINDOW, nullptr);
+    untracked = makeWindow(WS_OVERLAPPEDWINDOW, nullptr);
+    child = makeWindow(WS_CHILD, untracked);
+  });
+  check(tracked && untracked && child, "create WinEvent test windows on another thread");
 
   DesktopMonitorKey key;
   GUID desktop{};
@@ -378,15 +421,12 @@ static void RunWinEventRoutingTests() {
   check(!g_wm.overflow.follow.hwnd, "destroy cancels a pending desktop follow");
 
   Reconcile::ForgetManagedWindow(tracked);
-  DestroyWindow(child);
-  DestroyWindow(untracked);
-  DestroyWindow(tracked);
   drain();
   g_wm.routing.evaluated.clear();
   g_wm.routing.pending.clear();
   g_wm.routing.ready = false;
   g_wm.desktop.state = ReconciledDesktopState::Unknown;
-  g_wm.threadId.store(0, std::memory_order_release);
+  g_wm.threadId.store(previousThread, std::memory_order_release);
   std::printf("Passed %u WinEvent routing checks.\n", checks);
 }
 
@@ -1286,7 +1326,7 @@ static void RunBspDragTests() {
   g_settings.dragPreviewFadeMs = 0;
   g_workspaces.Save(fixture.key, previewWorkspace);
   DragPreview::DragSession previewDrag{source, source, fixture.key.ResolveMonitor(), fixture.key,
-                                      originalSourceFrame, {}, {}, {}, {}};
+                                      originalSourceFrame, {}, {}, {}, {}, {}};
   DragPreview::UpdateDropPreview(previewDrag, SharedGeometry::RectCenter(originalSourceFrame));
   check(!previewDrag.target && DragPreview::g_overlay.fadeTo == 255 && DragPreview::g_overlay.shown &&
             EqualRect(&DragPreview::g_overlay.shown->dragged, &originalSourceFrame) &&
@@ -1553,6 +1593,64 @@ static void RunBspDragTests() {
   DragPreview::End();
   check(!IsWindowVisible(overlay.outline) && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
         "zero fade duration also hides the preview immediately without a timer");
+
+  const HICON sourceIcon = LoadIconW(nullptr, IDI_INFORMATION);
+  const HICON targetIcon = LoadIconW(nullptr, IDI_WARNING);
+  SendMessageW(source, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(sourceIcon));
+  SendMessageW(target, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(targetIcon));
+  DragPreview::DragSession badgeDrag{};
+  g_settings.dragPreviewFillOpacity = 25;
+  g_settings.dragPreviewIconSizeDip = 24;
+  g_settings.dragPreviewFadeMs = 96;
+  DragPreview::Show({narrowTile, wideTile, source, target}, &badgeDrag, 144);
+  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs / 2);
+  const auto& draggedBadge = overlay.draggedBadge;
+  const auto& affectedBadge = overlay.affectedBadge;
+  RECT badgeFrame{};
+  BYTE badgeAlpha = 0;
+  const POINT tileCenter = SharedGeometry::RectCenter(narrowTile);
+  check(IsWindowVisible(draggedBadge.window) && IsWindowVisible(affectedBadge.window) &&
+            draggedBadge.icon && affectedBadge.icon && draggedBadge.icon != affectedBadge.icon &&
+            badgeDrag.icons.size() == 2 && draggedBadge.iconSize == 36 &&
+            GetWindowRect(draggedBadge.window, &badgeFrame) && Layout::RectWidth(badgeFrame) == 48 &&
+            SharedGeometry::RectCenter(badgeFrame).x == tileCenter.x &&
+            SharedGeometry::RectCenter(badgeFrame).y == tileCenter.y &&
+            GetLayeredWindowAttributes(draggedBadge.window, nullptr, &badgeAlpha, nullptr) && badgeAlpha == 128 &&
+            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 32 &&
+            SendMessageW(draggedBadge.window, WM_NCHITTEST, 0, 0) == HTTRANSPARENT,
+        "badges use DPI-scaled sizes and fade independently of the fill opacity");
+  const auto cachedIcon = draggedBadge.icon;
+  const bool savedLightTheme = TrayUi::g_session.systemLightTheme;
+  const bool actualLightTheme = TrayUi::ReadSystemLightTheme();
+  TrayUi::g_session.systemLightTheme = !actualLightTheme;
+  const COLORREF oldBadgeColor = TrayUi::FlyoutBackgroundColor();
+  ValidateRect(draggedBadge.window, nullptr);
+  ValidateRect(affectedBadge.window, nullptr);
+  const ULONGLONG badgeFadeStart = overlay.fadeStarted;
+  TrayUi::TrayWindowProc(nullptr, WM_THEMECHANGED, 0, 0);
+  check(TrayUi::g_session.systemLightTheme == actualLightTheme &&
+            TrayUi::FlyoutBackgroundColor() != oldBadgeColor &&
+            GetUpdateRect(draggedBadge.window, nullptr, FALSE) &&
+            GetUpdateRect(affectedBadge.window, nullptr, FALSE) &&
+            draggedBadge.icon == cachedIcon && overlay.fadeStarted == badgeFadeStart &&
+            GetLayeredWindowAttributes(draggedBadge.window, nullptr, &badgeAlpha, nullptr) && badgeAlpha == 128,
+        "a theme change repaints both visible badges without restarting the fade or clearing their icons");
+  TrayUi::g_session.systemLightTheme = savedLightTheme;
+  SendMessageW(source, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(targetIcon));
+  DragPreview::Show({wideTile, narrowTile, source, target}, &badgeDrag, 144);
+  check(draggedBadge.icon == cachedIcon && badgeDrag.icons.size() == 2,
+        "moving the preview keeps the cached window icons");
+  DragPreview::Show({wideTile, wideTile, source}, &badgeDrag, 144);
+  check(IsWindowVisible(draggedBadge.window) && !IsWindowVisible(affectedBadge.window),
+        "a snap-back shows only the dragged app badge");
+  DragPreview::End();
+  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  check(!IsWindowVisible(draggedBadge.window) && !draggedBadge.icon, "the badge hides and releases its icon after the fade");
+  badgeDrag.icons.clear();
+  g_settings.dragPreviewIconSizeDip = 0;
+  DragPreview::Show({wideTile, narrowTile, source, target}, &badgeDrag, 144);
+  check(!IsWindowVisible(draggedBadge.window) && !IsWindowVisible(affectedBadge.window) && badgeDrag.icons.empty(),
+        "a zero icon size disables badges and icon queries");
   DragPreview::Shutdown();
   TrayUi::g_preferences.showToasts = savedToasts;
   std::printf("Passed %u BSP drag checks.\n", check.passed);
@@ -1710,33 +1808,43 @@ static void RunGhostWindowTests() {
   auto send = [](DWORD event, HWND hwnd) {
     Platform::WindowEvents::WinEventProc(nullptr, event, hwnd, OBJID_WINDOW, CHILDID_SELF, 0, 0);
   };
+  HWND eventGhost = nullptr, eventWindow = nullptr;
+  WinEventTestThread ghostThread([&] {
+    eventGhost = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"", WS_POPUP,
+                                 f.workArea.left, f.workArea.top, 400, 300,
+                                 nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    eventWindow = CreateWindowExW(0, L"STATIC", L"", WS_OVERLAPPEDWINDOW, 0, 0, 400, 300,
+                                  nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  });
+  check(eventGhost && eventWindow, "create foreign-thread windows for ghost routing");
+  g_testGhost = eventGhost;
   g_wm.threadId.store(GetCurrentThreadId(), std::memory_order_release);
   drain();
-  send(EVENT_OBJECT_LOCATIONCHANGE, ghost);
+  send(EVENT_OBJECT_LOCATIONCHANGE, eventGhost);
   check(drain().empty() && g_wm.ghosts.empty(), "a ghost isn't recognized from a location change alone");
-  send(EVENT_SYSTEM_MINIMIZESTART, ghost);
-  check(stateChangeOf(hung) && g_wm.ghosts.count(ghost) == 1,
+  send(EVENT_SYSTEM_MINIMIZESTART, eventGhost);
+  check(stateChangeOf(hung) && g_wm.ghosts.count(eventGhost) == 1,
         "minimizing a ghost has the WM thread look at its hung window again");
-  send(EVENT_OBJECT_LOCATIONCHANGE, ghost);
+  send(EVENT_OBJECT_LOCATIONCHANGE, eventGhost);
   check(stateChangeOf(hung), "a known ghost's other events count for its hung window too");
-  send(EVENT_SYSTEM_FOREGROUND, ghost);
+  send(EVENT_SYSTEM_FOREGROUND, eventGhost);
   check(postedOnly(WM_APP_FOREGROUND_CHANGED, reinterpret_cast<WPARAM>(hung), 0),
         "a ghost in front means its hung window is");
-  send(EVENT_SYSTEM_MOVESIZESTART, ghost);
+  send(EVENT_SYSTEM_MOVESIZESTART, eventGhost);
   check(Gestures::IsMoveSizeGestureInProgress(hung) &&
-            postedOnly(WM_APP_MOVE_SIZE_START, reinterpret_cast<WPARAM>(hung), reinterpret_cast<LPARAM>(ghost)),
+            postedOnly(WM_APP_MOVE_SIZE_START, reinterpret_cast<WPARAM>(hung), reinterpret_cast<LPARAM>(eventGhost)),
         "a ghost drag starts a preview for the hung window using the displayed ghost");
-  const RECT ghostStart = FloatingWindowFixture::Frame(ghost);
-  FloatingWindowFixture::AppMove(ghost, ghostStart.left + 30, ghostStart.top + 20,
+  const RECT ghostStart = FloatingWindowFixture::Frame(eventGhost);
+  FloatingWindowFixture::AppMove(eventGhost, ghostStart.left + 30, ghostStart.top + 20,
                                  Layout::RectWidth(ghostStart), Layout::RectHeight(ghostStart));
-  send(EVENT_SYSTEM_MOVESIZEEND, ghost);
+  send(EVENT_SYSTEM_MOVESIZEEND, eventGhost);
   check(postedOnly(WM_APP_MOVE_SIZE_END, reinterpret_cast<WPARAM>(hung), 0) &&
             Gestures::ConsumeMoveSizeGesture(hung).intent == MoveSizeIntent::Move,
         "a ghost drag uses its displayed frame and queues the hung window's move");
-  send(EVENT_OBJECT_DESTROY, ghost);
+  send(EVENT_OBJECT_DESTROY, eventGhost);
   check(stateChangeOf(hung) && g_wm.ghosts.empty(),
         "a ghost's destroy, when the app recovers, is a state change, never the window's destroy");
-  send(EVENT_SYSTEM_MINIMIZESTART, other);
+  send(EVENT_SYSTEM_MINIMIZESTART, eventWindow);
   check(drain().size() == 1 && g_wm.ghosts.empty(), "an untracked window that is no ghost is handled as before");
 
   // Without the user32 exports there is no ghost to follow.

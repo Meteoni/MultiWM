@@ -5,6 +5,8 @@ namespace DragPreview {
 
 constexpr wchar_t kPreviewClassName[] = L"WindhawkMultiWMDragPreview";
 
+using PreviewIcon = std::shared_ptr<std::remove_pointer_t<HICON>>;
+
 struct DragSession {
   HWND source;
   HWND displayedWindow;
@@ -15,6 +17,7 @@ struct DragSession {
   std::vector<Commands::TiledDropFrame> frames;
   std::optional<uint64_t> revision;
   std::optional<Commands::TiledDropTarget> target;
+  std::unordered_map<HWND, PreviewIcon> icons;
 };
 
 static std::optional<DragSession> g_drag;
@@ -22,9 +25,23 @@ static std::optional<DragSession> g_drag;
 constexpr UINT_PTR kFadeTimer = 1;
 constexpr UINT kFadeIntervalMs = 16;
 
+struct IconBadge {
+  HWND window = nullptr;
+  PreviewIcon icon;
+  LONG iconSize = 0;
+  LONG badgeSize = 0;
+
+  void Hide() {
+    if (window) ShowWindow(window, SW_HIDE);
+    icon.reset();
+  }
+};
+
 struct Overlay {
   HWND fill = nullptr;
   HWND outline = nullptr;
+  IconBadge draggedBadge;
+  IconBadge affectedBadge;
   ATOM windowClass = 0;
   COLORREF accent = 0;
   COLORREF colorKey = RGB(1, 0, 1);
@@ -37,6 +54,12 @@ struct Overlay {
 
 static Overlay g_overlay;
 
+static void RefreshBadgeTheme() {
+  for (const IconBadge* badge : {&g_overlay.draggedBadge, &g_overlay.affectedBadge}) {
+    if (badge->window && IsWindowVisible(badge->window)) InvalidateRect(badge->window, nullptr, FALSE);
+  }
+}
+
 static bool ApplyAlpha(BYTE fadeAlpha) {
   g_overlay.fadeAlpha = fadeAlpha;
   const BYTE fillAlpha = static_cast<BYTE>(MulDiv(fadeAlpha, g_settings.dragPreviewFillOpacity, 100));
@@ -44,6 +67,9 @@ static bool ApplyAlpha(BYTE fadeAlpha) {
   const BOOL fillSet = SetLayeredWindowAttributes(g_overlay.fill, 0, fillAlpha, LWA_ALPHA);
   const BOOL outlineSet = SetLayeredWindowAttributes(
       g_overlay.outline, g_overlay.colorKey, outlineAlpha, LWA_COLORKEY | LWA_ALPHA);
+  for (const IconBadge* badge : {&g_overlay.draggedBadge, &g_overlay.affectedBadge}) {
+    if (badge->icon) SetLayeredWindowAttributes(badge->window, 0, fadeAlpha, LWA_ALPHA);
+  }
   return fillSet && outlineSet;
 }
 
@@ -61,6 +87,8 @@ static void StepFade(ULONGLONG now) {
   if (alpha == 0) {
     ShowWindow(g_overlay.fill, SW_HIDE);
     ShowWindow(g_overlay.outline, SW_HIDE);
+    g_overlay.draggedBadge.Hide();
+    g_overlay.affectedBadge.Hide();
   }
 }
 
@@ -87,6 +115,19 @@ static LRESULT CALLBACK PreviewWindowProc(HWND hwnd, UINT message, WPARAM wparam
 
   PAINTSTRUCT paint{};
   HDC dc = BeginPaint(hwnd, &paint);
+  for (const IconBadge* badge : {&g_overlay.draggedBadge, &g_overlay.affectedBadge}) {
+    if (hwnd != badge->window) continue;
+    if (badge->icon) {
+      if (HBRUSH background = CreateSolidBrush(TrayUi::FlyoutBackgroundColor())) {
+        FillRect(dc, &paint.rcPaint, background);
+        DeleteObject(background);
+      }
+      const LONG inset = (badge->badgeSize - badge->iconSize) / 2;
+      DrawIconEx(dc, inset, inset, badge->icon.get(), badge->iconSize, badge->iconSize, 0, nullptr, DI_NORMAL);
+    }
+    EndPaint(hwnd, &paint);
+    return 0;
+  }
   HBRUSH accent = CreateSolidBrush(g_overlay.accent);
   if (hwnd == g_overlay.outline) {
     HBRUSH transparent = CreateSolidBrush(g_overlay.colorKey);
@@ -127,8 +168,113 @@ static LRESULT CALLBACK PreviewWindowProc(HWND hwnd, UINT message, WPARAM wparam
   return 0;
 }
 
-static void Show(const Commands::TiledDropPreview& preview) {
+// The width in pixels of `icon`'s image, or 0 when it can't be read.
+static LONG IconPixelSize(HICON icon) {
+  ICONINFO info{};
+  if (!icon || !GetIconInfo(icon, &info)) return 0;
+  BITMAP bitmap{};
+  const HBITMAP image = info.hbmColor ? info.hbmColor : info.hbmMask;
+  const LONG size = image && GetObjectW(image, sizeof(bitmap), &bitmap) ? bitmap.bmWidth : 0;
+  if (info.hbmColor) DeleteObject(info.hbmColor);
+  if (info.hbmMask) DeleteObject(info.hbmMask);
+  return size;
+}
+
+// `icon` at `size` pixels, reloaded from the executable resource it records
+// (most apps' class icons do), so the badge needs no stretching. Null when it
+// records none; a copy of an icon loses that record, so pass the app's own.
+static HICON ReloadIconAtSize(HICON icon, LONG size) {
+  ICONINFOEXW info{};
+  info.cbSize = sizeof(info);
+  if (!GetIconInfoExW(icon, &info)) return nullptr;
+  if (info.hbmColor) DeleteObject(info.hbmColor);
+  if (info.hbmMask) DeleteObject(info.hbmMask);
+  if (!info.szModName[0]) return nullptr;
+  return static_cast<HICON>(CopyImage(icon, IMAGE_ICON, size, size, LR_COPYFROMRESOURCE));
+}
+
+// For a badge `size` pixels wide, true when an icon `candidate` pixels wide
+// beats one `current` wide: the smallest that covers the badge, failing that
+// the largest.
+static bool IsBetterBadgeIcon(LONG candidate, LONG current, LONG size) {
+  const bool covers = candidate >= size;
+  if (covers != (current >= size)) return covers;
+  return covers ? candidate < current : candidate > current;
+}
+
+// The window's icon for a badge `size` pixels wide, as an owned copy: reloaded
+// at exactly that size from its app's resources when the icon records them,
+// else the smallest of the window's icons at least that large (shrunk), else
+// the largest (stretched). The window's own icons come before its class's. The
+// big icon is asked for only when the small ones won't do, since each
+// WM_GETICON may wait up to 8 ms for a busy app. Null when it has none.
+static PreviewIcon LoadBadgeIcon(HWND window, UINT dpi, LONG size) {
+  auto ask = [&](WPARAM which) {
+    DWORD_PTR handle = 0;
+    SendMessageTimeoutW(window, WM_GETICON, which, dpi, SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT, 8, &handle);
+    return reinterpret_cast<HICON>(handle);
+  };
+  auto classIcon = [&](int index) { return reinterpret_cast<HICON>(GetClassLongPtrW(window, index)); };
+  HICON chosen = nullptr;
+  LONG chosenSize = 0;
+  for (int step = 0; step < 4; ++step) {
+    if (step == 2 && chosenSize >= size) break;  // The small icons already cover the badge.
+    const HICON icon = step == 0 ? ask(ICON_SMALL) : step == 1 ? classIcon(GCLP_HICONSM)
+                     : step == 2 ? ask(ICON_BIG) : classIcon(GCLP_HICON);
+    if (!icon) continue;
+    if (HICON exact = ReloadIconAtSize(icon, size)) return PreviewIcon(exact, DestroyIcon);
+    const LONG pixels = IconPixelSize(icon);
+    if (pixels > 0 && (!chosen || IsBetterBadgeIcon(pixels, chosenSize, size))) {
+      chosen = icon;
+      chosenSize = pixels;
+    }
+  }
+  HICON copy = chosen ? CopyIcon(chosen) : nullptr;
+  return copy ? PreviewIcon(copy, DestroyIcon) : PreviewIcon{};
+}
+
+static void ShowBadge(IconBadge& badge, DragSession& drag, HWND window, const RECT& tile, UINT dpi) {
+  const LONG iconSize = SharedGeometry::ScaleDip(g_settings.dragPreviewIconSizeDip, dpi);
+  const LONG badgeSize = iconSize + SharedGeometry::ScaleDip(8, dpi);
+  if (!window || iconSize <= 0 || badgeSize > Layout::RectWidth(tile) || badgeSize > Layout::RectHeight(tile)) {
+    badge.Hide();
+    return;
+  }
+
+  // A window can change its icon or stop responding. Cache even missed lookups
+  // for this drag, and retain our own copy while a badge is fading out.
+  auto [entry, firstVisit] = drag.icons.try_emplace(window);
+  if (firstVisit) entry->second = LoadBadgeIcon(window, dpi, iconSize);
+  if (!entry->second) {
+    badge.Hide();
+    return;
+  }
+
+  if (!badge.window) {
+    badge.window = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        kPreviewClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!badge.window) return;
+    const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+    DwmSetWindowAttribute(badge.window, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+  }
+  badge.badgeSize = badgeSize;
+  badge.iconSize = iconSize;
+  badge.icon = entry->second;
+  const POINT center = SharedGeometry::RectCenter(tile);
+  if (!SetLayeredWindowAttributes(badge.window, 0, g_overlay.fadeAlpha, LWA_ALPHA) ||
+      !SetWindowPos(badge.window, HWND_TOPMOST, center.x - badgeSize / 2, center.y - badgeSize / 2,
+                    badgeSize, badgeSize, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER)) {
+    badge.Hide();
+    return;
+  }
+  InvalidateRect(badge.window, nullptr, FALSE);
+}
+
+static void Show(const Commands::TiledDropPreview& preview, DragSession* drag = nullptr, UINT dpi = 96) {
   if (g_overlay.fadeTo == 255 && g_overlay.shown &&
+      g_overlay.shown->draggedWindow == preview.draggedWindow &&
+      g_overlay.shown->affectedWindow == preview.affectedWindow &&
       EqualRect(&g_overlay.shown->dragged, &preview.dragged) &&
       EqualRect(&g_overlay.shown->affected, &preview.affected)) {
     return;
@@ -182,6 +328,18 @@ static void Show(const Commands::TiledDropPreview& preview) {
   }
   InvalidateRect(g_overlay.fill, nullptr, FALSE);
   InvalidateRect(g_overlay.outline, nullptr, FALSE);
+
+  const bool sameTile = EqualRect(&preview.dragged, &preview.affected);
+  if (drag && (g_settings.dragPreviewFillOpacity > 0 || sameTile)) {
+    ShowBadge(g_overlay.draggedBadge, *drag, preview.draggedWindow, preview.dragged, dpi);
+  } else {
+    g_overlay.draggedBadge.Hide();
+  }
+  if (drag && !sameTile && g_settings.dragPreviewOutlineOpacity > 0) {
+    ShowBadge(g_overlay.affectedBadge, *drag, preview.affectedWindow, preview.affected, dpi);
+  } else {
+    g_overlay.affectedBadge.Hide();
+  }
   g_overlay.shown = preview;
   FadeTo(255, changedTarget);
 }
@@ -203,7 +361,7 @@ static void Begin(HWND source, HWND displayedWindow) {
   if (!Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key)) return;
   const auto start = Gestures::g_moveSize.startRects.find(source);
   if (start == Gestures::g_moveSize.startRects.end()) return;
-  g_drag.emplace(DragSession{source, displayedWindow, monitor, std::move(key), start->second, {}, {}, {}, {}});
+  g_drag.emplace(DragSession{source, displayedWindow, monitor, std::move(key), start->second, {}, {}, {}, {}, {}});
 }
 
 // Capture tile bounds once per workspace revision and replan only when the
@@ -228,7 +386,7 @@ static void UpdateDropPreview(DragSession& drag, POINT cursor) {
   if (Platform::Monitors::GetWorkspaceMetrics(drag.monitor, &metrics)) {
     if (target) {
       if (const auto preview = Commands::PlanTiledDropPreview(drag.workspace, drag.source, *target, metrics)) {
-        Show(*preview);
+        Show(*preview, &drag, metrics.dpi);
         return;
       }
     }
@@ -236,7 +394,7 @@ static void UpdateDropPreview(DragSession& drag, POINT cursor) {
     // window cannot be moved back by MultiWM.
     const WindowRecord* source = drag.workspace.Find(drag.source);
     if (drag.displayedWindow == drag.source && source && source->canMove && !IsRectEmpty(&drag.start)) {
-      Show({drag.start, drag.start});
+      Show({drag.start, drag.start, drag.source}, &drag, metrics.dpi);
       return;
     }
   }
@@ -277,6 +435,8 @@ static void Shutdown() {
   g_drag.reset();
   if (g_overlay.fill) DestroyWindow(g_overlay.fill);
   if (g_overlay.outline) DestroyWindow(g_overlay.outline);
+  if (g_overlay.draggedBadge.window) DestroyWindow(g_overlay.draggedBadge.window);
+  if (g_overlay.affectedBadge.window) DestroyWindow(g_overlay.affectedBadge.window);
   if (g_overlay.windowClass) UnregisterClassW(kPreviewClassName, GetModuleHandleW(nullptr));
   g_overlay = {};
 }

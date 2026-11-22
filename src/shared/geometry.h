@@ -92,8 +92,24 @@ inline RECT RemoveFrameMargins(const RECT& windowRect, const RECT& margins) {
 }
 
 // How close, in physical pixels, every edge of a window must be to its
-// monitor's for the window to count as covering it (CoversMonitor).
+// monitor's for the window to count as covering it (CoversMonitor), and its
+// size to the monitor's to count as monitor-sized (IsMonitorSized).
 inline constexpr LONG kCoversMonitorTolerance = 2;
+
+// True when `windowRect` is `monitorRect`'s size, within the tolerance, wherever
+// it is: an app asking for fullscreen without maximizing. Both mods read
+// fullscreen this way, so a window mid-way through moving and sizing itself to
+// its monitor already counts. Exact, not "at least": with an auto-hidden
+// taskbar, a window filling the work area is larger than its monitor by its
+// invisible resize borders, and isn't fullscreen. Compare with the monitor the
+// window is on, never another, or a window the size of a smaller monitor would
+// count on a larger one.
+inline bool IsMonitorSized(const RECT& windowRect, const RECT& monitorRect) {
+  return std::abs((windowRect.right - windowRect.left) - (monitorRect.right - monitorRect.left)) <=
+             kCoversMonitorTolerance &&
+         std::abs((windowRect.bottom - windowRect.top) - (monitorRect.bottom - monitorRect.top)) <=
+             kCoversMonitorTolerance;
+}
 
 // True when `windowRect` covers `monitorRect`, every edge within the tolerance:
 // how an app in fullscreen without maximizing looks.

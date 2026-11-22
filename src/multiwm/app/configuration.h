@@ -514,6 +514,8 @@ void LoadSettings() {
       ReadBoundedIntSetting(L"appearance.DragPreview.OutlineWidth", L"Drag Preview Outline Width", 1, 20, 4);
   g_settings.dragPreviewOutlineRadiusDip =
       ReadBoundedIntSetting(L"appearance.DragPreview.OutlineCornerRadius", L"Drag Preview Outline Corner Radius", 0, 32, 8);
+  g_settings.dragPreviewIconSizeDip =
+      ReadBoundedIntSetting(L"appearance.DragPreview.AppIconSize", L"Drag Preview App Icon Size", 0, 64, 32);
   g_settings.dragPreviewFadeMs =
       ReadBoundedIntSetting(L"appearance.DragPreview.FadeDurationMs", L"Drag Preview Fade Duration", 0, 500, 96);
   g_settings.automaticNewWindowPosition =

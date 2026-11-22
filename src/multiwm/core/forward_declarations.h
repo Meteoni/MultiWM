@@ -73,6 +73,11 @@ namespace CompanionSnapshot {
 static void NotifyDisplayChanged();
 }  // namespace CompanionSnapshot
 
+// Defined in app/drag_preview.h.
+namespace DragPreview {
+static void RefreshBadgeTheme();
+}  // namespace DragPreview
+
 // Defined in app/tray_ui.h.
 namespace TrayUi {
 static void LoadSettings();

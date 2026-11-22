@@ -362,6 +362,7 @@ struct SettingsState {
   LONG dragPreviewOutlineOpacity = 100;
   LONG dragPreviewOutlineWidthDip = 4;
   LONG dragPreviewOutlineRadiusDip = 8;
+  LONG dragPreviewIconSizeDip = 32;
   UINT dragPreviewFadeMs = 96;
   AutomaticNewWindowPosition automaticNewWindowPosition =
       AutomaticNewWindowPosition::LastSlot;

@@ -1195,9 +1195,9 @@ static void DumpConfigurationSnapshot(ReportBuilder& report) {
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Swap) {
     report.Line(L"BSP split edge size: %ld%%", g_settings.bspSplitEdgePercent);
-    report.Line(L"Drag preview: fill=%ld%% outline=%ld%% width=%ld radius=%ld (96-DPI logical px), fade=%u ms",
+    report.Line(L"Drag preview: fill=%ld%% outline=%ld%% width=%ld radius=%ld icon=%ld (96-DPI logical px), fade=%u ms",
                 g_settings.dragPreviewFillOpacity, g_settings.dragPreviewOutlineOpacity, g_settings.dragPreviewOutlineWidthDip,
-                g_settings.dragPreviewOutlineRadiusDip, g_settings.dragPreviewFadeMs);
+                g_settings.dragPreviewOutlineRadiusDip, g_settings.dragPreviewIconSizeDip, g_settings.dragPreviewFadeMs);
   }
   report.Line(
       L"Automatic insertion position: %ls",

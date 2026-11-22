@@ -498,6 +498,8 @@ static FlyoutInstance* GetOrCreateFlyoutForMonitor(HMONITOR monitor) {
       kFlyoutWindowClassName, L"", WS_POPUP, 0, 0, 0, 0,
       nullptr, nullptr, module, instance.get());
   if (!instance->hwnd) return nullptr;
+  const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+  DwmSetWindowAttribute(instance->hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
 
   g_session.flyouts.push_back(std::move(instance));
   return g_session.flyouts.back().get();
@@ -533,11 +535,6 @@ static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
   int y = g_preferences.flyoutAtTop ? workArea.top + edgeGap
                       : workArea.bottom - height - edgeGap;
   y += ScaleForDpi(g_preferences.flyoutOffsetYDip, dpi);
-
-  int radius = ScaleForDpi(8, dpi);
-  HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
-                                   radius * 2, radius * 2);
-  if (region && !SetWindowRgn(instance->hwnd, region, TRUE)) DeleteObject(region);
 
   instance->shownTick = GetTickCount();
   // Allow roughly 75 ms per character, retaining the minimum for short hints.
@@ -729,6 +726,7 @@ static void HandleThemeChanged() {
   if (light == g_session.systemLightTheme) return;
   g_session.systemLightTheme = light;
   RebuildIcons();
+  DragPreview::RefreshBadgeTheme();
   for (const auto& instance : g_session.flyouts) {
     if (instance->hwnd && IsWindowVisible(instance->hwnd)) {
       InvalidateRect(instance->hwnd, nullptr, TRUE);

@@ -154,15 +154,17 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
   return constraints;
 }
 
-// True when `hwnd`'s window rectangle covers its whole monitor: how Chromium and
+// True when `hwnd`'s window rectangle is its monitor's size: how Chromium and
 // similar apps look in fullscreen while Windows still reports them as restored.
+// Size, not position (SharedGeometry::IsMonitorSized), so an app part-way
+// through moving and sizing itself to its monitor is already fullscreen.
 static bool CoversItsMonitor(HWND hwnd) {
   RECT windowRect{};
   if (!GetWindowRect(hwnd, &windowRect)) return false;
-  HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONULL);
+  HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONEAREST);
   MONITORINFO monitorInfo{sizeof(monitorInfo)};
   return monitor && GetMonitorInfoW(monitor, &monitorInfo) &&
-         SharedGeometry::CoversMonitor(windowRect, monitorInfo.rcMonitor);
+         SharedGeometry::IsMonitorSized(windowRect, monitorInfo.rcMonitor);
 }
 
 // --- Ghost windows -------------------------------------------------------------

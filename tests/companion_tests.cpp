@@ -550,6 +550,93 @@ int main() {
     Companion::DefWindowProcWHook(hwnd, WM_WINDOWPOSCHANGING, 0, reinterpret_cast<LPARAM>(&hide));
     check(hide.x == 0 && hide.cx == 0 && unchanged(appMove(hwnd)), "hiding the window ends settling");
 
+    // WinUI can initially look resizable, then switch to a fixed-size overlay.
+    showPlaced();
+    const LONG_PTR resizeStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle & ~WS_SIZEBOX);
+    const bool fixedSizeMovePassed = unchanged(appMove(hwnd));
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle);
+    check(fixedSizeMovePassed && unchanged(appMove(hwnd)), "losing the resize border releases the app's moves");
+
+    // PowerToys' WinUI overlays: fixed-size when shown, the resize border back
+    // by the next move. The show's verdict releases the window for good and
+    // returns it, still hidden, to the frame it had before the companion moved it.
+    RECT ownFrame{};
+    {
+      Companion::PhysicalCoordinatesScope physical;
+      GetWindowRect(hwnd, &ownFrame);
+    }
+    showPlaced();
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle & ~WS_SIZEBOX);
+    positionCalls.clear();
+    Companion::ShowWindowHook(hwnd, SW_SHOWNORMAL);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle);
+    check(positionCalls.size() == 1 && positionCalls[0].x == ownFrame.left && positionCalls[0].y == ownFrame.top &&
+              positionCalls[0].width == SharedGeometry::Width(ownFrame) &&
+              positionCalls[0].height == SharedGeometry::Height(ownFrame),
+          "a show that finds the window fixed-size returns it to its own frame");
+    check(unchanged(appMove(hwnd)), "after that, the app's moves are its own even with the border back");
+
+    showPlaced();
+    const RECT& monitor = monitorInfo.rcMonitor;
+    const int width = SharedGeometry::Width(monitor);
+    const int height = SharedGeometry::Height(monitor);
+    WINDOWPOS fullscreen{hwnd, nullptr, monitor.left, monitor.top, width, height, moveFlags};
+    Companion::SteerSettlingWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&fullscreen));
+    check(fullscreen.x == monitor.left && fullscreen.y == monitor.top &&
+              fullscreen.cx == width && fullscreen.cy == height && fullscreen.flags == moveFlags &&
+              unchanged(appMove(hwnd)),
+          "a fullscreen request passes through and ends settling");
+
+    // Borderless fullscreen in two steps (move to the monitor's corner, then
+    // size to it): each step is read against the app's last request, not the
+    // held tile, so the second asks for the whole monitor and gets it.
+    showPlaced();
+    WINDOWPOS corner{hwnd, nullptr, monitor.left, monitor.top, 0, 0, moveFlags | SWP_NOSIZE};
+    Companion::SteerSettlingWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&corner));
+    check(heldAt(corner, testMargins), "the move to the monitor's corner is held");
+    WINDOWPOS size{hwnd, nullptr, 0, 0, width, height, moveFlags | SWP_NOMOVE};
+    Companion::SteerSettlingWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&size));
+    check(size.x == monitor.left && size.y == monitor.top && size.cx == width && size.cy == height &&
+              !(size.flags & (SWP_NOMOVE | SWP_NOSIZE)) && unchanged(appMove(hwnd)),
+          "sizing to the monitor after the held move is fullscreen: the app's frame passes and settling ends");
+
+    // Size first, move second: the monitor-sized request is fullscreen already.
+    showPlaced();
+    WINDOWPOS sizeFirst{hwnd, nullptr, 0, 0, width, height, moveFlags | SWP_NOMOVE};
+    Companion::SteerSettlingWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&sizeFirst));
+    check(sizeFirst.cx == width && sizeFirst.cy == height && unchanged(appMove(hwnd)),
+          "sizing to the monitor before moving there is fullscreen and ends settling");
+
+    // Requests the hold replaced aren't lost when the window turns out ineligible:
+    // the release moves it to the app's last request, not its creation frame.
+    auto releasedTo = [&](LONG x, LONG y, LONG w, LONG h) {
+      return positionCalls.size() == 1 && positionCalls[0].x == x && positionCalls[0].y == y &&
+             positionCalls[0].width == w && positionCalls[0].height == h;
+    };
+    showPlaced();
+    check(heldAt(appMove(hwnd), testMargins), "the app's move is held");
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle & ~WS_SIZEBOX);
+    positionCalls.clear();
+    Companion::ShowWindowHook(hwnd, SW_SHOWNORMAL);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle);
+    check(releasedTo(900, 900, 600, 500), "a show that finds the window fixed-size moves it to the app's last request");
+
+    // A style change alone moves nothing, so it releases the window itself.
+    showPlaced();
+    check(heldAt(appMove(hwnd), testMargins), "the app's move is held");
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle & ~WS_SIZEBOX);
+    STYLESTRUCT styles{static_cast<DWORD>(resizeStyle), static_cast<DWORD>(resizeStyle & ~WS_SIZEBOX)};
+    positionCalls.clear();
+    Companion::DefWindowProcWHook(hwnd, WM_STYLECHANGED, GWL_STYLE, reinterpret_cast<LPARAM>(&styles));
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle);
+    check(releasedTo(900, 900, 600, 500) && unchanged(appMove(hwnd)),
+          "dropping the resize border releases the window to the app's last request");
+    showPlaced();
+    positionCalls.clear();
+    Companion::DefWindowProcWHook(hwnd, WM_STYLECHANGED, GWL_STYLE, reinterpret_cast<LPARAM>(&styles));
+    check(positionCalls.empty() && heldAt(appMove(hwnd), testMargins), "a style change that keeps it eligible keeps the hold");
+
     Companion::EndSettling();
     nativeResult = savedResult;
     ++body.generation;

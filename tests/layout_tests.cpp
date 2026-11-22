@@ -365,6 +365,16 @@ static void RunFloatingPlacementTests() {
   tileArea = SharedGeometry::KeepTilesOffWholeMonitor({2, 1, 1919, 1078}, monitorRect);
   check(EqualRect(&tileArea, &expected), "edges within the tolerance move to 3 px too, evenly");
   check(!SharedGeometry::CoversMonitor(tileArea, monitorRect), "the result never covers the monitor");
+  check(!SharedGeometry::IsMonitorSized(tileArea, monitorRect), "nor is it the monitor's size");
+
+  // Fullscreen is the monitor's size, wherever the window is.
+  check(SharedGeometry::IsMonitorSized({0, 0, 1920, 1080}, monitorRect), "the monitor's own rect is fullscreen");
+  check(SharedGeometry::IsMonitorSized({300, 200, 2220, 1280}, monitorRect),
+        "a monitor-sized window part-way to its corner is fullscreen");
+  check(SharedGeometry::IsMonitorSized({1, -1, 1922, 1081}, monitorRect), "within the tolerance is fullscreen");
+  check(!SharedGeometry::IsMonitorSized({-7, -7, 1927, 1087}, monitorRect),
+        "a work-area window with invisible borders under a hidden taskbar isn't fullscreen");
+  check(!SharedGeometry::IsMonitorSized({0, 0, 1920, 1040}, monitorRect), "one axis alone isn't fullscreen");
   tileArea = SharedGeometry::KeepTilesOffWholeMonitor({0, 0, 1920, 1022}, monitorRect);
   expected = {0, 0, 1920, 1022};
   check(EqualRect(&tileArea, &expected), "a visible taskbar or any larger inset leaves the work area alone");
