@@ -38,6 +38,7 @@ static const wchar_t* DiagnosticPlacementResultName(PlacementResult result) {
     case PlacementResult::AccessDenied: return L"AccessDenied";
     case PlacementResult::Refused: return L"Refused";
     case PlacementResult::Dead: return L"Dead";
+    case PlacementResult::Unresponsive: return L"Unresponsive";
     default: return L"Unknown";
   }
 }
@@ -653,6 +654,7 @@ static constexpr DiagnosticCounterRowSpec kPlacementCounterRows[] = {
     {L"Placement access denied", &Counters::placementAccessDenied},
     {L"Placement refused", &Counters::placementRefused},
     {L"Placement dead HWND", &Counters::placementDead},
+    {L"Placement deferred (unresponsive)", &Counters::placementUnresponsive},
     {L"Floating geometry repairs", &Counters::floatingGeometryRepairs},
     {L"Constraint probes", &Counters::constraintProbeAttempts},
     {L"  constraint probe successes", &Counters::constraintProbeSuccesses},
@@ -1383,7 +1385,7 @@ static bool DumpTelemetryConsistency(ReportBuilder& report, const Counters& c) {
        c.lifecycleEventsProcessed, false},
       {L"placement result sum == placement checks",
        c.placementSuccess + c.placementSuppressedByPhysicalState + c.placementAdjusted +
-           c.placementAccessDenied + c.placementRefused + c.placementDead,
+           c.placementAccessDenied + c.placementRefused + c.placementDead + c.placementUnresponsive,
        c.placementChecks, false},
       {L"placement path sum == placement checks",
        c.placementNoOps + c.placementPreflightStops + c.setWindowPosCalls, c.placementChecks, false},

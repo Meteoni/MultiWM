@@ -138,6 +138,14 @@ static void ProcessConstraintRetryTimer() {
   ArmConstraintRetryTimer();
 }
 
+static bool RefreshWorkspaceGhostSizes(Workspace& workspace) {
+  bool changed = false;
+  for (HWND hwnd : workspace.TiledWindows()) {
+    changed |= workspace.UpdateGhostSize(hwnd, Platform::Windows::GetRestoredGhostSize(hwnd));
+  }
+  return changed;
+}
+
 // Refreshes the application-owned native minimum contract without introducing a
 // second solver notion of "proof". Normal arrangement probes only records that
 // are missing, stale-DPI, or still resolving an admission/restore. User-authored
@@ -145,10 +153,10 @@ static void ProcessConstraintRetryTimer() {
 // relaxed same-DPI minimum cannot remain cached indefinitely.
 static bool RefreshWorkspaceNativeConstraints(
     Workspace& workspace, bool forceAll, const wchar_t* reason) {
-  bool changed = false;
+  bool changed = RefreshWorkspaceGhostSizes(workspace);
   for (HWND hwnd : workspace.TiledWindows()) {
     const WindowRecord* record = workspace.Find(hwnd);
-    if (!record ||
+    if (!record || record->ghostSize.cx > 0 ||
         Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
       continue;
     }
@@ -982,6 +990,13 @@ static TiledPlacementOutcome PlaceTiledWindow(
   if (Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     return {};
   }
+  if (const HWND ghost = Platform::Windows::GhostWindowOf(hwnd)) {
+    CancelConformanceLease(hwnd);
+    if (record->canMove && !Gestures::IsMoveSizeGestureInProgress(hwnd)) {
+      Platform::Windows::MoveGhostWindow(hwnd, ghost, target);
+    }
+    return {};
+  }
 
   const PlacementObservation observation =
       Platform::Windows::PlaceWindowChecked(hwnd, record->canMove, target);
@@ -1005,6 +1020,9 @@ static TiledPlacementOutcome PlaceTiledWindow(
   switch (observation.result) {
     case PlacementResult::Success:
       if (observation.placementIssued) BeginConformanceLease(hwnd, target, false, context.preferredTiledWindow);
+      break;
+    case PlacementResult::Unresponsive:
+      BeginConformanceLease(hwnd, target, true, context.preferredTiledWindow);
       break;
     case PlacementResult::AdjustedByWindow:
     case PlacementResult::Refused:

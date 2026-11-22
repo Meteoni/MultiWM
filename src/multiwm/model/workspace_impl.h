@@ -204,6 +204,7 @@ Workspace::PlacementAction Workspace::ApplyPlacementObservation(
     case PlacementResult::SuppressedByPhysicalState:
     case PlacementResult::AdjustedByWindow:
     case PlacementResult::Refused:
+    case PlacementResult::Unresponsive:
       return PlacementAction::None;
 
     case PlacementResult::AccessDenied:
@@ -292,6 +293,14 @@ bool Workspace::UpdateConstraints(
   }
   record->constraints = constraints;
   return changed;
+}
+
+bool Workspace::UpdateGhostSize(HWND hwnd, SIZE size) {
+  RuntimeLifecycle::AssertWmThread(L"Workspace::UpdateGhostSize");
+  WindowRecord* record = FindMutable(hwnd);
+  if (!record || (record->ghostSize.cx == size.cx && record->ghostSize.cy == size.cy)) return false;
+  record->ghostSize = size;
+  return true;
 }
 
 bool Workspace::HasSuspended() const {

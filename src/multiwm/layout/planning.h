@@ -43,7 +43,13 @@ static std::vector<WindowConstraints> ActiveWindowConstraints(
   constraints.reserve(workspace.ActiveCount());
   for (HWND hwnd : workspace.TiledWindows()) {
     const WindowRecord* record = workspace.Find(hwnd);
-    constraints.push_back(record ? record->constraints : WindowConstraints{});
+    WindowConstraints limits = record ? record->constraints : WindowConstraints{};
+    if (record && record->ghostSize.cx > 0 && record->ghostSize.cy > 0) {
+      limits.minWidth = limits.maxWidth = record->ghostSize.cx;
+      limits.minHeight = limits.maxHeight = record->ghostSize.cy;
+      limits.valid = true;
+    }
+    constraints.push_back(limits);
   }
   return constraints;
 }

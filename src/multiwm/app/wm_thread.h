@@ -58,6 +58,7 @@ static void UnregisterConfiguredHotkeys() {
 static void RememberManagedForeground(HWND hwnd) {
   AssertWmThread(L"RememberManagedForeground");
   if (!hwnd) return;
+  if (const HWND hung = Platform::Windows::HungWindowOfGhost(hwnd)) hwnd = hung;
 
   g_workspaces.UpdateEach(g_workspaces.OwnersOf(hwnd), [&](const DesktopMonitorKey&, Workspace& workspace) {
     return workspace.RememberFocusedWindow(hwnd);

@@ -51,7 +51,11 @@ static inline long long WindowAreaOnWorkArea(HWND hwnd, const RECT& workArea) {
 // Win32 observation lives here, outside Model. These helpers translate live HWND
 // properties/geometry into value objects consumed by Workspace and reconciliation.
 
-constexpr UINT kConstraintProbeTimeoutMs = 40;
+// How long MultiWM waits for an app to answer a message it must answer
+// synchronously: its size limits (ProbeWindowConstraints), or whether it is
+// responsive at all before a placement (PlaceWindowChecked). An app that takes
+// longer is treated as busy for now; MultiWM never blocks on it for longer.
+constexpr UINT kAppResponseTimeoutMs = 40;
 
 
 static void GetFrameDecorationSpan(
@@ -118,7 +122,7 @@ static WindowConstraints ProbeWindowConstraints(HWND hwnd) {
                 hwnd, WM_GETMINMAXINFO, 0,
                 reinterpret_cast<LPARAM>(&mmi),
                 SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
-                kConstraintProbeTimeoutMs, &result)
+                kAppResponseTimeoutMs, &result)
           : 0;
   if (!delivered) {
     DWORD error = GetLastError();
@@ -205,11 +209,45 @@ static HWND HungWindowOfGhost(HWND ghost) {
   return hung && hung != ghost && IsWindow(hung) ? hung : nullptr;
 }
 
+static bool GetDisplayedWindowFrameRect(HWND hwnd, RECT* frame) {
+  const HWND ghost = GhostWindowOf(hwnd);
+  return GetWindowFrameRect(ghost ? ghost : hwnd, frame);
+}
+
 // A ghost's state, read as GetPhysicalSuspensionReason reads a window's.
 static SuspensionReason GhostSuspensionReason(HWND ghost) {
   if (IsIconic(ghost)) return SuspensionReason::Minimized;
   if (!IsWindowVisible(ghost)) return SuspensionReason::Hidden;
   return IsZoomed(ghost) || CoversItsMonitor(ghost) ? SuspensionReason::Maximized : SuspensionReason::None;
+}
+
+static SIZE GetRestoredGhostSize(HWND hwnd) {
+  const HWND ghost = GhostWindowOf(hwnd);
+  RECT frame{};
+  if (!ghost || GhostSuspensionReason(ghost) != SuspensionReason::None ||
+      !GetWindowFrameRect(ghost, &frame)) return {};
+  const SIZE size{Layout::RectWidth(frame), Layout::RectHeight(frame)};
+  return size.cx > 0 && size.cy > 0 ? size : SIZE{};
+}
+
+// Queue a position-only move on the surrogate while it still represents hwnd.
+// Windows reports the ghost itself as hung, and the original app is still busy.
+static bool MoveGhostWindow(HWND hwnd, HWND ghost, const RECT& target) {
+  RECT frame{};
+  if (GhostSuspensionReason(ghost) != SuspensionReason::None ||
+      !GetWindowFrameRect(ghost, &frame) ||
+      Layout::RectWidth(frame) != Layout::RectWidth(target) ||
+      Layout::RectHeight(frame) != Layout::RectHeight(target)) return false;
+  if (Layout::RectsNear(frame, target)) return true;
+
+  RECT bounds{};
+  if (!GetWindowRect(ghost, &bounds) || GhostWindowOf(hwnd) != ghost) return false;
+  if (SetWindowPos(ghost, nullptr, bounds.left + (target.left - frame.left),
+                   bounds.top + (target.top - frame.top), 0, 0,
+                   SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER |
+                       SWP_NOOWNERZORDER | SWP_NOSENDCHANGING)) return true;
+  Diagnostics::RecordEvent(L"ghost placement failed hwnd=%p ghost=%p error=%lu", hwnd, ghost, GetLastError());
+  return false;
 }
 
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
@@ -575,6 +613,9 @@ static PlacementObservation PlaceWindowChecked(
       case PlacementResult::Dead:
         ++Diagnostics::g_runtime.counters.placementDead;
         break;
+      case PlacementResult::Unresponsive:
+        ++Diagnostics::g_runtime.counters.placementUnresponsive;
+        break;
     }
     if (result != PlacementResult::Success &&
         result != PlacementResult::SuppressedByPhysicalState) {
@@ -594,11 +635,6 @@ static PlacementObservation PlaceWindowChecked(
     ++Diagnostics::g_runtime.counters.placementPreflightStops;
     return finish(PlacementResult::Refused);
   }
-  if (IsHungAppWindow(hwnd)) {
-    ++Diagnostics::g_runtime.counters.placementPreflightStops;
-    return finish(PlacementResult::Refused);
-  }
-
   RECT currentFrame{};
   if (GetWindowFrameRect(hwnd, &currentFrame)) {
     observation.observed = currentFrame;
@@ -617,6 +653,32 @@ static PlacementObservation PlaceWindowChecked(
     offsetTop = extendedFrame.top - windowRect.top;
     offsetRight = windowRect.right - extendedFrame.right;
     offsetBottom = windowRect.bottom - extendedFrame.bottom;
+  }
+
+  // IsHungAppWindow lags behind a stopped message pump. Check that a foreign
+  // thread answers before attempting a placement that can call into that thread.
+  DWORD processId = 0;
+  const DWORD windowThread = GetWindowThreadProcessId(hwnd, &processId);
+  if (!windowThread) {
+    ++Diagnostics::g_runtime.counters.placementPreflightStops;
+    return finish(PlacementResult::Dead);
+  }
+  if (windowThread != GetCurrentThreadId()) {
+    const bool hung = IsHungAppWindow(hwnd);
+    DWORD_PTR ignored = 0;
+    SetLastError(ERROR_SUCCESS);
+    const bool responds = !hung &&
+        SendMessageTimeoutW(hwnd, WM_NULL, 0, 0,
+                            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+                            kAppResponseTimeoutMs, &ignored);
+    const DWORD probeError = GetLastError();
+    const bool sameWindow = IsSameLiveWindow(hwnd, processId);
+    if (!sameWindow || !responds) {
+      ++Diagnostics::g_runtime.counters.placementPreflightStops;
+      if (!sameWindow) return finish(PlacementResult::Dead);
+      return finish(probeError == ERROR_ACCESS_DENIED ? PlacementResult::AccessDenied
+                                                     : PlacementResult::Unresponsive);
+    }
   }
 
   // Close the final physical-state race at the actual mutation boundary. The

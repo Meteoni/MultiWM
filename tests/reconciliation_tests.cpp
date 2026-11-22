@@ -1112,6 +1112,112 @@ static HWND g_testGhost = nullptr;
 static HWND WINAPI TestGhostFromHung(HWND hwnd) { return hwnd && hwnd == g_testHung ? g_testGhost : nullptr; }
 static HWND WINAPI TestHungFromGhost(HWND hwnd) { return hwnd && hwnd == g_testGhost ? g_testHung : nullptr; }
 
+static void CheckGhostLayoutAndCommands(CheckCounter& check, FloatingWindowFixture& f, HWND other) {
+  const HWND hung = g_testHung;
+  const HWND ghost = g_testGhost;
+  const RECT originalFrame = FloatingWindowFixture::Frame(hung);
+  const LONG width = std::min<LONG>(320, (Layout::RectWidth(f.workArea) - f.metrics.gap) / 4);
+  const LONG height = std::min<LONG>(240, (Layout::RectHeight(f.workArea) - f.metrics.gap) / 4);
+  for (const TileLayout layout : {TileLayout::Columns, TileLayout::Rows}) {
+    FloatingWindowFixture::AppMove(ghost, f.workArea.left + 25, f.workArea.top + 30, width, height);
+    f.Seed(layout);
+    Workspace workspace = f.Load();
+    workspace.AdmitTiled(FloatingWindowFixture::Record(other));
+    workspace.UpdateConstraints(hung, WindowConstraints{1, 1, f.metrics.dpi, true});
+    g_workspaces.Save(f.key, workspace);
+
+    Reconcile::ProcessWindowLifecycleEvent(EVENT_OBJECT_STATECHANGE, hung);
+    workspace = f.Load();
+    std::vector<RECT> cells;
+    Layout::PlanPreferredCells(workspace, f.workArea, f.metrics.gap, &cells);
+    check(Layout::RectsNear(FloatingWindowFixture::Frame(ghost), SharedGeometry::CenteredIn(cells[0], width, height)),
+          "a ghost state change centers the fixed-size ghost in a larger tile");
+    const RECT appFrame = FloatingWindowFixture::Frame(hung);
+    check(EqualRect(&originalFrame, &appFrame) && workspace.Find(hung)->constraints.minWidth == 1,
+          "ghost layout keeps the real window frame and native limits intact");
+
+    MoveSizeGesture gesture;
+    gesture.hasRects = true;
+    gesture.start = gesture.end = FloatingWindowFixture::Frame(other);
+    if (layout == TileLayout::Columns) {
+      gesture.end.left = f.workArea.left + f.metrics.gap + width / 2;
+    } else {
+      gesture.end.top = f.workArea.top + f.metrics.gap + height / 2;
+    }
+    Commands::HandleUserResize(f.key, workspace, other, f.workArea, f.metrics.gap, gesture);
+    workspace = f.Load();
+    Layout::PlanPreferredCells(workspace, f.workArea, f.metrics.gap, &cells);
+    const LONG remaining = layout == TileLayout::Columns ? Layout::RectWidth(cells[0]) : Layout::RectHeight(cells[0]);
+    const LONG minimum = layout == TileLayout::Columns ? width : height;
+    check(remaining >= minimum && remaining <= minimum + 1 &&
+              Layout::RectsNear(FloatingWindowFixture::Frame(ghost), SharedGeometry::CenteredIn(cells[0], width, height)),
+          "dragging the sibling stops at the ghost size on the active axis");
+  }
+
+  const HWND third = f.CreateTestWindow(nullptr);
+  g_settings.reverseDwindle = false;
+  f.Seed(TileLayout::Dwindle);
+  Workspace workspace = f.Load();
+  workspace.AdmitTiled(FloatingWindowFixture::Record(other));
+  workspace.AdmitTiled(FloatingWindowFixture::Record(third));
+  check(workspace.SwapTiled(hung, other), "put the ghost above a sibling in Dwindle");
+  g_workspaces.Save(f.key, workspace);
+  Placement::ArrangeWorkspace(f.key);
+  workspace = f.Load();
+  MoveSizeGesture resize;
+  resize.hasRects = true;
+  resize.start = resize.end = FloatingWindowFixture::Frame(third);
+  resize.end.top = f.workArea.top + f.metrics.gap + height / 2;
+  Commands::HandleUserResize(f.key, workspace, third, f.workArea, f.metrics.gap, resize);
+  workspace = f.Load();
+  std::vector<RECT> cells;
+  Layout::PlanPreferredCells(workspace, f.workArea, f.metrics.gap, &cells);
+  check(Layout::RectHeight(cells[1]) == height &&
+            Layout::RectsNear(FloatingWindowFixture::Frame(ghost), SharedGeometry::CenteredIn(cells[1], width, height)),
+        "Dwindle clamps the divider while leaving slack around the ghost on the other axis");
+
+  f.Seed(TileLayout::Columns);
+  workspace = f.Load();
+  workspace.AdmitTiled(FloatingWindowFixture::Record(other));
+  workspace.AdmitTiled(FloatingWindowFixture::Record(third));
+  g_workspaces.Save(f.key, workspace);
+  Placement::ArrangeWorkspace(f.key);
+  auto ghostIsInSlot = [&](size_t index) {
+    const Workspace current = f.Load();
+    std::vector<RECT> plan;
+    return current.TiledIndex(hung) == index &&
+        Layout::BuildWorkspaceLayoutPlan(current, f.workArea, f.metrics.gap, &plan) ==
+            Layout::LayoutPlanStatus::Success &&
+        Layout::RectsNear(FloatingWindowFixture::Frame(ghost), plan[index]);
+  };
+  Commands::DemoteFocusedWindow(ghost);
+  check(ghostIsInSlot(1), "demoting the focused ghost moves it one slot");
+  Commands::DemoteFocusedWindow(ghost);
+  check(ghostIsInSlot(2), "a second demotion moves the ghost to the last slot");
+  Commands::PromoteFocusedWindow(ghost);
+  check(ghostIsInSlot(1), "promoting the focused ghost moves it one slot");
+  Commands::SwapMaster(ghost);
+  check(ghostIsInSlot(0), "swapping the focused ghost with master moves it to the first slot");
+
+  MoveSizeGesture drop;
+  drop.hasDropPoint = true;
+  drop.dropPoint = SharedGeometry::RectCenter(FloatingWindowFixture::Frame(ghost));
+  workspace = f.Load();
+  const size_t otherIndex = workspace.TiledIndex(other);
+  g_settings.mouseMoveBehavior = MouseMoveBehavior::Swap;
+  Commands::HandleUserMove(f.key, workspace, other, drop);
+  check(ghostIsInSlot(otherIndex) && f.Load().TiledIndex(other) == 0,
+        "dropping a sibling onto the displayed ghost swaps their tiles");
+
+  g_testGhost = nullptr;
+  Reconcile::ProcessWindowLifecycleEvent(EVENT_OBJECT_STATECHANGE, hung);
+  workspace = f.Load();
+  check(workspace.Find(hung)->ghostSize.cx == 0 && workspace.Find(hung)->ghostSize.cy == 0 &&
+            Layout::RectWidth(FloatingWindowFixture::Frame(hung)) > width,
+        "after recovery the actual app uses its tile without the ghost's fixed size");
+  g_testGhost = ghost;
+}
+
 // While an app is hung, MultiWM reads its window's state from the ghost DWM shows
 // for it, and the ghost's events reach the WM thread as the window's. Real
 // visible test windows; the ghost pairing is faked.
@@ -1150,6 +1256,8 @@ static void RunGhostWindowTests() {
   Reconcile::ReconcileKnownWindows(Reconcile::ReconcileScope::Participation, &changed, hung);
   check(f.Load().IsTiled(hung), "restoring the ghost tiles the hung window again");
 
+  CheckGhostLayoutAndCommands(check, f, other);
+
   // Events: a ghost's events are its hung window's; its destroy is not.
   struct Posted { UINT message; WPARAM wParam; LPARAM lParam; };
   auto drain = [] {
@@ -1183,6 +1291,16 @@ static void RunGhostWindowTests() {
   send(EVENT_SYSTEM_FOREGROUND, ghost);
   check(postedOnly(WM_APP_FOREGROUND_CHANGED, reinterpret_cast<WPARAM>(hung), 0),
         "a ghost in front means its hung window is");
+  send(EVENT_SYSTEM_MOVESIZESTART, ghost);
+  check(Gestures::IsMoveSizeGestureInProgress(hung) && drain().empty(),
+        "a ghost drag starts a gesture for the hung window");
+  const RECT ghostStart = FloatingWindowFixture::Frame(ghost);
+  FloatingWindowFixture::AppMove(ghost, ghostStart.left + 30, ghostStart.top + 20,
+                                 Layout::RectWidth(ghostStart), Layout::RectHeight(ghostStart));
+  send(EVENT_SYSTEM_MOVESIZEEND, ghost);
+  check(postedOnly(WM_APP_MOVE_SIZE_END, reinterpret_cast<WPARAM>(hung), 0) &&
+            Gestures::ConsumeMoveSizeGesture(hung).intent == MoveSizeIntent::Move,
+        "a ghost drag uses its displayed frame and queues the hung window's move");
   send(EVENT_OBJECT_DESTROY, ghost);
   check(stateChangeOf(hung) && g_wm.ghosts.empty(),
         "a ghost's destroy, when the app recovers, is a state change, never the window's destroy");
@@ -1213,9 +1331,14 @@ struct SlowLimitsWindow {
   RECT frame{};
 
   static LRESULT CALLBACK Proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_APP) {
+      SetEvent(reinterpret_cast<HANDLE>(wparam));
+      WaitForSingleObject(reinterpret_cast<HANDLE>(lparam), 3000);
+      return 0;
+    }
     auto* self = reinterpret_cast<SlowLimitsWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (message == WM_GETMINMAXINFO && self && self->slow) {
-      Sleep(3 * Platform::Windows::kConstraintProbeTimeoutMs);  // Longer than the query waits.
+      Sleep(3 * Platform::Windows::kAppResponseTimeoutMs);  // Longer than the query waits.
       return 0;
     }
     if (message == WM_DESTROY) PostQuitMessage(0);
@@ -1337,6 +1460,68 @@ static void RunConstraintRetryTests() {
   Reconcile::ForgetManagedWindow(slow.hwnd);
   FloatingWindowFixture::ClearLeases();
   std::printf("Passed %u size-limit retry checks.\n", check.passed);
+}
+
+static void RunUnresponsivePlacementTest() {
+  CheckCounter check;
+  FloatingWindowFixture f(check);
+  // The wait is kAppResponseTimeoutMs whatever Window Change Delay says.
+  g_settings.reconcileDelayMs = 2000;
+  SlowLimitsWindow paused(f.workArea);
+  check(paused.hwnd != nullptr, "create the window to pause");
+  paused.slow = false;
+  f.Seed(TileLayout::Columns);
+  Workspace before = f.Load();
+  before.AdmitTiled(FloatingWindowFixture::Record(paused.hwnd));
+  g_workspaces.Save(f.key, before);
+  Placement::ArrangeWorkspace(f.key);
+  before = f.Load();
+  Workspace candidate = before;
+  candidate.SetLayout(TileLayout::Rows);
+  Placement::RememberPendingLayoutMutation(f.key, before, candidate, f.hwnd,
+                                           Placement::UserLayoutMutationKind::Resize, L"Resize");
+  g_workspaces.Save(f.key, candidate);
+
+  const HANDLE pausedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  const HANDLE resumeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  check(pausedEvent && resumeEvent &&
+            PostMessageW(paused.hwnd, WM_APP, reinterpret_cast<WPARAM>(pausedEvent),
+                         reinterpret_cast<LPARAM>(resumeEvent)) &&
+            WaitForSingleObject(pausedEvent, 3000) == WAIT_OBJECT_0 &&
+            !IsHungAppWindow(paused.hwnd),
+        "the window has stopped pumping before Windows marks it hung");
+  const ULONGLONG start = GetTickCount64();
+  Placement::ArrangeWorkspace(f.key);
+  const ULONGLONG elapsed = GetTickCount64() - start;
+  // GetTickCount64 advances in steps of about 16 ms.
+  check(elapsed + 16 >= Platform::Windows::kAppResponseTimeoutMs && elapsed < 1000,
+        "retile waits the app response timeout, not Window Change Delay, and returns while the app is paused");
+  const Workspace deferred = f.Load();
+  check(deferred.Find(paused.hwnd)->lastPlacementResult == PlacementResult::Unresponsive &&
+            deferred.Find(f.hwnd)->lastPlacementResult == PlacementResult::Success,
+        "retile defers the unresponsive window and places its responsive sibling");
+  for (auto& [window, lease] : TestLeases()) lease.expiresAtTickMs = 1;
+  Placement::ProcessConformanceTimer();
+  const Workspace settled = f.Load();
+  check(settled.Layout() == TileLayout::Rows && settled.IsTiled(paused.hwnd) &&
+            !Placement::g_pendingProofs.FindLayoutMutation(f.key),
+        "the deadline keeps the resize and the unresponsive window's slot");
+
+  SetEvent(resumeEvent);
+  DWORD_PTR ignored = 0;
+  check(SendMessageTimeoutW(paused.hwnd, WM_NULL, 0, 0, SMTO_BLOCK, 3000, &ignored) != 0,
+        "the paused app resumes message processing");
+  CloseHandle(resumeEvent);
+  CloseHandle(pausedEvent);
+  Reconcile::ProcessWindowLifecycleEvent(EVENT_OBJECT_STATECHANGE, paused.hwnd);
+  const Workspace recovered = f.Load();
+  check(recovered.Find(paused.hwnd)->lastPlacementResult == PlacementResult::Success &&
+            Layout::RectsNear(FloatingWindowFixture::Frame(paused.hwnd),
+                              recovered.Find(paused.hwnd)->lastRequestedRect),
+        "a recovery state event places the resumed window on its tile");
+
+  Reconcile::ForgetManagedWindow(paused.hwnd);
+  std::printf("Passed %u unresponsive placement checks.\n", check.passed);
 }
 
 // Tile Workspace hears which windows Automatic overflow released while it ran,
@@ -1797,10 +1982,9 @@ static void RunDiagnosticReportShapeTest() {
     digest ^= static_cast<unsigned char>(ch);
     digest *= 1099511628211ull;
   }
-  // Recorded from the implementation as of 2026-11-20 (the always-zero
-  // "ignored" record counts removed; one Explorer shell binding line instead of
-  // two). Intentional report format changes must update this value.
-  if (digest != 0x670263f5aa825297ull) {
+  // Includes the placement deferral counter for unresponsive windows.
+  // Intentional report format changes must update this value.
+  if (digest != 0x793f680f454408f0ull) {
     std::fprintf(stderr, "FAILED: diagnostic report shape changed (%016llx)\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }
@@ -2234,6 +2418,7 @@ int main() {
   RunOverflowDestinationFitTests();
   RunCommandReleaseTests();
   RunConstraintRetryTests();
+  RunUnresponsivePlacementTest();
   RunGhostWindowTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();

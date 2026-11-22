@@ -488,12 +488,25 @@ static void FinalizeExpiredConformanceLease(
     stale();
     return;
   }
+  // A window that still cannot answer has given us no evidence that it rejects
+  // the tile. Keep its slot and let responsive siblings settle the mutation.
+  if (record->constraints.lastProbeError == ERROR_TIMEOUT) {
+    g_workspaces.Save(key, workspace);
+    ClearSettledLayoutMutation(key, workspace);
+    stale();
+    return;
+  }
   if (constraintRefresh == ConformanceConstraintRefresh::Changed) {
     const WindowConstraints& observed = record->constraints;
     Diagnostics::RecordEvent(
         L"conformance deadline refreshed native constraints hwnd=%p min=%ldx%ld dpi=%u",
         hwnd, observed.minWidth, observed.minHeight, observed.dpi);
     g_workspaces.Save(key, workspace);
+    ArrangeWorkspace(key, lease.preferredTiledWindow);
+    return;
+  }
+  if (record->lastPlacementResult == PlacementResult::Unresponsive) {
+    // The window answered again. Give it a placement before judging its frame.
     ArrangeWorkspace(key, lease.preferredTiledWindow);
     return;
   }
@@ -746,7 +759,8 @@ static bool HandleFloatingLeaseLocationChange(HWND hwnd, const ConformanceLease&
     // The app's answer to this placement is its own frame. Keep it.
     CancelConformanceLease(hwnd, lease.generation);
     RememberCurrentFloatingGeometry(owner->key, workspace, hwnd);
-  } else if (placement.result == PlacementResult::Refused && leaseRetained) {
+  } else if ((placement.result == PlacementResult::Refused ||
+              placement.result == PlacementResult::Unresponsive) && leaseRetained) {
     const ULONGLONG due = std::min(
         lease.expiresAtTickMs, GetTickCount64() + g_settings.conformanceRepairIntervalMs);
     DeferConformanceLeaseRepair(hwnd, lease.generation, due);
@@ -790,6 +804,7 @@ static void FinalizeExpiredFloatingLease(HWND hwnd, const ConformanceLease& leas
 // imply that this routine had no effects. All rectangles are physical screen pixels.
 static bool HandleTiledWindowLocationChange(HWND hwnd) {
   if (Gestures::IsMoveSizeGestureInProgress(hwnd)) return true;
+  if (Platform::Windows::GhostWindowOf(hwnd)) return true;
 
   ConformanceLease lease;
   const ConformanceLeaseReadResult leaseState = ReadConformanceLease(hwnd, &lease);
@@ -798,6 +813,9 @@ static bool HandleTiledWindowLocationChange(HWND hwnd) {
     return true;
   }
   const bool hasLease = leaseState == ConformanceLeaseReadResult::Active;
+  // Once Windows knows the app is hung, its next repair cannot succeed. The
+  // existing deadline can settle bookkeeping and ghost recovery can reflow.
+  if (hasLease && IsHungAppWindow(hwnd)) return true;
   if (hasLease && lease.kind == ConformanceLeaseKind::Floating) {
     return HandleFloatingLeaseLocationChange(hwnd, lease);
   }

@@ -93,12 +93,12 @@ static HWND ResolveMoveSizeTarget(DWORD event, HWND hwnd) {
 // An event on a ghost is about the hung window it stands in for, whose state is
 // read from the ghost (Platform::Windows::GhostWindowOf). Known ghosts are
 // remembered; a new one is recognized when it is shown, takes the foreground,
-// or is minimized or restored, one of which a ghost always does first.
+// is minimized or restored, or starts a move/resize gesture.
 
 static bool CanIntroduceGhost(DWORD event) {
   return event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_FOREGROUND ||
          event == EVENT_OBJECT_STATECHANGE || event == EVENT_SYSTEM_MINIMIZESTART ||
-         event == EVENT_SYSTEM_MINIMIZEEND;
+         event == EVENT_SYSTEM_MINIMIZEEND || IsMoveSizeEvent(event);
 }
 
 // The managed hung window `hwnd` is the ghost of, or nullptr. A known ghost is
@@ -170,7 +170,7 @@ static bool IsDiscoveryPrompt(DWORD event, HWND hwnd) {
 
 // A user drag or resize always wins over pending automatic work for that window.
 // For managed windows, records the start/end frames that Gestures classifies later.
-static void OnMoveSize(DWORD event, HWND hwnd, bool tracked) {
+static void OnMoveSize(DWORD event, HWND hwnd, bool tracked, HWND frameWindow) {
   if (event == EVENT_SYSTEM_MOVESIZESTART) {
     g_wm.CancelPendingWindowMoves(hwnd);
     if (g_wm.routing.ready) {
@@ -188,7 +188,7 @@ static void OnMoveSize(DWORD event, HWND hwnd, bool tracked) {
   }
 
   RECT frame{};
-  if (Platform::Windows::GetWindowFrameRect(hwnd, &frame)) {
+  if (Platform::Windows::GetWindowFrameRect(frameWindow, &frame)) {
     if (event == EVENT_SYSTEM_MOVESIZESTART) {
       Gestures::g_moveSize.startRects[hwnd] = frame;
     } else {
@@ -226,7 +226,11 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // Anything that happens to a ghost may change its hung window's state: have the
   // WM thread look again. Its destroy, when the app recovers, is not the window's.
   if (const HWND hung = ResolveGhost(event, hwnd)) {
-    QueueWindowEvent(EVENT_OBJECT_STATECHANGE, hung);
+    if (IsMoveSizeEvent(event)) {
+      OnMoveSize(event, hung, true, hwnd);
+    } else {
+      QueueWindowEvent(EVENT_OBJECT_STATECHANGE, hung);
+    }
     return;
   }
 
@@ -239,7 +243,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   } else if (!tracked && !IsDiscoveryPrompt(event, hwnd)) {
     return;  // Unknown window, and not an event that should trigger discovery.
   } else if (IsMoveSizeEvent(event)) {
-    OnMoveSize(event, hwnd, tracked);
+    OnMoveSize(event, hwnd, tracked, hwnd);
   } else {
     OnLifecycleEvent(event, hwnd);
   }

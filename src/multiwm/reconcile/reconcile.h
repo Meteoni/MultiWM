@@ -250,7 +250,7 @@ static bool ReadoptFloatingSnapshot(
     const WindowRecord* record = workspace.Find(hwnd);
     if (record && record->state == ManageState::Floating) {
       RECT frame{};
-      if (Platform::Windows::GetWindowFrameRect(hwnd, &frame)) {
+      if (Platform::Windows::GetDisplayedWindowFrameRect(hwnd, &frame)) {
         workspace.RememberFloatingGeometry(hwnd, frame, dpi);
       }
       changed |= workspace.ActivateTiled(hwnd);
@@ -1508,6 +1508,22 @@ static void ProcessWindowLifecycleEvent(DWORD event, HWND hwnd) {
       // minimize/maximize/fullscreen transitions preserve membership through a
       // saved slot. Run immediately and after settle.
       ReconcileManagedWindowStateNow(hwnd);
+      // Ghost creation, size changes and recovery can change tile geometry
+      // without changing participation.
+      if (event == EVENT_OBJECT_STATECHANGE && Platform::Windows::IsWindowTrackedInAnyState(hwnd)) {
+        const auto owner = Placement::LoadConformanceWorkspace(hwnd);
+        const WindowRecord* record = owner ? owner->workspace.Find(hwnd) : nullptr;
+        if (record && owner->workspace.IsTiled(hwnd) &&
+            owner->workspace.Layout() != TileLayout::Floating) {
+          const SIZE size = Platform::Windows::GetRestoredGhostSize(hwnd);
+          if (!Gestures::IsMoveSizeGestureInProgress(hwnd) &&
+              (size.cx != record->ghostSize.cx || size.cy != record->ghostSize.cy ||
+               (!size.cx && record->lastPlacementResult == PlacementResult::Unresponsive &&
+                !IsHungAppWindow(hwnd)))) {
+            Placement::ArrangeWorkspace(owner->key);
+          }
+        }
+      }
       ScheduleLifecycleReconcile(hwnd);
       break;
 

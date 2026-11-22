@@ -118,6 +118,21 @@ statically linked and run them through this script; direct `.exe` launches do
 not receive the policy. See the [Windows policy documentation](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-process_mitigation_binary_signature_policy)
 and [Windhawk's injector](https://github.com/ramensoftware/windhawk/blob/main/src/windhawk/engine/new_process_injector.cpp).
 
+For manual hung-window testing, build and launch the standalone fixture from
+the repository root.
+
+```powershell
+$CompilerRoot = 'C:/path/to/Windhawk/Compiler'
+New-Item -ItemType Directory -Force output/tests | Out-Null
+& "$CompilerRoot/bin/clang++.exe" -target x86_64-w64-mingw32 -municode -mwindows -static `
+  tests/hung_window.cpp -o output/tests/hung_window.exe
+./output/tests/hung_window.exe
+```
+
+Let MultiWM tile the resizable window, then click **Hang for 60 seconds**.
+Interact with the window during the pause to exercise Windows' ghost window.
+The app resumes automatically and can be hung again.
+
 Build with the Windhawk/WHAM compiler configuration. For changes to layout,
 ownership, or native sequencing, exercise the affected behavior and compare the
 result with the prior implementation. Include failures, stale observations, and

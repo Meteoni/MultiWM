@@ -177,7 +177,8 @@ static RouteStep MoveToRouteMonitor(
   const RECT target = SharedGeometry::CenteredIn(
       workArea, Layout::RectWidth(*sourceFrame), Layout::RectHeight(*sourceFrame));
   const auto placed = Platform::Windows::PlaceWindowChecked(hwnd, true, target, true);
-  if (placed.result == PlacementResult::SuppressedByPhysicalState) return RouteStep::Retry;
+  if (placed.result == PlacementResult::SuppressedByPhysicalState ||
+      placed.result == PlacementResult::Unresponsive) return RouteStep::Retry;
   AddUniqueMonitor(monitors, Platform::Windows::GetWindowPhysicalMonitor(hwnd));
   if (placed.result != PlacementResult::Success ||
       Platform::Windows::GetWindowPhysicalMonitor(hwnd) != route.targetMonitor) {

@@ -59,6 +59,7 @@ struct Counters {
   uint64_t placementAccessDenied = 0;
   uint64_t placementRefused = 0;
   uint64_t placementDead = 0;
+  uint64_t placementUnresponsive = 0;
   uint64_t floatingGeometryRepairs = 0;
 
   uint64_t constraintProbeAttempts = 0;

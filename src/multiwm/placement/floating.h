@@ -107,16 +107,17 @@ static bool RepairFloatingGeometry(
   if (!Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) return false;
   const RECT& workArea = metrics.workArea;
   const UINT targetDpi = metrics.dpi;
+  const HWND ghost = Platform::Windows::GhostWindowOf(hwnd);
 
   SharedGeometry::FloatingRequest request;
-  request.source = FloatingSizeSourceFor(hint.intent);
+  request.source = ghost ? SharedGeometry::FloatingSizeSource::Own : FloatingSizeSourceFor(hint.intent);
   request.workArea = workArea;
-  request.canResize = record->canResize;
+  request.canResize = !ghost && record->canResize;
   request.honorPreserveSize = hint.intent != FloatingPlacementIntent::FailureCenter;
   request.defaultSize = SIZE{SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.width, targetDpi),
                              SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.height, targetDpi)};
   RECT current{};
-  if (Platform::Windows::GetWindowFrameRect(hwnd, &current) && current.right > current.left &&
+  if (Platform::Windows::GetWindowFrameRect(ghost ? ghost : hwnd, &current) && current.right > current.left &&
       current.bottom > current.top) {
     request.current = SIZE{SharedGeometry::Width(current), SharedGeometry::Height(current)};
   }
@@ -160,6 +161,12 @@ static bool RepairFloatingGeometry(
   if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     return false;
   }
+  if (ghost) {
+    if (!Platform::Windows::MoveGhostWindow(hwnd, ghost, target)) return false;
+    workspace.RememberFloatingGeometry(hwnd, target, targetDpi);
+    ++Diagnostics::g_runtime.counters.floatingGeometryRepairs;
+    return true;
+  }
   return PlaceFloatingWindow(workspace, hwnd, targetDpi, target, placement->moveOnly);
 }
 
@@ -171,6 +178,7 @@ static bool StepFloatingWindowSize(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd, int direction) {
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record || !record->canMove || !record->canResize || !IsWindow(hwnd) ||
+      Platform::Windows::GhostWindowOf(hwnd) ||
       Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     return false;
   }
@@ -217,7 +225,7 @@ static bool RememberCurrentFloatingGeometry(
   if (!monitor) return false;
 
   RECT frame{};
-  if (!Platform::Windows::GetWindowFrameRect(hwnd, &frame) || frame.right <= frame.left ||
+  if (!Platform::Windows::GetDisplayedWindowFrameRect(hwnd, &frame) || frame.right <= frame.left ||
       frame.bottom <= frame.top) {
     return false;
   }
@@ -231,7 +239,7 @@ static bool RememberCurrentFloatingGeometry(
 static void RememberFloatingLayoutFrames(Workspace& workspace, UINT dpi) {
   for (HWND hwnd : workspace.TiledWindows()) {
     RECT frame{};
-    if (Platform::Windows::IsSuspendedOrCloaked(hwnd) || !Platform::Windows::GetWindowFrameRect(hwnd, &frame)) {
+    if (Platform::Windows::IsSuspendedOrCloaked(hwnd) || !Platform::Windows::GetDisplayedWindowFrameRect(hwnd, &frame)) {
       continue;
     }
     workspace.RememberFloatingGeometry(hwnd, frame, dpi);

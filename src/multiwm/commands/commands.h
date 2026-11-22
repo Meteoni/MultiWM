@@ -26,6 +26,7 @@ static bool ValidateUserLayoutMutation(
       const WindowRecord* currentRecord = current.Find(hwnd);
       if (currentRecord) {
         candidate.UpdateConstraints(hwnd, currentRecord->constraints);
+        candidate.UpdateGhostSize(hwnd, currentRecord->ghostSize);
       }
     }
   }
@@ -101,10 +102,11 @@ struct ForegroundWorkspace {
   Workspace workspace;
 };
 
-static std::optional<ForegroundWorkspace> LoadForegroundWorkspace() {
+static std::optional<ForegroundWorkspace> LoadForegroundWorkspace(HWND foreground = GetForegroundWindow()) {
   ForegroundWorkspace current;
-  current.foreground = GetForegroundWindow();
-  if (!current.foreground) return std::nullopt;
+  if (!foreground) return std::nullopt;
+  const HWND hung = Platform::Windows::HungWindowOfGhost(foreground);
+  current.foreground = hung ? hung : foreground;
   current.monitor = Platform::Windows::GetWindowPhysicalMonitor(current.foreground);
   GUID desktopId{};
   if (!current.monitor ||
@@ -133,9 +135,9 @@ static constexpr const wchar_t* kNotInFloatingLayout = L"Not available in the Fl
 
 // Promotes the foreground window, or its tiled owner, to the master slot, then
 // clears stale gesture samples for both windows and reflows the workspace.
-void SwapMaster() {
+void SwapMaster(HWND foreground = GetForegroundWindow()) {
   ++Diagnostics::g_runtime.counters.swapMasterCommands;
-  auto current = LoadForegroundWorkspace();
+  auto current = LoadForegroundWorkspace(foreground);
   if (!current) return ReportNoTargetWindow(current);
   if (current->workspace.Layout() == TileLayout::Floating) return ReportCommandRefused(kNotInFloatingLayout, current);
   const DesktopMonitorKey& key = current->key;
@@ -164,14 +166,14 @@ void SwapMaster() {
 // Moves the focused tiled window one slot toward or away from the front of the
 // workspace's logical order. The operation is deliberately non-wrapping so the
 // first and last slots remain stable boundaries.
-static void MoveFocusedWindowOneSlot(bool promote) {
+static void MoveFocusedWindowOneSlot(bool promote, HWND foreground) {
   if (promote) {
     ++Diagnostics::g_runtime.counters.promoteWindowCommands;
   } else {
     ++Diagnostics::g_runtime.counters.demoteWindowCommands;
   }
 
-  auto current = LoadForegroundWorkspace();
+  auto current = LoadForegroundWorkspace(foreground);
   if (!current) return ReportNoTargetWindow(current);
   if (current->workspace.Layout() == TileLayout::Floating) return ReportCommandRefused(kNotInFloatingLayout, current);
   const DesktopMonitorKey& key = current->key;
@@ -207,12 +209,12 @@ static void MoveFocusedWindowOneSlot(bool promote) {
       resolved, index, otherIndex);
 }
 
-void PromoteFocusedWindow() {
-  MoveFocusedWindowOneSlot(true);
+void PromoteFocusedWindow(HWND foreground = GetForegroundWindow()) {
+  MoveFocusedWindowOneSlot(true, foreground);
 }
 
-void DemoteFocusedWindow() {
-  MoveFocusedWindowOneSlot(false);
+void DemoteFocusedWindow(HWND foreground = GetForegroundWindow()) {
+  MoveFocusedWindowOneSlot(false, foreground);
 }
 
 void FloatFocusedWindow() {
@@ -277,6 +279,7 @@ static std::optional<FocusedMember> LoadFocusedMember() {
   const WindowRecord* record = focused.workspace.Find(focused.hwnd);
   focused.floating = focused.workspace.Layout() == TileLayout::Floating ||
                      (record && record->state == ManageState::Floating);
+  if (!focused.floating) Placement::RefreshWorkspaceGhostSizes(focused.workspace);
   return focused;
 }
 
@@ -311,7 +314,7 @@ void StepFocusedWindowSize(bool grow) {
 
   if (focused->floating) {
     const WindowRecord* record = focused->workspace.Find(focused->hwnd);
-    if (record && !record->canResize) {
+    if ((record && !record->canResize) || Platform::Windows::GhostWindowOf(focused->hwnd)) {
       TrayUi::ShowCommandFailureFlyout(L"This window can't be resized", focused->monitor);
     } else if (Placement::StepFloatingWindowSize(focused->key, focused->workspace, focused->hwnd, grow ? 1 : -1)) {
       g_workspaces.Save(focused->key, focused->workspace);
@@ -561,7 +564,7 @@ static void HandleUserMove(
     for (HWND candidate : workspace.TiledWindows()) {
       if (candidate == hwnd) continue;
       RECT rect{};
-      if (Platform::Windows::GetWindowFrameRect(candidate, &rect) && PtInRect(&rect, gesture.dropPoint)) {
+      if (Platform::Windows::GetDisplayedWindowFrameRect(candidate, &rect) && PtInRect(&rect, gesture.dropPoint)) {
         target = candidate;
         break;
       }
@@ -601,6 +604,7 @@ static void HandleUserResize(
     return;
   }
 
+  Placement::RefreshWorkspaceGhostSizes(workspace);
   Workspace candidate = workspace;
   bool changed = false;
   switch (candidate.Layout()) {

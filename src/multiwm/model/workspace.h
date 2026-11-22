@@ -119,6 +119,7 @@ enum class PlacementResult {
   AccessDenied,
   Refused,
   Dead,
+  Unresponsive,
 };
 
 // Native minimum tracking constraints converted to the DWM extended-frame
@@ -180,6 +181,9 @@ struct WindowRecord {
   // title change cannot make an explicitly protected window tileable by accident.
   bool alwaysFloating = false;
   WindowConstraints constraints{};
+  // The visible ghost's fixed frame size in physical pixels while it stands in
+  // for this window. Zero when there is no restored ghost.
+  SIZE ghostSize{};
 
   PlacementResult lastPlacementResult = PlacementResult::Success;
   RECT lastRequestedRect{};
@@ -314,6 +318,7 @@ class Workspace {
   // previous one. Also assigns a tiling generation to a non-floating record that
   // had none, even when it returns false.
   bool UpdateConstraints(HWND hwnd, const WindowConstraints& constraints);
+  bool UpdateGhostSize(HWND hwnd, SIZE size);
   // Stores the floating frame (physical pixels, captured at `dpi`) to restore
   // when floated again. Returns false for an empty frame or an unchanged value.
   bool RememberFloatingGeometry(HWND hwnd, const RECT& frame, UINT dpi);
