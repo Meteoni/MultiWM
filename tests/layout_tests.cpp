@@ -1894,17 +1894,6 @@ static void RunBspLayoutTests() {
   check(same(frames(stepped, {a, b}), {{0, 0, 800, 900}, {800, 0, 1600, 900}}), "reset evens the split");
   check(!stepped.ResetTiledSize(area, 0, stepped.TiledIndex(b), 0.5), "an even split has nothing to reset");
 
-  // Set Master trades places with the largest window, not the first one.
-  Workspace mastered;
-  mastered.SetLayout(TileLayout::Bsp);
-  for (HWND hwnd : {a, b, c}) admit(mastered, hwnd);
-  check(mastered.TiledWindows().front() == a && Commands::LargestBspWindow(mastered, a, area, 0) == b,
-        "the right half, not the first quarter, is the largest window");
-  check(Commands::LargestBspWindow(mastered, b, area, 0) == b, "the largest window is already there");
-  check(Commands::LargestBspWindow(stepped, b, area, 0) == b, "even halves don't trade places");
-  const RECT oddArea{0, 0, 1601, 900};
-  check(Commands::LargestBspWindow(stepped, a, oddArea, 0) == a, "a pixel of rounding doesn't make one larger");
-
   // The companion's prediction runs the real admission, so it lands in the
   // leaf the arrival rule picks.
   const Platform::Monitors::WorkspaceMetrics metrics{area, 96, 0};

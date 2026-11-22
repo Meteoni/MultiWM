@@ -96,7 +96,7 @@ struct Counters {
   uint64_t tileCommands = 0;
   uint64_t layoutCycleCommands = 0;
   uint64_t floatFocusedCommands = 0;
-  uint64_t swapMasterCommands = 0;
+  uint64_t layoutActionCommands = 0;
   uint64_t promoteWindowCommands = 0;
   uint64_t demoteWindowCommands = 0;
   uint64_t growWindowCommands = 0;
@@ -547,6 +547,7 @@ enum class UserLayoutMutationKind {
   Resize,
   Order,
   BspMerge,
+  BspRotate,
   LayoutChange,
 };
 

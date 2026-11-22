@@ -350,6 +350,7 @@ class Workspace {
   // Swaps two tiled windows' positions. False unless both are tiled and distinct.
   bool SwapTiled(HWND first, HWND second);
   // Exchanges two BSP sibling tiles, including their saved shares of the split.
+  size_t BspSiblingDivider(HWND first, HWND second) const;
   bool SwapBspSiblingTiles(HWND first, HWND second);
   // Gives the source's space to its sibling and splits another BSP tile with it.
   bool MoveBspLeaf(HWND source, HWND target, bool allowAlternateDirection = false);

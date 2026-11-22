@@ -714,7 +714,7 @@ static constexpr DiagnosticCounterRowSpec kRuntimeCounterRows[] = {
     {L"Tile commands", &Counters::tileCommands},
     {L"Layout cycle commands", &Counters::layoutCycleCommands},
     {L"Float focused commands", &Counters::floatFocusedCommands},
-    {L"Swap master commands", &Counters::swapMasterCommands},
+    {L"Layout action commands", &Counters::layoutActionCommands},
     {L"Promote window commands", &Counters::promoteWindowCommands},
     {L"Demote window commands", &Counters::demoteWindowCommands},
     {L"Grow window commands", &Counters::growWindowCommands},

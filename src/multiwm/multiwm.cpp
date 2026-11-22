@@ -45,9 +45,9 @@ continuous polling.
 - Monocle
 
 ## Getting Started
-Move a tiled window to **float it** or **swap it with the window underneath**. In BSP, drop near an edge to split the target tile or in the center to swap. The preview fills the destination of the dragged window and outlines the destination of the other window.
+Move a tiled window to **float it** or **swap it with the window underneath**. In BSP, drop near an edge to split the target tile or in the center to swap. Windows sharing a divider swap on center and parallel edge drops, and rotate on perpendicular edge drops. The preview fills the destination of the dragged window and outlines the destination of the other window.
 
-By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
+By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), the layout action (Alt+M, rotates the focused split in BSP or promotes the focused window),
 moving windows through the logical order (Alt+, / .), resizing the focused window (Alt+= / - / 0),
 floating a window (Alt+F), and switching between Automatic and Manual management (Alt+R).
 If another program already uses one of these shortcuts, a toast names it. A hotkey that can't act,
@@ -304,8 +304,8 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     $name: Cycle Layout
     $description: Switch to the next layout. Blank disables this shortcut.
   - SwapMasterKey: "M"
-    $name: Set Master Window
-    $description: Make the focused window the main window. In BSP, it trades places with the largest window. Blank disables this shortcut.
+    $name: Layout Action
+    $description: Rotate the focused window's parent split in BSP. In other tiled layouts, promote the focused window to the first slot. Blank disables this shortcut.
   - PromoteWindowKey: ","
     $name: Promote Focused Window
     $description: Move the focused window one place earlier. Blank disables this shortcut.
@@ -359,7 +359,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     #! $min: 0
     #! $max: 50
     #! $format: slider
-    $description: Percentage of each BSP tile from an edge that triggers a split. A drop on an edge splits in that direction if both windows fit and the dragged pane overlaps that edge of the original tile. The center swaps windows. At 0 all drops swap window positions and keep the weights with the tiles. With edge zones enabled, windows sharing a divider swap sides and carry their weights.
+    $description: Percentage of each BSP tile from an edge that triggers a split. A drop on an edge splits in that direction if both windows fit and the dragged pane overlaps that edge of the original tile. The center swaps windows. At 0 all drops swap window positions and keep the weights with the tiles. For windows sharing a divider, perpendicular edges rotate the split. The rest of the tile swaps the windows. Each window keeps its saved share.
   - FloatingDefaultSize: "960, 640"
     $name: Floating Default Size (DPI-scaled pixels)
     $description: Size of a window the first time it floats (Float Focused, a drag, the Floating layout) and of a new window that can't be tiled. Override-size rules replace it in Automatic mode. Enter width, height (100-4000).

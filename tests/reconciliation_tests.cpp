@@ -1141,7 +1141,7 @@ static void RunBspDragTests() {
     if (zone == Zone::Right) gesture.dropPoint.x = frame.right - 1;
     if (zone == Zone::Top) gesture.dropPoint.y = frame.top;
     if (zone == Zone::Bottom) gesture.dropPoint.y = frame.bottom - 1;
-    Commands::HandleUserMove(fixture.key, workspace, dragged, gesture);
+    Commands::HandleUserMove(fixture.key, workspace, dragged, gesture, fixture.workArea);
     return fixture.Load();
   };
 
@@ -1211,7 +1211,7 @@ static void RunBspDragTests() {
         "put the original target at x=300 to x=650");
   Workspace offEdgeCandidate = offEdge;
   std::vector<RECT> offEdgeRects;
-  check(Commands::PrepareTiledDrop(offEdgeCandidate, source, {target, Zone::Right}) ==
+  check(Commands::PrepareTiledDrop(offEdgeCandidate, source, {target, Zone::Right}, offEdgeMetrics.workArea) ==
             Placement::UserLayoutMutationKind::BspMerge &&
             Layout::BuildWorkspaceLayoutPlan(offEdgeCandidate, offEdgeMetrics.workArea, 0, &offEdgeRects) ==
                 Layout::LayoutPlanStatus::Success &&
@@ -1221,7 +1221,7 @@ static void RunBspDragTests() {
 
   for (const Zone zone : {Zone::Left, Zone::Top}) {
     Workspace leadingSplit = initial;
-    check(Commands::PrepareTiledDrop(leadingSplit, source, {target, zone}) ==
+    check(Commands::PrepareTiledDrop(leadingSplit, source, {target, zone}, fixture.workArea) ==
               Placement::UserLayoutMutationKind::BspMerge &&
               leadingSplit.TiledIndex(source) + 1 == leadingSplit.TiledIndex(target),
           "dropping on a leading edge puts the dragged window first in the split");
@@ -1395,6 +1395,60 @@ static void RunBspDragTests() {
                                            fixture.metrics.dpi, true};
   const double originalRatio = uneven.Bsp().Nodes().front().ratio;
   g_settings.adaptiveDwindleSlots = 0;
+  const auto rotatedAxis = landscape ? Layout::Axis::Y : Layout::Axis::X;
+  const Zone leadingPerpendicular = landscape ? Zone::Top : Zone::Left;
+  for (const Zone edge : {leadingPerpendicular, splitEdge}) {
+    const auto preview = Commands::PlanTiledDropPreview(uneven, source, {target, edge}, fixture.metrics);
+    const Workspace rotated = dropOnto(source, target, edge);
+    const RECT sourceFrame = FloatingWindowFixture::Frame(source);
+    const RECT targetFrame = FloatingWindowFixture::Frame(target);
+    const bool leading = edge == leadingPerpendicular;
+    check(preview && EqualRect(&preview->dragged, &sourceFrame) && EqualRect(&preview->affected, &targetFrame) &&
+              rotated.Bsp().Nodes().front().direction == rotatedAxis &&
+              rotated.TiledWindows().front() == (leading ? source : target) &&
+              std::abs(rotated.Bsp().Nodes().front().ratio - (leading ? originalRatio : 1.0 - originalRatio)) < 1e-9,
+          "both perpendicular edges rotate the sibling split, carry shares, and match the drop preview");
+    FloatingWindowFixture::ClearLeases();
+    g_workspaces.Save(fixture.key, uneven);
+    Placement::ArrangeWorkspace(fixture.key);
+  }
+  Workspace alongAxis = dropOnto(source, target, fittingEdge);
+  check(!alongAxis.Bsp().Nodes().front().direction && alongAxis.TiledWindows().front() == target &&
+            std::abs(alongAxis.Bsp().Nodes().front().ratio - (1.0 - originalRatio)) < 1e-9,
+        "an edge along the existing split performs the weighted swap");
+  FloatingWindowFixture::ClearLeases();
+  g_workspaces.Save(fixture.key, uneven);
+  Placement::ArrangeWorkspace(fixture.key);
+
+  Commands::ApplyLayoutAction(source);
+  const Workspace rotatedByKey = fixture.Load();
+  check(rotatedByKey.TiledWindows() == uneven.TiledWindows() &&
+            rotatedByKey.Bsp().Nodes().front().direction == rotatedAxis &&
+            rotatedByKey.Bsp().Nodes().front().ratio == originalRatio,
+        "the layout action rotates the focused split without changing its order or ratio");
+  Commands::ApplyLayoutAction(source);
+  check(fixture.Load().HasSameLayoutStateAs(uneven), "the layout action toggles the split back");
+
+  reportedMinimum = {landscape ? 1 : sourceWidth * 3 / 4, landscape ? sourceHeight * 3 / 4 : 1};
+  Workspace tooTallToRotate = uneven;
+  tooTallToRotate.UpdateConstraints(source, {reportedMinimum.x, reportedMinimum.y, fixture.metrics.dpi, true});
+  g_workspaces.Save(fixture.key, tooTallToRotate);
+  originalProcedure = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(source, GWLP_WNDPROC,
+                                                                  reinterpret_cast<LONG_PTR>(reportMinimum)));
+  check(originalProcedure != nullptr, "install a minimum that fits only the current split direction");
+  const auto rejectedRotations = Diagnostics::g_runtime.counters.rejectedOrderCommands;
+  check(!Commands::PlanTiledDropPreview(tooTallToRotate, source, {target, splitEdge}, fixture.metrics) &&
+            dropOnto(source, target, splitEdge).HasSameLayoutStateAs(uneven),
+        "a perpendicular drop that cannot fit rejects the rotation");
+  Commands::ApplyLayoutAction(source);
+  check(fixture.Load().HasSameLayoutStateAs(uneven) &&
+            Diagnostics::g_runtime.counters.rejectedOrderCommands == rejectedRotations + 2,
+        "the layout action also rejects a rotation that cannot fit");
+  SetWindowLongPtrW(source, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(originalProcedure));
+  FloatingWindowFixture::ClearLeases();
+  g_workspaces.Save(fixture.key, uneven);
+  Placement::ArrangeWorkspace(fixture.key);
+
   reportedMinimum = {increasedMinimum.minWidth, increasedMinimum.minHeight};
   originalProcedure = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(target, GWLP_WNDPROC,
                                                                   reinterpret_cast<LONG_PTR>(reportMinimum)));
@@ -1582,7 +1636,7 @@ static void CheckGhostLayoutAndCommands(CheckCounter& check, FloatingWindowFixtu
   drop.dropPoint = SharedGeometry::RectCenter(FloatingWindowFixture::Frame(ghost));
   workspace = f.Load();
   g_settings.mouseMoveBehavior = MouseMoveBehavior::Swap;
-  Commands::HandleUserMove(f.key, workspace, other, drop);
+  Commands::HandleUserMove(f.key, workspace, other, drop, f.workArea);
   check(f.Load().TiledIndex(hung) == 1 && f.Load().TiledIndex(other) == 0,
         "dropping a sibling onto the ghost is refused: the ghost would have to move");
 
@@ -2568,7 +2622,7 @@ static void RunDiagnosticReportShapeTest() {
   }
   // Includes the adaptive split settings measured from saved dividers.
   // Intentional report format changes must update this value.
-  if (digest != 0xa39f8192ee9dfeedull) {
+  if (digest != 0x9b009582af3d245cull) {
     std::fprintf(stderr, "FAILED: diagnostic report shape changed (%016llx)\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }

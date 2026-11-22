@@ -62,9 +62,9 @@ glossary, and testing.
 - Monocle
 
 ## Getting Started
-Move a tiled window to **float it** or **swap it with the window underneath**. In BSP, drop near an edge to split the target tile in that direction, or in the center to swap. Adaptive dividers can make room as long as the dragged pane overlaps the requested edge of the original tile. The preview fills the destination of the dragged window and outlines the destination of the other window. When a drop would snap the dragged window back, both shapes mark its original tile. Adjust **BSP Split Edge Size** under Window Behavior and customize the hint under **Appearance > Drag Preview** in Windhawk. With edge zones enabled, windows that share a divider swap sides and carry their weights.
+Move a tiled window to **float it** or **swap it with the window underneath**. In BSP, drop near an edge to split the target tile in that direction, or in the center to swap. Adaptive dividers can make room as long as the dragged pane overlaps the requested edge of the original tile. The preview fills the destination of the dragged window and outlines the destination of the other window. When a drop would snap the dragged window back, both shapes mark its original tile. Adjust **BSP Split Edge Size** under Window Behavior and customize the hint under **Appearance > Drag Preview** in Windhawk. With edge zones enabled, windows sharing a divider rotate the split on perpendicular edge drops. The rest of the tile swaps them. Each window carries its saved share.
 
-By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
+By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), running the layout action (Alt+M, rotates the focused split in BSP or promotes the focused window in other tiled layouts),
 moving windows through the logical order (Alt+, / .), resizing the focused window (Alt+= / - / 0), floating a
 window (Alt+F), and switching between Automatic and Manual management (Alt+R). If another program already uses
 one of these shortcuts, a toast names it; choose a different key or modifier in the hotkey settings.

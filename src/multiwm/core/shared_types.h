@@ -193,7 +193,7 @@ void NotifyDisplayTopologyChanged();
 enum HotkeyIds {
   HK_TILE = 1,
   HK_LAYOUT = 2,
-  HK_SWAP_MASTER = 3,
+  HK_LAYOUT_ACTION = 3,
   HK_MANAGEMENT_MODE_TOGGLE = 4,
   HK_FLOAT_FOCUSED = 5,
   HK_DIAGNOSTIC_DUMP = 6,
@@ -331,7 +331,7 @@ struct SettingsState {
   UINT tilingModifiers = MOD_ALT;
   UINT tileKey = 'T';
   UINT layoutKey = 'L';
-  UINT swapMasterKey = 'M';
+  UINT layoutActionKey = 'M';
   UINT promoteWindowKey = VK_OEM_COMMA;
   UINT demoteWindowKey = VK_OEM_PERIOD;
   UINT managementModeToggleKey = 'R';
@@ -406,7 +406,7 @@ struct HotkeyBinding {
 inline constexpr HotkeyBinding kHotkeyBindings[] = {
     {HK_TILE, L"hotkeys.TileKey", &SettingsState::tileKey, L"Tile Workspace", false},
     {HK_LAYOUT, L"hotkeys.LayoutKey", &SettingsState::layoutKey, L"Cycle Layout", false},
-    {HK_SWAP_MASTER, L"hotkeys.SwapMasterKey", &SettingsState::swapMasterKey, L"Set Master Window", false},
+    {HK_LAYOUT_ACTION, L"hotkeys.SwapMasterKey", &SettingsState::layoutActionKey, L"Layout Action", false},
     {HK_PROMOTE_WINDOW, L"hotkeys.PromoteWindowKey", &SettingsState::promoteWindowKey, L"Promote Focused Window",
      true},
     {HK_DEMOTE_WINDOW, L"hotkeys.DemoteWindowKey", &SettingsState::demoteWindowKey, L"Demote Focused Window", true},

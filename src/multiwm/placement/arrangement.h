@@ -399,6 +399,7 @@ static void ReportRejectedLayoutMutation(
       break;
     case UserLayoutMutationKind::Order:
     case UserLayoutMutationKind::BspMerge:
+    case UserLayoutMutationKind::BspRotate:
       ++Diagnostics::g_runtime.counters.rejectedOrderCommands;
       break;
     case UserLayoutMutationKind::LayoutChange:
@@ -454,9 +455,9 @@ static bool TryRollbackPendingLayoutMutation(
     g_pendingProofs.DiscardLayoutMutation(key);
     return false;
   }
-  // A rejected merge relinquishes the target even if the original layout now
-  // needs constraint recovery of its own.
-  if (mutation.kind != UserLayoutMutationKind::BspMerge) {
+  // A rejected split change restores its previous geometry even if that
+  // layout now needs constraint recovery of its own.
+  if (mutation.kind != UserLayoutMutationKind::BspMerge && mutation.kind != UserLayoutMutationKind::BspRotate) {
     std::vector<RECT> restoredRects;
     const auto restoredStatus = Layout::BuildWorkspaceLayoutPlan(
         restored, rollbackMetrics.workArea, rollbackMetrics.gap, &restoredRects);
@@ -1185,7 +1186,9 @@ static void ArrangeWorkspace(
     const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
     std::optional<Layout::BspMergeDestination> merge;
     if (pending && pending->bspDropEdge) merge = Layout::BspMergeDestination{pending->subject, *pending->bspDropEdge};
-    const auto planStatus = Layout::PlanWithNewBspSplitFallback(workspace, workArea, gap, &rects, merge);
+    const auto planStatus = pending && pending->kind == UserLayoutMutationKind::BspRotate
+        ? Layout::BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects)
+        : Layout::PlanWithNewBspSplitFallback(workspace, workArea, gap, &rects, merge);
     if (planStatus == Layout::LayoutPlanStatus::NotApplicable) {
       g_workspaces.Save(key, workspace);
       break;

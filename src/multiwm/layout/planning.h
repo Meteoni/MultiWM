@@ -322,13 +322,16 @@ struct BspMergeDestination {
   RECT originalEdge;
 };
 
-// Turns BSP split `node` the other way. A direction that matches its depth's
-// default is stored as no direction, so the depth rule applies again.
-static void TurnBspSplit(Workspace& workspace, size_t node, const RECT& workArea) {
-  const BspTree& tree = workspace.Bsp();
+static Axis DefaultBspSplitAxis(const BspTree& tree, size_t node, const RECT& workArea) {
   size_t depth = 0;
   for (size_t parent = tree.Parent(node); parent != BspTree::kNotFound; parent = tree.Parent(parent)) ++depth;
-  const Axis defaultDirection = AlternatingAxis(FirstSplitAxis(workArea), depth);
+  return AlternatingAxis(FirstSplitAxis(workArea), depth);
+}
+
+// A direction matching the depth default lets the depth rule apply again.
+static void TurnBspSplit(Workspace& workspace, size_t node, const RECT& workArea) {
+  const BspTree& tree = workspace.Bsp();
+  const Axis defaultDirection = DefaultBspSplitAxis(tree, node, workArea);
   const Axis alternate = tree.Nodes()[node].direction.value_or(defaultDirection) == Axis::X ? Axis::Y : Axis::X;
   workspace.SetBspSplitDirection(node, alternate == defaultDirection ? std::nullopt : std::optional{alternate});
 }

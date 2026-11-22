@@ -260,8 +260,8 @@ static WmMessageDisposition DispatchWmThreadMessage(const MSG& msg) {
         case HK_LAYOUT:
           Commands::CycleCurrentWorkspaceLayout();
           break;
-        case HK_SWAP_MASTER:
-          Commands::SwapMaster();
+        case HK_LAYOUT_ACTION:
+          Commands::ApplyLayoutAction();
           break;
         case HK_PROMOTE_WINDOW:
           Commands::PromoteFocusedWindow();

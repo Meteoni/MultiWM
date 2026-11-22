@@ -232,62 +232,53 @@ static void ReportNoTargetWindow(const std::optional<ForegroundWorkspace>& curre
 
 static constexpr const wchar_t* kNotInFloatingLayout = L"Not available in the Floating layout";
 
-// BSP has no master, so Set Master trades places with the largest window as
-// shown. `focused`, a tiled window, is returned when it is the largest or
-// within 1% of it, so two even halves don't swap for nothing; ties go to the
-// first. Pure; `workArea` and `gap` are physical.
-static HWND LargestBspWindow(const Workspace& workspace, HWND focused, const RECT& workArea, LONG gap) {
-  const std::vector<RECT> cells = Model::PlanBspCells(workspace, workArea, gap).rects;
-  const size_t focusedIndex = workspace.TiledIndex(focused);
-  if (cells.empty() || focusedIndex >= cells.size()) return nullptr;
-  size_t largest = 0;
-  for (size_t i = 1; i < cells.size(); ++i) {
-    if (Layout::RectAreaLL(cells[i]) > Layout::RectAreaLL(cells[largest])) largest = i;
-  }
-  if (Layout::RectAreaLL(cells[focusedIndex]) * 100 >= Layout::RectAreaLL(cells[largest]) * 99) return focused;
-  return workspace.TiledWindows()[largest];
-}
-
-// The window Set Master swaps `resolved` with: the master (the first window),
-// or in BSP the largest one. Null when the work area can't be read.
-static HWND SetMasterPartner(const Workspace& workspace, HWND resolved, HMONITOR monitor) {
-  if (workspace.Layout() != TileLayout::Bsp) return workspace.TiledWindows().front();
-  Platform::Monitors::WorkspaceMetrics metrics;
-  if (!Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) return nullptr;
-  return LargestBspWindow(workspace, resolved, metrics.workArea, metrics.gap);
-}
-
-// Promotes the foreground window, or its tiled owner, to the master slot (in
-// BSP, the largest window's place), then clears stale gesture samples for both
-// windows and reflows the workspace.
-void SwapMaster(HWND foreground = GetForegroundWindow()) {
-  ++Diagnostics::g_runtime.counters.swapMasterCommands;
+// Promote the focused window, or rotate its immediate divider in BSP.
+void ApplyLayoutAction(HWND foreground = GetForegroundWindow()) {
+  ++Diagnostics::g_runtime.counters.layoutActionCommands;
   auto current = LoadForegroundWorkspace(foreground);
   if (!current) return ReportNoTargetWindow(current);
-  if (current->workspace.Layout() == TileLayout::Floating) return ReportCommandRefused(kNotInFloatingLayout, current);
-  const DesktopMonitorKey& key = current->key;
   const Workspace& workspace = current->workspace;
+  if (workspace.Layout() == TileLayout::Floating) return ReportCommandRefused(kNotInFloatingLayout, current);
 
-  HWND resolved = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
-  if (!resolved) return ReportNoTargetWindow(current);
-  const bool bsp = workspace.Layout() == TileLayout::Bsp;
-  HWND oldMaster = SetMasterPartner(workspace, resolved, current->monitor);
-  if (!oldMaster) return;
-  if (resolved == oldMaster) {
-    return ReportCommandRefused(bsp ? L"Already the largest window" : L"Already the master window", current);
-  }
+  const HWND focused = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
+  if (!focused) return ReportNoTargetWindow(current);
   Workspace candidate = workspace;
-  if (bsp ? !candidate.SwapTiled(resolved, oldMaster) : !candidate.MakeMaster(resolved, &oldMaster)) return;
-  if (!AcceptUserLayoutMutation(key, current->monitor, workspace, candidate, resolved,
-                                Placement::UserLayoutMutationKind::Order, L"Set master")) {
-    return;
+  using Kind = Placement::UserLayoutMutationKind;
+  const bool rotate = workspace.Layout() == TileLayout::Bsp;
+  const auto kind = rotate ? Kind::BspRotate : Kind::Order;
+  const wchar_t* action = rotate ? L"Rotate split" : L"Set master";
+  const BspTree& tree = workspace.Bsp();
+  size_t divider = BspTree::kNotFound;
+  HWND oldMaster = nullptr;
+  if (rotate) {
+    Platform::Monitors::WorkspaceMetrics metrics;
+    if (!Platform::Monitors::GetWorkspaceMetrics(current->monitor, &metrics)) return;
+    const size_t leaf = tree.FindLeaf(focused);
+    if (leaf != BspTree::kNotFound) divider = tree.Parent(leaf);
+    const auto shown = Model::PlanBspCells(workspace, metrics.workArea, metrics.gap);
+    if (std::ranges::none_of(shown.splits, [divider](const Layout::BspSplit& split) { return split.node == divider; })) {
+      return ReportCommandRefused(L"No shared split to rotate", current);
+    }
+    Layout::TurnBspSplit(candidate, divider, metrics.workArea);
+  } else {
+    if (focused == workspace.TiledWindows().front()) return ReportCommandRefused(L"Already the master window", current);
+    if (!candidate.MakeMaster(focused, &oldMaster)) return;
   }
+
+  const DesktopMonitorKey& key = current->key;
+  if (!AcceptUserLayoutMutation(key, current->monitor, workspace, candidate, focused, kind, action)) return;
   g_workspaces.Save(key, candidate);
-  Gestures::ClearMoveSizeSamples(oldMaster);
-  Gestures::ClearMoveSizeSamples(resolved);
-  Placement::ArrangeWorkspace(key, resolved);
-  Diagnostics::RecordEvent(
-      L"Swap Master old=%p new=%p", oldMaster, resolved);
+  if (rotate) {
+    for (size_t i = divider + 1, end = tree.SubtreeEnd(divider); i < end; ++i) {
+      if (HWND window = tree.Nodes()[i].window) Gestures::ClearMoveSizeSamples(window);
+    }
+    Diagnostics::RecordEvent(L"BSP split rotated hwnd=%p", focused);
+  } else {
+    Gestures::ClearMoveSizeSamples(oldMaster);
+    Gestures::ClearMoveSizeSamples(focused);
+    Diagnostics::RecordEvent(L"Swap Master old=%p new=%p", oldMaster, focused);
+  }
+  Placement::ArrangeWorkspace(key, focused);
 }
 
 // Moves the focused tiled window one slot toward or away from the front of the
@@ -686,11 +677,26 @@ static std::optional<TiledDropTarget> FindTiledDropTarget(
 
 // Shared by the preview and the final drop. Only the supplied trial is changed.
 static std::optional<Placement::UserLayoutMutationKind> PrepareTiledDrop(
-    Workspace& candidate, HWND source, const TiledDropTarget& target) {
+    Workspace& candidate, HWND source, const TiledDropTarget& target, const RECT& workArea) {
   using Kind = Placement::UserLayoutMutationKind;
-  if (candidate.Layout() == TileLayout::Bsp && g_settings.bspSplitEdgePercent > 0 &&
-      candidate.SwapBspSiblingTiles(source, target.window)) {
-    return Kind::Order;
+  const bool horizontal = target.zone == TileDropZone::Left || target.zone == TileDropZone::Right;
+  const Layout::Axis requestedAxis = horizontal ? Layout::Axis::X : Layout::Axis::Y;
+  const bool leading = target.zone == TileDropZone::Left || target.zone == TileDropZone::Top;
+  if (g_settings.bspSplitEdgePercent > 0) {
+    const size_t divider = candidate.BspSiblingDivider(source, target.window);
+    if (divider != BspTree::kNotFound) {
+      const BspTree& tree = candidate.Bsp();
+      const Layout::Axis axis =
+          tree.Nodes()[divider].direction.value_or(Layout::DefaultBspSplitAxis(tree, divider, workArea));
+      if (target.zone == TileDropZone::Center || axis == requestedAxis) {
+        if (candidate.SwapBspSiblingTiles(source, target.window)) return Kind::Order;
+        return std::nullopt;
+      }
+      const bool sourceFirst = tree.Nodes()[divider + 1].window == source;
+      if (sourceFirst != leading && !candidate.SwapBspSiblingTiles(source, target.window)) return std::nullopt;
+      Layout::TurnBspSplit(candidate, divider, workArea);
+      return Kind::BspRotate;
+    }
   }
   if (target.zone == TileDropZone::Center) {
     if (candidate.SwapTiled(source, target.window)) return Kind::Order;
@@ -698,12 +704,9 @@ static std::optional<Placement::UserLayoutMutationKind> PrepareTiledDrop(
   }
   if (!candidate.MoveBspLeaf(source, target.window)) return std::nullopt;
 
-  const bool horizontal = target.zone == TileDropZone::Left || target.zone == TileDropZone::Right;
-  if (target.zone == TileDropZone::Left || target.zone == TileDropZone::Top) {
-    candidate.SwapTiled(source, target.window);
-  }
+  if (leading) candidate.SwapTiled(source, target.window);
   const BspTree& tree = candidate.Bsp();
-  candidate.SetBspSplitDirection(tree.Parent(tree.FindLeaf(source)), horizontal ? Layout::Axis::X : Layout::Axis::Y);
+  candidate.SetBspSplitDirection(tree.Parent(tree.FindLeaf(source)), requestedAxis);
   return Kind::BspMerge;
 }
 
@@ -717,7 +720,7 @@ static std::optional<TiledDropPreview> PlanTiledDropPreview(
     const Workspace& workspace, HWND source, const TiledDropTarget& target,
     const Platform::Monitors::WorkspaceMetrics& metrics) {
   Workspace candidate = workspace;
-  const auto kind = PrepareTiledDrop(candidate, source, target);
+  const auto kind = PrepareTiledDrop(candidate, source, target, metrics.workArea);
   if (!kind) return std::nullopt;
   std::vector<RECT> rects;
   std::optional<RECT> bspDropEdge;
@@ -736,7 +739,7 @@ static std::optional<TiledDropPreview> PlanTiledDropPreview(
 
 static void HandleUserMove(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
-    const MoveSizeGesture& gesture) {
+    const MoveSizeGesture& gesture, const RECT& workArea) {
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
     Placement::CancelConformanceLease(hwnd);
     Placement::DiscardPendingAdmissionRecovery(hwnd);
@@ -757,15 +760,16 @@ static void HandleUserMove(
       ? FindTiledDropTarget(TiledDropFrames(workspace, hwnd), workspace.Layout(), gesture.dropPoint) : std::nullopt;
   if (target) {
     Workspace candidate = workspace;
-    const auto kind = PrepareTiledDrop(candidate, hwnd, *target);
-    const bool merge = kind == Placement::UserLayoutMutationKind::BspMerge;
-    const wchar_t* action = merge ? L"Merge to target tile" : L"Swap";
+    const auto kind = PrepareTiledDrop(candidate, hwnd, *target, workArea);
+    using Kind = Placement::UserLayoutMutationKind;
+    const bool merge = kind == Kind::BspMerge;
+    const wchar_t* action = merge ? L"Merge to target tile" : kind == Kind::BspRotate ? L"Rotate split" : L"Swap";
     if (kind && AcceptUserLayoutMutation(key, key.ResolveMonitor(), workspace, candidate, hwnd, *kind, action,
                                          merge ? &*target : nullptr)) {
       workspace = std::move(candidate);
       preferredTiledWindow = hwnd;
       g_workspaces.Save(key, workspace);
-      if (!merge) ++Diagnostics::g_runtime.counters.tiledSwapActions;
+      if (*kind == Kind::Order) ++Diagnostics::g_runtime.counters.tiledSwapActions;
       Wh_Log(L"User drag applied %ls to HWND %p and target %p", action, hwnd, target->window);
       Diagnostics::RecordEvent(L"user drag hwnd=%p target=%p action=%ls", hwnd, target->window, action);
     }
@@ -908,7 +912,7 @@ void ApplyUserMoveSize(HWND hwnd) {
       break;
 
     case MoveSizeIntent::Move:
-      HandleUserMove(key, state, tiledHwnd, gesture);
+      HandleUserMove(key, state, tiledHwnd, gesture, metrics.workArea);
       break;
 
     case MoveSizeIntent::Resize:

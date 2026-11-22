@@ -1334,15 +1334,18 @@ bool Workspace::SwapTiled(HWND first, HWND second) {
   return true;
 }
 
-bool Workspace::SwapBspSiblingTiles(HWND first, HWND second) {
-  if (layout_ != TileLayout::Bsp) return false;
+size_t Workspace::BspSiblingDivider(HWND first, HWND second) const {
+  if (layout_ != TileLayout::Bsp || first == second) return BspTree::kNotFound;
   const size_t firstLeaf = bspTree_.FindLeaf(first);
   const size_t secondLeaf = bspTree_.FindLeaf(second);
-  if (firstLeaf == BspTree::kNotFound || secondLeaf == BspTree::kNotFound) return false;
+  if (firstLeaf == BspTree::kNotFound || secondLeaf == BspTree::kNotFound) return BspTree::kNotFound;
   const size_t divider = bspTree_.Parent(firstLeaf);
-  if (divider == BspTree::kNotFound || divider != bspTree_.Parent(secondLeaf) || !SwapTiled(first, second)) {
-    return false;
-  }
+  return divider == bspTree_.Parent(secondLeaf) ? divider : BspTree::kNotFound;
+}
+
+bool Workspace::SwapBspSiblingTiles(HWND first, HWND second) {
+  const size_t divider = BspSiblingDivider(first, second);
+  if (divider == BspTree::kNotFound || !SwapTiled(first, second)) return false;
 
   double& ratio = bspTree_.SplitNode(divider).ratio;
   ratio = Layout::ClampSplitRatio(1.0 - ratio);
