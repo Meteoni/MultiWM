@@ -37,7 +37,7 @@ except the sibling `shared/` and `companion/` roots.
 | `reconcile/` | `Reconcile` | Turning observed OS state into model changes: discovery, ownership repair, initial-placement rules, overflow |
 | `commands/` | `Commands`, `Gestures` | Hotkey/tray commands and interpreting user drags and resizes |
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |
-| `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot`, `DragPreview`, `PreviewComposition` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot, the drag preview (planned on the WM thread, drawn on its own thread with DirectComposition, or layered GDI windows as a fallback) |
+| `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot`, `DragPreview` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot, the drag preview (planned on the WM thread and drawn as layered GDI windows on a dedicated preview thread) |
 | `windhawk/` | — | Windhawk's stock tool-mod launcher. Not MultiWM logic. |
 | `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry` | Code compiled by both mods, so both decide alike: window-rule matching, the window-shape checks and process-name read behind it, the companion snapshot layout, geometry/size-limit and frame-border arithmetic, and the split arithmetic both mods fit BSP minimum sizes with (`SharedSplits`). Windows and the standard library only. |
 | `companion/` | `Companion` | The separate MultiWM Companion mod (`src/companion/multiwm-companion.cpp`). Never included by MultiWM. |

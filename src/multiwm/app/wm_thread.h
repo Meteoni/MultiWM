@@ -429,8 +429,6 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
     Wh_Log(L"Tiling layout tray icon unavailable; window management remains active");
   }
   ReportStartupProblems(unavailableHotkeys);
-  // Its own thread attaches to the GPU meanwhile; this one carries on.
-  DragPreview::Start();
 
   CompanionSnapshot::PublishIfChanged();
   RunWmMessageLoop();

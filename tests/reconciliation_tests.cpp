@@ -1322,8 +1322,6 @@ static void RunBspDragTests() {
           "a blocked edge neither uses nor commits a perpendicular split");
   }
 
-  // These checks read the GDI preview windows; composition has its own below.
-  DragPreview::g_allowComposition = false;
   const UINT savedFadeMs = g_settings.dragPreviewFadeMs;
   g_settings.dragPreviewFadeMs = 0;
   g_workspaces.Save(fixture.key, previewWorkspace);
@@ -1536,13 +1534,13 @@ static void RunBspDragTests() {
   DragPreview::StepFade(fadeInStart + g_settings.dragPreviewFadeMs);
   RECT displayedFill{}, displayedOutline{};
   BYTE fillAlpha = 0, outlineAlpha = 0;
-  DWORD outlineFlags = 0;
+  DWORD fillFlags = 0, outlineFlags = 0;
   check(IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
             GetWindowRect(overlay.fill, &displayedFill) && EqualRect(&displayedFill, &wideTile) &&
             GetWindowRect(overlay.outline, &displayedOutline) && EqualRect(&displayedOutline, &narrowTile) &&
-            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 64 &&
+            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, &fillFlags) && fillAlpha == 64 &&
             GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, &outlineFlags) && outlineAlpha == 255 &&
-            outlineFlags == (LWA_COLORKEY | LWA_ALPHA) &&
+            fillFlags == (LWA_COLORKEY | LWA_ALPHA) && outlineFlags == fillFlags &&
             (GetWindowLongPtrW(overlay.fill, GWL_EXSTYLE) & WS_EX_TRANSPARENT) &&
             (GetWindowLongPtrW(overlay.outline, GWL_EXSTYLE) & WS_EX_TRANSPARENT) &&
             GetForegroundWindow() == previouslyFocused,
@@ -1595,6 +1593,46 @@ static void RunBspDragTests() {
   DragPreview::End();
   check(!IsWindowVisible(overlay.outline) && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
         "zero fade duration also hides the preview immediately without a timer");
+  check(!DragPreview::EnsurePreviewThread() && !DragPreview::g_previewThread.handle,
+        "a synchronous fallback keeps ownership of its preview windows");
+
+  // Check the GDI corners in a private bitmap so the active desktop is irrelevant.
+  {
+    const LONG savedRadius = g_settings.dragPreviewOutlineRadiusDip;
+    g_settings.dragPreviewFillOpacity = 25;
+    g_settings.dragPreviewOutlineRadiusDip = 12;
+    DragPreview::Show({wideTile, narrowTile});
+    HDC dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = 128;
+    bitmapInfo.bmiHeader.biHeight = 128;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    HGDIOBJ original = SelectObject(dc, bitmap);
+    HBRUSH accent = CreateSolidBrush(overlay.accent);
+    check(dc && bitmap && original && original != HGDI_ERROR && accent, "create the GDI preview test bitmap");
+    const RECT update{0, 0, 128, 128};
+    DragPreview::PaintPreviewShape(overlay.fill, dc, update, accent);
+    check(GetPixel(dc, 0, 0) == overlay.colorKey && GetPixel(dc, 32, 32) == overlay.accent,
+          "the GDI fill has a transparent rounded corner and an accented interior");
+    DragPreview::PaintPreviewShape(overlay.outline, dc, update, accent);
+    check(GetPixel(dc, 0, 0) == overlay.colorKey && GetPixel(dc, 64, 0) == overlay.accent,
+          "the GDI outline shares the fill's corner radius");
+
+    g_settings.dragPreviewOutlineRadiusDip = 0;
+    DragPreview::Show({narrowTile, wideTile});
+    DragPreview::PaintPreviewShape(overlay.fill, dc, update, accent);
+    check(GetPixel(dc, 0, 0) == overlay.accent, "a zero radius gives the GDI fill square corners");
+    DeleteObject(accent);
+    SelectObject(dc, original);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    DragPreview::End();
+    g_settings.dragPreviewOutlineRadiusDip = savedRadius;
+  }
 
   const HICON sourceIcon = LoadIconW(nullptr, IDI_INFORMATION);
   const HICON targetIcon = LoadIconW(nullptr, IDI_WARNING);
@@ -1652,70 +1690,25 @@ static void RunBspDragTests() {
   DragPreview::Show({wideTile, narrowTile, source, target}, true, 144);
   check(!IsWindowVisible(draggedBadge.window) && !IsWindowVisible(affectedBadge.window) && overlay.icons.empty(),
         "a zero icon size disables badges and icon queries");
+
+  g_settings.dragPreviewIconSizeDip = 24;
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144);
+  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  DragPreview::End();
+  check(IsWindowVisible(draggedBadge.window) && IsWindowVisible(affectedBadge.window) &&
+            DestroyWindow(overlay.outline),
+        "both badges are visible when a GDI window is lost during fade-out");
+  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs / 2);
+  check(!IsWindowVisible(overlay.fill) && !IsWindowVisible(draggedBadge.window) &&
+            !IsWindowVisible(affectedBadge.window) && !draggedBadge.icon && !affectedBadge.icon &&
+            !overlay.fading && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
+        "a GDI fade failure hides the preview and both badges immediately");
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144);
+  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  check(IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
+            IsWindowVisible(draggedBadge.window) && IsWindowVisible(affectedBadge.window),
+        "the next preview recreates the missing GDI window and shows both badges");
   DragPreview::Shutdown();
-
-  // DirectComposition: one host window, drawn on the GPU, faded by DWM.
-  {
-    DragPreview::g_allowComposition = true;
-    g_settings.dragPreviewFillOpacity = 100;
-    g_settings.dragPreviewOutlineOpacity = 100;
-    g_settings.dragPreviewIconSizeDip = 24;
-    g_settings.dragPreviewFadeMs = 0;
-    DragPreview::Show({wideTile, narrowTile, source, target}, true, 144);
-    const HWND host = overlay.host;
-    RECT hostFrame{}, both{};
-    UnionRect(&both, &wideTile, &narrowTile);
-    RECT covered{};
-    check(DragPreview::Composed() && host && IsWindowVisible(host) && !overlay.fill && !overlay.outline &&
-              (GetWindowLongPtrW(host, GWL_EXSTYLE) & PreviewComposition::kHostExStyle) ==
-                  PreviewComposition::kHostExStyle &&
-              GetWindowRect(host, &hostFrame) && IntersectRect(&covered, &hostFrame, &both) &&
-              EqualRect(&covered, &both) && overlay.icons.size() == 2,
-          "composition shows the preview in one click-through host window, with both badges");
-    for (int frame = 0; frame < 4; ++frame) DwmFlush();
-    auto screenPixel = [](POINT point) {
-      HDC screen = GetDC(nullptr);
-      HDC memory = CreateCompatibleDC(screen);
-      HBITMAP bitmap = CreateCompatibleBitmap(screen, 1, 1);
-      HGDIOBJ old = SelectObject(memory, bitmap);
-      BitBlt(memory, 0, 0, 1, 1, screen, point.x, point.y, SRCCOPY | CAPTUREBLT);
-      const COLORREF color = GetPixel(memory, 0, 0);
-      SelectObject(memory, old);
-      DeleteObject(bitmap);
-      DeleteDC(memory);
-      ReleaseDC(nullptr, screen);
-      return color;
-    };
-    const POINT inFill{wideTile.left + 30, wideTile.top + 30};
-    check(screenPixel(inFill) == overlay.accent, "the composed fill is drawn in the accent");
-    check(WindowFromPoint(inFill) != host, "the mouse goes through the composed preview");
-
-    g_settings.dragPreviewFadeMs = 96;
-    DragPreview::Show({narrowTile, wideTile, source, target}, true, 144);
-    check(overlay.fadeFrom == 128 && overlay.fadeTo == 255 && KillTimer(host, DragPreview::kFadeTimer),
-          "a changed destination starts DWM's fade at half strength, with one timer for its end");
-    const ULONGLONG fadeStart = overlay.fadeStarted;
-    DragPreview::Show({narrowTile, wideTile, source, target}, true, 144);
-    check(overlay.fadeStarted == fadeStart, "the same preview doesn't restart the fade");
-    DragPreview::StepFade(fadeStart + g_settings.dragPreviewFadeMs);
-    DragPreview::End();
-    check(overlay.fadeTo == 0 && IsWindowVisible(host), "ending fades the composed preview out");
-    DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
-    check(!IsWindowVisible(host) && !KillTimer(host, DragPreview::kFadeTimer),
-          "the finished fade-out hides the host and stops its timer");
-    DragPreview::FadeTo(0);
-    check(!IsWindowVisible(host), "repeated fade-outs while hidden do nothing");
-
-    // A composition failure (a lost device) falls back to GDI for the session.
-    DragPreview::DisableComposition(L"test");
-    DragPreview::Show({wideTile, narrowTile, source, target}, true, 144);
-    check(!DragPreview::Composed() && overlay.compositionFailed && overlay.fill && IsWindowVisible(overlay.outline) &&
-              !IsWindowVisible(host),
-          "after a composition failure the preview uses GDI windows");
-    DragPreview::Shutdown();
-    check(!DragPreview::Composed() && !overlay.compositionFailed && !overlay.host,
-          "shutdown releases composition; the next session tries it again");
-  }
 
   // On its own thread: the preview's windows belong to that thread, which
   // MultiWM ignores like its own; GDI fades are paced by DWM there.
@@ -1740,13 +1733,12 @@ static void RunBspDragTests() {
       return true;
     };
 
-    DragPreview::g_allowComposition = false;
     g_settings.dragPreviewFillOpacity = 25;
     g_settings.dragPreviewOutlineOpacity = 100;
     g_settings.dragPreviewIconSizeDip = 0;
     g_settings.dragPreviewFadeMs = 96;
     check(DragPreview::EnsurePreviewThread(), "start the preview thread");
-    DWORD previewThread = DragPreview::g_previewThread.id.load();
+    const DWORD previewThread = DragPreview::g_previewThread.id.load();
     auto gdiFillAt = [&](BYTE alpha) {
       for (HWND window : threadWindows(previewThread)) {
         RECT frame{};
@@ -1767,51 +1759,10 @@ static void RunBspDragTests() {
     DragPreview::Hide();
     check(waitFor([&] { return noneVisible(previewThread); }), "hiding fades the GDI preview out on its thread");
     DragPreview::Shutdown();
-    check(!DragPreview::g_previewThread.handle && !DragPreview::IsPreviewThread(previewThread) &&
-              threadWindows(previewThread).empty(),
+    check(!DragPreview::g_previewThread.handle && !DragPreview::g_previewThread.stopEvent &&
+              !DragPreview::IsPreviewThread(previewThread) && threadWindows(previewThread).empty(),
           "shutdown joins the thread, which destroys its windows");
 
-    // Composed on the thread: the session start attaches to the GPU there
-    // before any drag, and the preview reaches the screen.
-    DragPreview::g_allowComposition = true;
-    g_settings.dragPreviewFillOpacity = 100;
-    DragPreview::Start();
-    previewThread = DragPreview::g_previewThread.id.load();
-    auto host = [&]() -> HWND {
-      for (HWND window : threadWindows(previewThread)) {
-        if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) return window;
-      }
-      return nullptr;
-    };
-    check(previewThread && waitFor([&] { return host() != nullptr; }) && !IsWindowVisible(host()),
-          "the session start attaches composition on the preview thread before the first drag");
-    DWORD colorization = 0;
-    BOOL opaque = FALSE;
-    const COLORREF accent = SUCCEEDED(DwmGetColorizationColor(&colorization, &opaque))
-        ? RGB((colorization >> 16) & 0xff, (colorization >> 8) & 0xff, colorization & 0xff)
-        : GetSysColor(COLOR_HIGHLIGHT);
-    const POINT inFill{wideTile.left + 30, wideTile.top + 30};
-    auto pixel = [](POINT point) {
-      HDC screen = GetDC(nullptr);
-      HDC memory = CreateCompatibleDC(screen);
-      HBITMAP bitmap = CreateCompatibleBitmap(screen, 1, 1);
-      HGDIOBJ old = SelectObject(memory, bitmap);
-      BitBlt(memory, 0, 0, 1, 1, screen, point.x, point.y, SRCCOPY | CAPTUREBLT);
-      const COLORREF color = GetPixel(memory, 0, 0);
-      SelectObject(memory, old);
-      DeleteObject(bitmap);
-      DeleteDC(memory);
-      ReleaseDC(nullptr, screen);
-      return color;
-    };
-    DragPreview::Show({wideTile, narrowTile});
-    check(waitFor([&] { return host() && IsWindowVisible(host()) && pixel(inFill) == accent; }),
-          "the composed preview, drawn on the preview thread, fades in on screen");
-    DragPreview::Hide();
-    check(waitFor([&] { return noneVisible(previewThread); }) && pixel(inFill) != accent,
-          "hiding fades the composed preview out and hides its host");
-    DragPreview::Shutdown();
-    check(threadWindows(previewThread).empty(), "shutdown releases composition and its host on the thread");
   }
   TrayUi::g_preferences.showToasts = savedToasts;
   std::printf("Passed %u BSP drag checks.\n", check.passed);
