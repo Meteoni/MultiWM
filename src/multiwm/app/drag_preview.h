@@ -1,11 +1,23 @@
 // Accent-colored feedback during a managed tiled-window drag.
 // Part of MultiWM's single source file; see the include order in src/multiwm/multiwm.cpp.
 //
-// Drawn with DirectComposition when it is available (preview_composition.h):
-// one host window holds the fill, outline and badges, and DWM runs the fades
-// itself at the display's refresh rate, so a busy WM thread can't make them
-// stutter. Otherwise, and for the rest of the session after any composition
-// failure, each part is a layered GDI window faded by a window timer.
+// The WM thread decides what to show (the drag session, its drop target and
+// the planned frames). A dedicated preview thread owns the preview's windows,
+// loads app icons and draws, so a WM thread busy with a rearrange or a slow
+// app never delays the preview. The WM thread sends each change as a
+// PresentRequest that carries everything needed, settings included, so the
+// preview thread never reads shared state.
+//
+// The preview is drawn with DirectComposition when it is available
+// (preview_composition.h): one host window holds the fill, outline and badges,
+// drawn on the GPU, and DWM runs the fades itself at the display's refresh
+// rate. The preview thread starts with the WM session and attaches to the GPU
+// then (about 120 ms, measured), so the first drag doesn't wait for it.
+// Otherwise, and for the rest of the session after a composition failure, each
+// part is a layered GDI window, faded once per composition (DwmFlush).
+//
+// If the thread can't start (and in tests that don't start it), the same code
+// runs on the caller's thread, with a window timer for GDI fades.
 
 namespace DragPreview {
 
@@ -23,7 +35,6 @@ struct DragSession {
   std::vector<Commands::TiledDropFrame> frames;
   std::optional<uint64_t> revision;
   std::optional<Commands::TiledDropTarget> target;
-  std::unordered_map<HWND, PreviewIcon> icons;
 };
 
 static std::optional<DragSession> g_drag;
@@ -32,7 +43,32 @@ constexpr UINT_PTR kFadeTimer = 1;
 constexpr UINT kFadeIntervalMs = 16;
 
 // False keeps the preview on GDI windows (tests that inspect them).
-static bool g_allowComposition = true;
+static std::atomic<bool> g_allowComposition{true};
+
+// The settings a preview is drawn with, read on the WM thread.
+struct PreviewStyle {
+  LONG fillOpacity = 0;     // Percent.
+  LONG outlineOpacity = 0;  // Percent.
+  LONG outlineWidthDip = 0;
+  LONG outlineRadiusDip = 0;
+  LONG iconSizeDip = 0;
+  UINT fadeMs = 0;
+  COLORREF badgeBackground = 0;
+};
+
+static PreviewStyle CurrentStyle() {
+  return {g_settings.dragPreviewFillOpacity, g_settings.dragPreviewOutlineOpacity,
+          g_settings.dragPreviewOutlineWidthDip, g_settings.dragPreviewOutlineRadiusDip,
+          g_settings.dragPreviewIconSizeDip, g_settings.dragPreviewFadeMs, TrayUi::FlyoutBackgroundColor()};
+}
+
+// One change to the shown preview, from the WM thread.
+struct PresentRequest {
+  Commands::TiledDropPreview preview;
+  PreviewStyle style;
+  UINT dpi = 96;
+  bool badges = false;  // Show app icons (a real drag, not a bare preview).
+};
 
 struct IconBadge {
   HWND window = nullptr;
@@ -47,46 +83,63 @@ struct IconBadge {
 };
 
 struct Overlay {
+  // GDI: one layered window per part.
   HWND fill = nullptr;
   HWND outline = nullptr;
   IconBadge draggedBadge;
   IconBadge affectedBadge;
-  ATOM windowClass = 0;
-  COLORREF accent = 0;
-  COLORREF colorKey = RGB(1, 0, 1);
-  BYTE fadeAlpha = 0;
-  BYTE fadeFrom = 0;
-  BYTE fadeTo = 0;
-  ULONGLONG fadeStarted = 0;
-  UINT fadeMs = 0;  // The running fade's duration, fixed when it starts.
-  std::optional<Commands::TiledDropPreview> shown;
-  UINT shownDpi = 96;
   // DirectComposition: the host window and its presenter, while it works.
   HWND host = nullptr;
   std::unique_ptr<PreviewComposition::Presenter> composition;
   bool compositionFailed = false;
+
+  ATOM windowClass = 0;
+  COLORREF accent = 0;
+  COLORREF colorKey = RGB(1, 0, 1);
+  PreviewStyle style;
+  BYTE fadeAlpha = 0;
+  BYTE fadeFrom = 0;
+  BYTE fadeTo = 0;
+  ULONGLONG fadeStarted = 0;
+  UINT fadeMs = 0;      // The running fade's duration, fixed when it starts.
+  bool fading = false;  // A GDI fade is being stepped.
+  // The preview thread steps GDI fades itself, once per composition.
+  bool paced = false;
+  std::optional<PresentRequest> shown;
+  // App icons by window for the current drag. Even missed lookups are kept: a
+  // window can change its icon or stop responding.
+  std::unordered_map<HWND, PreviewIcon> icons;
 };
 
+// Owned by the thread that presents: the preview thread once started, else the caller.
 static Overlay g_overlay;
+
+// Milliseconds on a high-resolution clock. GetTickCount64 advances in ~15.6 ms
+// steps, coarser than a frame, so a fade timed by it moves unevenly.
+static ULONGLONG PreviewClockMs() {
+  static const LONGLONG frequency = [] {
+    LARGE_INTEGER value{};
+    QueryPerformanceFrequency(&value);
+    return value.QuadPart;
+  }();
+  LARGE_INTEGER now{};
+  QueryPerformanceCounter(&now);
+  return frequency >= 1000 ? static_cast<ULONGLONG>(now.QuadPart / (frequency / 1000)) : GetTickCount64();
+}
 
 static bool Composed() { return g_overlay.composition && g_overlay.composition->Attached(); }
 
-static void RepaintComposedTheme();
-
-static void RefreshBadgeTheme() {
-  if (Composed()) {
-    RepaintComposedTheme();
-    return;
-  }
-  for (const IconBadge* badge : {&g_overlay.draggedBadge, &g_overlay.affectedBadge}) {
-    if (badge->window && IsWindowVisible(badge->window)) InvalidateRect(badge->window, nullptr, FALSE);
-  }
+static bool SameRequest(const PresentRequest& a, const PresentRequest& b) {
+  return a.preview.draggedWindow == b.preview.draggedWindow && a.preview.affectedWindow == b.preview.affectedWindow &&
+         EqualRect(&a.preview.dragged, &b.preview.dragged) && EqualRect(&a.preview.affected, &b.preview.affected);
 }
+
+// --- Fades -------------------------------------------------------------------------
 
 static bool ApplyAlpha(BYTE fadeAlpha) {
   g_overlay.fadeAlpha = fadeAlpha;
-  const BYTE fillAlpha = static_cast<BYTE>(MulDiv(fadeAlpha, g_settings.dragPreviewFillOpacity, 100));
-  const BYTE outlineAlpha = static_cast<BYTE>(MulDiv(fadeAlpha, g_settings.dragPreviewOutlineOpacity, 100));
+  const BYTE fillAlpha = static_cast<BYTE>(MulDiv(fadeAlpha, g_overlay.style.fillOpacity, 100));
+  const BYTE outlineAlpha = static_cast<BYTE>(MulDiv(fadeAlpha, g_overlay.style.outlineOpacity, 100));
   const BOOL fillSet = SetLayeredWindowAttributes(g_overlay.fill, 0, fillAlpha, LWA_ALPHA);
   const BOOL outlineSet = SetLayeredWindowAttributes(
       g_overlay.outline, g_overlay.colorKey, outlineAlpha, LWA_COLORKEY | LWA_ALPHA);
@@ -128,6 +181,7 @@ static void StepFade(ULONGLONG now) {
   if (alpha != g_overlay.fadeAlpha) ApplyAlpha(alpha);
   if (now - g_overlay.fadeStarted < g_overlay.fadeMs) return;
 
+  g_overlay.fading = false;
   KillTimer(g_overlay.fill, kFadeTimer);
   if (alpha == 0) {
     ShowWindow(g_overlay.fill, SW_HIDE);
@@ -155,13 +209,13 @@ static bool ComposedFadeTo(BYTE alpha, bool restart, const PreviewComposition::S
                            std::optional<BYTE> startAt = std::nullopt) {
   // Called on every mouse move while nothing is targeted: only a change commits.
   if (!scene && !restart && g_overlay.fadeTo == alpha) return true;
-  const ULONGLONG now = GetTickCount64();
+  const ULONGLONG now = PreviewClockMs();
   const BYTE current = startAt.value_or(AlphaAt(now));
   if (restart || g_overlay.fadeTo != alpha) {
     g_overlay.fadeFrom = current;
     g_overlay.fadeTo = alpha;
     g_overlay.fadeStarted = now;
-    g_overlay.fadeMs = g_settings.dragPreviewFadeMs;
+    g_overlay.fadeMs = g_overlay.style.fadeMs;
   }
   const ULONGLONG end = g_overlay.fadeStarted + g_overlay.fadeMs;
   const UINT remaining = now < end ? static_cast<UINT>(end - now) : 0;
@@ -177,7 +231,7 @@ static bool ComposedFadeTo(BYTE alpha, bool restart, const PreviewComposition::S
   return true;
 }
 
-// The window timer runs only during the transition.
+// GDI: unpaced, a window timer runs only during the transition.
 static void FadeTo(BYTE alpha, bool restart = false) {
   if (Composed()) {
     ComposedFadeTo(alpha, restart, nullptr);
@@ -186,13 +240,16 @@ static void FadeTo(BYTE alpha, bool restart = false) {
   if (!g_overlay.fill || !g_overlay.outline || (!restart && g_overlay.fadeTo == alpha)) return;
   g_overlay.fadeFrom = g_overlay.fadeAlpha;
   g_overlay.fadeTo = alpha;
-  g_overlay.fadeStarted = GetTickCount64();
-  g_overlay.fadeMs = g_settings.dragPreviewFadeMs;
-  if (g_overlay.fadeFrom == alpha || g_overlay.fadeMs == 0 ||
-      !SetTimer(g_overlay.fill, kFadeTimer, kFadeIntervalMs, nullptr)) {
+  g_overlay.fadeStarted = PreviewClockMs();
+  g_overlay.fadeMs = g_overlay.style.fadeMs;
+  g_overlay.fading = true;
+  const bool immediate = g_overlay.fadeFrom == alpha || g_overlay.fadeMs == 0;
+  if (immediate || (!g_overlay.paced && !SetTimer(g_overlay.fill, kFadeTimer, kFadeIntervalMs, nullptr))) {
     StepFade(g_overlay.fadeStarted + g_overlay.fadeMs);
   }
 }
+
+// --- GDI painting ------------------------------------------------------------------
 
 static void PaintRoundedRect(HDC dc, const RECT& rect, int cornerRadius, HBRUSH brush) {
   if (IsRectEmpty(&rect)) return;
@@ -215,8 +272,8 @@ static void PaintOutline(HWND hwnd, HDC dc, const PAINTSTRUCT& paint, HBRUSH acc
   RECT bounds{};
   GetClientRect(hwnd, &bounds);
   const UINT dpi = GetDpiForWindow(hwnd);
-  const int width = std::max(1, MulDiv(g_settings.dragPreviewOutlineWidthDip, dpi, 96));
-  const int radius = std::min<LONG>(MulDiv(g_settings.dragPreviewOutlineRadiusDip, dpi, 96),
+  const int width = std::max(1, MulDiv(g_overlay.style.outlineWidthDip, dpi, 96));
+  const int radius = std::min<LONG>(MulDiv(g_overlay.style.outlineRadiusDip, dpi, 96),
                                    std::min(Layout::RectWidth(bounds), Layout::RectHeight(bounds)) / 2);
   PaintRoundedRect(dc, bounds, radius, accent);
   InflateRect(&bounds, -width, -width);
@@ -226,7 +283,7 @@ static void PaintOutline(HWND hwnd, HDC dc, const PAINTSTRUCT& paint, HBRUSH acc
 
 static void PaintBadge(HDC dc, const PAINTSTRUCT& paint, const IconBadge& badge) {
   if (!badge.icon) return;
-  if (HBRUSH background = CreateSolidBrush(TrayUi::FlyoutBackgroundColor())) {
+  if (HBRUSH background = CreateSolidBrush(g_overlay.style.badgeBackground)) {
     FillRect(dc, &paint.rcPaint, background);
     DeleteObject(background);
   }
@@ -238,7 +295,7 @@ static LRESULT CALLBACK PreviewWindowProc(HWND hwnd, UINT message, WPARAM wparam
   if (message == WM_NCHITTEST) return HTTRANSPARENT;
   if (message == WM_ERASEBKGND) return 1;
   if (message == WM_TIMER && (hwnd == g_overlay.fill || hwnd == g_overlay.host) && wparam == kFadeTimer) {
-    StepFade(GetTickCount64());
+    StepFade(PreviewClockMs());
     return 0;
   }
   if (message != WM_PAINT || hwnd == g_overlay.host) return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -258,6 +315,8 @@ static LRESULT CALLBACK PreviewWindowProc(HWND hwnd, UINT message, WPARAM wparam
   EndPaint(hwnd, &paint);
   return 0;
 }
+
+// --- App icons ---------------------------------------------------------------------
 
 // The width in pixels of `icon`'s image, or 0 when it can't be read.
 static LONG IconPixelSize(HICON icon) {
@@ -333,21 +392,34 @@ struct BadgePlan {
   LONG badgeSize;
 };
 
-static std::optional<BadgePlan> PlanBadge(DragSession& drag, HWND window, const RECT& tile, UINT dpi) {
-  const LONG iconSize = SharedGeometry::ScaleDip(g_settings.dragPreviewIconSizeDip, dpi);
+static std::optional<BadgePlan> PlanBadge(HWND window, const RECT& tile, UINT dpi) {
+  const LONG iconSize = SharedGeometry::ScaleDip(g_overlay.style.iconSizeDip, dpi);
   const LONG badgeSize = iconSize + SharedGeometry::ScaleDip(8, dpi);
   if (!window || iconSize <= 0 || badgeSize > Layout::RectWidth(tile) || badgeSize > Layout::RectHeight(tile)) {
     return std::nullopt;
   }
-  // A window can change its icon or stop responding. Cache even missed lookups
-  // for this drag.
-  auto [entry, firstVisit] = drag.icons.try_emplace(window);
+  auto [entry, firstVisit] = g_overlay.icons.try_emplace(window);
   if (firstVisit) entry->second = LoadBadgeIcon(window, dpi, iconSize);
   if (!entry->second) return std::nullopt;
   const POINT center = SharedGeometry::RectCenter(tile);
-  const RECT frame{center.x - badgeSize / 2, center.y - badgeSize / 2, center.x - badgeSize / 2 + badgeSize,
-                   center.y - badgeSize / 2 + badgeSize};
-  return BadgePlan{frame, entry->second, iconSize, badgeSize};
+  const LONG left = center.x - badgeSize / 2;
+  const LONG top = center.y - badgeSize / 2;
+  return BadgePlan{{left, top, left + badgeSize, top + badgeSize}, entry->second, iconSize, badgeSize};
+}
+
+// --- Windows -----------------------------------------------------------------------
+
+constexpr DWORD kGdiPreviewExStyle =
+    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+
+static bool EnsureWindowClass() {
+  if (g_overlay.windowClass) return true;
+  WNDCLASSW windowClass{};
+  windowClass.lpfnWndProc = PreviewWindowProc;
+  windowClass.hInstance = GetModuleHandleW(nullptr);
+  windowClass.lpszClassName = kPreviewClassName;
+  g_overlay.windowClass = RegisterClassW(&windowClass);
+  return g_overlay.windowClass != 0;
 }
 
 static HWND CreatePreviewWindow(DWORD exStyle) {
@@ -355,11 +427,75 @@ static HWND CreatePreviewWindow(DWORD exStyle) {
                          GetModuleHandleW(nullptr), nullptr);
 }
 
-constexpr DWORD kGdiPreviewExStyle =
-    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+// Attaches DirectComposition to its host window once. False when it isn't
+// allowed or available; the preview then uses GDI windows.
+static bool EnsureComposition() {
+  if (Composed()) return true;
+  if (!g_allowComposition.load() || g_overlay.compositionFailed || !EnsureWindowClass()) return false;
+  if (!g_overlay.host) g_overlay.host = CreatePreviewWindow(PreviewComposition::kHostExStyle);
+  auto presenter = std::make_unique<PreviewComposition::Presenter>();
+  if (!g_overlay.host || !presenter->Attach(g_overlay.host)) {
+    DisableComposition(L"DirectComposition is unavailable");
+    return false;
+  }
+  g_overlay.composition = std::move(presenter);
+  return true;
+}
 
-static void ShowBadge(IconBadge& badge, DragSession& drag, HWND window, const RECT& tile, UINT dpi) {
-  const auto plan = PlanBadge(drag, window, tile, dpi);
+// --- Composed preview --------------------------------------------------------------
+
+// The host window's frame for `preview`: the monitor's tiling area, which
+// holds every tile and never covers the whole monitor (so nothing reads the
+// host as a fullscreen window), stretched to any preview frame outside it.
+static RECT CompositionHostFrame(const Commands::TiledDropPreview& preview) {
+  RECT area{};
+  UnionRect(&area, &preview.dragged, &preview.affected);
+  MONITORINFO monitor{sizeof(monitor)};
+  if (GetMonitorInfoW(MonitorFromRect(&preview.dragged, MONITOR_DEFAULTTONEAREST), &monitor)) {
+    const RECT tiling = SharedGeometry::KeepTilesOffWholeMonitor(monitor.rcWork, monitor.rcMonitor);
+    UnionRect(&area, &area, &tiling);
+  }
+  return area;
+}
+
+static std::optional<PreviewComposition::BadgeScene> ComposedBadge(HWND window, const RECT& tile, UINT dpi) {
+  const auto plan = PlanBadge(window, tile, dpi);
+  if (!plan) return std::nullopt;
+  // The GDI badge uses DWM's rounded corners, 8 px at 96 DPI.
+  return PreviewComposition::BadgeScene{plan->frame, plan->icon.get(), plan->iconSize,
+                                        SharedGeometry::ScaleDip(8, dpi), g_overlay.style.badgeBackground};
+}
+
+static PreviewComposition::Scene ComposedScene(const PresentRequest& request) {
+  const Commands::TiledDropPreview& preview = request.preview;
+  const PreviewStyle& style = g_overlay.style;
+  const UINT dpi = request.dpi;
+  PreviewComposition::Scene scene;
+  scene.host = CompositionHostFrame(preview);
+  scene.accent = g_overlay.accent;
+  scene.fill = preview.dragged;
+  scene.fillOpacity = style.fillOpacity / 100.0f;
+  // The GDI fill uses DWM's rounded corners, 8 px at 96 DPI.
+  scene.fillRadius = SharedGeometry::ScaleDip(8, dpi);
+  scene.outline = preview.affected;
+  scene.outlineOpacity = style.outlineOpacity / 100.0f;
+  scene.outlineWidth = std::max(1, MulDiv(style.outlineWidthDip, dpi, 96));
+  scene.outlineRadius = std::min<LONG>(MulDiv(style.outlineRadiusDip, dpi, 96),
+                                      std::min(Layout::RectWidth(preview.affected),
+                                               Layout::RectHeight(preview.affected)) / 2);
+  if (!request.badges) return scene;
+  const bool sameTile = EqualRect(&preview.dragged, &preview.affected);
+  if (style.fillOpacity > 0 || sameTile) scene.badges[0] = ComposedBadge(preview.draggedWindow, preview.dragged, dpi);
+  if (!sameTile && style.outlineOpacity > 0) {
+    scene.badges[1] = ComposedBadge(preview.affectedWindow, preview.affected, dpi);
+  }
+  return scene;
+}
+
+// --- GDI preview -------------------------------------------------------------------
+
+static void ShowBadge(IconBadge& badge, HWND window, const RECT& tile, UINT dpi) {
+  const auto plan = PlanBadge(window, tile, dpi);
   if (!plan) {
     badge.Hide();
     return;
@@ -383,83 +519,6 @@ static void ShowBadge(IconBadge& badge, DragSession& drag, HWND window, const RE
   InvalidateRect(badge.window, nullptr, FALSE);
 }
 
-static bool EnsureWindowClass() {
-  if (g_overlay.windowClass) return true;
-  WNDCLASSW windowClass{};
-  windowClass.lpfnWndProc = PreviewWindowProc;
-  windowClass.hInstance = GetModuleHandleW(nullptr);
-  windowClass.lpszClassName = kPreviewClassName;
-  g_overlay.windowClass = RegisterClassW(&windowClass);
-  return g_overlay.windowClass != 0;
-}
-
-// Attaches DirectComposition to its host window once. False when it isn't
-// allowed or available; the preview then uses GDI windows.
-static bool EnsureComposition() {
-  if (Composed()) return true;
-  if (!g_allowComposition || g_overlay.compositionFailed || !EnsureWindowClass()) return false;
-  if (!g_overlay.host) g_overlay.host = CreatePreviewWindow(PreviewComposition::kHostExStyle);
-  auto presenter = std::make_unique<PreviewComposition::Presenter>();
-  if (!g_overlay.host || !presenter->Attach(g_overlay.host)) {
-    DisableComposition(L"DirectComposition is unavailable");
-    return false;
-  }
-  g_overlay.composition = std::move(presenter);
-  return true;
-}
-
-// The host window's frame for `preview`: the monitor's tiling area, which
-// holds every tile and never covers the whole monitor (so nothing reads the
-// host as a fullscreen window), stretched to any preview frame outside it.
-static RECT CompositionHostFrame(const Commands::TiledDropPreview& preview) {
-  RECT area{};
-  UnionRect(&area, &preview.dragged, &preview.affected);
-  MONITORINFO monitor{sizeof(monitor)};
-  if (GetMonitorInfoW(MonitorFromRect(&preview.dragged, MONITOR_DEFAULTTONEAREST), &monitor)) {
-    const RECT tiling = SharedGeometry::KeepTilesOffWholeMonitor(monitor.rcWork, monitor.rcMonitor);
-    UnionRect(&area, &area, &tiling);
-  }
-  return area;
-}
-
-static PreviewComposition::Scene ComposedScene(const Commands::TiledDropPreview& preview, DragSession* drag,
-                                               UINT dpi) {
-  PreviewComposition::Scene scene;
-  scene.host = CompositionHostFrame(preview);
-  scene.accent = g_overlay.accent;
-  scene.fill = preview.dragged;
-  scene.fillOpacity = g_settings.dragPreviewFillOpacity / 100.0f;
-  // The GDI fill uses DWM's rounded corners, 8 px at 96 DPI.
-  scene.fillRadius = SharedGeometry::ScaleDip(8, dpi);
-  scene.outline = preview.affected;
-  scene.outlineOpacity = g_settings.dragPreviewOutlineOpacity / 100.0f;
-  scene.outlineWidth = std::max(1, MulDiv(g_settings.dragPreviewOutlineWidthDip, dpi, 96));
-  scene.outlineRadius = std::min<LONG>(MulDiv(g_settings.dragPreviewOutlineRadiusDip, dpi, 96),
-                                      std::min(Layout::RectWidth(preview.affected),
-                                               Layout::RectHeight(preview.affected)) / 2);
-  if (!drag) return scene;
-  const bool sameTile = EqualRect(&preview.dragged, &preview.affected);
-  auto badge = [&](HWND window, const RECT& tile) -> std::optional<PreviewComposition::BadgeScene> {
-    const auto plan = PlanBadge(*drag, window, tile, dpi);
-    if (!plan) return std::nullopt;
-    return PreviewComposition::BadgeScene{plan->frame, plan->icon.get(), plan->iconSize,
-                                          SharedGeometry::ScaleDip(8, dpi), TrayUi::FlyoutBackgroundColor()};
-  };
-  if (g_settings.dragPreviewFillOpacity > 0 || sameTile) scene.badges[0] = badge(preview.draggedWindow, preview.dragged);
-  if (!sameTile && g_settings.dragPreviewOutlineOpacity > 0) {
-    scene.badges[1] = badge(preview.affectedWindow, preview.affected);
-  }
-  return scene;
-}
-
-// A theme change recolours the badges: present the shown preview again,
-// keeping its fade.
-static void RepaintComposedTheme() {
-  if (!g_overlay.shown || g_overlay.fadeTo == 0) return;
-  const auto scene = ComposedScene(*g_overlay.shown, g_drag ? &*g_drag : nullptr, g_overlay.shownDpi);
-  ComposedFadeTo(g_overlay.fadeTo, false, &scene);
-}
-
 static bool EnsureGdiWindows() {
   if (!EnsureWindowClass()) return false;
   for (HWND* window : {&g_overlay.fill, &g_overlay.outline}) {
@@ -472,7 +531,9 @@ static bool EnsureGdiWindows() {
   return true;
 }
 
-static void ShowWithGdi(const Commands::TiledDropPreview& preview, DragSession* drag, UINT dpi, bool changedTarget) {
+static void ShowWithGdi(const PresentRequest& request, bool changedTarget) {
+  const Commands::TiledDropPreview& preview = request.preview;
+  const PreviewStyle& style = g_overlay.style;
   if (!EnsureGdiWindows()) return;
   if (!ApplyAlpha(changedTarget ? 128 : g_overlay.fadeAlpha)) {
     FadeTo(0);
@@ -485,8 +546,8 @@ static void ShowWithGdi(const Commands::TiledDropPreview& preview, DragSession* 
                                   Layout::RectHeight(frame), visibility | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
                  : nullptr;
   };
-  HDWP batch = position(BeginDeferWindowPos(2), g_overlay.fill, preview.dragged, g_settings.dragPreviewFillOpacity);
-  batch = position(batch, g_overlay.outline, preview.affected, g_settings.dragPreviewOutlineOpacity);
+  HDWP batch = position(BeginDeferWindowPos(2), g_overlay.fill, preview.dragged, style.fillOpacity);
+  batch = position(batch, g_overlay.outline, preview.affected, style.outlineOpacity);
   if (!batch || !EndDeferWindowPos(batch)) {
     FadeTo(0);
     return;
@@ -495,29 +556,25 @@ static void ShowWithGdi(const Commands::TiledDropPreview& preview, DragSession* 
   InvalidateRect(g_overlay.outline, nullptr, FALSE);
 
   const bool sameTile = EqualRect(&preview.dragged, &preview.affected);
-  if (drag && (g_settings.dragPreviewFillOpacity > 0 || sameTile)) {
-    ShowBadge(g_overlay.draggedBadge, *drag, preview.draggedWindow, preview.dragged, dpi);
+  if (request.badges && (style.fillOpacity > 0 || sameTile)) {
+    ShowBadge(g_overlay.draggedBadge, preview.draggedWindow, preview.dragged, request.dpi);
   } else {
     g_overlay.draggedBadge.Hide();
   }
-  if (drag && !sameTile && g_settings.dragPreviewOutlineOpacity > 0) {
-    ShowBadge(g_overlay.affectedBadge, *drag, preview.affectedWindow, preview.affected, dpi);
+  if (request.badges && !sameTile && style.outlineOpacity > 0) {
+    ShowBadge(g_overlay.affectedBadge, preview.affectedWindow, preview.affected, request.dpi);
   } else {
     g_overlay.affectedBadge.Hide();
   }
-  g_overlay.shown = preview;
-  g_overlay.shownDpi = dpi;
+  g_overlay.shown = request;
   FadeTo(255, changedTarget);
 }
 
-static void Show(const Commands::TiledDropPreview& preview, DragSession* drag = nullptr, UINT dpi = 96) {
-  if (g_overlay.fadeTo == 255 && g_overlay.shown &&
-      g_overlay.shown->draggedWindow == preview.draggedWindow &&
-      g_overlay.shown->affectedWindow == preview.affectedWindow &&
-      EqualRect(&g_overlay.shown->dragged, &preview.dragged) &&
-      EqualRect(&g_overlay.shown->affected, &preview.affected)) {
-    return;
-  }
+// --- Presentation (the presenting thread) ------------------------------------------
+
+static void Present(const PresentRequest& request) {
+  if (g_overlay.fadeTo == 255 && g_overlay.shown && SameRequest(*g_overlay.shown, request)) return;
+  g_overlay.style = request.style;
 
   DWORD accent = 0;
   BOOL opaqueBlend = FALSE;
@@ -528,26 +585,192 @@ static void Show(const Commands::TiledDropPreview& preview, DragSession* drag = 
   // Reveal the new destination immediately at half strength. If the hint
   // is already fading in, let that fade finish without a new opacity drop.
   // DWM runs a composed fade, so its opacity is read from the clock.
-  const BYTE shownAlpha = Composed() ? AlphaAt(GetTickCount64()) : g_overlay.fadeAlpha;
-  const bool changedTarget = g_overlay.fadeTo == 255 && shownAlpha == 255 && g_settings.dragPreviewFadeMs > 0;
+  const BYTE shownAlpha = Composed() ? AlphaAt(PreviewClockMs()) : g_overlay.fadeAlpha;
+  const bool changedTarget = g_overlay.fadeTo == 255 && shownAlpha == 255 && g_overlay.style.fadeMs > 0;
   if (EnsureComposition()) {
-    const auto scene = ComposedScene(preview, drag, dpi);
+    const auto scene = ComposedScene(request);
     if (ComposedFadeTo(255, changedTarget, &scene, changedTarget ? std::optional<BYTE>(128) : std::nullopt)) {
-      g_overlay.shown = preview;
-      g_overlay.shownDpi = dpi;
+      g_overlay.shown = request;
       return;
     }
     // Composition just failed and was turned off: GDI from a fresh start.
     g_overlay.fadeAlpha = 0;
     g_overlay.fadeTo = 0;
   }
-  ShowWithGdi(preview, drag, dpi, changedTarget);
+  ShowWithGdi(request, changedTarget);
+}
+
+// A theme change recolours the badges, keeping the fade.
+static void RepaintBadges(COLORREF background) {
+  g_overlay.style.badgeBackground = background;
+  if (Composed()) {
+    if (!g_overlay.shown || g_overlay.fadeTo == 0) return;
+    g_overlay.shown->style.badgeBackground = background;
+    const auto scene = ComposedScene(*g_overlay.shown);
+    ComposedFadeTo(g_overlay.fadeTo, false, &scene);
+    return;
+  }
+  for (const IconBadge* badge : {&g_overlay.draggedBadge, &g_overlay.affectedBadge}) {
+    if (badge->window && IsWindowVisible(badge->window)) InvalidateRect(badge->window, nullptr, FALSE);
+  }
+}
+
+static void DestroyOverlay() {
+  g_overlay.composition.reset();
+  for (HWND window : {g_overlay.fill, g_overlay.outline, g_overlay.draggedBadge.window,
+                      g_overlay.affectedBadge.window, g_overlay.host}) {
+    if (window) DestroyWindow(window);
+  }
+  if (g_overlay.windowClass) UnregisterClassW(kPreviewClassName, GetModuleHandleW(nullptr));
+  g_overlay = {};
+}
+
+// --- The preview thread ------------------------------------------------------------
+
+enum PreviewMessage : UINT {
+  kPresentMessage = WM_APP + 1,  // lParam: PresentRequest*, owned by the receiver.
+  kFadeOutMessage,
+  kBadgeThemeMessage,            // wParam: the new badge background.
+  kNewDragMessage,               // Forget the last drag's icons.
+  kWarmUpMessage,                // Attach to the GPU before the first drag.
+};
+
+struct PreviewThread {
+  HANDLE handle = nullptr;
+  std::atomic<DWORD> id{0};
+};
+static PreviewThread g_previewThread;
+
+// True for the preview thread, whose windows MultiWM must ignore like its own.
+static bool IsPreviewThread(DWORD threadId) {
+  const DWORD id = g_previewThread.id.load(std::memory_order_acquire);
+  return id && id == threadId;
+}
+
+static void HandlePreviewMessage(const MSG& msg) {
+  switch (msg.message) {
+    case kPresentMessage: {
+      std::unique_ptr<PresentRequest> request(reinterpret_cast<PresentRequest*>(msg.lParam));
+      if (request) Present(*request);
+      return;
+    }
+    case kFadeOutMessage:
+      FadeTo(0);
+      return;
+    case kBadgeThemeMessage:
+      RepaintBadges(static_cast<COLORREF>(msg.wParam));
+      return;
+    case kNewDragMessage:
+      g_overlay.icons.clear();
+      return;
+    case kWarmUpMessage:
+      EnsureComposition();
+      return;
+    default:
+      DispatchMessageW(&msg);
+  }
+}
+
+// Handles every queued message. False once the thread should exit.
+static bool DrainPreviewMessages() {
+  MSG msg{};
+  while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+    if (msg.message == WM_QUIT) return false;
+    HandlePreviewMessage(msg);
+  }
+  return true;
+}
+
+// Waits for messages while idle; while a GDI fade runs, steps it once per
+// composition so every frame DWM shows has its own opacity. Composed fades
+// need nothing per frame: DWM runs them.
+static DWORD WINAPI PreviewThreadProc(LPVOID ready) {
+  SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));  // WIC, for badge icons.
+  MSG msg{};
+  PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);  // Create the queue before anyone posts.
+  g_overlay.paced = true;
+  SetEvent(static_cast<HANDLE>(ready));
+  for (;;) {
+    if (!g_overlay.fading) {
+      const BOOL received = GetMessageW(&msg, nullptr, 0, 0);
+      if (received <= 0) break;
+      HandlePreviewMessage(msg);
+      continue;
+    }
+    if (!DrainPreviewMessages()) break;
+    if (!g_overlay.fading) continue;
+    StepFade(PreviewClockMs());
+    if (g_overlay.fading && FAILED(DwmFlush())) Sleep(kFadeIntervalMs);
+  }
+  DestroyOverlay();
+  if (com) CoUninitialize();
+  return 0;
+}
+
+// Starts the preview thread once. False when it can't start; the preview then
+// runs on the WM thread.
+static bool EnsurePreviewThread() {
+  if (g_previewThread.handle) return true;
+  HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!ready) return false;
+  DWORD id = 0;
+  HANDLE thread = CreateThread(nullptr, 0, PreviewThreadProc, ready, 0, &id);
+  const bool started = thread && WaitForSingleObject(ready, 2000) == WAIT_OBJECT_0;
+  CloseHandle(ready);
+  if (!started) {
+    if (thread) {
+      PostThreadMessageW(id, WM_QUIT, 0, 0);
+      WaitForSingleObject(thread, 2000);
+      CloseHandle(thread);
+    }
+    Wh_Log(L"Drag preview thread did not start; previews run on the WM thread");
+    return false;
+  }
+  SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+  g_previewThread.handle = thread;
+  g_previewThread.id.store(id, std::memory_order_release);
+  return true;
+}
+
+// Sends a message to the preview thread. False when there is no thread, so the
+// caller presents on its own thread instead.
+static bool PostToPreviewThread(UINT message, WPARAM wparam = 0, LPARAM lparam = 0) {
+  const DWORD id = g_previewThread.id.load(std::memory_order_acquire);
+  return id && PostThreadMessageW(id, message, wparam, lparam);
+}
+
+// --- WM thread API -----------------------------------------------------------------
+
+// At the start of a WM session: start the preview thread and attach to the
+// GPU there, so the first drag doesn't wait. Nothing while previews are off.
+static void Start() {
+  if (g_settings.DragPreviewEnabled() && EnsurePreviewThread()) PostToPreviewThread(kWarmUpMessage);
+}
+
+static void Show(const Commands::TiledDropPreview& preview, bool badges = false, UINT dpi = 96) {
+  PresentRequest request{preview, CurrentStyle(), dpi, badges};
+  if (!g_previewThread.id.load(std::memory_order_acquire)) {
+    Present(request);
+    return;
+  }
+  auto* posted = new PresentRequest(request);
+  if (!PostToPreviewThread(kPresentMessage, 0, reinterpret_cast<LPARAM>(posted))) delete posted;
+}
+
+static void Hide() {
+  if (!PostToPreviewThread(kFadeOutMessage)) FadeTo(0);
+}
+
+static void RefreshBadgeTheme() {
+  const COLORREF background = TrayUi::FlyoutBackgroundColor();
+  if (!PostToPreviewThread(kBadgeThemeMessage, background)) RepaintBadges(background);
 }
 
 static void End(HWND source = nullptr) {
   if (source && (!g_drag || g_drag->source != source)) return;
   g_drag.reset();
-  FadeTo(0);
+  Hide();
 }
 
 static void Begin(HWND source, HWND displayedWindow) {
@@ -561,7 +784,9 @@ static void Begin(HWND source, HWND displayedWindow) {
   if (!Platform::Monitors::GetCurrentWorkspaceKey(monitor, &key)) return;
   const auto start = Gestures::g_moveSize.startRects.find(source);
   if (start == Gestures::g_moveSize.startRects.end()) return;
-  g_drag.emplace(DragSession{source, displayedWindow, monitor, std::move(key), start->second, {}, {}, {}, {}, {}});
+  // Previews turned on mid-session start the thread with the first drag.
+  if (!EnsurePreviewThread() || !PostToPreviewThread(kNewDragMessage)) g_overlay.icons.clear();
+  g_drag.emplace(DragSession{source, displayedWindow, monitor, std::move(key), start->second, {}, {}, {}, {}});
 }
 
 // Capture tile bounds once per workspace revision and replan only when the
@@ -586,7 +811,7 @@ static void UpdateDropPreview(DragSession& drag, POINT cursor) {
   if (Platform::Monitors::GetWorkspaceMetrics(drag.monitor, &metrics)) {
     if (target) {
       if (const auto preview = Commands::PlanTiledDropPreview(drag.workspace, drag.source, *target, metrics)) {
-        Show(*preview, &drag, metrics.dpi);
+        Show(*preview, true, metrics.dpi);
         return;
       }
     }
@@ -594,11 +819,11 @@ static void UpdateDropPreview(DragSession& drag, POINT cursor) {
     // window cannot be moved back by MultiWM.
     const WindowRecord* source = drag.workspace.Find(drag.source);
     if (drag.displayedWindow == drag.source && source && source->canMove && !IsRectEmpty(&drag.start)) {
-      Show({drag.start, drag.start, drag.source}, &drag, metrics.dpi);
+      Show({drag.start, drag.start, drag.source}, true, metrics.dpi);
       return;
     }
   }
-  FadeTo(0);
+  Hide();
 }
 
 static void OnWindowEvent(DWORD event, HWND hwnd) {
@@ -624,7 +849,7 @@ static void OnWindowEvent(DWORD event, HWND hwnd) {
       MonitorFromRect(&current, MONITOR_DEFAULTTONULL) != drag.monitor ||
       Gestures::ClassifyMoveSizeIntent(drag.start, current, 1, false) != MoveSizeIntent::Move) {
     drag.revision.reset();
-    FadeTo(0);
+    Hide();
     return;
   }
 
@@ -633,13 +858,16 @@ static void OnWindowEvent(DWORD event, HWND hwnd) {
 
 static void Shutdown() {
   g_drag.reset();
-  g_overlay.composition.reset();
-  for (HWND window : {g_overlay.fill, g_overlay.outline, g_overlay.draggedBadge.window,
-                      g_overlay.affectedBadge.window, g_overlay.host}) {
-    if (window) DestroyWindow(window);
+  if (HANDLE thread = g_previewThread.handle) {
+    PostThreadMessageW(g_previewThread.id.load(std::memory_order_acquire), WM_QUIT, 0, 0);
+    // The thread only ever waits on DWM, the GPU or an 8 ms icon request.
+    if (WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) Wh_Log(L"Drag preview thread did not exit");
+    CloseHandle(thread);
+    g_previewThread.handle = nullptr;
+    g_previewThread.id.store(0, std::memory_order_release);
+    return;
   }
-  if (g_overlay.windowClass) UnregisterClassW(kPreviewClassName, GetModuleHandleW(nullptr));
-  g_overlay = {};
+  DestroyOverlay();
 }
 
 }  // namespace DragPreview

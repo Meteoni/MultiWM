@@ -76,6 +76,7 @@ static void NotifyDisplayChanged();
 // Defined in app/drag_preview.h.
 namespace DragPreview {
 static void RefreshBadgeTheme();
+static bool IsPreviewThread(DWORD threadId);
 }  // namespace DragPreview
 
 // Defined in app/tray_ui.h.

@@ -219,10 +219,11 @@ static void OnLifecycleEvent(DWORD event, HWND hwnd) {
   QueueWindowEvent(event, hwnd);
 }
 
-// The tray, toasts and drag preview all belong to the WM thread.
+// The tray and toasts belong to the WM thread, the drag preview to its own.
 static bool IsOwnWindow(HWND hwnd) {
   const DWORD wmThread = g_wm.threadId.load(std::memory_order_acquire);
-  return wmThread && GetWindowThreadProcessId(hwnd, nullptr) == wmThread;
+  const DWORD owner = GetWindowThreadProcessId(hwnd, nullptr);
+  return owner && ((wmThread && owner == wmThread) || DragPreview::IsPreviewThread(owner));
 }
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
