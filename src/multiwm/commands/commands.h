@@ -3,6 +3,79 @@
 
 namespace Commands {
 
+// A tiled window whose cell `candidate` (planned as `candidateRects`) would move
+// while the window is hung and shown by its ghost, or nullptr. MultiWM can't
+// move a ghost: dwm.exe owns it and refuses positioning from other processes, so
+// only the ghost itself can move, when the user drags it. A cell may stay where
+// `current` plans it, or land exactly where the ghost is shown.
+static HWND FindGhostAUserChangeWouldMove(
+    const Workspace* current, const Workspace& candidate, const std::vector<RECT>& candidateRects,
+    const Platform::Monitors::WorkspaceMetrics& metrics) {
+  std::vector<RECT> currentRects;
+  bool currentPlanned = false;
+  for (size_t i = 0; i < candidate.TiledWindows().size() && i < candidateRects.size(); ++i) {
+    const HWND hwnd = candidate.TiledWindows()[i];
+    const WindowRecord* record = candidate.Find(hwnd);
+    if (!record || record->ghostSize.cx <= 0 || record->ghostSize.cy <= 0) continue;
+    const RECT& planned = candidateRects[i];
+    if (current && !currentPlanned) {
+      currentPlanned = true;
+      if (Layout::BuildWorkspaceLayoutPlan(*current, metrics.workArea, metrics.gap, &currentRects) !=
+          Layout::LayoutPlanStatus::Success) {
+        currentRects.clear();
+      }
+    }
+    const size_t was = current ? current->TiledIndex(hwnd) : Workspace::kNotFound;
+    if (was < currentRects.size() && Layout::RectsNear(planned, currentRects[was])) continue;
+    RECT shown{};
+    if (Platform::Windows::GetDisplayedWindowFrameRect(hwnd, &shown) && Layout::RectsNear(planned, shown)) continue;
+    return hwnd;
+  }
+  return nullptr;
+}
+
+// True, after telling the user, when `candidate` would move a hung window's
+// ghost (FindGhostAUserChangeWouldMove).
+static bool RefuseMovingAGhost(
+    const Workspace* current, const Workspace& candidate, const std::vector<RECT>& rects,
+    const Platform::Monitors::WorkspaceMetrics& metrics, HMONITOR monitor, const wchar_t* action) {
+  const HWND ghosted = FindGhostAUserChangeWouldMove(current, candidate, rects, metrics);
+  if (!ghosted) return false;
+  std::wstring name = Placement::ProcessDisplayName(ghosted);
+  if (name.empty()) name = L"A window";
+  const std::wstring text = name + L" isn't responding and can't be moved";
+  TrayUi::ShowCommandFailureFlyout(text.c_str(), monitor);
+  Diagnostics::RecordEvent(L"layout mutation rejected action=%ls: hung window can't move hwnd=%p",
+                           action ? action : L"Layout mutation", ghosted);
+  return true;
+}
+
+// Plans `candidate`, a user change of `kind`, into `rects`. A layout change to
+// Dwindle that doesn't fit as is may reassign windows to slots that fit, which
+// replaces `candidate`. That reassignment was always accepted unplanned, so
+// `*acceptAsIs` is set when it can't then be planned for the checks that follow.
+static Layout::LayoutPlanStatus PlanUserLayoutMutation(
+    Workspace& candidate, Placement::UserLayoutMutationKind kind, const wchar_t* action,
+    const Platform::Monitors::WorkspaceMetrics& metrics, std::vector<RECT>* rects, bool* acceptAsIs) {
+  Layout::LayoutPlanStatus status = Layout::BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, rects);
+  if (status != Layout::LayoutPlanStatus::Unsatisfiable || candidate.Layout() != TileLayout::Dwindle ||
+      kind != Placement::UserLayoutMutationKind::LayoutChange) {
+    return status;
+  }
+  Workspace reassigned = candidate;
+  size_t movedWindowCount = 0;
+  if (!Layout::ReassignDwindleLayoutConversionForConstraints(reassigned, metrics.workArea, metrics.gap,
+                                                              &movedWindowCount)) {
+    return status;
+  }
+  candidate = std::move(reassigned);
+  Diagnostics::RecordEvent(L"dwindle layout conversion reassigned windows action=%ls moved=%zu",
+                           action ? action : L"Change layout", movedWindowCount);
+  status = Layout::BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, rects);
+  *acceptAsIs = status != Layout::LayoutPlanStatus::Success;
+  return status;
+}
+
 // User-authored geometry changes are rejected before commit when cached native
 // constraints already make them impossible. A short-lived transaction handles a
 // minimum that an application changes only during the resulting placement.
@@ -16,7 +89,8 @@ static bool ValidateUserLayoutMutation(
   // the user's operation is feasible.
   Workspace current;
   bool committedConstraintsChanged = false;
-  if (g_workspaces.Load(key, &current)) {
+  const bool haveCurrent = g_workspaces.Load(key, &current);
+  if (haveCurrent) {
     committedConstraintsChanged =
         Placement::RefreshWorkspaceNativeConstraints(current, true, L"user mutation");
     if (committedConstraintsChanged) {
@@ -33,30 +107,14 @@ static bool ValidateUserLayoutMutation(
 
   Platform::Monitors::WorkspaceMetrics metrics;
   std::vector<RECT> rects;
+  bool acceptAsIs = false;
   Layout::LayoutPlanStatus status = Layout::LayoutPlanStatus::Unsatisfiable;
   if (Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) {
-    status = Layout::BuildWorkspaceLayoutPlan(
-        candidate, metrics.workArea, metrics.gap, &rects);
-    if (status == Layout::LayoutPlanStatus::Unsatisfiable &&
-        candidate.Layout() == TileLayout::Dwindle) {
-      if (kind == Placement::UserLayoutMutationKind::LayoutChange) {
-        Workspace reassigned = candidate;
-        size_t movedWindowCount = 0;
-        if (Layout::ReassignDwindleLayoutConversionForConstraints(
-                reassigned, metrics.workArea, metrics.gap,
-                &movedWindowCount)) {
-          candidate = std::move(reassigned);
-          Diagnostics::RecordEvent(
-              L"dwindle layout conversion reassigned windows action=%ls moved=%zu",
-              action ? action : L"Change layout", movedWindowCount);
-          return true;
-        }
-      }
-    }
+    status = PlanUserLayoutMutation(candidate, kind, action, metrics, &rects, &acceptAsIs);
   }
-  if (status == Layout::LayoutPlanStatus::Success ||
-      status == Layout::LayoutPlanStatus::NotApplicable) {
-    return true;
+  if (acceptAsIs || status == Layout::LayoutPlanStatus::NotApplicable) return true;
+  if (status == Layout::LayoutPlanStatus::Success) {
+    return !RefuseMovingAGhost(haveCurrent ? &current : nullptr, candidate, rects, metrics, monitor, action);
   }
 
   Placement::ReportRejectedLayoutMutation(

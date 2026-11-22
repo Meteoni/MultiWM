@@ -1112,102 +1112,81 @@ static HWND g_testGhost = nullptr;
 static HWND WINAPI TestGhostFromHung(HWND hwnd) { return hwnd && hwnd == g_testHung ? g_testGhost : nullptr; }
 static HWND WINAPI TestHungFromGhost(HWND hwnd) { return hwnd && hwnd == g_testGhost ? g_testHung : nullptr; }
 
+// MultiWM can't move a real ghost (dwm.exe refuses), so it lays the other windows
+// out around the ghost's fixed size and refuses user layout changes that would
+// move the ghost's planned frame, unless the new frame is where the ghost is
+// shown. The test "ghost" is an ordinary window, which the user's drags move.
 static void CheckGhostLayoutAndCommands(CheckCounter& check, FloatingWindowFixture& f, HWND other) {
   const HWND hung = g_testHung;
   const HWND ghost = g_testGhost;
   const RECT originalFrame = FloatingWindowFixture::Frame(hung);
   const LONG width = std::min<LONG>(320, (Layout::RectWidth(f.workArea) - f.metrics.gap) / 4);
   const LONG height = std::min<LONG>(240, (Layout::RectHeight(f.workArea) - f.metrics.gap) / 4);
-  for (const TileLayout layout : {TileLayout::Columns, TileLayout::Rows}) {
-    FloatingWindowFixture::AppMove(ghost, f.workArea.left + 25, f.workArea.top + 30, width, height);
-    f.Seed(layout);
-    Workspace workspace = f.Load();
-    workspace.AdmitTiled(FloatingWindowFixture::Record(other));
-    workspace.UpdateConstraints(hung, WindowConstraints{1, 1, f.metrics.dpi, true});
-    g_workspaces.Save(f.key, workspace);
+  auto planned = [&](const Workspace& workspace, HWND hwnd) {
+    std::vector<RECT> plan;
+    const size_t index = workspace.TiledIndex(hwnd);
+    return Layout::BuildWorkspaceLayoutPlan(workspace, f.workArea, f.metrics.gap, &plan) ==
+                   Layout::LayoutPlanStatus::Success && index < plan.size()
+               ? plan[index] : RECT{};
+  };
 
-    Reconcile::ProcessWindowLifecycleEvent(EVENT_OBJECT_STATECHANGE, hung);
-    workspace = f.Load();
-    std::vector<RECT> cells;
-    Layout::PlanPreferredCells(workspace, f.workArea, f.metrics.gap, &cells);
-    check(Layout::RectsNear(FloatingWindowFixture::Frame(ghost), SharedGeometry::CenteredIn(cells[0], width, height)),
-          "a ghost state change centers the fixed-size ghost in a larger tile");
-    const RECT appFrame = FloatingWindowFixture::Frame(hung);
-    check(EqualRect(&originalFrame, &appFrame) && workspace.Find(hung)->constraints.minWidth == 1,
-          "ghost layout keeps the real window frame and native limits intact");
-
-    MoveSizeGesture gesture;
-    gesture.hasRects = true;
-    gesture.start = gesture.end = FloatingWindowFixture::Frame(other);
-    if (layout == TileLayout::Columns) {
-      gesture.end.left = f.workArea.left + f.metrics.gap + width / 2;
-    } else {
-      gesture.end.top = f.workArea.top + f.metrics.gap + height / 2;
-    }
-    Commands::HandleUserResize(f.key, workspace, other, f.workArea, f.metrics.gap, gesture);
-    workspace = f.Load();
-    Layout::PlanPreferredCells(workspace, f.workArea, f.metrics.gap, &cells);
-    const LONG remaining = layout == TileLayout::Columns ? Layout::RectWidth(cells[0]) : Layout::RectHeight(cells[0]);
-    const LONG minimum = layout == TileLayout::Columns ? width : height;
-    check(remaining >= minimum && remaining <= minimum + 1 &&
-              Layout::RectsNear(FloatingWindowFixture::Frame(ghost), SharedGeometry::CenteredIn(cells[0], width, height)),
-          "dragging the sibling stops at the ghost size on the active axis");
-  }
-
+  FloatingWindowFixture::AppMove(ghost, f.workArea.left + 25, f.workArea.top + 30, width, height);
+  const RECT ghostShown = FloatingWindowFixture::Frame(ghost);
   const HWND third = f.CreateTestWindow(nullptr);
-  g_settings.reverseDwindle = false;
-  f.Seed(TileLayout::Dwindle);
+  f.Seed(TileLayout::Columns);
   Workspace workspace = f.Load();
   workspace.AdmitTiled(FloatingWindowFixture::Record(other));
   workspace.AdmitTiled(FloatingWindowFixture::Record(third));
-  check(workspace.SwapTiled(hung, other), "put the ghost above a sibling in Dwindle");
+  workspace.UpdateConstraints(hung, WindowConstraints{1, 1, f.metrics.dpi, true});
   g_workspaces.Save(f.key, workspace);
-  Placement::ArrangeWorkspace(f.key);
-  workspace = f.Load();
-  MoveSizeGesture resize;
-  resize.hasRects = true;
-  resize.start = resize.end = FloatingWindowFixture::Frame(third);
-  resize.end.top = f.workArea.top + f.metrics.gap + height / 2;
-  Commands::HandleUserResize(f.key, workspace, third, f.workArea, f.metrics.gap, resize);
-  workspace = f.Load();
-  std::vector<RECT> cells;
-  Layout::PlanPreferredCells(workspace, f.workArea, f.metrics.gap, &cells);
-  check(Layout::RectHeight(cells[1]) == height &&
-            Layout::RectsNear(FloatingWindowFixture::Frame(ghost), SharedGeometry::CenteredIn(cells[1], width, height)),
-        "Dwindle clamps the divider while leaving slack around the ghost on the other axis");
 
-  f.Seed(TileLayout::Columns);
+  Reconcile::ProcessWindowLifecycleEvent(EVENT_OBJECT_STATECHANGE, hung);
   workspace = f.Load();
-  workspace.AdmitTiled(FloatingWindowFixture::Record(other));
-  workspace.AdmitTiled(FloatingWindowFixture::Record(third));
-  g_workspaces.Save(f.key, workspace);
-  Placement::ArrangeWorkspace(f.key);
-  auto ghostIsInSlot = [&](size_t index) {
-    const Workspace current = f.Load();
-    std::vector<RECT> plan;
-    return current.TiledIndex(hung) == index &&
-        Layout::BuildWorkspaceLayoutPlan(current, f.workArea, f.metrics.gap, &plan) ==
-            Layout::LayoutPlanStatus::Success &&
-        Layout::RectsNear(FloatingWindowFixture::Frame(ghost), plan[index]);
-  };
+  check(workspace.Find(hung)->ghostSize.cx == width && workspace.Find(hung)->ghostSize.cy == height &&
+            Layout::RectsNear(FloatingWindowFixture::Frame(ghost), ghostShown) &&
+            Layout::RectsNear(FloatingWindowFixture::Frame(other), planned(workspace, other)),
+        "a ghost's siblings tile around its fixed size; the ghost stays where it is");
+  const RECT appFrame = FloatingWindowFixture::Frame(hung);
+  check(EqualRect(&originalFrame, &appFrame) && workspace.Find(hung)->constraints.minWidth == 1,
+        "ghost layout keeps the real window frame and native limits intact");
+
+  // Splitters: one that would move the ghost's planned frame is refused, one
+  // between two other windows is not.
+  const Workspace beforeResize = workspace;
+  MoveSizeGesture gesture;
+  gesture.hasRects = true;
+  gesture.start = gesture.end = FloatingWindowFixture::Frame(other);
+  gesture.end.left -= Layout::RectWidth(f.workArea) / 20;
+  Commands::HandleUserResize(f.key, workspace, other, f.workArea, f.metrics.gap, gesture);
+  check(f.Load().HasSameLayoutStateAs(beforeResize), "a splitter drag that would move the ghost is refused");
+  workspace = f.Load();
+  gesture.start = gesture.end = FloatingWindowFixture::Frame(third);
+  gesture.end.left -= Layout::RectWidth(f.workArea) / 20;
+  Commands::HandleUserResize(f.key, workspace, third, f.workArea, f.metrics.gap, gesture);
+  const RECT ghostFrameAfter = planned(f.Load(), hung);
+  const RECT ghostFrameBefore = planned(beforeResize, hung);
+  check(!f.Load().HasSameLayoutStateAs(beforeResize) && EqualRect(&ghostFrameAfter, &ghostFrameBefore),
+        "a splitter drag that leaves the ghost's frame alone is accepted");
+
+  // Order: refused while it would move the ghost, accepted once the user has
+  // dragged the ghost to where the new order puts it.
   Commands::DemoteFocusedWindow(ghost);
-  check(ghostIsInSlot(1), "demoting the focused ghost moves it one slot");
+  check(f.Load().TiledIndex(hung) == 0, "demoting the focused ghost is refused while it can't move");
+  Workspace demoted = f.Load();
+  demoted.SwapTiled(hung, other);
+  const RECT demotedFrame = planned(demoted, hung);
+  FloatingWindowFixture::AppMove(ghost, demotedFrame.left, demotedFrame.top, width, height);
   Commands::DemoteFocusedWindow(ghost);
-  check(ghostIsInSlot(2), "a second demotion moves the ghost to the last slot");
-  Commands::PromoteFocusedWindow(ghost);
-  check(ghostIsInSlot(1), "promoting the focused ghost moves it one slot");
-  Commands::SwapMaster(ghost);
-  check(ghostIsInSlot(0), "swapping the focused ghost with master moves it to the first slot");
+  check(f.Load().TiledIndex(hung) == 1, "the same demotion is accepted once the ghost is where it lands");
 
   MoveSizeGesture drop;
   drop.hasDropPoint = true;
   drop.dropPoint = SharedGeometry::RectCenter(FloatingWindowFixture::Frame(ghost));
   workspace = f.Load();
-  const size_t otherIndex = workspace.TiledIndex(other);
   g_settings.mouseMoveBehavior = MouseMoveBehavior::Swap;
   Commands::HandleUserMove(f.key, workspace, other, drop);
-  check(ghostIsInSlot(otherIndex) && f.Load().TiledIndex(other) == 0,
-        "dropping a sibling onto the displayed ghost swaps their tiles");
+  check(f.Load().TiledIndex(hung) == 1 && f.Load().TiledIndex(other) == 0,
+        "dropping a sibling onto the ghost is refused: the ghost would have to move");
 
   g_testGhost = nullptr;
   Reconcile::ProcessWindowLifecycleEvent(EVENT_OBJECT_STATECHANGE, hung);

@@ -990,11 +990,11 @@ static TiledPlacementOutcome PlaceTiledWindow(
   if (Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     return {};
   }
-  if (const HWND ghost = Platform::Windows::GhostWindowOf(hwnd)) {
+  // A hung window shown by its ghost keeps its slot but isn't placed: the app
+  // can't move, and dwm.exe, which owns the ghost, refuses positioning from
+  // other processes (measured, also elevated). Only the user can drag a ghost.
+  if (Platform::Windows::GhostWindowOf(hwnd)) {
     CancelConformanceLease(hwnd);
-    if (record->canMove && !Gestures::IsMoveSizeGestureInProgress(hwnd)) {
-      Platform::Windows::MoveGhostWindow(hwnd, ghost, target);
-    }
     return {};
   }
 

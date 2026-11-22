@@ -95,8 +95,11 @@ static bool RepairFloatingGeometry(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const FloatingPlacementHint& hint) {
   const WindowRecord* record = workspace.Find(hwnd);
+  // A hung window shown by its ghost can't be placed (see PlaceTiledWindow);
+  // the ghost stays wherever it is, or wherever the user drags it.
   if (!record || !record->canMove || !IsWindow(hwnd) ||
-      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
+      Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None ||
+      Platform::Windows::GhostWindowOf(hwnd)) {
     return false;
   }
 
@@ -107,17 +110,16 @@ static bool RepairFloatingGeometry(
   if (!Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) return false;
   const RECT& workArea = metrics.workArea;
   const UINT targetDpi = metrics.dpi;
-  const HWND ghost = Platform::Windows::GhostWindowOf(hwnd);
 
   SharedGeometry::FloatingRequest request;
-  request.source = ghost ? SharedGeometry::FloatingSizeSource::Own : FloatingSizeSourceFor(hint.intent);
+  request.source = FloatingSizeSourceFor(hint.intent);
   request.workArea = workArea;
-  request.canResize = !ghost && record->canResize;
+  request.canResize = record->canResize;
   request.honorPreserveSize = hint.intent != FloatingPlacementIntent::FailureCenter;
   request.defaultSize = SIZE{SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.width, targetDpi),
                              SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.height, targetDpi)};
   RECT current{};
-  if (Platform::Windows::GetWindowFrameRect(ghost ? ghost : hwnd, &current) && current.right > current.left &&
+  if (Platform::Windows::GetWindowFrameRect(hwnd, &current) && current.right > current.left &&
       current.bottom > current.top) {
     request.current = SIZE{SharedGeometry::Width(current), SharedGeometry::Height(current)};
   }
@@ -160,12 +162,6 @@ static bool RepairFloatingGeometry(
   // target is being calculated. Never overwrite it.
   if (Platform::Windows::GetPhysicalSuspensionReason(hwnd) != SuspensionReason::None) {
     return false;
-  }
-  if (ghost) {
-    if (!Platform::Windows::MoveGhostWindow(hwnd, ghost, target)) return false;
-    workspace.RememberFloatingGeometry(hwnd, target, targetDpi);
-    ++Diagnostics::g_runtime.counters.floatingGeometryRepairs;
-    return true;
   }
   return PlaceFloatingWindow(workspace, hwnd, targetDpi, target, placement->moveOnly);
 }

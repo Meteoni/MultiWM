@@ -230,25 +230,10 @@ static SIZE GetRestoredGhostSize(HWND hwnd) {
   return size.cx > 0 && size.cy > 0 ? size : SIZE{};
 }
 
-// Queue a position-only move on the surrogate while it still represents hwnd.
-// Windows reports the ghost itself as hung, and the original app is still busy.
-static bool MoveGhostWindow(HWND hwnd, HWND ghost, const RECT& target) {
-  RECT frame{};
-  if (GhostSuspensionReason(ghost) != SuspensionReason::None ||
-      !GetWindowFrameRect(ghost, &frame) ||
-      Layout::RectWidth(frame) != Layout::RectWidth(target) ||
-      Layout::RectHeight(frame) != Layout::RectHeight(target)) return false;
-  if (Layout::RectsNear(frame, target)) return true;
-
-  RECT bounds{};
-  if (!GetWindowRect(ghost, &bounds) || GhostWindowOf(hwnd) != ghost) return false;
-  if (SetWindowPos(ghost, nullptr, bounds.left + (target.left - frame.left),
-                   bounds.top + (target.top - frame.top), 0, 0,
-                   SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER |
-                       SWP_NOOWNERZORDER | SWP_NOSENDCHANGING)) return true;
-  Diagnostics::RecordEvent(L"ghost placement failed hwnd=%p ghost=%p error=%lu", hwnd, ghost, GetLastError());
-  return false;
-}
+// MultiWM can't move a ghost: dwm.exe owns it and refuses SetWindowPos,
+// MoveWindow, SetWindowPlacement and DeferWindowPos from other processes with
+// ERROR_ACCESS_DENIED, even elevated, while messages still get through
+// (measured on 26100). Only the ghost moves itself, when the user drags it.
 
 static SuspensionReason GetPhysicalSuspensionReason(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) return SuspensionReason::None;
