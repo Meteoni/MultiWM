@@ -39,7 +39,7 @@ except the sibling `shared/` and `companion/` roots.
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |
 | `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot |
 | `windhawk/` | — | Windhawk's stock tool-mod launcher. Not MultiWM logic. |
-| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry` | Code compiled by both mods, so both decide alike: window-rule matching, the window-shape checks and process-name read behind it, the companion snapshot layout, and geometry/size-limit and frame-border arithmetic. Windows and the standard library only. |
+| `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry` | Code compiled by both mods, so both decide alike: window-rule matching, the window-shape checks and process-name read behind it, the companion snapshot layout, geometry/size-limit and frame-border arithmetic, and the split arithmetic both mods fit BSP minimum sizes with (`SharedSplits`). Windows and the standard library only. |
 | `companion/` | `Companion` | The separate MultiWM Companion mod (`src/companion/multiwm-companion.cpp`). Never included by MultiWM. |
 
 ## The companion mod
@@ -70,7 +70,10 @@ while MultiWM places the window without them.
 
 The snapshot holds each current-desktop workspace's next-admission tile and default
 floating frame, definite overflow-float predictions, known window ownership/treatment, rules and per-window
-restore frames. Prediction uses MultiWM's layout planner with the monitor's physical
+restore frames. A BSP workspace adds the tiles an arrival tries, in arrangement's order:
+the split tile, that split turned, then the largest other tile both ways, each with the splits above
+it and the other sides' minimums. The companion fits the window's live minimum to them with the
+planner's own arithmetic (`shared/split_geometry.h`), so its tile and rectangle are MultiWM's. Prediction uses MultiWM's layout planner with the monitor's physical
 work area, DPI-scaled insets and gap. The companion starts from the application's
 proposed geometry, queries its live size limits, and adjusts its original positioning
 call. The native call retains its command, flags, batching and return value. An
@@ -136,12 +139,13 @@ it does not prove every application uses default handling. Restore-to-maximized,
 Floating workspaces, unsupported thread contexts and unavailable hints pass through.
 
 Local overflow-float hints cover definite capacity overflow and a minimum larger
-than the work area. The direct-centre policy applies when routing is disabled, or
-there is exactly one monitor with desktop creation off. General routed-overflow
-destinations and full geometry-based admission prediction remain deferred; see
-[the plan](VFX_COMPANION_PLAN.md).
+than the work area when the window will float in place. BSP also publishes a
+local float when none of its tiles can fit even a minimal new window. BSP
+overflow can route to another monitor on the current desktop when enabled.
+General routed-overflow destinations and full geometry-based admission prediction
+remain deferred (see [the plan](VFX_COMPANION_PLAN.md)).
 
-ABI 5.0 uses fixed-width structures with layout assertions for x86 and x64. Bounds
+ABI 5.1 uses fixed-width structures with layout assertions for x86 and x64. Bounds
 are 16 workspaces, 2048 tracked HWNDs, 128 restore hints and 32 KiB of encoded rules.
 The reader caches the body by generation and writer PID and decodes rules only
 when their bytes change. ABI 5 uses 64-byte tracked entries and 32-byte restore
@@ -206,6 +210,7 @@ anything. When you see a check repeated after a native call, that is why.
 | You want to… | Start in |
 | --- | --- |
 | Add a layout or change how one divides space | `layout/algorithms.h`, then `layout/planning.h` (`BuildWorkspaceLayoutPlan`) |
+| Change the BSP layout | `model/bsp_tree.h` (the stored split tree: insertion, removal), `layout/bsp_layout.h` (its rectangles), `Workspace::SyncBspTree` (keeping it in step with membership) |
 | Change what happens when a window appears | `reconcile/reconcile.h` (admission helpers near the top) |
 | Change a window rule's effect | `app/configuration.h` (parsing) and `platform/native_windows.h` (`FindMatchingWindowRule`) |
 | Add a hotkey or tray command | `core/shared_types.h` (IDs), `app/wm_thread.h`, `commands/commands.h` |

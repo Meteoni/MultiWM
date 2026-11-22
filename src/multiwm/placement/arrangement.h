@@ -188,12 +188,13 @@ static bool RefreshWorkspaceNativeConstraints(
 static void RememberPendingLayoutMutation(
     const DesktopMonitorKey& key, const Workspace& previous,
     const Workspace& candidate, HWND subject, UserLayoutMutationKind kind,
-    const wchar_t* action) {
+    const wchar_t* action, std::optional<RECT> bspDropEdge = std::nullopt) {
   PendingLayoutMutation mutation;
   mutation.previous = previous;
   mutation.candidate = candidate;
   mutation.subject = subject;
   mutation.kind = kind;
+  mutation.bspDropEdge = bspDropEdge;
   mutation.action = action ? action : L"Layout mutation";
   g_pendingProofs.RememberLayoutMutation(key, std::move(mutation));
 }
@@ -330,6 +331,42 @@ static std::wstring NeedMoreSpaceMessage(const std::vector<HWND>& windows) {
   return message;
 }
 
+static std::wstring SpaceFloatMessage(const std::vector<SpaceFloat>& floats) {
+  if (floats.empty()) return {};
+  if (floats.size() == 1 && floats.front().reason == SpaceFloatReason::NoBspTileFits) {
+    return L"No BSP tile has enough space. Window floated.";
+  }
+  const auto countLimited = static_cast<size_t>(std::count_if(floats.begin(), floats.end(), [](const SpaceFloat& item) {
+    return item.reason == SpaceFloatReason::CountLimit;
+  }));
+  std::wstring message = floats.size() == 1 ? ProcessDisplayName(floats.front().window)
+                                           : std::to_wstring(floats.size()) + L" windows";
+  if (message.empty()) message = L"A window";
+  message += L" floated";
+  if (countLimited == floats.size()) return message + L" at the auto-tiling limit";
+  if (countLimited) return message + L" due to space or the auto-tiling limit";
+  return message + (floats.size() == 1 ? L" because it needs more space" : L" because they need more space");
+}
+
+static void ShowSpaceFloatToast(const std::vector<SpaceFloat>& floats, HMONITOR monitor) {
+  if (floats.empty()) return;
+  const std::wstring message = SpaceFloatMessage(floats);
+  TrayUi::ShowCommandFailureFlyout(message.c_str(), monitor);
+}
+
+// A user command reports every float it caused; otherwise only the ones that
+// announce themselves (SpaceFloat::announce) are toasted.
+static void ReportSpaceFloats(const std::vector<SpaceFloat>& floats, HMONITOR monitor) {
+  if (g_wm.commandReleases) {
+    g_wm.commandReleases->insert(g_wm.commandReleases->end(), floats.begin(), floats.end());
+    return;
+  }
+  std::vector<SpaceFloat> announced;
+  std::copy_if(floats.begin(), floats.end(), std::back_inserter(announced),
+               [](const SpaceFloat& item) { return item.announce; });
+  ShowSpaceFloatToast(announced, monitor);
+}
+
 // NeedMoreSpaceMessage for the tiled windows `involved` marks; `fallback` is the
 // window to blame when none is marked, if it can be named.
 static std::wstring ConstraintConflictMessage(
@@ -361,6 +398,7 @@ static void ReportRejectedLayoutMutation(
       ++Diagnostics::g_runtime.counters.rejectedResizeGestures;
       break;
     case UserLayoutMutationKind::Order:
+    case UserLayoutMutationKind::BspMerge:
       ++Diagnostics::g_runtime.counters.rejectedOrderCommands;
       break;
     case UserLayoutMutationKind::LayoutChange:
@@ -371,8 +409,11 @@ static void ReportRejectedLayoutMutation(
   HWND culprit = Layout::FindConstraintCulprit(
       rejectedWorkspace, rejectedRects, subject);
   if (!culprit) culprit = culpritHint;
-  ShowWindowConstraintConflict(
-      rejectedWorkspace, rejectedRects, culprit, monitor);
+  if (kind == UserLayoutMutationKind::BspMerge) {
+    TrayUi::ShowCommandFailureFlyout(L"Not enough room for a split on that edge.", monitor);
+  } else {
+    ShowWindowConstraintConflict(rejectedWorkspace, rejectedRects, culprit, monitor);
+  }
   Wh_Log(
       L"%ls rejected by layout constraints subject=%p culprit=%p",
       action, subject, culprit);
@@ -413,16 +454,19 @@ static bool TryRollbackPendingLayoutMutation(
     g_pendingProofs.DiscardLayoutMutation(key);
     return false;
   }
-  std::vector<RECT> restoredRects;
-  const Layout::LayoutPlanStatus restoredStatus = Layout::BuildWorkspaceLayoutPlan(
-      restored, rollbackMetrics.workArea, rollbackMetrics.gap, &restoredRects);
-  if (restoredStatus != Layout::LayoutPlanStatus::Success &&
-      restoredStatus != Layout::LayoutPlanStatus::NotApplicable) {
-    Diagnostics::RecordEvent(
-        L"layout mutation rollback no longer feasible action=%ls desktop=%08X",
-        mutation.action, key.desktopId.Data1);
-    g_pendingProofs.DiscardLayoutMutation(key);
-    return false;
+  // A rejected merge relinquishes the target even if the original layout now
+  // needs constraint recovery of its own.
+  if (mutation.kind != UserLayoutMutationKind::BspMerge) {
+    std::vector<RECT> restoredRects;
+    const auto restoredStatus = Layout::BuildWorkspaceLayoutPlan(
+        restored, rollbackMetrics.workArea, rollbackMetrics.gap, &restoredRects);
+    if (restoredStatus == Layout::LayoutPlanStatus::Unsatisfiable) {
+      Diagnostics::RecordEvent(
+          L"layout mutation rollback no longer feasible action=%ls desktop=%08X",
+          mutation.action, key.desktopId.Data1);
+      g_pendingProofs.DiscardLayoutMutation(key);
+      return false;
+    }
   }
 
   for (HWND hwnd : workspace->TiledWindows()) CancelConformanceLease(hwnd);
@@ -490,45 +534,46 @@ static size_t AutomaticWindowLimitForMonitor(const Model::MonitorId& monitor) {
 }
 
 // True when Automatic overflow routes a window it releases to another monitor or
-// a new desktop (it floats in place meanwhile). False: it floats the window and
-// centres it (FloatWindowAfterFailure). The companion snapshot publishes this.
-static bool AutomaticOverflowRoutes() {
+// an allowed new desktop (it floats in place meanwhile). Otherwise it floats
+// and centres the window. The companion snapshot publishes this policy.
+static bool AutomaticOverflowRoutes(bool allowNewDesktop = true) {
   // With exactly one display, monitor-only routing has no destination. The
   // inexpensive count query also keeps the publisher current after hot-plug.
   // A zero/unknown count retains routing rather than promising a float hint.
   return RuntimeLifecycle::IsAutomaticMode() && Platform::WindowEvents::g_hooks.hideDestroy &&
-         (g_settings.overflowCreateDesktop ||
+         ((allowNewDesktop && g_settings.overflowCreateDesktop) ||
           (g_settings.overflowTryOtherMonitors && GetSystemMetrics(SM_CMONITORS) != 1));
 }
-
-// Why Automatic overflow releases a window (FloatAutomaticOverflowWindow's
-// `reason`). Compared by address.
-inline constexpr const wchar_t* kOverflowCountLimit = L"count limit";  // Past the Auto-tiling Limit.
-inline constexpr const wchar_t* kOverflowCannotFit = L"cannot fit";    // No room at its size limits.
 
 // Arrangement releases the slot first; physical routing runs after every source
 // workspace in the burst has been saved, so discovery snapshots cannot go stale
 // midway through admission. A failed route therefore already has a safe fallback.
 static bool FloatAutomaticOverflowWindow(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
-    const wchar_t* reason) {
+    SpaceFloatReason reason, std::vector<SpaceFloat>& localFloats) {
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record) return false;
   const DWORD processId = record->pid;
   const bool monitorFixed = record->automaticOverflowMonitorFixed;
   const uint64_t generation = record->tilingGeneration;
-  const bool route = AutomaticOverflowRoutes();
+  const bool allowNewDesktop = workspace.Layout() != TileLayout::Bsp;
+  const bool route = AutomaticOverflowRoutes(allowNewDesktop);
+  // Only BSP's can't-fit floats speak up; the auto-tiling limit stays quiet.
+  const bool announce = workspace.Layout() == TileLayout::Bsp && reason != SpaceFloatReason::CountLimit;
   CancelConformanceLease(hwnd);
   DiscardPendingAdmissionRecovery(hwnd);
   if (!(route ? workspace.Float(hwnd) : FloatWindowAfterFailure(key, workspace, hwnd))) return false;
   if (route) {
     g_wm.overflow.windows.insert(hwnd);
     g_wm.overflow.queue.push_back(
-        {hwnd, processId, key.desktopId, key.monitor.deviceId, monitorFixed, generation});
+        {hwnd, processId, key.desktopId, key.monitor.deviceId, monitorFixed, generation, allowNewDesktop, reason,
+         announce});
     Reconcile::ScheduleLifecycleReconcile(nullptr);
+  } else {
+    localFloats.push_back({hwnd, reason, announce});
   }
-  Diagnostics::RecordEvent(L"automatic overflow hwnd=%p reason=%ls route=%d", hwnd, reason, route ? 1 : 0);
-  if (g_wm.commandReleases) g_wm.commandReleases->emplace_back(hwnd, reason);
+  Diagnostics::RecordEvent(L"automatic overflow hwnd=%p reason=%ls route=%d", hwnd,
+                           reason == SpaceFloatReason::CountLimit ? L"count limit" : L"cannot fit", route ? 1 : 0);
   return true;
 }
 
@@ -596,7 +641,7 @@ static std::vector<LimitOccupant> CollectAutomaticLimitOccupants(
 // awaiting initial placement, and releases excess slots through overflow policy.
 // WM thread only; the caller saves the resulting workspace before routing it.
 static void EnforceAutomaticWindowLimit(
-    const DesktopMonitorKey& key, Workspace& workspace, HMONITOR monitor) {
+    const DesktopMonitorKey& key, Workspace& workspace, HMONITOR monitor, std::vector<SpaceFloat>& localFloats) {
   if (!RuntimeLifecycle::IsAutomaticMode() || workspace.Layout() == TileLayout::Floating) return;
   const size_t limit = AutomaticWindowLimitForMonitor(key.monitor);
   if (!limit) return;
@@ -611,7 +656,7 @@ static void EnforceAutomaticWindowLimit(
     ++retainedSlots;
     // Visible maximized members count, but are not restored just to move them.
     if (exceedsLimit && !Gestures::IsMoveSizeGestureInProgress(occupant.hwnd) &&
-        FloatAutomaticOverflowWindow(key, workspace, occupant.hwnd, kOverflowCountLimit)) {
+        FloatAutomaticOverflowWindow(key, workspace, occupant.hwnd, SpaceFloatReason::CountLimit, localFloats)) {
       --retainedSlots;
     }
   }
@@ -634,7 +679,8 @@ struct ArrangementContext {
   HMONITOR monitor;
   const Platform::Monitors::WorkspaceMetrics& metrics;
   HWND preferredTiledWindow;
-  bool constraintFailureReported = false;
+  std::vector<SpaceFloat> localFloats;
+  std::wstring unresolvedConstraint;
 };
 
 enum class ArrangementStep { Replan, Finished };
@@ -841,30 +887,22 @@ static ConstraintVictim ChooseConstraintVictim(
 }
 
 // Commits a successful admission recovery (a pending window moved to a slot it
-// fits, possibly reassigning siblings). The pre-recovery order is kept until the
-// window settles, so it can be restored if a race strands its siblings.
+// fits). Keep the pre-recovery order until the window settles so a suspension
+// during placement can restore the previous slot preferences.
 static void ApplyAdmissionRecovery(
     const DesktopMonitorKey& key, Workspace& workspace, const Workspace& baseline,
     Layout::AdmissionRecoveryPlan& recovery) {
   RememberPendingAdmissionRecovery(key, recovery.window, baseline);
   workspace = std::move(recovery.workspace);
-  if (recovery.reassignedWindows > 0) {
-    Wh_Log(L"Dwindle admission reassigned %zu windows across compatible slots for HWND %p",
-           recovery.reassignedWindows, static_cast<void*>(recovery.window));
-    Diagnostics::RecordEvent(L"dwindle admission matched all constraints hwnd=%p slot=%zu reassigned=%zu",
-                             recovery.window, recovery.toIndex, recovery.reassignedWindows);
-  }
-  if (recovery.fromIndex != recovery.toIndex) {
-    Wh_Log(L"Constraint-aware admission repositioned HWND %p from slot %zu to %zu",
-           static_cast<void*>(recovery.window), recovery.fromIndex, recovery.toIndex);
-    Diagnostics::RecordEvent(L"constraint-aware admission repositioned hwnd=%p from=%zu to=%zu",
-                             recovery.window, recovery.fromIndex, recovery.toIndex);
-  }
+  Wh_Log(L"Constraint-aware admission repositioned HWND %p from slot %zu to %zu",
+         static_cast<void*>(recovery.window), recovery.fromIndex, recovery.toIndex);
+  Diagnostics::RecordEvent(L"constraint-aware admission repositioned hwnd=%p from=%zu to=%zu",
+                           recovery.window, recovery.fromIndex, recovery.toIndex);
   g_workspaces.Save(key, workspace);
 }
 
-// Floats the chosen window (Automatic mode routes it through overflow), tells
-// the user once per arrangement in Manual mode, and saves.
+// Floats the chosen window and saves. A BSP admission floats in place once
+// all candidate tiles have failed.
 static ArrangementStep ReleaseConstraintVictim(
     Workspace& workspace, ArrangementContext& context, const std::vector<RECT>& rects,
     const std::vector<WindowConstraints>& activeConstraints, const ConstraintVictim& victim,
@@ -873,19 +911,19 @@ static ArrangementStep ReleaseConstraintVictim(
   RecordConstraintRemoval(workspace, rects, activeConstraints, victimRecord, victim.hwnd,
                           victim.reason, context.preferredTiledWindow);
   CancelConformanceLease(victim.hwnd);
-  const HWND culprit = Layout::FindConstraintCulprit(workspace, rects, victim.hwnd);
-  const bool automaticOverflow = RuntimeLifecycle::IsAutomaticMode();
-  if (!context.constraintFailureReported && !automaticOverflow) {
-    ShowWindowConstraintConflict(workspace, rects, culprit ? culprit : victim.hwnd, context.monitor);
-    context.constraintFailureReported = true;
-  }
+  const bool rejectedBspAdmission = workspace.Layout() == TileLayout::Bsp && victimRecord.pendingInsertionPlacement;
+  const bool useOverflow = RuntimeLifecycle::IsAutomaticMode() && !rejectedBspAdmission;
   DiscardPendingAdmissionRecovery(victim.hwnd);
-  const bool floated = automaticOverflow
-      ? FloatAutomaticOverflowWindow(key, workspace, victim.hwnd, kOverflowCannotFit)
+  const bool floated = useOverflow
+      ? FloatAutomaticOverflowWindow(key, workspace, victim.hwnd, SpaceFloatReason::CannotFit, context.localFloats)
       : FloatWindowAfterFailure(key, workspace, victim.hwnd);
   if (!floated) {
     g_workspaces.Save(key, workspace);
     return ArrangementStep::Finished;
+  }
+  if (!useOverflow) {
+    const auto reason = rejectedBspAdmission ? SpaceFloatReason::NoBspTileFits : SpaceFloatReason::CannotFit;
+    context.localFloats.push_back({victim.hwnd, reason});
   }
   ++Diagnostics::g_runtime.counters.constraintFloats;
   g_workspaces.Save(key, workspace);
@@ -952,10 +990,7 @@ static ArrangementStep RecoverUnsatisfiableLayout(
   if (!victimRecord) {
     // No removal can make this layout fit: keep everyone, tell the user once.
     const HWND culprit = Layout::FindConstraintCulprit(workspace, rects, context.preferredTiledWindow);
-    if (!context.constraintFailureReported) {
-      ShowWindowConstraintConflict(workspace, rects, culprit, context.monitor);
-      context.constraintFailureReported = true;
-    }
+    context.unresolvedConstraint = ConstraintConflictMessage(workspace, FindConflictingWindows(workspace, rects), culprit);
     Diagnostics::RecordEvent(
         L"constraint conflict left membership unchanged; no single settled removal is sufficient desktop=%08X",
         key.desktopId.Data1);
@@ -1115,7 +1150,8 @@ static void ArrangeWorkspace(
   const LONG gap = metrics.gap;
 
   ObserveAndRepairWorkspaceForArrangement(workspace);
-  EnforceAutomaticWindowLimit(key, workspace, monitor);
+  ArrangementContext context{key, monitor, metrics, preferredTiledWindow};
+  EnforceAutomaticWindowLimit(key, workspace, monitor, context.localFloats);
   if (const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
       pending && !workspace.HasSameWindowMembershipAs(pending->candidate)) {
     Diagnostics::RecordEvent(
@@ -1126,8 +1162,8 @@ static void ArrangeWorkspace(
   // Native reports are cached between arrangements. The first pass below probes
   // missing/stale reports and pending admissions/restores before geometry is solved.
   const size_t maxPasses = workspace.ActiveCount() * 5 + 8;
-  ArrangementContext context{key, monitor, metrics, preferredTiledWindow};
-  for (size_t pass = 0; pass < maxPasses; ++pass) {
+  size_t pass = 0;
+  for (; pass < maxPasses; ++pass) {
     ++Diagnostics::g_runtime.counters.arrangePasses;
     if (workspace.Layout() == TileLayout::Floating || workspace.Empty()) {
       if (workspace.Layout() == TileLayout::Floating) {
@@ -1138,7 +1174,7 @@ static void ArrangeWorkspace(
       }
       g_workspaces.Save(key, workspace);
       ClearSettledLayoutMutation(key, workspace);
-      return;
+      break;
     }
 
     if (pass == 0) {
@@ -1146,25 +1182,32 @@ static void ArrangeWorkspace(
     }
 
     std::vector<RECT> rects;
-    Layout::LayoutPlanStatus planStatus =
-        Layout::BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects);
+    const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
+    std::optional<Layout::BspMergeDestination> merge;
+    if (pending && pending->bspDropEdge) merge = Layout::BspMergeDestination{pending->subject, *pending->bspDropEdge};
+    const auto planStatus = Layout::PlanWithNewBspSplitFallback(workspace, workArea, gap, &rects, merge);
     if (planStatus == Layout::LayoutPlanStatus::NotApplicable) {
       g_workspaces.Save(key, workspace);
-      return;
+      break;
     }
     if (planStatus == Layout::LayoutPlanStatus::Unsatisfiable) {
-      if (RecoverUnsatisfiableLayout(workspace, context, rects) == ArrangementStep::Finished) return;
+      if (RecoverUnsatisfiableLayout(workspace, context, rects) == ArrangementStep::Finished) break;
       continue;
     }
 
-    if (ApplyWorkspacePlacements(workspace, context, rects) == ArrangementStep::Finished) return;
+    if (ApplyWorkspacePlacements(workspace, context, rects) == ArrangementStep::Finished) break;
   }
 
-  Diagnostics::RecordEvent(
-      L"arrangement safety bound exhausted desktop=%08X active=%zu",
-      key.desktopId.Data1, workspace.ActiveCount());
-  g_workspaces.Save(key, workspace);
-  ClearSettledLayoutMutation(key, workspace);
+  if (pass == maxPasses) {
+    Diagnostics::RecordEvent(L"arrangement safety bound exhausted desktop=%08X active=%zu", key.desktopId.Data1, workspace.ActiveCount());
+    g_workspaces.Save(key, workspace);
+    ClearSettledLayoutMutation(key, workspace);
+  }
+  if (context.localFloats.empty()) {
+    TrayUi::ShowCommandFailureFlyout(context.unresolvedConstraint.c_str(), monitor);
+  } else {
+    ReportSpaceFloats(context.localFloats, monitor);
+  }
 }
 
 } // namespace Placement

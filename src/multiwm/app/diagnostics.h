@@ -121,6 +121,30 @@ static std::wstring DiagnosticWeightsString(const std::vector<double>& weights) 
   return result;
 }
 
+// The BSP tree in preorder. A split includes its ratio and any saved direction.
+static std::wstring DiagnosticBspTreeString(const BspTree& tree) {
+  std::wstring result;
+  std::vector<size_t> pending;  // Children still to print at each open split.
+  for (const BspNode& node : tree.Nodes()) {
+    wchar_t buffer[64]{};
+    if (BspTree::IsSplit(node)) {
+      const wchar_t* direction = !node.direction ? L"" : *node.direction == Layout::Axis::X ? L"X" : L"Y";
+      swprintf(buffer, ARRAYSIZE(buffer), L"%.3g%ls(", node.ratio, direction);
+      result += buffer;
+      pending.push_back(2);
+      continue;
+    }
+    swprintf(buffer, ARRAYSIZE(buffer), L"%p", static_cast<void*>(node.window));
+    result += buffer;
+    while (!pending.empty() && --pending.back() == 0) {
+      pending.pop_back();
+      result += L")";
+    }
+    if (!pending.empty()) result += L" ";
+  }
+  return result;
+}
+
 static std::wstring DiagnosticLayoutCycleString(const std::vector<TileLayout>& layouts) {
   std::wstring result;
   for (size_t i = 0; i < layouts.size(); ++i) {
@@ -1166,13 +1190,15 @@ static void DumpConfigurationSnapshot(ReportBuilder& report) {
       g_settings.insetsDip.right, g_settings.insetsDip.bottom,
       g_settings.floatingDefaultSizeDip.width, g_settings.floatingDefaultSizeDip.height);
   report.Line(L"Master percent: %ld", g_settings.masterPercent);
-  report.Line(L"Adaptive Dwindle slots: %zu", g_settings.adaptiveDwindleSlots);
-  report.Line(
-      L"Adaptive Dwindle percentage: %ld (automatic envelope %.0f%%-%.0f%%)",
-      g_settings.adaptiveDwindlePercentage,
-      Layout::GetAdaptiveDwindleRatioEnvelope().minimum * 100.0,
-      Layout::GetAdaptiveDwindleRatioEnvelope().maximum * 100.0);
+  report.Line(L"Adaptive Split Depth: %zu", g_settings.adaptiveDwindleSlots);
+  report.Line(L"Adaptive Split Percentage: %ld points from each saved divider", g_settings.adaptiveDwindlePercentage);
   report.Line(L"Mouse move behavior: %ls", DiagnosticMouseMoveBehaviorName(g_settings.mouseMoveBehavior));
+  if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Swap) {
+    report.Line(L"BSP split edge size: %ld%%", g_settings.bspSplitEdgePercent);
+    report.Line(L"Drag preview: fill=%ld%% outline=%ld%% width=%ld radius=%ld (96-DPI logical px), fade=%u ms",
+                g_settings.dragPreviewFillOpacity, g_settings.dragPreviewOutlineOpacity, g_settings.dragPreviewOutlineWidthDip,
+                g_settings.dragPreviewOutlineRadiusDip, g_settings.dragPreviewFadeMs);
+  }
   report.Line(
       L"Automatic insertion position: %ls",
       g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused
@@ -1290,6 +1316,7 @@ static void DumpWorkspace(
   report.Line(L"stackWeights: %ls", DiagnosticWeightsString(state.StackWeights()).c_str());
   report.Line(L"gridWeights:  %ls", DiagnosticWeightsString(state.GridWeights()).c_str());
   report.Line(L"dwindlePreferredRatios: %ls", DiagnosticWeightsString(state.DwindleRatios()).c_str());
+  if (!state.Bsp().Empty()) report.Line(L"bspTree: %ls", DiagnosticBspTreeString(state.Bsp()).c_str());
 
   struct LogicalRecordRef {
     size_t logicalIndex;

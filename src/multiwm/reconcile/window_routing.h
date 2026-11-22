@@ -615,7 +615,7 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
   }
   auto fits = [&](Workspace& candidate) {
     std::vector<RECT> rects;
-    if (Layout::BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, &rects) != Layout::LayoutPlanStatus::Success) return false;
+    if (Layout::PlanWithNewBspSplitFallback(candidate, metrics.workArea, metrics.gap, &rects) != Layout::LayoutPlanStatus::Success) return false;
     const size_t index = candidate.TiledIndex(hwnd);
     if (index >= rects.size()) return false;
     destination.frame = rects[index];
@@ -624,15 +624,17 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
   if (fits(trial)) return destination;
   // Otherwise what arrangement's recovery does with the saved destination
   // (RecoverUnsatisfiableLayout): move a pending admission, this one or a newer
-  // one, to a slot where everyone fits, in Dwindle also reassigning siblings.
+  // one, to a slot where everyone fits while preserving the other windows' order.
   // Its later steps aren't modelled: when this fails, the incoming window is
   // normally the admission that introduced the conflict, and would be floated.
   Layout::AdmissionRecoveryPlan recovery;
   if (!Layout::TryRecoverPendingAdmission(trial, metrics.workArea, metrics.gap,
-                                          Placement::OrderRemovalCandidates(trial, nullptr), nullptr, &recovery) ||
-      !fits(recovery.workspace)) {
+                                          Placement::OrderRemovalCandidates(trial, nullptr), nullptr, &recovery)) {
     return std::nullopt;
   }
+  const size_t index = recovery.workspace.TiledIndex(hwnd);
+  if (index >= recovery.rects.size()) return std::nullopt;
+  destination.frame = recovery.rects[index];
   trial = std::move(recovery.workspace);
   return destination;
 }
@@ -659,6 +661,7 @@ struct OverflowSource {
 struct OverflowRequestResult {
   OverflowOutcome outcome;
   PendingDesktopFollow follow{};
+  bool placedFloating = false;
 };
 
 // The last check before an overflow move is committed: the window is still the
@@ -833,6 +836,7 @@ static OverflowRequestResult TryCommitOverflowDestination(
   AddPendingWorkspaceArrange(desktop, monitor);
   if (!differentDesktop) Placement::ArrangeWorkspace(targetKey);
   OverflowRequestResult result{OverflowOutcome::Placed};
+  result.placedFloating = destination->workspace.Layout() == TileLayout::Floating;
   if (differentDesktop && hwnd == batch.foreground) {
     result.follow = {hwnd, processId, request.sourceDesktop, desktop, source.frame, GetTickCount64() + kOverflowFollowTimeoutMs, batch.inputTick};
   }
@@ -915,7 +919,8 @@ static OverflowRequestResult ProcessOverflowRequest(
 
   OverflowRequestResult result{OverflowOutcome::NoDestination};
   // Try source capacity first, then other monitors, then at most one new desktop.
-  const size_t candidateCount = monitors.size() + (g_settings.overflowCreateDesktop ? 1 : 0);
+  const bool allowNewDesktop = request.allowNewDesktop && source.workspace.Layout() != TileLayout::Bsp;
+  const size_t candidateCount = monitors.size() + (allowNewDesktop && g_settings.overflowCreateDesktop ? 1 : 0);
   for (size_t index = 0; index < candidateCount; ++index) {
     const bool createDesktop = index == monitors.size();
     const HMONITOR monitor = createDesktop ? source.monitor : monitors[index];
@@ -936,8 +941,23 @@ static OverflowRequestResult ProcessOverflowRequest(
       if (Placement::RepairFloatingGeometry(source.key, fallback, hwnd, hint)) g_workspaces.Save(source.key, fallback);
     }
   }
-  return {result.outcome == OverflowOutcome::Retry ? OverflowOutcome::Failed : result.outcome, result.follow};
+  if (result.outcome == OverflowOutcome::Retry) result.outcome = OverflowOutcome::Failed;
+  return result;
+}
 
+// Routing can change ownership. Report only a completed release whose live
+// record is still floating; a newly tiled window owns any later release.
+static HMONITOR FinishedOverflowFloatMonitor(const PendingWindowOverflow& request, const OverflowRequestResult& result) {
+  if (result.outcome != OverflowOutcome::NoDestination && result.outcome != OverflowOutcome::Failed &&
+      !result.placedFloating) return nullptr;
+  if (!Platform::Windows::IsSameLiveWindow(request.hwnd, request.processId)) return nullptr;
+  const auto owners = g_workspaces.OwnersOf(request.hwnd);
+  Workspace workspace;
+  if (owners.size() != 1 || !g_workspaces.Load(owners.front(), &workspace)) return nullptr;
+  const WindowRecord* record = workspace.Find(request.hwnd);
+  if (!record || record->pid != request.processId || record->state != ManageState::Floating || record->alwaysFloating ||
+      (!result.placedFloating && record->tilingGeneration != request.tilingGeneration)) return nullptr;
+  return owners.front().ResolveMonitor();
 }
 
 // Overflow work runs only after admission/arrangement has saved every source.
@@ -963,13 +983,17 @@ static void ProcessWindowOverflow() {
   batch.foreground = GetForegroundWindow();
   batch.inputTick = Platform::Input::LastInputTick().value_or(0);
   PendingDesktopFollow follow{};
+  std::unordered_map<HMONITOR, std::vector<SpaceFloat>> floatsByMonitor;
   for (PendingWindowOverflow request : pending) {
     const auto result = ProcessOverflowRequest(request, batch);
     if (result.outcome == OverflowOutcome::Retry) {
       g_wm.overflow.queue.push_back(std::move(request));
+    } else if (HMONITOR monitor = FinishedOverflowFloatMonitor(request, result)) {
+      floatsByMonitor[monitor].push_back({request.hwnd, request.reason, request.announceLocalFloat});
     }
     if (result.follow.hwnd) follow = result.follow;
   }
+  for (const auto& [monitor, floats] : floatsByMonitor) Placement::ReportSpaceFloats(floats, monitor);
 
   if (follow.hwnd) {
     if (Platform::Input::NoInputSince(follow.inputTickMs) && IsWindow(follow.hwnd) &&

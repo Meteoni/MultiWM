@@ -160,6 +160,8 @@ struct WindowRecord {
   bool canResize = true;
   bool topmost = false;
 
+  // Order of focus observations in this workspace. Zero means never focused.
+  uint64_t lastFocusSequence = 0;
   // Monotonic admission generation provides stable ordering for constraint
   // recovery candidates. Reordering never changes this value.
   uint64_t tilingGeneration = 0;
@@ -282,6 +284,10 @@ class Workspace {
     if (dwindleRatios_.empty()) return {};
     return {dwindleRatios_.begin(), dwindleRatios_.end() - 1};
   }
+  // The BSP layout's split tree: one leaf per tiled or maximized window. Empty
+  // in other layouts.
+  const BspTree& Bsp() const { return bspTree_; }
+  void SetBspSplitDirection(size_t node, std::optional<Layout::Axis> direction);
   size_t ActiveCount() const { return windows_.size(); }
   // Windows counted against the auto-tiling limit: tiled plus maximized-suspended.
   // Always 0 in the Floating layout.
@@ -303,9 +309,9 @@ class Workspace {
   // (floating windows have no logical position).
   size_t LogicalIndex(HWND hwnd) const;
   HWND LastFocusedWindow() const { return lastFocusedWindow_; }
-  HWND LastFocusedTiledWindow() const {
-    return IsTiled(lastFocusedWindow_) ? lastFocusedWindow_ : nullptr;
-  }
+  // Most recently focused window still tiled. An arriving BSP window is
+  // excluded when choosing the leaf it will split.
+  HWND LastFocusedTiledWindow(HWND excluded = nullptr) const;
   bool HasSuspended() const;
   // True when every tiled window appears in `snapshot`.
   bool AllTiledVisible(const std::vector<HWND>& snapshot) const;
@@ -343,6 +349,10 @@ class Workspace {
   bool MakeMaster(HWND hwnd, HWND* oldMaster = nullptr);
   // Swaps two tiled windows' positions. False unless both are tiled and distinct.
   bool SwapTiled(HWND first, HWND second);
+  // Exchanges two BSP sibling tiles, including their saved shares of the split.
+  bool SwapBspSiblingTiles(HWND first, HWND second);
+  // Gives the source's space to its sibling and splits another BSP tile with it.
+  bool MoveBspLeaf(HWND source, HWND target, bool allowAlternateDirection = false);
   // Moves a still-settling window (pendingInsertionPlacement) to another tiled
   // index, shifting suspended slots so every window keeps a unique position.
   bool MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex);
@@ -382,13 +392,15 @@ class Workspace {
   bool ActivateTiled(HWND hwnd);
   // Adds an unknown window as Floating. False if `record.hwnd` is null or known.
   bool AdmitFloating(WindowRecord record);
-  // Adds `record` as Tiled at the end. If the window is already known, refreshes
-  // its observations and re-tiles it. True when added or re-tiled.
+  // Adds `record` as Tiled at the end; in BSP, by splitting the shallowest
+  // tiled leaf. If the window is already known, refreshes its observations and
+  // re-tiles it (a suspended one returns to its BSP leaf). True when added or re-tiled.
   // Exception to the convention: for a known window that is already tiled this
   // returns false but still refreshes its observed fields from `record`.
   bool AdmitTiled(WindowRecord record);
   // Like AdmitTiled, but inserts right after `anchor` when `anchor` is tiled and
-  // the window is new. Otherwise behaves exactly like AdmitTiled.
+  // the window is new (in BSP, by splitting `anchor`'s leaf). Otherwise behaves
+  // exactly like AdmitTiled.
   bool AdmitTiledAfter(WindowRecord record, HWND anchor);
   // Adds a window found while the workspace is first created. With
   // reason == None it is tiled at the end; Minimized/Maximized admits it as
@@ -450,11 +462,16 @@ class Workspace {
   bool LearnDwindleResize(
       const RECT& workArea, LONG gap, size_t resizedIndex,
       const ::MoveSizeGesture& gesture);
+  // Each dragged edge moves the nearest split whose divider it is.
+  bool LearnBspResize(
+      const RECT& workArea, LONG gap, size_t resizedIndex,
+      const ::MoveSizeGesture& gesture);
 
   // --- Window-size commands (defined in layout/resize_steps.h) ---------------
   //
   // Both change only the preference that sizes the window at `index`: its grid
-  // or stack weight, the master ratio, or its own Dwindle split. Other windows'
+  // or stack weight, the master ratio, its own Dwindle split, or in BSP the
+  // nearest split that divides it from a neighbour. Other windows'
   // preferences stay as they are, so their temporary minimum-size fitting never
   // becomes a preference. Monocle and Floating have none; both return false.
 
@@ -508,7 +525,9 @@ class Workspace {
   void OpenLogicalGapAt(size_t logicalIndex);
   size_t LogicalWindowCount() const;
   SuspendedSlot MakeAppendedSuspendedSlot() const;
-  void AppendTiledWithDefaultWeight(HWND hwnd);
+  // `followFocus`: BSP only, see InsertBspLeaf. Windows found while a
+  // workspace is first created don't follow focus, so they lay out evenly.
+  void AppendTiledWithDefaultWeight(HWND hwnd, bool followFocus = true);
   // The weight a new slot at `weightIndex` of the current layout's weights
   // starts with: the one an overflow-created workspace inherited for that
   // position, else 1.0 (an even 0.5 split in Dwindle).
@@ -547,6 +566,7 @@ class Workspace {
     dwindlePushes_ = std::move(state.pushes);
   }
   bool AcceptShownDwindleLayout(const RECT& workArea, LONG gap);
+  bool AcceptShownBspLayout(const RECT& workArea, LONG gap);
   bool ApplyTiledStep(const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent);
   // What a size step moves for the window at `index` (layout/resize_steps.h).
   struct TiledStepTarget;
@@ -554,6 +574,27 @@ class Workspace {
       const RECT& workArea, LONG gap, size_t index, bool grow, const std::vector<RECT>& rects,
       const std::vector<Layout::DwindleSplit>& splits, const std::vector<WindowConstraints>& constraints) const;
   bool ResetDwindleSplit(const RECT& workArea, LONG gap, size_t index);
+  std::optional<TiledStepTarget> ChooseBspStepTarget(
+      const RECT& workArea, LONG gap, size_t index, const std::vector<WindowConstraints>& constraints) const;
+  bool ResetBspSplit(const RECT& workArea, LONG gap, size_t index);
+  // BSP: keeps the tree in step with the records, then orders the tiled windows
+  // as their leaves are (EnsureWeights calls it). Tiled and maximized windows
+  // have leaves; any other window loses its own. One without a leaf gets one
+  // by InsertBspLeaf.
+  void SyncBspTree();
+  // BSP: puts the tiled windows in their leaves' order, changing nothing else.
+  void OrderTiledByBspLeaves();
+  // BSP's arrival rule: when following focus, splits the most recently focused
+  // tiled leaf. Otherwise splits the largest tiled leaf or becomes the root.
+  // Nothing when the window already has a leaf.
+  void InsertBspLeaf(HWND hwnd, bool followFocus, bool allowAlternateDirection = false);
+  // BSP: true for a tiled window's leaf, the only leaves the layout shows.
+  bool IsBspLeafTiled(HWND window) const;
+  // BSP: true when `record` keeps a leaf: tiled or maximized.
+  static bool KeepsBspLeaf(const WindowRecord& record);
+  // BSP tree invariant violations, for Validate: in other layouts, a tree that
+  // should be empty.
+  std::vector<const wchar_t*> BspTreeProblems() const;
   void RecordDwindlePushes(const std::vector<double>& before, size_t ownSplit);
   void KeepDwindleDivider(size_t split);
   void RelaxDwindlePushes(const RECT& workArea, LONG gap, size_t afterSplit, size_t keepIndex);
@@ -569,6 +610,7 @@ class Workspace {
   // User preferences; native minimums adjust rendered geometry only.
   std::vector<double> dwindleRatios_;
   std::vector<DwindlePush> dwindlePushes_;
+  BspTree bspTree_;
 
   // Active slot geometry is remembered per layout family. This makes Monocle
   // and ordinary layout cycling presentation-like with respect to the previous
@@ -586,6 +628,13 @@ class Workspace {
   RememberedGeometry rememberedMasterStack_;
   RememberedGeometry rememberedGrid_;
   RememberedGeometry rememberedDwindle_;
+  // BSP's tree, kept on the same terms: reused when the tiled order is unchanged.
+  struct RememberedBsp {
+    std::vector<HWND> order;
+    BspTree tree;
+    bool operator==(const RememberedBsp&) const = default;
+  };
+  RememberedBsp rememberedBsp_;
 
   HWND lastFocusedWindow_ = nullptr;
 };

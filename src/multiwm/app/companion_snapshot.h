@@ -166,6 +166,18 @@ static void AppendWorkspaceHints(const GUID& desktop, CompanionAbi::SnapshotBody
     RememberFrameMargins(workspace, metrics.dpi);
 
     const uint32_t workspaceIndex = body->workspaceCount++;
+    // The tiles a BSP arrival tries, so the companion can pick the one that
+    // fits the window's own minimum. None past the limit: the window floats.
+    body->bspArrivals[workspaceIndex] = limitReached
+        ? CompanionAbi::BspArrivalTiles{}
+        : Placement::PredictBspArrivalTiles(workspace, metrics, insertAfterFocused);
+    if (workspace.Layout() == TileLayout::Bsp) {
+      const auto workspaceBit = static_cast<uint16_t>(1u << workspaceIndex);
+      body->bspWorkspaces |= workspaceBit;
+      if (prediction.newWindowFloats && (!limitReached || !Placement::AutomaticOverflowRoutes(false))) {
+        body->bspLocalFloats |= workspaceBit;
+      }
+    }
     CompanionAbi::WorkspaceHint& hint = body->workspaces[workspaceIndex];
     hint.monitorRect = monitorInfo.rcMonitor;
     hint.workArea = metrics.workArea;

@@ -30,11 +30,6 @@ static bool TryParseLayoutSetting(PCWSTR str, TileLayout* outLayout) {
       return true;
     }
   }
-  // Compatibility alias for configurations saved before 1.13.29.
-  if (wcscmp(str, L"bsp") == 0) {
-    *outLayout = TileLayout::Dwindle;
-    return true;
-  }
   return false;
 }
 
@@ -509,6 +504,18 @@ void LoadSettings() {
   // Behavior choices.
   g_settings.mouseMoveBehavior = StringSettingIs(L"windowBehavior.MouseMoveBehavior", L"swap")
       ? MouseMoveBehavior::Swap : MouseMoveBehavior::Float;
+  g_settings.bspSplitEdgePercent =
+      ReadBoundedIntSetting(L"windowBehavior.BspSplitEdgePercent", L"BSP Split Edge Size", 0, 50, 25);
+  g_settings.dragPreviewFillOpacity =
+      ReadBoundedIntSetting(L"appearance.DragPreview.FillOpacity", L"Drag Preview Fill Opacity", 0, 100, 25);
+  g_settings.dragPreviewOutlineOpacity =
+      ReadBoundedIntSetting(L"appearance.DragPreview.OutlineOpacity", L"Drag Preview Outline Opacity", 0, 100, 100);
+  g_settings.dragPreviewOutlineWidthDip =
+      ReadBoundedIntSetting(L"appearance.DragPreview.OutlineWidth", L"Drag Preview Outline Width", 1, 20, 4);
+  g_settings.dragPreviewOutlineRadiusDip =
+      ReadBoundedIntSetting(L"appearance.DragPreview.OutlineCornerRadius", L"Drag Preview Outline Corner Radius", 0, 32, 8);
+  g_settings.dragPreviewFadeMs =
+      ReadBoundedIntSetting(L"appearance.DragPreview.FadeDurationMs", L"Drag Preview Fade Duration", 0, 500, 96);
   g_settings.automaticNewWindowPosition =
       StringSettingIs(L"general.AutomaticNewWindowPosition", L"after_focused")
       ? AutomaticNewWindowPosition::AfterFocused : AutomaticNewWindowPosition::LastSlot;

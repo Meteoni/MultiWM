@@ -162,16 +162,21 @@ static bool FitSlotAxis(LONG& start, LONG& end, LONG areaStart, LONG areaEnd, LO
   return true;
 }
 
+static bool FitsMinimum(const RECT& region, const SharedGeometry::FrameLimits& limits) {
+  return Width(region) >= limits.minWidth && Height(region) >= limits.minHeight;
+}
+
 // Where MultiWM will put a window whose size limits don't match the tiled
 // `slot` it was predicted (frames, physical pixels):
 //  - larger than its maximum: centred in the slot at the maximum, as MultiWM's
 //    planner does, so the hint is exact;
 //  - smaller than its minimum: grown at the edges that face other windows, an
 //    approximation of MultiWM's constrained step, which MultiWM then refines.
-// Returns nothing when the minimum doesn't fit the work area: MultiWM can't tile
-// that window, so the companion gives no hint. Pure.
+// Returns nothing when the minimum doesn't fit the work area. BSP also
+// defers growth to MultiWM, which can search for a split that fits.
 static std::optional<RECT> FitSlotToLimits(
-    const RECT& slot, const RECT& workArea, const SharedGeometry::FrameLimits& limits) {
+    const RECT& slot, const RECT& workArea, const SharedGeometry::FrameLimits& limits, bool allowGrowth) {
+  if (!allowGrowth && !FitsMinimum(slot, limits)) return std::nullopt;
   RECT fitted = slot;
   if (!FitSlotAxis(fitted.left, fitted.right, workArea.left, workArea.right, limits.minWidth, limits.maxWidth) ||
       !FitSlotAxis(fitted.top, fitted.bottom, workArea.top, workArea.bottom, limits.minHeight, limits.maxHeight)) {
@@ -179,6 +184,7 @@ static std::optional<RECT> FitSlotToLimits(
   }
   return fitted;
 }
+
 
 // How MultiWM treats the frame PredictFrame returns once it reads the window's
 // size limits.
@@ -215,9 +221,8 @@ static std::optional<SharedGeometry::FloatingPlacement> PredictFloatingPlacement
 // hint when known or Automatic discovery otherwise, and how MultiWM applies the
 // window's size limits to it (`*kind`). `*floating` is the floating placement
 // behind a floating frame, which the limits are fitted to. For a tiled slot it
-// is where overflow would centre the window if its minimum turns out larger
-// than the work area (MultiWM then floats it); nothing when overflow routes
-// such a window instead. Returns nothing, with `*reason` set, when MultiWM
+// is the fallback if its minimum turns out larger than the work area and
+// MultiWM floats it locally. Returns nothing, with `*reason` set, when MultiWM
 // won't manage it or the snapshot can't say where it goes.
 static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const HintInputs& inputs, TargetKind* kind,
                                         std::optional<SharedGeometry::FloatingPlacement>* floating,
@@ -293,17 +298,17 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
     return (*floating)->frame;
   }
 
-  // Automatic overflow floats a window it can't tile and, unless it routes the
-  // window elsewhere, centres it (FailureCenter). A new window has no remembered
-  // floating frame, so FailureCenter sizes it as Fallback does.
-  if (inputs.flags & kFlagOverflowCentersFloat) {
+  // FailureCenter uses the default floating size for a new window. BSP floats
+  // a failed split locally, while a release at the window limit uses overflow.
+  if ((inputs.flags & kFlagOverflowCentersFloat) || inputs.bspFloatsLocally ||
+      (inputs.bspLayout && workspace.hasTiledFrame)) {
     *floating = PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, true);
   }
   if (!workspace.hasTiledFrame) {
     if (!workspace.newWindowFloats) return reject("no free tiled slot");
     if (!*floating) return reject("overflow routes the window");
     *kind = TargetKind::Float;
-    *reason = "overflow floats it";
+    *reason = inputs.bspFloatsLocally ? "BSP floats it locally" : "overflow floats it";
     return (*floating)->frame;
   }
   return workspace.tiledFrame;
@@ -325,6 +330,45 @@ struct PredictedPlacement {
   RECT windowRect;
   bool keepSize;
 };
+
+// Where `target`, a frame of `kind` from PredictFrame, ends up once MultiWM
+// applies the window's `limits`: tiles by FitSlotToLimits, floating frames by
+// the rule both mods share, and a BSP arrival (new, or moved here) in the first
+// tile MultiWM tries that fits it. Restores already carry their exact tile. No
+// value, with `*reason` set, when the companion should give no hint; a float
+// MultiWM will fall back to sets `*reason` too.
+static std::optional<RECT> FitTargetToLimits(
+    const RECT& target, TargetKind kind, const std::optional<SharedGeometry::FloatingPlacement>& floating,
+    const HintInputs& inputs, const SharedGeometry::FrameLimits& limits, const char** reason) {
+  const RECT& workArea = inputs.workspace->workArea;
+  auto floatLocally = [&](const char* why) -> std::optional<RECT> {
+    *reason = why;
+    return SharedGeometry::FitFloatingPlacementToLimits(*floating, limits);
+  };
+  auto noHint = [&](const char* why) -> std::optional<RECT> {
+    *reason = why;
+    return std::nullopt;
+  };
+  if (kind == TargetKind::Float) return SharedGeometry::FitFloatingPlacementToLimits(*floating, limits);
+  const bool bspArrival = inputs.bspArrivals.count > 0 && (!inputs.tracked || inputs.intent == PlacementIntent::Arrival);
+  if (bspArrival) {
+    using CompanionAbi::BspArrivalChoice;
+    BspArrivalChoice choice =
+        CompanionAbi::ChooseBspArrivalTile(inputs.bspArrivals, workArea, limits.minWidth, limits.minHeight);
+    if (choice.outcome == BspArrivalChoice::Outcome::Tile) {
+      // A capped window is centred in its tile, as MultiWM's planner centres it.
+      SharedGeometry::CenterWithinMaximumSize(choice.tile.left, choice.tile.right, limits.maxWidth);
+      SharedGeometry::CenterWithinMaximumSize(choice.tile.top, choice.tile.bottom, limits.maxHeight);
+      return choice.tile;
+    }
+    if (choice.outcome == BspArrivalChoice::Outcome::Unknown) return noHint("BSP tile depends on another arrival");
+    return floating && !inputs.tracked ? floatLocally("no BSP tile fits: floats locally") : noHint("no BSP tile fits");
+  }
+  if (const auto fitted = FitSlotToLimits(target, workArea, limits, !inputs.bspLayout)) return fitted;
+  if (inputs.bspLayout && FitsMinimum(workArea, limits)) return noHint("BSP tile needs a new layout plan");
+  if (floating) return floatLocally("minimum larger than the work area: floats locally");
+  return noHint("minimum larger than the work area; no floating hint");
+}
 
 // Calculates without placing. `proposed` is the app's intended window rectangle
 // in physical screen pixels, including resize borders. DWM margins translate
@@ -372,26 +416,18 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   }
 
   // MultiWM predicted the slot without knowing this window's size limits. Apply
-  // them the way MultiWM will once it reads them: tiles by FitSlotToLimits,
-  // floating frames by the rule both mods share.
+  // them the way MultiWM will once it reads them.
   RECT frameTarget = *target;
   if (kind != TargetKind::KeepSize) {
     const UINT dpi = inputs.workspace->dpi ? inputs.workspace->dpi : 96;
     const auto limits = QueryFrameLimits(hwnd, dpi, margins);
     if (!limits) return std::nullopt;
-    if (kind == TargetKind::Float) {
-      frameTarget = SharedGeometry::FitFloatingPlacementToLimits(*floating, *limits);
-    } else if (const auto fitted = FitSlotToLimits(frameTarget, inputs.workspace->workArea, *limits)) {
-      frameTarget = *fitted;
-    } else if (floating) {
-      // A minimum larger than the work area: MultiWM floats the window
-      // (IntrinsicMinimum) and overflow centres it.
-      frameTarget = SharedGeometry::FitFloatingPlacementToLimits(*floating, *limits);
-      reason = "minimum larger than the work area: overflow floats it";
-    } else {
-      LogDecision(hwnd, path, "minimum larger than the work area; overflow routes it");
+    const auto fitted = FitTargetToLimits(*target, kind, floating, inputs, *limits, &reason);
+    if (!fitted) {
+      LogDecision(hwnd, path, reason);
       return std::nullopt;
     }
+    frameTarget = *fitted;
   }
   if (reason) LogDecision(hwnd, path, reason);
   // The snapshot holds visible frames; SetWindowPos takes the window rectangle,

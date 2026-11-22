@@ -5,7 +5,7 @@
 // Nothing ever flows back to MultiWM.
 //
 // Both mods compile this file: only Windows and the standard library here.
-// Include shared/window_rules.h first.
+// Include shared/window_rules.h and shared/split_geometry.h first.
 //
 // ABI rules: every field has a fixed width and offset, checked below for both
 // bitnesses. A change that moves or reinterprets a field bumps kAbiMajor and the
@@ -27,19 +27,21 @@ namespace CompanionAbi {
 
 // The section exists while MultiWM or any reader holds a handle, so it outlives a
 // MultiWM restart; a restarted MultiWM reopens it and rewrites the header.
-inline constexpr wchar_t kSectionName[] = L"Local\\MultiWM.Companion.Snapshot.v5";
+inline constexpr wchar_t kSectionName[] = L"Local\\MultiWM.Companion.Snapshot.v6";
 // Held open by MultiWM only. Readers probe it to tell a live MultiWM from a
 // section that only their own handles keep alive.
-inline constexpr wchar_t kAliveEventName[] = L"Local\\MultiWM.Companion.Alive.v5";
+inline constexpr wchar_t kAliveEventName[] = L"Local\\MultiWM.Companion.Alive.v6";
 
 inline constexpr uint32_t kMagic = 0x5343574D;  // "MWCS"
-inline constexpr uint16_t kAbiMajor = 5;
+inline constexpr uint16_t kAbiMajor = 6;
 inline constexpr uint16_t kAbiMinor = 0;
 
 inline constexpr uint32_t kMaxWorkspaces = 16;
 inline constexpr uint32_t kMaxTrackedWindows = 2048;
 inline constexpr uint32_t kRulesCapacity = 32768;
 inline constexpr uint32_t kMaxRestoreWindows = 128;
+inline constexpr uint32_t kMaxBspArrivalTiles = 4;
+inline constexpr uint32_t kMaxBspPathSplits = 16;
 
 enum SnapshotFlags : uint32_t {
   // MultiWM's WM thread is running and the rest of the body is meaningful.
@@ -72,9 +74,8 @@ struct WorkspaceHint {
   uint8_t floatingLayout;    // The workspace uses the Floating layout.
   uint8_t hasTiledFrame;
   uint8_t hasFloatingFrame;
-  // Tiled layouts: Automatic overflow will float the next new
-  // window instead of tiling it, whatever its size: the window limit is reached,
-  // or no slot fits even a minimal window. 0 from older writers.
+  // Tiled layouts: the next new window will float regardless of its size,
+  // because the limit is reached or even a minimal window cannot fit.
   uint8_t newWindowFloats;
 };
 
@@ -111,6 +112,60 @@ struct RestoreWindowHint {
   RECT frame;
 };
 
+// One tile a BSP arrival may get, for a window whose size limits MultiWM
+// doesn't know yet. Include shared/split_geometry.h first.
+struct BspArrivalTile {
+  RECT tile;  // At the saved ratios: the tile a window with no minimum gets.
+  // The splits above the tile (SharedSplits::SolveBspPath), root first. Fitting
+  // the window's own minimum to them gives MultiWM's tile exactly. A length past
+  // kMaxBspPathSplits means the path was too deep to publish.
+  uint32_t pathLength;
+  uint32_t reserved0;
+  SharedSplits::BspPathSplit path[kMaxBspPathSplits];
+};
+
+// The tiles MultiWM tries for the next arrival on a BSP workspace, in its order:
+// the split tile (focused or largest), that split turned, the largest other
+// tile, and that split turned. A window takes the first one that fits it and
+// floats when none does.
+struct BspArrivalTiles {
+  uint32_t count;  // Up to kMaxBspArrivalTiles.
+  // 0 while another arrival hasn't settled: arrangement may then turn that one's
+  // split instead, so only the first tile, which needs no turn, is certain.
+  uint32_t othersSettled;
+  int32_t gap;           // The gap MultiWM plans with, physical pixels.
+  uint32_t reserved0;
+  double adaptiveDeviation;  // How far adaptive splits may move (SharedSplits::SplitFit).
+  BspArrivalTile tiles[kMaxBspArrivalTiles];
+};
+
+// Where a BSP arrival whose minimum is `minWidth` x `minHeight` goes.
+struct BspArrivalChoice {
+  enum class Outcome { Tile, Floats, Unknown } outcome = Outcome::Unknown;
+  RECT tile{};  // Outcome::Tile: the whole tile, before a maximum size centres the window in it.
+};
+
+// Decides as MultiWM's arrangement does: tries `tiles` in its order, fitting
+// the minimum to each one's published splits with the planner's own arithmetic
+// (SharedSplits::SolveBspPath). The first that fits is MultiWM's tile exactly;
+// none means MultiWM floats the window. Unknown when the snapshot can't say: no
+// tiles, a path too deep to publish, or a later tile while another arrival
+// hasn't settled (arrangement may turn that one's split instead). Pure.
+inline BspArrivalChoice ChooseBspArrivalTile(const BspArrivalTiles& tiles, const RECT& workArea, LONG minWidth,
+                                             LONG minHeight) {
+  const uint32_t count = tiles.count < kMaxBspArrivalTiles ? tiles.count : kMaxBspArrivalTiles;
+  for (uint32_t i = 0; i < count; ++i) {
+    const BspArrivalTile& tile = tiles.tiles[i];
+    if ((i > 0 && !tiles.othersSettled) || tile.pathLength > kMaxBspPathSplits) return {};
+    if (const auto frame = SharedSplits::SolveBspPath(workArea, tiles.gap, tiles.adaptiveDeviation, tile.path,
+                                                      tile.pathLength, minWidth, minHeight)) {
+      return {BspArrivalChoice::Outcome::Tile, *frame};
+    }
+  }
+  if (count == 0 || !tiles.othersSettled) return {};
+  return {BspArrivalChoice::Outcome::Floats, {}};
+}
+
 struct SnapshotBody {
   uint64_t generation;  // Increases with every publish.
   GUID desktopId;       // The desktop these workspaces belong to.
@@ -119,13 +174,17 @@ struct SnapshotBody {
   uint32_t trackedCount;
   uint32_t rulesBytes;
   uint32_t restoreWindowCount;
-  uint32_t reserved0;
+  // One bit per workspace. Zero from older writers.
+  uint16_t bspWorkspaces;  // BSP tile hints may require the full tree to refit.
+  uint16_t bspLocalFloats; // Definite BSP admission floats that stay on this monitor.
   WorkspaceHint workspaces[kMaxWorkspaces];
   // Every known window, including owners on other desktops. HWND values are
   // 32-bit significant on Windows. Duplicate owners publish Unknown treatment.
   TrackedWindowHint trackedWindows[kMaxTrackedWindows];
   uint8_t rules[kRulesCapacity];  // See SerializeRules.
   RestoreWindowHint restoreWindows[kMaxRestoreWindows];
+  // Per workspace; count 0 unless its bspWorkspaces bit is set.
+  BspArrivalTiles bspArrivals[kMaxWorkspaces];
 };
 
 struct SnapshotSection {
@@ -141,15 +200,21 @@ struct SnapshotSection {
   SnapshotBody body;
 };
 
+static_assert(kMaxWorkspaces <= 16, "Workspace masks use 16 bits");
 static_assert(sizeof(WorkspaceHint) == 72, "WorkspaceHint layout");
 static_assert(sizeof(TrackedWindowHint) == 64, "TrackedWindowHint layout");
 static_assert(offsetof(TrackedWindowHint, frameMargins) == 44, "TrackedWindowHint margins");
 static_assert(sizeof(RestoreWindowHint) == 32, "RestoreWindowHint layout");
+static_assert(sizeof(BspArrivalTile) == 24 + sizeof(SharedSplits::BspPathSplit) * kMaxBspPathSplits, "BspArrivalTile layout");
+static_assert(offsetof(BspArrivalTiles, tiles) == 24, "BspArrivalTiles layout");
+static_assert(sizeof(BspArrivalTiles) == 24 + sizeof(BspArrivalTile) * kMaxBspArrivalTiles, "BspArrivalTiles layout");
+static_assert(offsetof(SnapshotBody, bspArrivals) % 8 == 0, "SnapshotBody layout");
 static_assert(offsetof(SnapshotBody, desktopId) == 8, "SnapshotBody layout");
 static_assert(offsetof(SnapshotBody, workspaces) == 48, "SnapshotBody layout");
 static_assert(offsetof(SnapshotBody, trackedWindows) == 48 + sizeof(WorkspaceHint) * kMaxWorkspaces, "SnapshotBody layout");
 static_assert(sizeof(SnapshotBody) == 48 + sizeof(WorkspaceHint) * kMaxWorkspaces + sizeof(TrackedWindowHint) * kMaxTrackedWindows +
-                                         kRulesCapacity + sizeof(RestoreWindowHint) * kMaxRestoreWindows,
+                                         kRulesCapacity + sizeof(RestoreWindowHint) * kMaxRestoreWindows +
+                                         sizeof(BspArrivalTiles) * kMaxWorkspaces,
               "SnapshotBody layout");
 static_assert(offsetof(SnapshotSection, sequence) == 16, "SnapshotSection layout");
 static_assert(offsetof(SnapshotSection, body) == 24, "SnapshotSection layout");

@@ -16,8 +16,11 @@ below are separate steps.
 - **Event-driven publication.** Between messages, repository revisions, mode,
   desktop, display and effective routing changes trigger a rebuild. Identical
   contents skip the write. There is no background minimized-window seeding.
-- **ABI 5.0.** The section is `Local\MultiWM.Companion.Snapshot.v5`; the
-  liveness event is `Local\MultiWM.Companion.Alive.v5`. Event presence identifies
+- **ABI 6.0.** The section is `Local\MultiWM.Companion.Snapshot.v6`; the
+  liveness event is `Local\MultiWM.Companion.Alive.v6`. BSP workspaces also
+  publish the tiles an arrival tries, in arrangement's order, each with the
+  splits above it, so the companion fits the window's minimum with the planner's
+  own arithmetic (shared/split_geometry.h). Event presence identifies
   a running MultiWM; it is not a change-notification event. A seqlock protects
   writes. Limits are 16 workspaces, 2048 tracked HWNDs, 128 restore hints and
   32 KiB of serialized rules. Layout assertions cover x86 and x64.

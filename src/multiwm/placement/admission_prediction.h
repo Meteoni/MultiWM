@@ -16,33 +16,20 @@ struct AdmissionPrediction {
   // new window goes in the Floating layout (NewWindowCenter), and where a window
   // that overflow floats is centred (FailureCenter), before size rules.
   std::optional<RECT> floatingFrame;
-  // Non-Floating layouts: Automatic overflow will float a new window, whatever
-  // its size, instead of tiling it. Whether it is then centred or routed is
-  // AutomaticOverflowRoutes.
+  // Non-Floating layouts: a new window will float regardless of its size.
+  // BSP floats locally when it finds no fitting tile. Automatic overflow can
+  // route other releases (AutomaticOverflowRoutes).
   bool newWindowFloats = false;
 };
 
-// For `trial`, a workspace whose plan a just-admitted minimal window
-// (kPredictedWindow, minimum 1x1) made unsatisfiable: true when arrangement's
-// recovery (RecoverUnsatisfiableLayout) will float that window. That is when no
-// established window is larger than the work area (that one would go first),
-// recovery can't move a pending admission to a slot that fits, and the windows
-// already settled fit without the pending ones, which blames the newest pending
-// admission: this one. A real window has a minimum at least as large, so it
-// can't fit where the minimal one doesn't.
-// Recovery runs without a preferred window here, the least restricted search;
-// with one it can only find fewer slots. Not modelled: an explicit layout
-// command still settling, whose rollback runs first.
-// Only reached for an unsatisfiable plan, which arrangement resolves at once, so
-// normally never; then a few extra plans. WM thread.
-static bool RecoveryFloatsPredictedWindow(const Workspace& trial, const Platform::Monitors::WorkspaceMetrics& metrics) {
-  if (FindWindowLargerThanWorkArea(trial, Layout::ActiveWindowConstraints(trial), metrics.workArea)) return false;
-  const auto candidates = OrderRemovalCandidates(trial, nullptr);
-  Layout::AdmissionRecoveryPlan recovery;
-  if (Layout::TryRecoverPendingAdmission(trial, metrics.workArea, metrics.gap, candidates, nullptr, &recovery)) {
-    return false;
-  }
-  return FindIntroducingPendingAdmission(trial, candidates, metrics.workArea, metrics.gap) == kPredictedWindow;
+// Admits kPredictedWindow, with no size limits, as Automatic discovery admits a
+// new window: after the retained focus when `insertAfterFocused`, else at the end.
+static bool AdmitPredictedWindow(Workspace& trial, bool insertAfterFocused) {
+  WindowRecord record;
+  record.hwnd = kPredictedWindow;
+  record.state = ManageState::Tiled;
+  const HWND anchor = insertAfterFocused ? trial.LastFocusedTiledWindow() : nullptr;
+  return anchor ? trial.AdmitTiledAfter(std::move(record), anchor) : trial.AdmitTiled(std::move(record));
 }
 
 // Where Automatic discovery would place an unknown, resizable window that has no
@@ -51,8 +38,8 @@ static bool RecoveryFloatsPredictedWindow(const Workspace& trial, const Platform
 //
 // - Tiled layouts run the real admission (AdmitTiled, or AdmitTiledAfter the
 //   retained focus when `insertAfterFocused`) on a copy and plan it with
-//   BuildWorkspaceLayoutPlan, so the result is exactly what arrangement would
-//   request. No tiled frame when `windowLimitReached` (the caller asks
+//   the same planner as arrangement, including alternate BSP tiles. No tiled
+//   frame when `windowLimitReached` (the caller asks
 //   WouldExceedAutomaticWindowLimit, which counts exactly as enforcement does)
 //   or the plan is unsatisfiable. Both float the window instead
 //   (`newWindowFloats`), except an unsatisfiable plan that recovery resolves
@@ -80,31 +67,100 @@ static AdmissionPrediction PredictAutomaticAdmission(
   }
 
   Workspace trial = workspace;
-  WindowRecord record;
-  record.hwnd = kPredictedWindow;
-  record.state = ManageState::Tiled;
-  const HWND anchor = insertAfterFocused ? trial.LastFocusedTiledWindow() : nullptr;
-  const bool admitted = anchor ? trial.AdmitTiledAfter(std::move(record), anchor)
-                               : trial.AdmitTiled(std::move(record));
-  if (!admitted) return prediction;
+  if (!AdmitPredictedWindow(trial, insertAfterFocused)) return prediction;
 
   std::vector<RECT> rects;
   const Layout::LayoutPlanStatus status =
-      Layout::BuildWorkspaceLayoutPlan(trial, metrics.workArea, metrics.gap, &rects);
+      Layout::PlanWithNewBspSplitFallback(trial, metrics.workArea, metrics.gap, &rects);
   if (status == Layout::LayoutPlanStatus::Unsatisfiable) {
-    prediction.newWindowFloats = RecoveryFloatsPredictedWindow(trial, metrics);
+    // Arrangement removes an intrinsically oversized window before searching
+    // for a slot. Otherwise it blames the admission if the settled tiles fit.
+    if (FindWindowLargerThanWorkArea(trial, Layout::ActiveWindowConstraints(trial), metrics.workArea)) return prediction;
+    const auto candidates = OrderRemovalCandidates(trial, nullptr);
+    Layout::AdmissionRecoveryPlan recovery;
+    if (!Layout::TryRecoverPendingAdmission(trial, metrics.workArea, metrics.gap, candidates, nullptr, &recovery)) {
+      prediction.newWindowFloats =
+          FindIntroducingPendingAdmission(trial, candidates, metrics.workArea, metrics.gap) == kPredictedWindow;
+      return prediction;
+    }
+    if (trial.Layout() != TileLayout::Bsp) return prediction;
+    trial = std::move(recovery.workspace);
+    rects = std::move(recovery.rects);
+  } else if (status != Layout::LayoutPlanStatus::Success) {
     return prediction;
   }
-  if (status != Layout::LayoutPlanStatus::Success) return prediction;
   const size_t index = trial.TiledIndex(kPredictedWindow);
   if (index < rects.size()) prediction.tiledFrame = rects[index];
   return prediction;
 }
 
+// The tile kPredictedWindow gets in `trial` with no minimum, and the splits
+// above it with the other windows' minimums (CompanionAbi::BspArrivalTile), so
+// the companion can fit the window's own minimum exactly as the planner will.
+// No value when the other windows don't fit. Plans only.
+static std::optional<CompanionAbi::BspArrivalTile> MeasureBspArrivalTile(
+    const Workspace& trial, const Platform::Monitors::WorkspaceMetrics& metrics) {
+  std::vector<RECT> rects;
+  if (Layout::BuildWorkspaceLayoutPlan(trial, metrics.workArea, metrics.gap, &rects) !=
+      Layout::LayoutPlanStatus::Success) {
+    return std::nullopt;
+  }
+  CompanionAbi::BspArrivalTile tile{};
+  tile.tile = rects[trial.TiledIndex(kPredictedWindow)];
+  const std::vector<SharedSplits::BspPathSplit> path =
+      Layout::BspPathTo(trial.Bsp(), trial.TiledWindows(), metrics.workArea, metrics.gap,
+                        Layout::ActiveWindowConstraints(trial), Layout::GetBspAdaptation(), kPredictedWindow);
+  tile.pathLength = static_cast<uint32_t>(path.size());
+  if (path.size() <= CompanionAbi::kMaxBspPathSplits) std::copy(path.begin(), path.end(), tile.path);
+  return tile;
+}
+
+// True when every tiled window but kPredictedWindow holds its tile: none can
+// still have its new split turned to make room (PlanWithNewBspSplitFallback).
+static bool BspArrivalsSettled(const Workspace& workspace) {
+  return std::none_of(workspace.TiledWindows().begin(), workspace.TiledWindows().end(), [&](HWND hwnd) {
+    const WindowRecord* record = workspace.Find(hwnd);
+    return hwnd != kPredictedWindow && record && record->pendingInsertionPlacement;
+  });
+}
+
+// The tiles the next Automatic arrival in BSP `workspace` tries, in
+// arrangement's order (CompanionAbi::BspArrivalTiles): the tile admission
+// splits, then that split turned (PlanWithNewBspSplitFallback), then the same
+// two at the largest other tile (TryRecoverPendingBspAdmission). Empty for
+// other layouts. Pure; a few plans, published for the companion. WM thread only.
+static CompanionAbi::BspArrivalTiles PredictBspArrivalTiles(
+    const Workspace& workspace, const Platform::Monitors::WorkspaceMetrics& metrics, bool insertAfterFocused) {
+  CompanionAbi::BspArrivalTiles tiles{};
+  Workspace admitted = workspace;
+  if (workspace.Layout() != TileLayout::Bsp || workspace.HasRecord(kPredictedWindow) ||
+      !AdmitPredictedWindow(admitted, insertAfterFocused)) {
+    return tiles;
+  }
+  tiles.othersSettled = BspArrivalsSettled(admitted) ? 1 : 0;
+  tiles.gap = metrics.gap;
+  tiles.adaptiveDeviation = Layout::GetBspAdaptation().deviation;
+  auto add = [&](const Workspace& trial) {
+    if (tiles.count == CompanionAbi::kMaxBspArrivalTiles) return;
+    if (const auto tile = MeasureBspArrivalTile(trial, metrics)) tiles.tiles[tiles.count++] = *tile;
+  };
+  auto addBothDirections = [&](const Workspace& trial) {
+    add(trial);
+    const size_t split = trial.Bsp().Parent(trial.Bsp().FindLeaf(kPredictedWindow));
+    if (split == BspTree::kNotFound) return;
+    Workspace turned = trial;
+    Layout::TurnBspSplit(turned, split, metrics.workArea);
+    add(turned);
+  };
+  addBothDirections(admitted);
+  if (Layout::MoveBspArrivalToLargestTile(admitted, kPredictedWindow)) addBothDirections(admitted);
+  return tiles;
+}
+
 // Where `hwnd`, a suspended member of `workspace`, will be tiled when it is
 // restored: MultiWM's own Restore on a copy (saved position, saved weight or
-// ratio, master status) planned with BuildWorkspaceLayoutPlan, which includes
-// the window's cached minimum and maximum sizes. That is the computation
+// ratio, master status) planned with the window's cached size limits. BSP also
+// searches other tiles when the first cannot fit. That is the computation
 // arrangement runs when the window really returns, so the result is exact
 // unless something changes during the restore itself (a new minimum, a DPI
 // change, the restore overflowing the window limit).
@@ -117,9 +173,16 @@ static std::optional<RECT> PredictRestoredFrame(
   Workspace trial = workspace;
   if (!trial.Restore(hwnd)) return std::nullopt;
   std::vector<RECT> rects;
-  if (Layout::BuildWorkspaceLayoutPlan(trial, metrics.workArea, metrics.gap, &rects) !=
+  if (Layout::PlanWithNewBspSplitFallback(trial, metrics.workArea, metrics.gap, &rects) !=
       Layout::LayoutPlanStatus::Success) {
-    return std::nullopt;
+    Layout::AdmissionRecoveryPlan recovery;
+    if (trial.Layout() != TileLayout::Bsp ||
+        !Layout::TryRecoverPendingAdmission(trial, metrics.workArea, metrics.gap, OrderRemovalCandidates(trial, nullptr),
+                                            nullptr, &recovery)) {
+      return std::nullopt;
+    }
+    trial = std::move(recovery.workspace);
+    rects = std::move(recovery.rects);
   }
   const size_t index = trial.TiledIndex(hwnd);
   if (index >= rects.size()) return std::nullopt;

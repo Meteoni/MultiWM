@@ -112,6 +112,7 @@ static void ToggleWindowManagementMode() {
 }
 
 static void HandleMoveSizeEndMessage(HWND hwnd) {
+  DragPreview::End(hwnd);
   ++Diagnostics::g_runtime.counters.moveSizeEndMessages;
   // MOVESIZEEND is an authoritative monitor-transition boundary. Repair monitor
   // ownership before interpreting final geometry, without querying desktop
@@ -174,16 +175,24 @@ static bool IsManagementModeMessage(const MSG& msg) {
 // continues receiving cross-apartment calls.
 static WmMessageDisposition DispatchWmThreadMessage(const MSG& msg) {
   switch (msg.message) {
+    case WM_APP_MOVE_SIZE_START:
+      DragPreview::Begin(reinterpret_cast<HWND>(msg.wParam), reinterpret_cast<HWND>(msg.lParam));
+      return WmMessageDisposition::Handled;
+
     case WM_APP_MOVE_SIZE_END:
       HandleMoveSizeEndMessage(reinterpret_cast<HWND>(msg.wParam));
       return WmMessageDisposition::Handled;
 
-    case WM_APP_WINDOW_EVENT:
-      Reconcile::ProcessWindowLifecycleEvent(
-          static_cast<DWORD>(msg.wParam), reinterpret_cast<HWND>(msg.lParam));
+    case WM_APP_WINDOW_EVENT: {
+      const auto event = static_cast<DWORD>(msg.wParam);
+      const HWND hwnd = reinterpret_cast<HWND>(msg.lParam);
+      Reconcile::ProcessWindowLifecycleEvent(event, hwnd);
+      DragPreview::OnWindowEvent(event, hwnd);
       return WmMessageDisposition::Handled;
+    }
 
     case WM_APP_VIRTUAL_DESKTOP_CHANGED:
+      DragPreview::End();
       Reconcile::HandleVirtualDesktopChanged();
       return WmMessageDisposition::Handled;
 
@@ -287,7 +296,7 @@ static WmMessageDisposition DispatchWmThreadMessage(const MSG& msg) {
 
 // Handles one thread message. A user command first cancels a pending desktop
 // follow, and afterwards says why any window it tried to tile was floated
-// instead (Commands::ReportCommandReleases).
+// instead.
 static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
   if (!IsUserCommandMessage(msg)) return DispatchWmThreadMessage(msg);
   // A new user command supersedes a pending "follow the overflowed window to its
@@ -296,7 +305,7 @@ static WmMessageDisposition HandleWmThreadMessage(const MSG& msg) {
   if (IsManagementModeMessage(msg)) return DispatchWmThreadMessage(msg);
   Commands::CommandReleaseScope releases;
   const WmMessageDisposition disposition = DispatchWmThreadMessage(msg);
-  Commands::ReportCommandReleases(releases.Released(), nullptr);
+  Placement::ShowSpaceFloatToast(releases.Released(), nullptr);
   return disposition;
 }
 
@@ -354,6 +363,7 @@ static void CleanupWmThread() {
   // Unhook WinEvent delivery before clearing transient callback observations so
   // no reentrant delivery can repopulate the next settings-reload session.
   UnregisterConfiguredHotkeys();
+  DragPreview::Shutdown();
   TrayUi::Shutdown();
   Platform::WindowEvents::RemoveWinEventHooks();
   Platform::VirtualDesktop::CleanupVirtualDesktopAPI();

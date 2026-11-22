@@ -188,16 +188,24 @@ static void OnMoveSize(DWORD event, HWND hwnd, bool tracked, HWND frameWindow) {
   }
 
   RECT frame{};
-  if (Platform::Windows::GetWindowFrameRect(frameWindow, &frame)) {
-    if (event == EVENT_SYSTEM_MOVESIZESTART) {
-      Gestures::g_moveSize.startRects[hwnd] = frame;
-    } else {
-      Gestures::g_moveSize.endRects[hwnd] = frame;
-      POINT cursor{};
-      if (GetCursorPos(&cursor)) Gestures::g_moveSize.endPoints[hwnd] = cursor;
+  const bool hasFrame = Platform::Windows::GetWindowFrameRect(frameWindow, &frame);
+  if (event == EVENT_SYSTEM_MOVESIZESTART) {
+    if (!hasFrame) return;
+    Gestures::g_moveSize.startRects[hwnd] = frame;
+    if (g_settings.DragPreviewEnabled()) {
+      if (const DWORD threadId = g_wm.threadId.load(std::memory_order_acquire)) {
+        PostThreadMessageW(threadId, WM_APP_MOVE_SIZE_START, reinterpret_cast<WPARAM>(hwnd),
+                           reinterpret_cast<LPARAM>(frameWindow));
+      }
     }
+    return;
   }
-  if (event == EVENT_SYSTEM_MOVESIZEEND) OnWindowMoveSizeEnd(hwnd);
+  if (hasFrame) {
+    Gestures::g_moveSize.endRects[hwnd] = frame;
+    POINT cursor{};
+    if (GetCursorPos(&cursor)) Gestures::g_moveSize.endPoints[hwnd] = cursor;
+  }
+  OnWindowMoveSizeEnd(hwnd);
 }
 
 // Show/hide/cloak/minimize/state changes: forward to the WM thread.

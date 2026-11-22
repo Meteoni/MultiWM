@@ -304,6 +304,86 @@ int main() {
     body.flags = completeFlags;
     hinted("a minimum wider than the work area gives no hint while overflow routes", false, 0, 0);
 
+    body.bspWorkspaces = 1;
+    hinted("BSP centres a window larger than the work area even when overflow routes", true, Width(work) + 200,
+           std::max<LONG>(600, floatHeight));
+    limits.minimum = {700, 600};
+    hinted("BSP defers a too-small tile to the full layout planner", false, 0, 0);
+    workspace.hasTiledFrame = 0;
+    workspace.newWindowFloats = 1;
+    hinted("the BSP count limit can still route to another monitor", false, 0, 0);
+    body.bspLocalFloats = 1;
+    limits.minimum = {100, 100};
+    hinted("a definite BSP fit failure centres the window on this monitor", true, floatWidth, floatHeight);
+    body.bspWorkspaces = 0;
+    body.bspLocalFloats = 0;
+    workspace.hasTiledFrame = 1;
+    workspace.newWindowFloats = 0;
+
+    // BSP arrival tiles: the window takes the first of MultiWM's tries whose
+    // published splits fit its minimum, at the rectangle MultiWM's planner
+    // gives it, and floats when none does.
+    body.bspWorkspaces = 1;
+    limits.maximum = {100000, 100000};
+    CompanionAbi::BspArrivalTiles& arrivals = body.bspArrivals[0];
+    arrivals = {};
+    arrivals.othersSettled = 1;
+    // The right half, the bottom half, then the whole work area.
+    auto halfSplit = [](bool alongX, bool adaptive) {
+      return SharedSplits::BspPathSplit{0.5, 1, 1, static_cast<uint8_t>(alongX), 0, static_cast<uint8_t>(adaptive), 0, 0};
+    };
+    arrivals.count = 3;
+    arrivals.tiles[0].pathLength = 1;
+    arrivals.tiles[0].path[0] = halfSplit(true, false);
+    arrivals.tiles[1].pathLength = 1;
+    arrivals.tiles[1].path[0] = halfSplit(false, false);
+    arrivals.tiles[2].pathLength = 0;
+    const LONG halfWidth = SharedSplits::SplitLeadingSpan(Width(work), 0.5);
+    const LONG halfHeight = SharedSplits::SplitLeadingSpan(Height(work), 0.5);
+    const RECT rightHalf{work.left + halfWidth, work.top, work.right, work.bottom};
+    const RECT bottomHalf{work.left, work.top + halfHeight, work.right, work.bottom};
+    const LONG marginsWidth = testMargins.left + testMargins.right;
+    const LONG marginsHeight = testMargins.top + testMargins.bottom;
+    auto tiledAt = [&](const char* description, const RECT& tile) {
+      ++body.generation;
+      positionCalls.clear();
+      Companion::SetWindowPosHook(hwnd, nullptr, 210, 220, 710, 510, showFlags);
+      check(positionCalls.size() == 1 && positionCalls[0].x == tile.left - testMargins.left &&
+                positionCalls[0].y == tile.top - testMargins.top &&
+                positionCalls[0].width == Width(tile) + testMargins.left + testMargins.right &&
+                positionCalls[0].height == Height(tile) + testMargins.top + testMargins.bottom,
+            description);
+    };
+    const LONG wide = Width(work) * 3 / 4;
+    const LONG tall = Height(work) * 3 / 4;
+    limits.minimum = {300, 200};
+    tiledAt("a BSP arrival that fits takes the tile MultiWM splits first", rightHalf);
+    limits.minimum = {wide, 200};
+    tiledAt("too wide for the first tile, it takes the turned split", bottomHalf);
+    limits.minimum = {wide, tall};
+    tiledAt("too tall for that too, it takes the next tile", work);
+    limits.minimum = {Width(work) + 200, 500};
+    hinted("a BSP arrival no tile fits floats on this monitor", true, Width(work) + 200, std::max<LONG>(500, floatHeight));
+    arrivals.othersSettled = 0;
+    limits.minimum = {wide, 200};
+    hinted("while another arrival settles, only the first tile is certain", false, 0, 0);
+    arrivals.othersSettled = 1;
+    // An adaptive split moves just far enough, as MultiWM's planner moves it.
+    arrivals.tiles[0].path[0] = halfSplit(true, true);
+    arrivals.adaptiveDeviation = 0.4;
+    const LONG grown = Width(work) / 2 + 100;
+    limits.minimum = {grown + marginsWidth, 200};
+    tiledAt("an adaptive divider gives the window exactly its minimum width",
+            RECT{work.right - grown, work.top, work.right, work.bottom});
+    limits.minimum = {300, marginsHeight + Height(work) / 4};
+    limits.maximum = {400, 100000};
+    tiledAt("a capped window is centred in its tile",
+            RECT{rightHalf.left + (Width(rightHalf) - (400 - marginsWidth)) / 2, work.top,
+                 rightHalf.left + (Width(rightHalf) - (400 - marginsWidth)) / 2 + 400 - marginsWidth, work.bottom});
+    limits.maximum = {2000, 2000};
+    arrivals = {};
+    body.bspWorkspaces = 0;
+
     limits.minimum = {100, 100};
     workspace.hasFloatingFrame = 0;
     workspace.floatingFrame = {};
@@ -483,7 +563,7 @@ int main() {
   {
     const RECT area{0, 0, 1200, 1000};
     auto fit = [&](RECT slot, SharedGeometry::FrameLimits frameLimits) {
-      return Companion::FitSlotToLimits(slot, area, frameLimits);
+      return Companion::FitSlotToLimits(slot, area, frameLimits, true);
     };
     auto equals = [](const std::optional<RECT>& rect, RECT expected) {
       return rect && EqualRect(&*rect, &expected);

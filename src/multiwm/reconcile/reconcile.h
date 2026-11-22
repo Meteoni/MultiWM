@@ -287,9 +287,9 @@ static bool AdmitUntrackedSnapshot(
     changed = true;
     if (admittedWindows) admittedWindows->push_back(hwnd);
 
-    // Preserve enumeration order when one reconciliation burst discovers several
-    // windows without changing the retained user-focus anchor.
-    if (afterFocused) anchor = hwnd;
+    // Preserve enumeration order in linear layouts. BSP keeps splitting the
+    // focused leaf throughout the burst.
+    if (afterFocused && workspace.Layout() != TileLayout::Bsp) anchor = hwnd;
   }
   return changed;
 }
@@ -347,6 +347,12 @@ static bool AdoptSnapshotGeometryIfEligible(
                                                  : workspace.TiledWindows().front();
   std::vector<WorkspaceGeometryItem> geometry = Platform::Windows::CaptureWorkspaceGeometry(
       workspace.TiledWindows(), monitor, workArea);
+  for (auto& item : geometry) {
+    const WindowRecord* previous = workspace.Find(item.record.hwnd);
+    if (previous && previous->pid == item.record.pid) {
+      item.record.lastFocusSequence = previous->lastFocusSequence;
+    }
+  }
   Workspace captured = Workspace::AdoptGeometry(
       workspace.Layout(), workArea, gap, g_settings.masterPercent / 100.0,
       geometry, preferredMaster);

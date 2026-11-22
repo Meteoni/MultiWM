@@ -85,6 +85,8 @@
 //    MasterStack/MasterStackH keep one stack weight per non-master active window.
 //    Dwindle keeps one outgoing ratio per active slot. The final slot's ratio
 //    is dormant until another leaf follows it, and survives suspension.
+//    BSP keeps a split tree with one leaf per tiled or maximized window; the
+//    tiled order is the order of its active leaves, left to right.
 // 6. A managed HWND has exactly one desktop+monitor workspace owner.
 // 7. Visibility/cloak events are dirty signals; ownership comes from explicit
 //    desktop/monitor queries, not from cloak state.
@@ -212,13 +214,16 @@ constexpr UINT WM_APP_LAYOUT_SET = WM_APP + 7;
 constexpr UINT WM_APP_MANAGEMENT_MODE_SET = WM_APP + 8;
 constexpr UINT WM_APP_TILE_WORKSPACE = WM_APP + 9;
 constexpr UINT WM_APP_FOREGROUND_CHANGED = WM_APP + 10;
+constexpr UINT WM_APP_MOVE_SIZE_START = WM_APP + 11;
 
 enum class WmMessageDisposition {
   Handled,
   DispatchToWindows,
 };
 
-enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, Dwindle, Monocle, Floating, COUNT };
+// Bsp is last so the earlier values, which settings digests and diagnostics
+// record, keep their numbers.
+enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, Dwindle, Monocle, Floating, Bsp, COUNT };
 
 // Every name a layout goes by, in TileLayout order.
 struct LayoutNames {
@@ -237,6 +242,7 @@ inline constexpr LayoutNames kLayoutNames[] = {
     {L"dwindle", L"Dwindle", L"Dwindle", L"DW", L"Dwindle"},
     {L"monocle", L"Monocle", L"Monocle", L"MN", L"Monocle"},
     {L"floating", L"Floating", L"Floating", L"FL", L"Floating"},
+    {L"bsp", L"BSP", L"BSP", L"BS", L"Bsp"},
 };
 static_assert(std::size(kLayoutNames) == static_cast<size_t>(TileLayout::COUNT),
               "kLayoutNames needs one entry per TileLayout");
@@ -269,7 +275,8 @@ static std::vector<TileLayout> MakeBuiltInLayoutCycle() {
       TileLayout::Columns,
       TileLayout::Rows,
       TileLayout::Monocle,
-      TileLayout::Floating};
+      TileLayout::Floating,
+      TileLayout::Bsp};
 }
 
 struct WorkspaceInsets {
@@ -350,6 +357,12 @@ struct SettingsState {
   // it unless this default itself changed.
   ManagementMode defaultManagementMode = ManagementMode::Automatic;
   MouseMoveBehavior mouseMoveBehavior = MouseMoveBehavior::Float;
+  LONG bspSplitEdgePercent = 25;
+  LONG dragPreviewFillOpacity = 25;
+  LONG dragPreviewOutlineOpacity = 100;
+  LONG dragPreviewOutlineWidthDip = 4;
+  LONG dragPreviewOutlineRadiusDip = 8;
+  UINT dragPreviewFadeMs = 96;
   AutomaticNewWindowPosition automaticNewWindowPosition =
       AutomaticNewWindowPosition::LastSlot;
   TileLayout defaultLayout = TileLayout::MasterStack;
@@ -370,6 +383,10 @@ struct SettingsState {
   // Settings the last load couldn't use, each as a short toast line ("Window
   // rule 3 ignored: invalid size"). The WM thread shows them once it starts.
   std::vector<std::wstring> problems;
+
+  bool DragPreviewEnabled() const {
+    return mouseMoveBehavior == MouseMoveBehavior::Swap && (dragPreviewFillOpacity > 0 || dragPreviewOutlineOpacity > 0);
+  }
 };
 
 // One configurable hotkey: its message ID, the Windhawk setting naming its key,

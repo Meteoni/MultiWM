@@ -784,11 +784,9 @@ static void RunOverflowDestinationProbeTests() {
   std::printf("Passed %u overflow destination probe checks.\n", check.passed);
 }
 
-// Overflow judges a destination as arrangement treats it once saved: a window
-// that fits only after admission recovery moves it, including Dwindle's
-// reassignment of siblings, is accepted. Searched over the minimum sizes of up
-// to five settled members and the incoming window (seeded, so repeatable), on
-// real invisible test windows, through the new-desktop path.
+// Overflow and arrangement agree on which Dwindle destinations fit, including
+// when the incoming window needs another insertion point. Seeded minimum sizes
+// exercise the new-desktop path with real invisible windows.
 static void RunOverflowDestinationFitTests() {
   CheckCounter check;
   FloatingWindowFixture fixture(check);
@@ -816,9 +814,9 @@ static void RunOverflowDestinationFitTests() {
     return result;
   };
 
-  size_t reassigned = 0;
+  size_t repositioned = 0;
   size_t compared = 0;
-  for (int attempt = 0; attempt < 20000 && reassigned < 20; ++attempt) {
+  for (int attempt = 0; attempt < 20000 && (compared < 300 || repositioned < 20); ++attempt) {
     Workspace initial;
     initial.SetLayout(TileLayout::Dwindle);
     const size_t memberCount = 2 + next(4);
@@ -836,19 +834,17 @@ static void RunOverflowDestinationFitTests() {
     Layout::AdmissionRecoveryPlan recovery;
     const bool recovered = !fits && Layout::TryRecoverPendingAdmission(
         expected, area, gap, Placement::OrderRemovalCandidates(expected, nullptr), nullptr, &recovery);
-    const bool needsReassignment = recovered && recovery.reassignedWindows > 0;
-    // Every case that needs reassignment, and a sample of the rest.
-    if (!needsReassignment && compared >= 300) continue;
+    if (!recovered && compared >= 300) continue;
     ++compared;
-    reassigned += needsReassignment ? 1 : 0;
+    repositioned += recovered ? 1 : 0;
     const auto destination = Reconcile::PlanOverflowDestination(
         fixture.key, incoming, FloatingWindowFixture::Frame(incomingWindow), &initial);
     check(destination.has_value() == (fits || recovered),
           "overflow accepts a destination exactly when arrangement would tile the window there");
   }
-  check(reassigned > 0, "some destinations fit only by reassigning Dwindle siblings");
-  std::printf("Passed %u overflow destination fit checks (%zu destinations, %zu needing reassignment).\n",
-              check.passed, compared, reassigned);
+  check(repositioned > 0, "some destinations fit only at an alternate insertion point");
+  std::printf("Passed %u overflow destination fit checks (%zu destinations, %zu needing repositioning).\n",
+              check.passed, compared, repositioned);
 }
 
 static bool IsCenteredIn(const RECT& rect, POINT center) {
@@ -1106,6 +1102,408 @@ static void RunFirstFloatingSizeTests() {
   std::printf("Passed %u first floating size checks.\n", check.passed);
 }
 
+// Exercise completed BSP drags against actual displayed tiles, including
+// the constraint preflight that restores the old layout after a rejected drop.
+static void RunBspDragTests() {
+  CheckCounter check;
+  FloatingWindowFixture fixture(check);
+  const HWND source = fixture.hwnd;
+  const HWND target = fixture.CreateTestWindow(nullptr);
+  const HWND sibling = fixture.CreateTestWindow(nullptr);
+  const bool savedToasts = TrayUi::g_preferences.showToasts;
+  TrayUi::g_preferences.showToasts = false;
+  g_settings.mouseMoveBehavior = MouseMoveBehavior::Swap;
+  g_settings.bspSplitEdgePercent = SettingsState{}.bspSplitEdgePercent;
+  g_settings.adaptiveDwindleSlots = 0;
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+
+  fixture.Seed(TileLayout::Bsp);
+  Workspace initial = fixture.Load();
+  for (HWND window : {target, sibling}) {
+    check(initial.AdmitTiled(FloatingWindowFixture::Record(window)), "admit a BSP drag test window");
+    initial.ClearInsertionPlacement(window);
+  }
+  g_workspaces.Save(fixture.key, initial);
+  Placement::ArrangeWorkspace(fixture.key);
+  initial = fixture.Load();
+  const RECT originalSourceFrame = FloatingWindowFixture::Frame(source);
+  const bool landscape = Layout::FirstSplitAxis(fixture.workArea) == Layout::Axis::X;
+  using Zone = Commands::TileDropZone;
+  const Zone splitEdge = landscape ? Zone::Bottom : Zone::Right;
+  const Zone fittingEdge = landscape ? Zone::Right : Zone::Bottom;
+  auto dropOnto = [&](HWND dragged, HWND destination, Zone zone = Zone::Center) {
+    Workspace workspace = fixture.Load();
+    const RECT frame = FloatingWindowFixture::Frame(destination);
+    MoveSizeGesture gesture;
+    gesture.hasDropPoint = true;
+    gesture.dropPoint = SharedGeometry::RectCenter(frame);
+    if (zone == Zone::Left) gesture.dropPoint.x = frame.left;
+    if (zone == Zone::Right) gesture.dropPoint.x = frame.right - 1;
+    if (zone == Zone::Top) gesture.dropPoint.y = frame.top;
+    if (zone == Zone::Bottom) gesture.dropPoint.y = frame.bottom - 1;
+    Commands::HandleUserMove(fixture.key, workspace, dragged, gesture);
+    return fixture.Load();
+  };
+
+  const RECT tile{0, 0, 200, 100};
+  check(Commands::PickTileDropZone(tile, {100, 50}, 25) == Zone::Center &&
+            Commands::PickTileDropZone(tile, {10, 50}, 25) == Zone::Left &&
+            Commands::PickTileDropZone(tile, {190, 50}, 25) == Zone::Right &&
+            Commands::PickTileDropZone(tile, {100, 5}, 25) == Zone::Top &&
+            Commands::PickTileDropZone(tile, {100, 95}, 25) == Zone::Bottom,
+        "the BSP drag zone selects the nearest edge or the center");
+  check(Commands::PickTileDropZone(tile, {10, 50}, 0) == Zone::Center &&
+            Commands::PickTileDropZone(tile, {100, 50}, 50) != Zone::Center,
+        "the edge-size slider can disable or fill the split zones");
+  const Platform::Monitors::WorkspaceMetrics portrait{{0, 0, 600, 1000}, 96, 0};
+  for (const Zone accepted : {Zone::Top, Zone::Bottom}) {
+    Workspace vertical;
+    vertical.SetLayout(TileLayout::Bsp);
+    if (accepted == Zone::Top) {
+      vertical.AdmitTiled(FloatingWindowFixture::Record(target));
+      vertical.AdmitTiledAfter(FloatingWindowFixture::Record(source), target);
+      vertical.AdmitTiledAfter(FloatingWindowFixture::Record(sibling), target);
+    } else {
+      vertical.AdmitTiled(FloatingWindowFixture::Record(source));
+      vertical.AdmitTiledAfter(FloatingWindowFixture::Record(sibling), source);
+      vertical.AdmitTiledAfter(FloatingWindowFixture::Record(target), sibling);
+    }
+    vertical.SetBspSplitDirection(vertical.Bsp().Parent(vertical.Bsp().FindLeaf(target)), Layout::Axis::Y);
+    const Zone rejected = accepted == Zone::Top ? Zone::Bottom : Zone::Top;
+    check(Commands::PlanTiledDropPreview(vertical, source, {target, accepted}, portrait) &&
+              !Commands::PlanTiledDropPreview(vertical, source, {target, rejected}, portrait),
+          "only the vertical side that overlaps the requested edge can split");
+  }
+
+  // Replay the LocalSend and Bitwarden diagnostic in physical pixels.
+  Workspace adaptiveDrop;
+  adaptiveDrop.SetLayout(TileLayout::Bsp);
+  adaptiveDrop.AdmitTiled(FloatingWindowFixture::Record(sibling));
+  adaptiveDrop.AdmitTiledAfter(FloatingWindowFixture::Record(target), sibling);
+  adaptiveDrop.AdmitTiledAfter(FloatingWindowFixture::Record(source), sibling);
+  adaptiveDrop.UpdateConstraints(sibling, {802, 542, 192, true});
+  adaptiveDrop.UpdateConstraints(source, {778, 989, 192, true});
+  adaptiveDrop.UpdateConstraints(target, {1178, 1190, 192, true});
+  const Platform::Monitors::WorkspaceMetrics reportedMetrics{{14, 14, 3058, 1804}, 192, 14};
+  g_settings.adaptiveDwindleSlots = 2;
+  g_settings.adaptiveDwindlePercentage = 20;
+  const auto leftDrop = Commands::PlanTiledDropPreview(adaptiveDrop, source, {target, Zone::Left}, reportedMetrics);
+  const auto rightDrop = Commands::PlanTiledDropPreview(adaptiveDrop, source, {target, Zone::Right}, reportedMetrics);
+  const RECT expectedLeft{1088, 14, 1866, 1804};
+  const RECT expectedRight{2280, 14, 3058, 1804};
+  check(leftDrop && rightDrop && EqualRect(&leftDrop->dragged, &expectedLeft) &&
+            EqualRect(&rightDrop->dragged, &expectedRight) &&
+            Layout::RectWidth(leftDrop->affected) == 1178 && Layout::RectWidth(rightDrop->affected) == 1178,
+        "both edges can borrow space within the adaptive limit and preview the chosen side");
+  g_settings.adaptiveDwindleSlots = 0;
+  check(!Commands::PlanTiledDropPreview(adaptiveDrop, source, {target, Zone::Left}, reportedMetrics) &&
+            !Commands::PlanTiledDropPreview(adaptiveDrop, source, {target, Zone::Right}, reportedMetrics),
+        "an edge drop cannot borrow space beyond the configured adaptive range");
+
+  Workspace offEdge;
+  offEdge.SetLayout(TileLayout::Bsp);
+  offEdge.AdmitTiled(FloatingWindowFixture::Record(source));
+  offEdge.AdmitTiledAfter(FloatingWindowFixture::Record(target), source);
+  offEdge.AdmitTiledAfter(FloatingWindowFixture::Record(sibling), target);
+  offEdge.SetBspSplitDirection(offEdge.Bsp().Parent(offEdge.Bsp().FindLeaf(target)), Layout::Axis::X);
+  const Platform::Monitors::WorkspaceMetrics offEdgeMetrics{{0, 0, 1000, 600}, 96, 0};
+  check(offEdge.StepTiledSize(offEdgeMetrics.workArea, 0, offEdge.TiledIndex(source), false, 20),
+        "put the original target at x=300 to x=650");
+  Workspace offEdgeCandidate = offEdge;
+  std::vector<RECT> offEdgeRects;
+  check(Commands::PrepareTiledDrop(offEdgeCandidate, source, {target, Zone::Right}) ==
+            Placement::UserLayoutMutationKind::BspMerge &&
+            Layout::BuildWorkspaceLayoutPlan(offEdgeCandidate, offEdgeMetrics.workArea, 0, &offEdgeRects) ==
+                Layout::LayoutPlanStatus::Success &&
+            offEdgeRects[offEdgeCandidate.TiledIndex(source)].right == 500 &&
+            !Commands::PlanTiledDropPreview(offEdge, source, {target, Zone::Right}, offEdgeMetrics),
+        "a split that overlaps the original tile away from the requested edge is rejected");
+
+  for (const Zone zone : {Zone::Left, Zone::Top}) {
+    Workspace leadingSplit = initial;
+    check(Commands::PrepareTiledDrop(leadingSplit, source, {target, zone}) ==
+              Placement::UserLayoutMutationKind::BspMerge &&
+              leadingSplit.TiledIndex(source) + 1 == leadingSplit.TiledIndex(target),
+          "dropping on a leading edge puts the dragged window first in the split");
+  }
+  Workspace expectedCenterSwap = initial;
+  check(expectedCenterSwap.SwapTiled(source, target), "prepare a center swap across BSP branches");
+  const auto centerPreview = Commands::PlanTiledDropPreview(initial, source, {target, Zone::Center}, fixture.metrics);
+  const Workspace centerSwapped = dropOnto(source, target);
+  const RECT afterCenterSwap = FloatingWindowFixture::Frame(source);
+  const RECT affectedAfterSwap = FloatingWindowFixture::Frame(target);
+  check(centerSwapped.HasSameLayoutStateAs(expectedCenterSwap) && centerPreview &&
+            EqualRect(&centerPreview->dragged, &afterCenterSwap) &&
+            EqualRect(&centerPreview->affected, &affectedAfterSwap),
+        "a center drop previews both sides of the swap across BSP branches");
+  FloatingWindowFixture::ClearLeases();
+  g_workspaces.Save(fixture.key, initial);
+  Placement::ArrangeWorkspace(fixture.key);
+
+  const auto offTargetRejections = Diagnostics::g_runtime.counters.rejectedOrderCommands;
+  check(dropOnto(target, source, splitEdge).HasSameLayoutStateAs(initial) &&
+            Diagnostics::g_runtime.counters.rejectedOrderCommands == offTargetRejections + 1,
+        "removing the dragged leaf cannot move it to a different tile while merging");
+
+  // The target fits its current half. Trying to divide it along the next axis
+  // would leave it less than the minimum it now reports.
+  static POINT reportedMinimum;
+  static WNDPROC originalProcedure;
+  const LONG sourceWidth = Layout::RectWidth(fixture.workArea);
+  const LONG sourceHeight = Layout::RectHeight(fixture.workArea);
+  reportedMinimum = landscape ? POINT{3 * sourceWidth / 8, 3 * sourceHeight / 4}
+                            : POINT{3 * sourceWidth / 4, 3 * sourceHeight / 8};
+  const WNDPROC reportMinimum = [](HWND window, UINT message, WPARAM wparam, LPARAM lparam) -> LRESULT {
+    if (message == WM_GETMINMAXINFO) {
+      reinterpret_cast<MINMAXINFO*>(lparam)->ptMinTrackSize = reportedMinimum;
+      return 0;
+    }
+    return CallWindowProcW(originalProcedure, window, message, wparam, lparam);
+  };
+  originalProcedure = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(target, GWLP_WNDPROC,
+                                                                  reinterpret_cast<LONG_PTR>(reportMinimum)));
+  check(originalProcedure != nullptr, "install the target's minimum-size procedure");
+  const auto rejectedOrders = Diagnostics::g_runtime.counters.rejectedOrderCommands;
+  FloatingWindowFixture::AppMove(source, originalSourceFrame.left + 15, originalSourceFrame.top,
+                                Layout::RectWidth(originalSourceFrame), Layout::RectHeight(originalSourceFrame));
+  check(dropOnto(source, target, splitEdge).HasSameLayoutStateAs(initial) &&
+            Diagnostics::g_runtime.counters.rejectedOrderCommands == rejectedOrders + 1 &&
+            Layout::RectsNear(FloatingWindowFixture::Frame(source), originalSourceFrame),
+        "an infeasible merge is rejected and the dragged window snaps back");
+  if (landscape) reportedMinimum.x = 1;
+  else reportedMinimum.y = 1;
+  Workspace previewWorkspace = fixture.Load();
+  previewWorkspace.UpdateConstraints(target, {reportedMinimum.x, reportedMinimum.y, fixture.metrics.dpi, true});
+  for (const Zone blockedEdge : {splitEdge, landscape ? Zone::Top : Zone::Left}) {
+    const auto rejectedBefore = Diagnostics::g_runtime.counters.rejectedOrderCommands;
+    check(!Commands::PlanTiledDropPreview(previewWorkspace, source, {target, blockedEdge}, fixture.metrics) &&
+              dropOnto(source, target, blockedEdge).HasSameLayoutStateAs(initial) &&
+              Diagnostics::g_runtime.counters.rejectedOrderCommands == rejectedBefore + 1,
+          "a blocked edge neither uses nor commits a perpendicular split");
+  }
+
+  const UINT savedFadeMs = g_settings.dragPreviewFadeMs;
+  g_settings.dragPreviewFadeMs = 0;
+  g_workspaces.Save(fixture.key, previewWorkspace);
+  DragPreview::DragSession previewDrag{source, source, fixture.key.ResolveMonitor(), fixture.key,
+                                      originalSourceFrame, {}, {}, {}, {}};
+  DragPreview::UpdateDropPreview(previewDrag, SharedGeometry::RectCenter(originalSourceFrame));
+  check(!previewDrag.target && DragPreview::g_overlay.fadeTo == 255 && DragPreview::g_overlay.shown &&
+            EqualRect(&DragPreview::g_overlay.shown->dragged, &originalSourceFrame) &&
+            EqualRect(&DragPreview::g_overlay.shown->affected, &originalSourceFrame),
+        "a drop away from other tiles previews both shapes at the source tile");
+  DragPreview::FadeTo(0);
+  const RECT targetFrame = FloatingWindowFixture::Frame(target);
+  POINT blockedPoint = SharedGeometry::RectCenter(targetFrame);
+  if (landscape) blockedPoint.y = targetFrame.bottom - 1;
+  else blockedPoint.x = targetFrame.right - 1;
+  DragPreview::UpdateDropPreview(previewDrag, blockedPoint);
+  RECT snapBackFill{}, snapBackOutline{};
+  check(previewDrag.target == Commands::TiledDropTarget{target, splitEdge} &&
+            IsWindowVisible(DragPreview::g_overlay.fill) && IsWindowVisible(DragPreview::g_overlay.outline) &&
+            GetWindowRect(DragPreview::g_overlay.fill, &snapBackFill) &&
+            GetWindowRect(DragPreview::g_overlay.outline, &snapBackOutline) &&
+            EqualRect(&snapBackFill, &originalSourceFrame) && EqualRect(&snapBackOutline, &originalSourceFrame),
+        "a rejected split displays both shapes at the source tile");
+  DragPreview::Shutdown();
+  g_settings.dragPreviewFadeMs = savedFadeMs;
+
+  const auto splitPreview = Commands::PlanTiledDropPreview(previewWorkspace, source, {target, fittingEdge}, fixture.metrics);
+  const Workspace merged = dropOnto(source, target, fittingEdge);
+  SetWindowLongPtrW(target, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(originalProcedure));
+  const RECT afterSplit = FloatingWindowFixture::Frame(source);
+  const RECT affectedAfterSplit = FloatingWindowFixture::Frame(target);
+  check(splitPreview && EqualRect(&splitPreview->dragged, &afterSplit) &&
+            EqualRect(&splitPreview->affected, &affectedAfterSplit),
+        "the fitting edge previews both panes in the split");
+  check(merged.TiledWindows() == std::vector<HWND>({sibling, target, source}) &&
+            merged.Bsp().Parent(merged.Bsp().FindLeaf(source)) == merged.Bsp().Parent(merged.Bsp().FindLeaf(target)),
+        "the BSP drag keeps the target first and puts the source beside it");
+  const BspNode& mergedSplit = merged.Bsp().Nodes()[merged.Bsp().Parent(merged.Bsp().FindLeaf(source))];
+  check(mergedSplit.direction == Layout::FirstSplitAxis(fixture.workArea) && mergedSplit.ratio == 0.5,
+        "the merge saves the chosen edge direction and keeps the new divider at 50/50");
+  const RECT sourceBeforeSwap = FloatingWindowFixture::Frame(source);
+  const RECT targetBeforeSwap = FloatingWindowFixture::Frame(target);
+  Workspace expectedSwap = merged;
+  check(expectedSwap.SwapTiled(source, target), "prepare the expected sibling swap");
+  const Workspace siblingSwap = dropOnto(source, target);
+  const RECT sourceAfterSwap = FloatingWindowFixture::Frame(source);
+  const RECT targetAfterSwap = FloatingWindowFixture::Frame(target);
+  check(siblingSwap.HasSameLayoutStateAs(expectedSwap) &&
+            EqualRect(&sourceAfterSwap, &targetBeforeSwap) && EqualRect(&targetAfterSwap, &sourceBeforeSwap),
+        "siblings exchange their exact tiles with BSP split zones enabled");
+
+  g_settings.bspSplitEdgePercent = 0;
+  check(dropOnto(source, target, splitEdge).HasSameLayoutStateAs(merged), "at zero edge size every zone swaps");
+  g_settings.bspSplitEdgePercent = 25;
+  Commands::PromoteFocusedWindow(source);
+  check(fixture.Load().HasSameLayoutStateAs(expectedSwap), "the keyboard shortcut still swaps BSP leaves");
+
+  FloatingWindowFixture::ClearLeases();
+  g_workspaces.Save(fixture.key, initial);
+  Placement::ArrangeWorkspace(fixture.key);
+  g_settings.adaptiveDwindleSlots = 2;
+  g_settings.adaptiveDwindlePercentage = 20;
+  Workspace late = dropOnto(source, target, splitEdge);
+  const auto* pending = Placement::g_pendingProofs.FindLayoutMutation(fixture.key);
+  check(pending && pending->bspDropEdge, "a successful merge retains its requested edge while native placement settles");
+  late.UpdateConstraints(target, {reportedMinimum.x, reportedMinimum.y, fixture.metrics.dpi, true});
+  Workspace perpendicular = late;
+  perpendicular.SetBspSplitDirection(perpendicular.Bsp().Parent(perpendicular.Bsp().FindLeaf(source)),
+                                     Layout::FirstSplitAxis(fixture.workArea));
+  std::vector<RECT> lateRects;
+  check(Layout::BuildWorkspaceLayoutPlan(perpendicular, fixture.workArea, fixture.metrics.gap, &lateRects) ==
+            Layout::LayoutPlanStatus::Success,
+        "a native minimum could be satisfied by turning the new split");
+  g_workspaces.Save(fixture.key, late);
+  Placement::ArrangeWorkspace(fixture.key);
+  check(fixture.Load().HasSameLayoutStateAs(initial),
+        "a native minimum reported during placement rolls back a merge that would turn");
+  late = dropOnto(source, target, splitEdge);
+  late.UpdateConstraints(source, {landscape ? sourceWidth * 3 / 5 : 1,
+                                  landscape ? 1 : sourceHeight * 3 / 5, fixture.metrics.dpi, true});
+  pending = Placement::g_pendingProofs.FindLayoutMutation(fixture.key);
+  const auto originalCells = Model::PlanBspCells(initial, fixture.workArea, fixture.metrics.gap).rects;
+  RECT overlap{};
+  check(Layout::BuildWorkspaceLayoutPlan(late, fixture.workArea, fixture.metrics.gap, &lateRects) ==
+            Layout::LayoutPlanStatus::Success &&
+            IntersectRect(&overlap, &lateRects[late.TiledIndex(source)], &originalCells[initial.TiledIndex(target)]) &&
+            !EqualRect(&overlap, &lateRects[late.TiledIndex(source)]) && pending && pending->bspDropEdge &&
+            IntersectRect(&overlap, &lateRects[late.TiledIndex(source)], &*pending->bspDropEdge),
+        "the raised minimum extends beyond the original tile and still overlaps the requested edge");
+  g_workspaces.Save(fixture.key, late);
+  Placement::ArrangeWorkspace(fixture.key);
+  check(fixture.Load().HasSameLayoutStateAs(late),
+        "a native minimum reported during placement can borrow space and keep the merge on its requested edge");
+  FloatingWindowFixture::ClearLeases();
+  fixture.Seed(TileLayout::Bsp);
+  Workspace uneven = fixture.Load();
+  check(uneven.AdmitTiled(FloatingWindowFixture::Record(target)), "admit a second tile under the root divider");
+  uneven.ClearInsertionPlacement(target);
+  check(uneven.StepTiledSize(fixture.workArea, fixture.metrics.gap, uneven.TiledIndex(target), true, 10),
+        "make the target tile larger than the source tile");
+  g_workspaces.Save(fixture.key, uneven);
+  Placement::ArrangeWorkspace(fixture.key);
+  uneven = fixture.Load();
+  const RECT narrowTile = FloatingWindowFixture::Frame(source);
+  const RECT wideTile = FloatingWindowFixture::Frame(target);
+  const auto splitSpan = [landscape](const RECT& tile) {
+    return landscape ? Layout::RectWidth(tile) : Layout::RectHeight(tile);
+  };
+  const LONG middleSpan = (splitSpan(narrowTile) + splitSpan(wideTile)) / 2;
+  const WindowConstraints increasedMinimum{landscape ? middleSpan : 1, landscape ? 1 : middleSpan,
+                                           fixture.metrics.dpi, true};
+  const double originalRatio = uneven.Bsp().Nodes().front().ratio;
+  g_settings.adaptiveDwindleSlots = 0;
+  reportedMinimum = {increasedMinimum.minWidth, increasedMinimum.minHeight};
+  originalProcedure = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(target, GWLP_WNDPROC,
+                                                                  reinterpret_cast<LONG_PTR>(reportMinimum)));
+  check(originalProcedure != nullptr, "install a minimum that fits only the wider tile");
+  Workspace weightedSwap = dropOnto(source, target);
+  check(weightedSwap.TiledWindows() == std::vector<HWND>({target, source}) &&
+            std::abs(weightedSwap.Bsp().Nodes().front().ratio - (1.0 - originalRatio)) < 1e-9 &&
+            std::abs(splitSpan(FloatingWindowFixture::Frame(source)) - splitSpan(narrowTile)) <= 1 &&
+            std::abs(splitSpan(FloatingWindowFixture::Frame(target)) - splitSpan(wideTile)) <= 1,
+        "siblings carry their saved shares to the opposite side, even when the larger window needs its share");
+  SetWindowLongPtrW(target, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(originalProcedure));
+
+  g_settings.adaptiveDwindleSlots = 2;
+  Placement::RefreshWorkspaceNativeConstraints(weightedSwap, true, L"BSP drag test");
+  weightedSwap.UpdateConstraints(source, increasedMinimum);
+  g_workspaces.Save(fixture.key, weightedSwap);
+  Placement::ArrangeWorkspace(fixture.key);
+  const LONG adaptedSourceSpan = splitSpan(FloatingWindowFixture::Frame(source));
+  const LONG adaptedTargetSpan = splitSpan(FloatingWindowFixture::Frame(target));
+  check(adaptedSourceSpan > splitSpan(narrowTile), "show an adaptively shifted divider");
+  originalProcedure = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(source, GWLP_WNDPROC,
+                                                                  reinterpret_cast<LONG_PTR>(reportMinimum)));
+  check(originalProcedure != nullptr, "keep reporting the dragged window's minimum during the swap");
+  const Workspace adaptedSwap = dropOnto(source, target);
+  check(adaptedSwap.TiledWindows() == uneven.TiledWindows() &&
+            std::abs(adaptedSwap.Bsp().Nodes().front().ratio - originalRatio) < 1e-9 &&
+            std::abs(splitSpan(FloatingWindowFixture::Frame(source)) - adaptedSourceSpan) <= 1 &&
+            std::abs(splitSpan(FloatingWindowFixture::Frame(target)) - adaptedTargetSpan) <= 1,
+        "swapping preserves the saved shares while adaptive fitting continues on the opposite sides");
+  SetWindowLongPtrW(source, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(originalProcedure));
+
+  g_settings.dragPreviewFillOpacity = 25;
+  g_settings.dragPreviewOutlineOpacity = 100;
+  g_settings.dragPreviewFadeMs = 96;
+  const HWND previouslyFocused = GetForegroundWindow();
+  DragPreview::Show({narrowTile, wideTile});
+  const auto& overlay = DragPreview::g_overlay;
+  const ULONGLONG fadeInStart = overlay.fadeStarted;
+  DragPreview::StepFade(fadeInStart + g_settings.dragPreviewFadeMs / 2);
+  check(overlay.fadeAlpha == 128, "the preview fades toward the configured opacity");
+  DragPreview::Show({wideTile, narrowTile});
+  check(overlay.fadeStarted == fadeInStart, "changing targets does not restart a fade");
+  DragPreview::StepFade(fadeInStart + g_settings.dragPreviewFadeMs);
+  RECT displayedFill{}, displayedOutline{};
+  BYTE fillAlpha = 0, outlineAlpha = 0;
+  DWORD outlineFlags = 0;
+  check(IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
+            GetWindowRect(overlay.fill, &displayedFill) && EqualRect(&displayedFill, &wideTile) &&
+            GetWindowRect(overlay.outline, &displayedOutline) && EqualRect(&displayedOutline, &narrowTile) &&
+            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 64 &&
+            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, &outlineFlags) && outlineAlpha == 255 &&
+            outlineFlags == (LWA_COLORKEY | LWA_ALPHA) &&
+            (GetWindowLongPtrW(overlay.fill, GWL_EXSTYLE) & WS_EX_TRANSPARENT) &&
+            (GetWindowLongPtrW(overlay.outline, GWL_EXSTYLE) & WS_EX_TRANSPARENT) &&
+            GetForegroundWindow() == previouslyFocused,
+        "the fill and transparent outline use their planned bounds and opacity without taking focus");
+  DragPreview::Show({wideTile, narrowTile});
+  check(overlay.fadeAlpha == 255 && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
+        "the same preview rectangles do not start another fade");
+  DragPreview::Show({narrowTile, wideTile});
+  check(overlay.fadeAlpha == 128 && GetWindowRect(overlay.fill, &displayedFill) &&
+            EqualRect(&displayedFill, &narrowTile) &&
+            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 32 &&
+            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, nullptr) && outlineAlpha == 128,
+        "a changed destination appears immediately at half opacity");
+  const ULONGLONG targetFadeStart = overlay.fadeStarted;
+  DragPreview::StepFade(targetFadeStart + g_settings.dragPreviewFadeMs / 2);
+  check(overlay.fadeAlpha == 192, "a changed destination fades toward full strength");
+  DragPreview::StepFade(targetFadeStart + g_settings.dragPreviewFadeMs);
+  DragPreview::End();
+  const ULONGLONG fadeOutStart = overlay.fadeStarted;
+  DragPreview::StepFade(fadeOutStart + g_settings.dragPreviewFadeMs / 2);
+  check(IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
+            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 32 &&
+            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, nullptr) && outlineAlpha == 127,
+        "the opaque outline fades out in step with the fill");
+  DragPreview::StepFade(fadeOutStart + g_settings.dragPreviewFadeMs);
+  check(!IsWindowVisible(overlay.fill) && !IsWindowVisible(overlay.outline) &&
+            !KillTimer(overlay.fill, DragPreview::kFadeTimer),
+        "the completed fade hides both overlays and stops the timer");
+  g_settings.dragPreviewFillOpacity = 10;
+  g_settings.dragPreviewOutlineOpacity = 60;
+  g_settings.dragPreviewFadeMs = 160;
+  DragPreview::Show({wideTile, narrowTile});
+  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  check(GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 26 &&
+            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, nullptr) && outlineAlpha == 153,
+        "fill and outline opacities are independently configurable");
+  DragPreview::End();
+  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+
+  g_settings.dragPreviewFillOpacity = 0;
+  g_settings.dragPreviewFadeMs = 0;
+  DragPreview::Show({wideTile, narrowTile});
+  check(g_settings.DragPreviewEnabled() && !IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
+            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, nullptr) && outlineAlpha == 153,
+        "zero fill opacity and zero fade duration show only the outline immediately");
+  DragPreview::Show({narrowTile, wideTile});
+  check(overlay.fadeAlpha == 255 && GetWindowRect(overlay.outline, &displayedOutline) &&
+            EqualRect(&displayedOutline, &wideTile) && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
+        "zero fade duration moves the preview immediately without dimming");
+  DragPreview::End();
+  check(!IsWindowVisible(overlay.outline) && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
+        "zero fade duration also hides the preview immediately without a timer");
+  DragPreview::Shutdown();
+  TrayUi::g_preferences.showToasts = savedToasts;
+  std::printf("Passed %u BSP drag checks.\n", check.passed);
+}
+
 // Stand-ins for user32's ghost pairing: `g_testGhost` is the ghost of `g_testHung`.
 static HWND g_testHung = nullptr;
 static HWND g_testGhost = nullptr;
@@ -1271,8 +1669,9 @@ static void RunGhostWindowTests() {
   check(postedOnly(WM_APP_FOREGROUND_CHANGED, reinterpret_cast<WPARAM>(hung), 0),
         "a ghost in front means its hung window is");
   send(EVENT_SYSTEM_MOVESIZESTART, ghost);
-  check(Gestures::IsMoveSizeGestureInProgress(hung) && drain().empty(),
-        "a ghost drag starts a gesture for the hung window");
+  check(Gestures::IsMoveSizeGestureInProgress(hung) &&
+            postedOnly(WM_APP_MOVE_SIZE_START, reinterpret_cast<WPARAM>(hung), reinterpret_cast<LPARAM>(ghost)),
+        "a ghost drag starts a preview for the hung window using the displayed ghost");
   const RECT ghostStart = FloatingWindowFixture::Frame(ghost);
   FloatingWindowFixture::AppMove(ghost, ghostStart.left + 30, ghostStart.top + 20,
                                  Layout::RectWidth(ghostStart), Layout::RectHeight(ghostStart));
@@ -1503,35 +1902,122 @@ static void RunUnresponsivePlacementTest() {
   std::printf("Passed %u unresponsive placement checks.\n", check.passed);
 }
 
-// Tile Workspace hears which windows Automatic overflow released while it ran,
-// and why; outside a command nothing is collected.
+// Local floats are reported with their reason. Routing only reports after the
+// live window ends up floating.
 static void RunCommandReleaseTests() {
   CheckCounter check;
   FloatingWindowFixture f(check);
   const HWND hwnd = f.hwnd;
   g_wm.managementMode = ManagementMode::Automatic;
-  auto release = [&](const wchar_t* reason) {
-    f.Seed(TileLayout::Columns);
+  const bool savedToasts = TrayUi::g_preferences.showToasts;
+  TrayUi::g_preferences.showToasts = false;
+  std::vector<SpaceFloat> localFloats;
+  auto release = [&](SpaceFloatReason reason, TileLayout layout = TileLayout::Columns) {
+    f.Seed(layout);
     Workspace workspace = f.Load();
-    const bool floated = Placement::FloatAutomaticOverflowWindow(f.key, workspace, hwnd, reason);
+    localFloats.clear();
+    const bool floated = Placement::FloatAutomaticOverflowWindow(f.key, workspace, hwnd, reason, localFloats);
     g_workspaces.Save(f.key, workspace);
+    Placement::ReportSpaceFloats(localFloats, f.key.ResolveMonitor());
     return floated;
   };
   check(g_wm.commandReleases == nullptr, "nothing collects releases outside a command");
-  check(release(Placement::kOverflowCannotFit), "an automatic release outside a command still floats");
+  check(release(SpaceFloatReason::CannotFit) && localFloats.size() == 1,
+        "an automatic release outside a command reports a local float");
+  // Automatic overflow floats quietly outside a command, except a BSP window
+  // that can't fit; the auto-tiling limit stays quiet in BSP too.
+  check(!localFloats[0].announce, "outside BSP, an automatic float isn't toasted");
+  check(release(SpaceFloatReason::CannotFit, TileLayout::Bsp) && localFloats.size() == 1 && localFloats[0].announce,
+        "a BSP window that can't fit is toasted");
+  check(release(SpaceFloatReason::CountLimit, TileLayout::Bsp) && localFloats.size() == 1 && !localFloats[0].announce,
+        "a BSP window at the auto-tiling limit isn't");
   {
     Commands::CommandReleaseScope scope;
-    check(release(Placement::kOverflowCannotFit) && release(Placement::kOverflowCountLimit),
+    check(release(SpaceFloatReason::CannotFit) && release(SpaceFloatReason::CountLimit),
           "release the window twice inside a command");
     const auto& released = scope.Released();
-    check(released.size() == 2 && released[0].first == hwnd &&
-              released[0].second == Placement::kOverflowCannotFit &&
-              released[1].second == Placement::kOverflowCountLimit,
+    check(released.size() == 2 && released[0].window == hwnd &&
+              released[0].reason == SpaceFloatReason::CannotFit &&
+              released[1].reason == SpaceFloatReason::CountLimit,
           "a command hears each release and its reason");
   }
   check(g_wm.commandReleases == nullptr, "the command's scope stops collecting when it ends");
-  check(Placement::NeedMoreSpaceMessage({}) == L"A window needs more space",
-        "an unnamed release still gets a message");
+  check(Placement::SpaceFloatMessage({{nullptr, SpaceFloatReason::CannotFit}}) ==
+            L"A window floated because it needs more space",
+        "an unnamed constraint float still gets a message");
+  check(Placement::SpaceFloatMessage({{nullptr, SpaceFloatReason::CountLimit}, {nullptr, SpaceFloatReason::CannotFit}}) ==
+            L"2 windows floated due to space or the auto-tiling limit",
+        "one summary covers both release reasons");
+
+  f.Seed(TileLayout::Columns);
+  Workspace crowded = f.Load();
+  for (int i = 0; i < 2; ++i) {
+    const HWND window = f.CreateTestWindow(nullptr);
+    check(crowded.AdmitTiled(FloatingWindowFixture::Record(window)), "admit another window before enforcing the limit");
+  }
+  g_workspaces.Save(f.key, crowded);
+  g_settings.automaticWindowLimit = 1;
+  {
+    Commands::CommandReleaseScope scope;
+    Placement::ArrangeWorkspace(f.key);
+    check(scope.Released().size() == 2 &&
+              Placement::SpaceFloatMessage(scope.Released()) == L"2 windows floated at the auto-tiling limit",
+          "one arrangement reports both local count-limit floats together");
+    Placement::ArrangeWorkspace(f.key);
+    check(scope.Released().size() == 2, "ordinary reflows do not report already-floating windows again");
+  }
+  g_settings.overflowCreateDesktop = true;
+  g_settings.overflowTryOtherMonitors = false;
+  g_settings.automaticWindowLimit = 1;
+  auto& hideDestroyHook = Platform::WindowEvents::g_hooks.hideDestroy;
+  const HWINEVENTHOOK savedHideDestroyHook = hideDestroyHook;
+  hideDestroyHook = reinterpret_cast<HWINEVENTHOOK>(1);
+  f.Seed(TileLayout::Bsp);
+  auto snapshot = std::make_unique<CompanionAbi::SnapshotBody>();
+  CompanionSnapshot::BuildBody(f.key.desktopId, snapshot.get());
+  check(snapshot->workspaceCount == 1 && snapshot->bspLocalFloats == 1 &&
+            snapshot->workspaces[0].newWindowFloats && !(snapshot->flags & CompanionAbi::kFlagOverflowCentersFloat),
+        "the companion predicts a local float for a BSP count limit while other layouts can create desktops");
+  for (const auto reason : {SpaceFloatReason::CountLimit, SpaceFloatReason::CannotFit}) {
+    FloatingWindowFixture::AppMove(hwnd, f.workArea.left + 20, f.workArea.top + 20, 400, 300);
+    check(release(reason, TileLayout::Bsp) && !g_wm.HasPendingOverflow(hwnd) &&
+              IsCenteredIn(FloatingWindowFixture::Frame(hwnd), f.center),
+          "BSP overflow floats in place when the only other option is a new desktop");
+  }
+  {
+    Commands::CommandReleaseScope scope;
+    check(release(SpaceFloatReason::CountLimit) && g_wm.HasPendingOverflow(hwnd) &&
+              localFloats.empty() && scope.Released().empty(),
+          "a routed overflow defers the notification even inside a command");
+  }
+  const auto queued = std::find_if(g_wm.overflow.queue.begin(), g_wm.overflow.queue.end(),
+                                  [&](const PendingWindowOverflow& request) { return request.hwnd == hwnd; });
+  check(queued != g_wm.overflow.queue.end() && queued->reason == SpaceFloatReason::CountLimit,
+        "deferred overflow carries its release reason");
+  const PendingWindowOverflow request = *queued;
+  using Reconcile::OverflowOutcome;
+  check(!Reconcile::FinishedOverflowFloatMonitor(request, {OverflowOutcome::Retry}) &&
+            !Reconcile::FinishedOverflowFloatMonitor(request, {OverflowOutcome::Placed}),
+        "incomplete routing and a successfully placed tile produce no float toast");
+  check(Reconcile::FinishedOverflowFloatMonitor(request, {OverflowOutcome::NoDestination}) == f.key.ResolveMonitor(),
+        "a routed window still floating when no destination fits can be reported");
+  f.Seed(TileLayout::Columns);
+  check(!Reconcile::FinishedOverflowFloatMonitor(request, {OverflowOutcome::Failed}),
+        "a late routing failure cannot announce a window that has since been tiled");
+  g_wm.CancelPendingOverflow(hwnd);
+
+  if (GetSystemMetrics(SM_CMONITORS) != 1) {
+    g_settings.overflowTryOtherMonitors = true;
+    check(release(SpaceFloatReason::CountLimit, TileLayout::Bsp), "BSP can overflow to another monitor");
+    const auto queued = std::find_if(g_wm.overflow.queue.begin(), g_wm.overflow.queue.end(),
+                                    [&](const PendingWindowOverflow& request) { return request.hwnd == hwnd; });
+    check(queued != g_wm.overflow.queue.end() && !queued->allowNewDesktop,
+          "the queued BSP overflow cannot create a new desktop after rebasing");
+    g_wm.CancelPendingOverflow(hwnd);
+  }
+  RuntimeLifecycle::CancelActorTimer(g_wm.timers.lifecycle);
+  hideDestroyHook = savedHideDestroyHook;
+  TrayUi::g_preferences.showToasts = savedToasts;
   std::printf("Passed %u command release checks.\n", check.passed);
 }
 
@@ -1644,9 +2130,8 @@ static void RunHiddenArrivalTests() {
   std::printf("Passed %u hidden arrival checks.\n", check.passed);
 }
 
-// Sequences in which a window that fitted must not be floated later: a sibling
-// leaving changes the remaining slots' shape, or another window raises its
-// minimum. Fake HWNDs only; toasts disabled; no native window is moved.
+// Constraint recovery for settled windows and new or returning members.
+// Fake HWNDs only; toasts disabled; no native window is moved.
 static void RunSettledWindowRecoveryTests() {
   int checks = 0;
   auto check = [&](bool passed, const char* message) {
@@ -1693,12 +2178,15 @@ static void RunSettledWindowRecoveryTests() {
     std::vector<RECT> rects;
     return Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects);
   };
+  std::vector<SpaceFloat> localFloats;
   auto recover = [&](Workspace& workspace) {
     std::vector<RECT> rects;
     Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects);
     g_workspaces.Save(key, workspace);
     Placement::ArrangementContext context{key, monitor, metrics, nullptr};
-    return Placement::RecoverUnsatisfiableLayout(workspace, context, rects);
+    const auto result = Placement::RecoverUnsatisfiableLayout(workspace, context, rects);
+    localFloats = std::move(context.localFloats);
+    return result;
   };
   auto tiled = [](const Workspace& workspace, HWND hwnd) { return workspace.IsTiled(hwnd); };
 
@@ -1743,6 +2231,8 @@ static void RunSettledWindowRecoveryTests() {
     check(plan(workspace) == Layout::LayoutPlanStatus::Unsatisfiable, "raised minimum overflows");
     check(recover(workspace) == Placement::ArrangementStep::Replan, "recovery floats one window");
     check(!tiled(workspace, a) && tiled(workspace, b) && tiled(workspace, c), "the window that grew is floated");
+    check(localFloats.size() == 1 && localFloats[0].window == a && localFloats[0].reason == SpaceFloatReason::CannotFit,
+          "Manual constraint recovery reports the window it actually floated");
   }
   {
     // An unsettled admission that fitted is not blamed for a later raised minimum.
@@ -1774,6 +2264,122 @@ static void RunSettledWindowRecoveryTests() {
     check(!tiled(workspace, c) && tiled(workspace, a) && tiled(workspace, b), "newcomer is rejected");
   }
 
+  {
+    // Three windows fit. Restoring d cuts the last slot in half, so c no longer
+    // fits at any insertion point that keeps a, b, c in order.
+    Workspace workspace = makeWorkspace(TileLayout::Dwindle, {{a, 1}, {b, 400}, {c, 400}, {d, 1}});
+    check(workspace.Suspend(d, SuspensionReason::Minimized) &&
+              plan(workspace) == Layout::LayoutPlanStatus::Success, "Dwindle fits with d minimized");
+    check(workspace.Restore(d) && plan(workspace) == Layout::LayoutPlanStatus::Unsatisfiable,
+          "restoring d at its saved slot makes the layout too narrow for c");
+    Workspace shuffled = workspace;
+    check(shuffled.SwapTiled(a, c) && plan(shuffled) == Layout::LayoutPlanStatus::Success,
+          "swapping established windows would make room for d");
+    check(recover(workspace) == Placement::ArrangementStep::Replan &&
+              workspace.Find(d) && workspace.Find(d)->state == ManageState::Floating,
+          "Dwindle floats d when it cannot be restored in order");
+    check(workspace.TiledWindows() == std::vector<HWND>({a, b, c}) &&
+              plan(workspace) == Layout::LayoutPlanStatus::Success,
+          "existing Dwindle order still fits");
+  }
+  {
+    // d needs one of the first two tiles. Inserting it before b keeps a, b, c
+    // in order and makes enough room for all four.
+    Workspace workspace = makeWorkspace(TileLayout::Dwindle, {{a, 400}, {b, 1}, {c, 1}, {d, 400}});
+    check(workspace.Suspend(d, SuspensionReason::Minimized) && workspace.Restore(d) &&
+              plan(workspace) == Layout::LayoutPlanStatus::Unsatisfiable,
+          "d cannot fit at its saved slot");
+    check(recover(workspace) == Placement::ArrangementStep::Replan &&
+              workspace.TiledWindows() == std::vector<HWND>({a, d, b, c}) &&
+              plan(workspace) == Layout::LayoutPlanStatus::Success,
+          "Dwindle restores d at an alternate insertion point");
+  }
+  {
+    // BSP tries the configured tile (focused or largest) in both directions,
+    // then the largest other tile once, then floats the arrival.
+    g_wm.managementMode = ManagementMode::Automatic;
+    g_settings.overflowCreateDesktop = true;
+    auto& hideDestroyHook = Platform::WindowEvents::g_hooks.hideDestroy;
+    const HWINEVENTHOOK savedHideDestroyHook = hideDestroyHook;
+    hideDestroyHook = reinterpret_cast<HWINEVENTHOOK>(1);
+    check(Placement::AutomaticOverflowRoutes(), "overflow routing is enabled");
+    for (const bool splitFocused : {true, false}) {
+      g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+      Workspace established = makeWorkspace(TileLayout::Bsp, {{a, 1}, {b, 1}, {c, 1}});
+      check(established.RememberFocusedWindow(a), "focus a smaller BSP tile");
+      if (!splitFocused) established.UpdateConstraints(b, {350, 750, 96, true});
+      check(plan(established) == Layout::LayoutPlanStatus::Success, "established BSP windows fit");
+
+      WindowRecord newcomer;
+      newcomer.hwnd = d;
+      newcomer.pid = 901;
+      newcomer.canMove = false;
+      newcomer.constraints = {300, splitFocused ? 300 : 250, 96, true};
+      if (splitFocused) g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
+
+      Workspace suspended = established;
+      check(suspended.AdmitInitial(newcomer, SuspensionReason::Minimized), "reserve a BSP restore");
+      const auto restoreHint = Placement::PredictRestoredFrame(suspended, d, metrics);
+
+      Workspace workspace = established;
+      if (splitFocused) {
+        check(workspace.AdmitTiled(newcomer), "admit to the focused BSP tile");
+      } else {
+        Workspace away = makeWorkspace(TileLayout::Bsp, {{d, 1}});
+        away.UpdateConstraints(d, newcomer.constraints);
+        WindowRecord returning;
+        check(away.ExtractForMigration(d, &returning), "extract a tiled window returning from another workspace");
+        workspace.AdmitMigrated(std::move(returning));
+      }
+      std::vector<RECT> rects;
+      check(Layout::PlanWithNewBspSplitFallback(workspace, metrics.workArea, metrics.gap, &rects) ==
+                Layout::LayoutPlanStatus::Unsatisfiable, "neither direction of the selected BSP split fits");
+      if (!splitFocused) {
+        // The first try was already the largest tile, so there is no fallback.
+        check(recover(workspace) == Placement::ArrangementStep::Replan && !tiled(workspace, d) &&
+                  localFloats.size() == 1 && localFloats[0].reason == SpaceFloatReason::NoBspTileFits,
+              "with the largest tile already tried, BSP floats the arrival");
+        check(!restoreHint, "the companion predicts no tile for a restore that will float");
+      } else {
+        check(recover(workspace) == Placement::ArrangementStep::Replan && tiled(workspace, d) && localFloats.empty(),
+              "BSP falls back to the largest tile and keeps the arrival tiled");
+        check(Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects) ==
+                  Layout::LayoutPlanStatus::Success &&
+                  restoreHint && EqualRect(&*restoreHint, &rects[workspace.TiledIndex(d)]),
+              "the companion predicts the same fallback tile on restore");
+        const auto& tree = workspace.Bsp();
+        const size_t divider = tree.Parent(tree.FindLeaf(d));
+        check(divider == tree.Parent(tree.FindLeaf(b)) && tree.Nodes()[divider].ratio == 0.5,
+              "the fallback splits the largest tile, the right half");
+        check(workspace.Suspend(d, SuspensionReason::Minimized) &&
+                  Placement::RestorePendingAdmissionRecoveryAfterSuspension(key, d, &workspace) &&
+                  workspace.Bsp() == established.Bsp(),
+              "suspending an unsettled BSP arrival restores the established tree");
+      }
+
+      newcomer.constraints = {900, 900, 96, true};
+      workspace = established;
+      check(workspace.AdmitTiled(newcomer), "admit a BSP window that can't fit any split");
+      check(recover(workspace) == Placement::ArrangementStep::Replan &&
+                localFloats.size() == 1 && localFloats[0].window == d &&
+                localFloats[0].reason == SpaceFloatReason::NoBspTileFits &&
+                Placement::SpaceFloatMessage(localFloats) == L"No BSP tile has enough space. Window floated.",
+            "a BSP admission reports a single toast after every split fails");
+      const WindowRecord* rejected = workspace.Find(d);
+      check(rejected && rejected->state == ManageState::Floating && !g_wm.overflow.windows.contains(d) &&
+                workspace.Bsp() == established.Bsp(),
+            "an arrival with no fitting tile floats in place");
+    }
+    g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
+    Workspace focused = makeWorkspace(TileLayout::Bsp, {{a, 1}, {b, 1}, {c, 1}});
+    focused.RememberFocusedWindow(a);
+    focused.UpdateConstraints(a, {500, 500, 96, true});
+    const auto admissionHint = Placement::PredictAutomaticAdmission(focused, metrics, false, true);
+    check(admissionHint.tiledFrame && !admissionHint.newWindowFloats,
+          "the companion predicts a different BSP tile when the focused tile is too small to split");
+    hideDestroyHook = savedHideDestroyHook;
+  }
+
   g_workspaces.Save(key, Workspace{});
   g_settings = savedSettings;
   TrayUi::g_preferences.showToasts = savedToasts;
@@ -1794,22 +2400,22 @@ static void RunConstraintRecoveryDigest() {
   const ManagementMode savedMode = g_wm.managementMode;
   TrayUi::g_preferences.showToasts = false;
   const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
-  // Fixed geometry so the digest does not depend on this machine's displays.
+  // Fixed landscape and portrait geometries keep the digest display-independent.
   Platform::Monitors::WorkspaceMetrics metrics;
-  metrics.workArea = {0, 0, 1920, 1040};
   metrics.gap = 12;
   metrics.dpi = 96;
   DesktopMonitorKey key;
   GUID desktop{};
   desktop.Data1 = 0xC0457;
   if (!DesktopMonitorKey::FromHMonitor(desktop, monitor, &key)) std::exit(1);
-  const LONG width = Layout::RectWidth(metrics.workArea);
-  const LONG height = Layout::RectHeight(metrics.workArea);
   const TileLayout layouts[] = {TileLayout::MasterStack, TileLayout::MasterStackH, TileLayout::Columns,
                                 TileLayout::Rows, TileLayout::Dwindle, TileLayout::Monocle};
 
   size_t exercised = 0, replans = 0;
   for (int iteration = 0; iteration < 3000; ++iteration) {
+    metrics.workArea = iteration % 2 == 0 ? RECT{0, 0, 1920, 1040} : RECT{0, 0, 1040, 1920};
+    const LONG width = Layout::RectWidth(metrics.workArea);
+    const LONG height = Layout::RectHeight(metrics.workArea);
     g_wm.managementMode = random(2) ? ManagementMode::Automatic : ManagementMode::Manual;
     Workspace workspace;
     workspace.SetLayout(layouts[random(std::size(layouts))]);
@@ -1858,7 +2464,7 @@ static void RunConstraintRecoveryDigest() {
     };
     mix(iteration);
     mix(static_cast<uint64_t>(step));
-    mix(context.constraintFailureReported);
+    mix(!context.localFloats.empty() || !context.unresolvedConstraint.empty());
     mixWorkspace(workspace);
     Workspace saved;
     mix(g_workspaces.Load(key, &saved));
@@ -1881,10 +2487,9 @@ static void RunConstraintRecoveryDigest() {
     std::fprintf(stderr, "FAILED: recovery digest inputs do not exercise all outcomes (%zu/%zu)\n", replans, exercised);
     std::exit(1);
   }
-  // Recorded from the implementation as of 2026-11-16: settled-window conflicts
-  // reorder or float a window from the conflict instead of an uninvolved
-  // pending admission (168 of 2467 outcomes changed vs. 2026-11-04).
-  if (digest != 0x59ab62281bd3f20cull) {
+  // Dwindle starts stacked on portrait work areas.
+  // Includes local space-float notices in both management modes.
+  if (digest != 0xa125dd71df6ddffbull) {
     std::fprintf(stderr, "FAILED: constraint recovery digest %016llx changed\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }
@@ -1961,9 +2566,9 @@ static void RunDiagnosticReportShapeTest() {
     digest ^= static_cast<unsigned char>(ch);
     digest *= 1099511628211ull;
   }
-  // Includes the placement deferral counter for unresponsive windows.
+  // Includes the adaptive split settings measured from saved dividers.
   // Intentional report format changes must update this value.
-  if (digest != 0x793f680f454408f0ull) {
+  if (digest != 0xa39f8192ee9dfeedull) {
     std::fprintf(stderr, "FAILED: diagnostic report shape changed (%016llx)\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }
@@ -2398,6 +3003,7 @@ int main() {
   RunCommandReleaseTests();
   RunConstraintRetryTests();
   RunUnresponsivePlacementTest();
+  RunBspDragTests();
   RunGhostWindowTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();

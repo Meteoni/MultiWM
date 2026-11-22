@@ -51,10 +51,10 @@ static bool PlanDwindleCells(
   return count >= 2 && outSplits->size() + 1 == count;
 }
 
-// The Dwindle layout exactly as the saved ratios give it, without adaptive
-// fitting. Once a resize has accepted the shown layout, this is the layout the
-// resize works on. False when a window would be below its minimum.
-static bool PlanSavedDwindleCells(
+// The Dwindle or BSP layout exactly as the saved ratios give it, without
+// adaptive fitting. Once a resize has accepted the shown layout, this is the
+// layout the resize works on. False when a window would be below its minimum.
+static bool PlanSavedCells(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     std::vector<RECT>* outRects, std::vector<Layout::DwindleSplit>* outSplits = nullptr) {
   if (workspace.ActiveCount() < 2) {
@@ -336,7 +336,7 @@ bool Workspace::LearnDwindleResize(
   // adaptive fitting never has to move another divider to make the drag fit.
   auto fits = [&] {
     std::vector<RECT> rects;
-    return PlanSavedDwindleCells(*this, workArea, gap, &rects);
+    return PlanSavedCells(*this, workArea, gap, &rects);
   };
   bool changed = false;
   auto applySelectedDivider = [&](size_t splitIndex, LONG firstSpanDelta) {
@@ -374,6 +374,122 @@ bool Workspace::LearnDwindleResize(
   }
 
   DebugValidateMutation(L"Workspace::LearnDwindleResize");
+  return true;
+}
+
+// The BSP layout as shown: the preferred cells, or the adaptively fitted ones
+// when minimums move dividers (still the preferred ones when nothing fits).
+static Layout::BspLayoutResult PlanBspCells(const Workspace& workspace, const RECT& workArea, LONG gap) {
+  Layout::BspLayoutResult shown;
+  Layout::LayoutBsp(workspace.Bsp(), workspace.TiledWindows(), workArea, gap, &shown);
+  const std::vector<WindowConstraints> constraints = Layout::ActiveWindowConstraints(workspace);
+  if (!Layout::RectsSatisfyWindowConstraints(shown.rects, constraints)) {
+    Layout::BspLayoutResult fitted;
+    if (Layout::FitBspLayout(workspace.Bsp(), workspace.TiledWindows(), workArea, gap, constraints,
+                             Layout::GetBspAdaptation(), &fitted)) {
+      shown = std::move(fitted);
+    }
+  }
+  return shown;
+}
+
+// Accepts the BSP layout as shown, as AcceptShownDwindleLayout does: every
+// divider adaptive fitting holds away from its ratio is saved where it shows.
+bool Workspace::AcceptShownBspLayout(const RECT& workArea, LONG gap) {
+  if (layout_ != TileLayout::Bsp) return false;
+  bool changed = false;
+  for (const Layout::BspSplit& split : PlanBspCells(*this, workArea, gap).splits) {
+    double& ratio = bspTree_.SplitNode(split.node).ratio;
+    if (split.usableSpan < 2 || Layout::SplitLeadingSpan(split.usableSpan, Layout::ClampSplitRatio(ratio)) == split.firstSpan) {
+      continue;
+    }
+    ratio = Layout::ClampSplitRatio(static_cast<double>(split.firstSpan) / split.usableSpan);
+    changed = true;
+  }
+  return changed;
+}
+
+// A shown split that divides a leaf from a neighbour, and the side it is on.
+struct BspSplitAround {
+  Layout::BspSplit split;
+  bool leafFirst = false;
+};
+
+// The shown splits with `leaf` (a node index) on one side, nearest first. The
+// nearest one on an axis and side is the divider along that edge of the leaf:
+// any split between them has the leaf on the other side, so that edge is
+// theirs too.
+static std::vector<BspSplitAround> BspSplitsAround(
+    const BspTree& tree, size_t leaf, const std::vector<Layout::BspSplit>& splits) {
+  std::vector<BspSplitAround> around;
+  if (leaf == BspTree::kNotFound) return around;
+  // Splits are listed ancestors first, so the nearest is the last.
+  for (auto it = splits.rbegin(); it != splits.rend(); ++it) {
+    if (leaf <= it->node || leaf >= tree.SubtreeEnd(it->node)) continue;
+    around.push_back({*it, leaf < tree.SecondChild(it->node)});
+  }
+  return around;
+}
+
+bool Workspace::LearnBspResize(
+    const RECT& workArea, LONG gap, size_t resizedIndex, const MoveSizeGesture& gesture) {
+  RuntimeLifecycle::AssertWmThread(L"Workspace::LearnBspResize");
+  EnsureWeights();
+  if (layout_ != TileLayout::Bsp || windows_.size() < 2 || resizedIndex >= windows_.size()) return false;
+
+  // A drag that changes a divider accepts the shown layout, as in Dwindle.
+  const BspTree before = bspTree_;
+  AcceptShownBspLayout(workArea, gap);
+  const Layout::BspLayoutResult shown = PlanBspCells(*this, workArea, gap);
+  const std::vector<BspSplitAround> around =
+      BspSplitsAround(bspTree_, bspTree_.FindLeaf(windows_[resizedIndex]), shown.splits);
+
+  struct Edge {
+    Layout::Axis axis;
+    bool farSide;  // Right or bottom.
+    LONG delta;
+  };
+  const Edge edges[] = {
+      {Layout::Axis::X, false, gesture.end.left - gesture.start.left},
+      {Layout::Axis::X, true, gesture.end.right - gesture.start.right},
+      {Layout::Axis::Y, false, gesture.end.top - gesture.start.top},
+      {Layout::Axis::Y, true, gesture.end.bottom - gesture.start.bottom},
+  };
+  // The dragged divider stops where the accepted layout runs out of room, so
+  // adaptive fitting never has to move another divider to make the drag fit.
+  auto fits = [&] {
+    std::vector<RECT> rects;
+    return PlanSavedCells(*this, workArea, gap, &rects);
+  };
+  bool changed = false;
+  for (const Edge& edge : edges) {
+    if (!IsMeaningfulResizeDelta(edge.delta)) continue;
+    // The far edge borders a split from its first side, the near edge from its second.
+    const auto match = std::find_if(around.begin(), around.end(), [&](const BspSplitAround& candidate) {
+      return candidate.split.axis == edge.axis && candidate.leafFirst == edge.farSide;
+    });
+    if (match == around.end()) continue;  // An edge of the work area.
+    const Layout::BspSplit& split = match->split;
+    if (split.usableSpan < 2) continue;
+    const LONG minimumSpan = std::min<LONG>(kMinLearnedResizeSpan, std::max<LONG>(1, (split.usableSpan - 1) / 2));
+    // Either edge moving by `delta` grows the first side by it.
+    const LONG newFirstSpan = std::clamp<LONG>(split.firstSpan + edge.delta, minimumSpan, split.usableSpan - minimumSpan);
+    double& ratio = bspTree_.SplitNode(split.node).ratio;
+    const double saved = ratio;
+    MoveRatioToward(ratio, Layout::ClampSplitRatio(static_cast<double>(newFirstSpan) / split.usableSpan), fits);
+    if (Layout::SplitLeadingSpan(split.usableSpan, Layout::ClampSplitRatio(ratio)) == split.firstSpan) {
+      ratio = saved;  // No room: not even a pixel moved.
+      continue;
+    }
+    changed = true;
+    Diagnostics::RecordEvent(L"bsp divider updated hwnd=%p node=%zu ratio=%.6f",
+                             windows_[resizedIndex], split.node, ratio);
+  }
+  if (!changed) {
+    bspTree_ = before;
+    return false;
+  }
+  DebugValidateMutation(L"Workspace::LearnBspResize");
   return true;
 }
 

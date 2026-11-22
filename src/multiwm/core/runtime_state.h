@@ -223,6 +223,16 @@ struct PendingWorkspaceArrange {
   HMONITOR monitor = nullptr;
 };
 
+enum class SpaceFloatReason { CannotFit, CountLimit, NoBspTileFits };
+
+struct SpaceFloat {
+  HWND window;
+  SpaceFloatReason reason;
+  // Toasted even outside a user command. Automatic overflow floats quietly, as
+  // it was set up to; BSP's can't-fit floats and Manual mode's floats say so.
+  bool announce = true;
+};
+
 struct PendingWindowOverflow {
   HWND hwnd = nullptr;
   DWORD processId = 0;
@@ -230,6 +240,9 @@ struct PendingWindowOverflow {
   std::wstring sourceMonitorId;
   bool monitorFixed = false;
   uint64_t tilingGeneration = 0;
+  bool allowNewDesktop = true;  // False for releases from BSP, even after rebasing.
+  SpaceFloatReason reason = SpaceFloatReason::CannotFit;
+  bool announceLocalFloat = false;  // SpaceFloat::announce if routing ends in a local float.
 };
 
 // A requested switch to the desktop a window was moved to, cancelled if the
@@ -377,10 +390,8 @@ struct WmRuntime {
   // in for (Platform::Windows::GhostWindowOf). Their events are the window's.
   std::unordered_map<HWND, HWND> ghosts;
 
-  // While a user command runs (Commands::TileWindows): the windows Automatic
-  // overflow releases, each with its reason, so the command can say why they
-  // weren't tiled. Automatic admission stays quiet. Null otherwise.
-  std::vector<std::pair<HWND, const wchar_t*>>* commandReleases = nullptr;
+  // Local space-related floats batched by the current user command, if any.
+  std::vector<SpaceFloat>* commandReleases = nullptr;
 
   // True when `hwnd` has a queued overflow request that has not run yet.
   bool HasPendingOverflow(HWND hwnd) const {
@@ -535,6 +546,7 @@ namespace Placement {
 enum class UserLayoutMutationKind {
   Resize,
   Order,
+  BspMerge,
   LayoutChange,
 };
 
@@ -545,6 +557,7 @@ struct PendingLayoutMutation {
   Workspace candidate;
   HWND subject = nullptr;
   UserLayoutMutationKind kind = UserLayoutMutationKind::Resize;
+  std::optional<RECT> bspDropEdge;
   const wchar_t* action = L"Layout mutation";
 };
 

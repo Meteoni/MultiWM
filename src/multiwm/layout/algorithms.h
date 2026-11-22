@@ -12,24 +12,12 @@ inline double ClampDouble(double value, double minVal, double maxVal) {
   return value;
 }
 
-// Divider ratios (master size, Dwindle splits) are kept within 10%..90% so neither
-// side of a divider can collapse to nothing.
-inline double ClampSplitRatio(double ratio) {
-  return ClampDouble(ratio, 0.1, 0.9);
-}
-
-// Pixels left for the two sides of a split after removing the gap between them.
-// The gap shrinks if needed so each side keeps at least one pixel.
-// Requires span >= 2.
-inline LONG UsableSplitSpan(LONG span, LONG gap) {
-  return span - std::clamp<LONG>(gap, 0, span - 2);
-}
-
-// Size of the first side of a split: `ratio` of `usable`, rounded to whole pixels,
-// always leaving at least one pixel for each side. Requires usable >= 2.
-inline LONG SplitLeadingSpan(LONG usable, double ratio) {
-  return std::clamp<LONG>(static_cast<LONG>(std::llround(usable * ratio)), 1, usable - 1);
-}
+// Divider arithmetic lives in shared/split_geometry.h, so the companion sizes
+// splits with the same code.
+using SharedSplits::AdaptiveSplitSpanBounds;
+using SharedSplits::ClampSplitRatio;
+using SharedSplits::SplitLeadingSpan;
+using SharedSplits::UsableSplitSpan;
 
 // Orders `indices` by distance from `origin` (closest first); ties keep the
 // lower index first. Used to prefer moving a window as little as possible.
@@ -67,6 +55,18 @@ static bool RectsNear(const RECT& a, const RECT& b, LONG tolerance = Model::kPla
 // Axis along which windows divide the available span: X is width, Y is height.
 // For MasterStack this is the master divider; stack members use the other axis.
 enum class Axis { X, Y };
+
+// The axis of a work area's first Dwindle or BSP split: side by side on a
+// landscape (or square) area, stacked on a portrait one, so a tall monitor
+// gets the same layout as a wide one turned on its side.
+inline Axis FirstSplitAxis(const RECT& workArea) {
+  return RectWidth(workArea) >= RectHeight(workArea) ? Axis::X : Axis::Y;
+}
+
+// The axis of a split `depth` levels below the first: splits alternate.
+constexpr Axis AlternatingAxis(Axis first, size_t depth) {
+  return depth % 2 == 0 ? first : (first == Axis::X ? Axis::Y : Axis::X);
+}
 
 // Divider axis of a weighted layout: Master + Stack (Vertical) and Columns split
 // the width; the Horizontal and Rows variants split the height.
@@ -254,11 +254,12 @@ static void SplitDwindleArea(
 // Ordered-chain Dwindle: each node gives its first child to startIndex and
 // recursively gives its second child to all later windows. Ratios belong to
 // those split nodes, so swapping windows exchanges leaves without reshaping the
-// tree. Fibonacci-style axes alternate by depth, starting side-by-side;
-// resizing an ancestor never rotates a descendant's divider.
+// tree. Fibonacci-style axes alternate by depth, starting at `firstAxis` (the
+// work area's FirstSplitAxis) for split 0; resizing an ancestor never rotates
+// a descendant's divider.
 void LayoutDwindle(
     const RECT& area, LONG gap, size_t startIndex, size_t count,
-    const std::vector<double>& splitRatios, bool reverse,
+    const std::vector<double>& splitRatios, bool reverse, Axis firstAxis,
     std::vector<RECT>& outRects,
     std::vector<DwindleSplit>* outSplits = nullptr) {
   if (count == 0) return;
@@ -269,7 +270,7 @@ void LayoutDwindle(
 
   const LONG width = area.right - area.left;
   const LONG height = area.bottom - area.top;
-  const bool splitAlongX = (startIndex % 2) == 0;
+  const bool splitAlongX = AlternatingAxis(firstAxis, startIndex) == Axis::X;
 
   const LONG span = splitAlongX ? width : height;
   if (span < 2) {
@@ -300,7 +301,7 @@ void LayoutDwindle(
 
   LayoutDwindle(
       remaining, gap, startIndex + 1, count - 1,
-      splitRatios, reverse, outRects, outSplits);
+      splitRatios, reverse, firstAxis, outRects, outSplits);
 }
 
 struct ConstraintExtent {

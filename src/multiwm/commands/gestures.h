@@ -22,7 +22,7 @@ namespace Gestures {
 // move, while a legitimate top/left-edge resize necessarily changes position
 // and size together. Opposite edges moving together is therefore the stronger
 // signal for translation.
-MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LONG tol = 1) {
+MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LONG tol = 1, bool log = true) {
   const LONG dl = after.left - before.left;
   const LONG dr = after.right - before.right;
   const LONG dt = after.top - before.top;
@@ -32,7 +32,7 @@ MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LON
     std::max(std::abs(dl), std::abs(dr)),
     std::max(std::abs(dt), std::abs(db)));
   if (maxEdgeDelta <= tol) {
-    Wh_Log(L"Move/size intent: none");
+    if (log) Wh_Log(L"Move/size intent: none");
     return MoveSizeIntent::None;
   }
 
@@ -48,11 +48,11 @@ MoveSizeIntent ClassifyMoveSizeIntent(const RECT& before, const RECT& after, LON
   // A translation must dominate deformation by a healthy margin. A normal
   // one-edge resize produces roughly equal scores, so it remains Resize.
   if (moveScore > resizeScore * 2) {
-    Wh_Log(L"Move/size intent: move (move=%lld resize=%lld)", moveScore, resizeScore);
+    if (log) Wh_Log(L"Move/size intent: move (move=%lld resize=%lld)", moveScore, resizeScore);
     return MoveSizeIntent::Move;
   }
 
-  Wh_Log(L"Move/size intent: resize (move=%lld resize=%lld)", moveScore, resizeScore);
+  if (log) Wh_Log(L"Move/size intent: resize (move=%lld resize=%lld)", moveScore, resizeScore);
   return MoveSizeIntent::Resize;
 }
 

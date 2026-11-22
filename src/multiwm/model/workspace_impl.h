@@ -139,8 +139,10 @@ bool Workspace::Validate(
     }
   } else if (!stackWeights_.empty() || !gridWeights_.empty() ||
              !dwindleRatios_.empty()) {
-    fail(L"weightless layout retains layout weights");
+    fail(layout_ == TileLayout::Bsp ? L"BSP layout retains unrelated layout weights"
+                                    : L"weightless layout retains layout weights");
   }
+  for (const wchar_t* problem : BspTreeProblems()) fail(problem);
 
   return valid;
 }
@@ -263,9 +265,28 @@ size_t Workspace::LogicalIndex(HWND hwnd) const {
   return kNotFound;
 }
 
+HWND Workspace::LastFocusedTiledWindow(HWND excluded) const {
+  HWND focused = nullptr;
+  uint64_t latestSequence = 0;
+  for (HWND hwnd : windows_) {
+    if (hwnd == excluded) continue;
+    const WindowRecord* record = Find(hwnd);
+    if (record && record->state == ManageState::Tiled && record->lastFocusSequence > latestSequence) {
+      focused = hwnd;
+      latestSequence = record->lastFocusSequence;
+    }
+  }
+  return focused;
+}
+
 bool Workspace::RememberFocusedWindow(HWND hwnd) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::RememberFocusedWindow");
-  if (!hwnd || !HasRecord(hwnd) || lastFocusedWindow_ == hwnd) return false;
+  if (!hwnd || lastFocusedWindow_ == hwnd) return false;
+  WindowRecord* record = FindMutable(hwnd);
+  if (!record) return false;
+
+  static uint64_t focusSequence = 0;
+  record->lastFocusSequence = ++focusSequence;
   lastFocusedWindow_ = hwnd;
   return true;
 }
@@ -448,6 +469,8 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
     const size_t ratioIndex =
         std::min(insertionActiveIndex, dwindleRatios_.size());
     dwindleRatios_.insert(dwindleRatios_.begin() + ratioIndex, NewSlotWeight(ratioIndex));
+  } else if (layout_ == TileLayout::Bsp) {
+    bspTree_.SplitLeaf(anchor, hwnd, true);
   }
 
   record.state = ManageState::Tiled;
@@ -484,6 +507,7 @@ bool Workspace::RememberFloatingGeometry(HWND hwnd, const RECT& frame, UINT dpi)
 
 // Logical slots, suspension, layout changes and rollback.
 void Workspace::EnsureWeights() {
+  if (layout_ != TileLayout::Bsp) bspTree_.Clear();
   if (IsMasterStackLayout(layout_)) {
     const size_t stackCount = windows_.empty() ? 0 : windows_.size() - 1;
     if (stackWeights_.size() != stackCount) stackWeights_ = Layout::DefaultWeights(stackCount);
@@ -493,6 +517,11 @@ void Workspace::EnsureWeights() {
     if (gridWeights_.size() != windows_.size()) gridWeights_ = Layout::DefaultWeights(windows_.size());
     stackWeights_.clear();
     dwindleRatios_.clear();
+  } else if (layout_ == TileLayout::Bsp) {
+    stackWeights_.clear();
+    gridWeights_.clear();
+    dwindleRatios_.clear();
+    SyncBspTree();
   } else if (layout_ == TileLayout::Dwindle) {
     // Keep one outgoing ratio per active slot, including a dormant ratio on the
     // final slot. The dormant value is what lets the predecessor's divider survive
@@ -545,6 +574,95 @@ void Workspace::RemoveActiveAt(size_t index, SuspendedSlot* saved) {
   windows_.erase(windows_.begin() + index);
   if (saved) *saved = slot;
   EnsureWeights();
+}
+
+bool Workspace::IsBspLeafTiled(HWND window) const {
+  return ContainsWindow(windows_, window);
+}
+
+bool Workspace::KeepsBspLeaf(const WindowRecord& record) {
+  // A tiled record outside windows_ is on its way to suspension, and is
+  // settled once its suspension reason is known.
+  return record.state == ManageState::Tiled ||
+         (record.state == ManageState::Suspended && record.hasSavedSlot &&
+          record.suspensionReason == SuspensionReason::Maximized);
+}
+
+void Workspace::InsertBspLeaf(HWND hwnd, bool followFocus, bool allowAlternateDirection) {
+  if (bspTree_.Contains(hwnd)) return;
+  if (followFocus && g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused) {
+    const HWND anchor = LastFocusedTiledWindow(hwnd);
+    if (anchor && bspTree_.SplitLeaf(anchor, hwnd, allowAlternateDirection)) return;
+  }
+  const HWND largest = bspTree_.LargestLeaf([this](HWND window) { return IsBspLeafTiled(window); });
+  if (largest && bspTree_.SplitLeaf(largest, hwnd, allowAlternateDirection)) return;
+  // Nothing tiled to split: beside a maximized window, or alone.
+  const std::vector<HWND> leaves = bspTree_.Leaves();
+  if (leaves.empty()) bspTree_.AddRoot(hwnd);
+  else bspTree_.SplitLeaf(leaves.front(), hwnd, allowAlternateDirection);
+}
+
+void Workspace::SyncBspTree() {
+  for (HWND leaf : bspTree_.Leaves()) {
+    const WindowRecord* record = Find(leaf);
+    if (!record || !KeepsBspLeaf(*record)) bspTree_.Remove(leaf);  // Its sibling takes its space.
+  }
+  // Windows that got here without an arrival (a layout switch, a repair) fill
+  // the largest leaves in turn, which lays a fresh tree out evenly.
+  for (HWND hwnd : windows_) InsertBspLeaf(hwnd, false);
+  std::vector<std::pair<size_t, HWND>> maximized;
+  for (const auto& [hwnd, record] : records_) {
+    if (record.state == ManageState::Suspended && KeepsBspLeaf(record) && !bspTree_.Contains(hwnd)) {
+      maximized.emplace_back(record.savedSlot.index, hwnd);
+    }
+  }
+  std::sort(maximized.begin(), maximized.end());
+  for (const auto& entry : maximized) InsertBspLeaf(entry.second, false);
+  OrderTiledByBspLeaves();
+}
+
+void Workspace::OrderTiledByBspLeaves() {
+  std::vector<HWND> ordered;
+  ordered.reserve(windows_.size());
+  for (HWND leaf : bspTree_.Leaves()) {
+    if (IsBspLeafTiled(leaf)) ordered.push_back(leaf);
+  }
+  // Every tiled window has a leaf by now; if one somehow doesn't, keep the
+  // order rather than drop it. An order that already matches is left alone,
+  // so callers' positions in it stay valid.
+  if (ordered.size() == windows_.size() && ordered != windows_) windows_ = std::move(ordered);
+}
+
+std::vector<const wchar_t*> Workspace::BspTreeProblems() const {
+  std::vector<const wchar_t*> problems;
+  if (layout_ != TileLayout::Bsp) {
+    if (!bspTree_.Empty()) problems.push_back(L"non-BSP layout retains a BSP tree");
+    return problems;
+  }
+  const std::vector<BspNode>& nodes = bspTree_.Nodes();
+  if (!nodes.empty() && bspTree_.SubtreeEnd(0) != nodes.size()) problems.push_back(L"BSP tree is malformed");
+  std::unordered_set<HWND> leaves;
+  std::vector<HWND> tiledLeaves;
+  for (const BspNode& node : nodes) {
+    if (BspTree::IsSplit(node)) {
+      if (!std::isfinite(node.ratio) || node.ratio < 0.1 || node.ratio > 0.9) {
+        problems.push_back(L"BSP ratio is outside the supported range");
+      }
+      continue;
+    }
+    if (!leaves.insert(node.window).second) problems.push_back(L"BSP tree has two leaves for one window");
+    const WindowRecord* record = Find(node.window);
+    if (!record || !KeepsBspLeaf(*record)) problems.push_back(L"BSP leaf is neither tiled nor maximized");
+    if (IsBspLeafTiled(node.window)) tiledLeaves.push_back(node.window);
+  }
+  if (tiledLeaves != windows_) problems.push_back(L"BSP leaves disagree with the tiled order");
+  for (const auto& [hwnd, record] : records_) {
+    if (KeepsBspLeaf(record) && !leaves.count(hwnd)) {
+      problems.push_back(L"tiled or maximized BSP window has no leaf");
+      break;
+    }
+  }
+  return problems;
 }
 
 size_t Workspace::ActiveIndexToLogicalIndex(size_t activeIndex) const {
@@ -615,6 +733,7 @@ bool Workspace::Suspend(HWND hwnd, SuspensionReason reason) {
       existing->tilingGeneration = NextTilingGeneration();
     }
     existing->suspensionReason = reason;
+    EnsureWeights();  // BSP: a window minimized from maximized gives up its leaf.
     DebugValidateMutation(L"Workspace::Suspend(reason update)");
     return true;
   }
@@ -631,9 +750,11 @@ bool Workspace::Suspend(HWND hwnd, SuspensionReason reason) {
   slot.index = logicalIndex;
 
   record->state = ManageState::Suspended;
+  bspTree_.ClearPendingDirection(hwnd);
   record->suspensionReason = reason;
   record->savedSlot = slot;
   record->hasSavedSlot = true;
+  EnsureWeights();  // BSP: only a maximized window keeps its leaf.
   DebugValidateMutation(L"Workspace::Suspend");
   return true;
 }
@@ -685,7 +806,7 @@ bool Workspace::AdmitInitial(
                      : ManageState::Suspended;
   record.pendingInsertionPlacement = true;
   if (reason == SuspensionReason::None) {
-    AppendTiledWithDefaultWeight(hwnd);
+    AppendTiledWithDefaultWeight(hwnd, false);
   } else {
     record.suspensionReason = reason;
     record.savedSlot = MakeAppendedSuspendedSlot();
@@ -733,6 +854,8 @@ bool Workspace::AdmitInitialAfter(
   } else if (layout_ == TileLayout::Dwindle) {
     record.savedSlot.weight = 0.5;
     record.savedSlot.hasWeight = true;
+  } else if (layout_ == TileLayout::Bsp && reason == SuspensionReason::Maximized) {
+    bspTree_.SplitLeaf(anchor, hwnd);  // Only a maximized window keeps a leaf.
   }
   record.hasSavedSlot = true;
 
@@ -785,14 +908,14 @@ bool Workspace::Restore(HWND hwnd) {
     dwindleRatios_.insert(
         dwindleRatios_.begin() + ratioIndex,
         slot.hasWeight ? Layout::ClampSplitRatio(slot.weight) : 0.5);
+  } else if (layout_ == TileLayout::Bsp) {
+    // A maximized window returns to its leaf; a minimized or hidden one
+    // arrives like a new window.
+    InsertBspLeaf(hwnd, true, true);
   }
 
   record->state = ManageState::Tiled;
-  // Preserve the saved slot as the first restore attempt, but keep the restored
-  // member movable until that placement has survived conformance. If its old
-  // slot became infeasible while suspended, ArrangeWorkspace can now apply the
-  // same nearest-slot / Dwindle recovery used for a fresh admission instead of
-  // immediately floating it.
+  // Keep the restored member pending until it settles so it can use admission recovery.
   record->pendingInsertionPlacement = layout_ != TileLayout::Floating;
   record->suspensionReason = SuspensionReason::None;
   record->savedSlot = {};
@@ -840,6 +963,7 @@ bool Workspace::Forget(HWND hwnd) {
     RemoveActiveAt(activeIndex);
     CloseLogicalGapAfterRemoval(logicalIndex);
     records_.erase(hwnd);
+    EnsureWeights();  // BSP: the record is gone, so its leaf goes too.
     DebugValidateMutation(L"Workspace::Forget(active)");
     return true;
   }
@@ -858,7 +982,7 @@ bool Workspace::Forget(HWND hwnd) {
   return true;
 }
 
-void Workspace::AppendTiledWithDefaultWeight(HWND hwnd) {
+void Workspace::AppendTiledWithDefaultWeight(HWND hwnd, bool followFocus) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::AppendTiledWithDefaultWeight");
   EnsureWeights();
   const size_t oldCount = windows_.size();
@@ -870,6 +994,9 @@ void Workspace::AppendTiledWithDefaultWeight(HWND hwnd) {
     stackWeights_.push_back(NewSlotWeight(oldCount - 1));
   } else if (layout_ == TileLayout::Dwindle) {
     dwindleRatios_.push_back(NewSlotWeight(oldCount));
+  } else if (layout_ == TileLayout::Bsp) {
+    InsertBspLeaf(hwnd, followFocus, true);  // A maximized window keeps the leaf it has.
+    OrderTiledByBspLeaves();  // The record may not be stored yet, so no full sync.
   }
 }
 
@@ -930,6 +1057,8 @@ void Workspace::AdmitMigrated(WindowRecord record, HWND anchor) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::AdmitMigrated");
   const HWND hwnd = record.hwnd;
   if (!hwnd) return;
+  // Focus recency belongs to the workspace where it was observed.
+  record.lastFocusSequence = 0;
   if (record.state == ManageState::Tiled ||
       record.state == ManageState::Suspended) {
     // A destination workspace admission is newer than its existing members and
@@ -986,10 +1115,20 @@ void Workspace::RememberCurrentLayoutGeometry() {
   if (RememberedGeometry* remembered = RememberedGeometryForCurrentLayout()) {
     *remembered = {windows_, *CurrentLayoutWeights()};
   }
+  if (layout_ == TileLayout::Bsp) {
+    rememberedBsp_ = {windows_, bspTree_};
+    rememberedBsp_.tree.ClearPendingDirection();
+  }
 }
 
 void Workspace::RestoreRememberedLayoutGeometry() {
   RuntimeLifecycle::AssertWmThread(L"Workspace::RestoreRememberedLayoutGeometry");
+  if (layout_ == TileLayout::Bsp) {
+    // EnsureWeights then drops leaves of windows that left meanwhile and adds
+    // ones for windows that arrived.
+    bspTree_ = rememberedBsp_.order == windows_ ? rememberedBsp_.tree : BspTree{};
+    return;
+  }
   const RememberedGeometry* remembered = RememberedGeometryForCurrentLayout();
   if (!remembered) return;
   std::vector<double>& weights = *CurrentLayoutWeights();
@@ -1085,7 +1224,8 @@ bool Workspace::HasSameLayoutStateAs(const Workspace& other) const {
       dwindleRatios_ == other.dwindleRatios_ &&
       rememberedMasterStack_ == other.rememberedMasterStack_ &&
       rememberedGrid_ == other.rememberedGrid_ &&
-      rememberedDwindle_ == other.rememberedDwindle_;
+      rememberedDwindle_ == other.rememberedDwindle_ &&
+      bspTree_ == other.bspTree_ && rememberedBsp_ == other.rememberedBsp_;
 }
 
 // Both rollback policies validate membership before copying geometry. Window
@@ -1102,6 +1242,8 @@ void Workspace::CopyLayoutGeometryFrom(const Workspace& source) {
   rememberedGrid_ = source.rememberedGrid_;
   rememberedDwindle_ = source.rememberedDwindle_;
   dwindlePushes_ = source.dwindlePushes_;
+  bspTree_ = source.bspTree_;
+  rememberedBsp_ = source.rememberedBsp_;
 }
 
 bool Workspace::RestoreLayoutStateFrom(const Workspace& source) {
@@ -1173,6 +1315,7 @@ bool Workspace::MakeMaster(HWND hwnd, HWND* oldMaster) {
   auto it = std::find(windows_.begin(), windows_.end(), hwnd);
   if (it == windows_.end() || it == windows_.begin()) return false;
   if (oldMaster) *oldMaster = windows_.front();
+  bspTree_.SwapWindows(windows_.front(), hwnd);  // BSP: the leaves trade windows too.
   std::iter_swap(windows_.begin(), it);
   DebugValidateMutation(L"Workspace::MakeMaster");
   return true;
@@ -1185,13 +1328,53 @@ bool Workspace::SwapTiled(HWND first, HWND second) {
   if (firstIt == windows_.end() || secondIt == windows_.end() || firstIt == secondIt) {
     return false;
   }
+  bspTree_.SwapWindows(first, second);  // BSP: the leaves trade windows too.
   std::iter_swap(firstIt, secondIt);
   DebugValidateMutation(L"Workspace::SwapTiled");
   return true;
 }
 
+bool Workspace::SwapBspSiblingTiles(HWND first, HWND second) {
+  if (layout_ != TileLayout::Bsp) return false;
+  const size_t firstLeaf = bspTree_.FindLeaf(first);
+  const size_t secondLeaf = bspTree_.FindLeaf(second);
+  if (firstLeaf == BspTree::kNotFound || secondLeaf == BspTree::kNotFound) return false;
+  const size_t divider = bspTree_.Parent(firstLeaf);
+  if (divider == BspTree::kNotFound || divider != bspTree_.Parent(secondLeaf) || !SwapTiled(first, second)) {
+    return false;
+  }
+
+  double& ratio = bspTree_.SplitNode(divider).ratio;
+  ratio = Layout::ClampSplitRatio(1.0 - ratio);
+  return true;
+}
+
+void Workspace::SetBspSplitDirection(size_t node, std::optional<Layout::Axis> direction) {
+  RuntimeLifecycle::AssertWmThread(L"Workspace::SetBspSplitDirection");
+  bspTree_.SplitNode(node).direction = direction;
+}
+
+bool Workspace::MoveBspLeaf(HWND source, HWND target, bool allowAlternateDirection) {
+  RuntimeLifecycle::AssertWmThread(L"Workspace::MoveBspLeaf");
+  if (layout_ != TileLayout::Bsp || source == target || !IsTiled(source) || !IsTiled(target)) return false;
+  const size_t sourceLeaf = bspTree_.FindLeaf(source);
+  const size_t targetLeaf = bspTree_.FindLeaf(target);
+  if (sourceLeaf == BspTree::kNotFound || targetLeaf == BspTree::kNotFound ||
+      bspTree_.Parent(sourceLeaf) == bspTree_.Parent(targetLeaf)) {
+    return false;
+  }
+
+  BspTree moved = bspTree_;
+  if (!moved.Remove(source) || !moved.SplitLeaf(target, source, allowAlternateDirection)) return false;
+  bspTree_ = std::move(moved);
+  OrderTiledByBspLeaves();
+  DebugValidateMutation(L"Workspace::MoveBspLeaf");
+  return true;
+}
+
 bool Workspace::MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::MovePendingAdmissionToIndex");
+  if (layout_ == TileLayout::Bsp) return false;
   auto current = std::find(windows_.begin(), windows_.end(), hwnd);
   if (current == windows_.end()) return false;
 
@@ -1240,6 +1423,7 @@ bool Workspace::ClearInsertionPlacement(HWND hwnd) {
   WindowRecord* record = FindMutable(hwnd);
   if (!record || !record->pendingInsertionPlacement) return false;
   record->pendingInsertionPlacement = false;
+  bspTree_.ClearPendingDirection(hwnd);
   DebugValidateMutation(L"Workspace::ClearInsertionPlacement");
   return true;
 }

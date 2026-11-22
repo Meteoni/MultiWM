@@ -1,11 +1,13 @@
 #include "../src/multiwm/multiwm.cpp"
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <random>
+#include <set>
 
 // Exercise real model/planner behavior without creating or moving native windows.
 
-static void RunAdaptiveDwindleTests() {
+static void RunAdaptiveSplitTests() {
   g_settings = SettingsState{};
   g_settings.adaptiveDwindleSlots = 2;
   g_settings.adaptiveDwindlePercentage = 40;
@@ -140,7 +142,48 @@ static void RunAdaptiveDwindleTests() {
               Layout::LayoutPlanStatus::Unsatisfiable, "fitting respects automatic ratio envelope");
     g_settings.adaptiveDwindlePercentage = 40;
   }
-  std::printf("Passed %d adaptive Dwindle checks.\n", checks);
+  g_settings.adaptiveDwindlePercentage = 15;
+  for (TileLayout layout : {TileLayout::Dwindle, TileLayout::Bsp}) {
+    Workspace workspace;
+    workspace.SetLayout(layout);
+    for (HWND hwnd : {first, second}) {
+      WindowRecord record;
+      record.hwnd = hwnd;
+      record.pid = 1;
+      check(workspace.AdmitTiled(record), "admit a window for the saved split test");
+    }
+    check(workspace.StepTiledSize(area, 0, workspace.TiledIndex(first), true, 30), "save an 80/20 split");
+    std::vector<RECT> rects;
+    auto plan = [&] { return Layout::BuildWorkspaceLayoutPlan(workspace, area, 0, &rects); };
+    check(plan() == Layout::LayoutPlanStatus::Success && Layout::RectWidth(rects[0]) == 800,
+          "the saved position gives the first window 80 percent");
+    workspace.UpdateConstraints(second, {210, 1, 96, true});
+    check(plan() == Layout::LayoutPlanStatus::Success && Layout::RectWidth(rects[0]) == 790,
+          "a one-point adjustment starts from the saved divider");
+    workspace.UpdateConstraints(second, {360, 1, 96, true});
+    check(plan() == Layout::LayoutPlanStatus::Unsatisfiable, "adjustment stays within 15 points of the saved divider");
+    workspace.UpdateConstraints(second, {80, 1, 96, true});
+    workspace.UpdateConstraints(first, {900, 1, 96, true});
+    check(plan() == Layout::LayoutPlanStatus::Success && Layout::RectWidth(rects[0]) == 900,
+          "the saved range allows up to the 90 percent ratio limit");
+    workspace.UpdateConstraints(first, {910, 1, 96, true});
+    check(plan() == Layout::LayoutPlanStatus::Unsatisfiable, "adjustment respects the 90 percent ratio limit");
+    workspace.UpdateConstraints(first, {80, 1, 96, true});
+    check(plan() == Layout::LayoutPlanStatus::Success && Layout::RectWidth(rects[0]) == 800,
+          "relaxing constraints restores the saved divider");
+
+    if (layout == TileLayout::Dwindle) {
+      workspace.UpdateConstraints(first, {300, 1, 96, true});
+      workspace.UpdateConstraints(second, {700, 1, 96, true});
+      check(plan() == Layout::LayoutPlanStatus::Unsatisfiable, "these minimums require a Dwindle reorder");
+      size_t moved = 0;
+      check(Layout::ReassignDwindleLayoutConversionForConstraints(workspace, area, 0, &moved) && moved == 2,
+            "Dwindle reorder searches around the saved divider");
+      check(plan() == Layout::LayoutPlanStatus::Success && Layout::RectWidth(rects[0]) == 700,
+            "the reordered Dwindle split fits at 70/30");
+    }
+  }
+  std::printf("Passed %d adaptive split checks.\n", checks);
 }
 
 static void RunWeightedResizeTests() {
@@ -750,8 +793,8 @@ static void RunDwindleResizeScenarioTests() {
 // The digest is the behavior: a pure refactor must print the same value, and an
 // intended behavior change must update kExpectedDigest deliberately.
 static void RunDwindlePlannerDigest() {
-  // Recorded from the implementation as of 2026-11-04 (commit 59f0168).
-  constexpr uint64_t kExpectedDigest = 0x2c5aa1a1e5f7011eull;
+  // Dwindle starts stacked on portrait work areas.
+  constexpr uint64_t kExpectedDigest = 0x64e969f883e0f56full;
   uint64_t digest = 1469598103934665603ull;
   auto mix = [&](uint64_t value) {
     digest ^= value;
@@ -780,7 +823,7 @@ static void RunDwindlePlannerDigest() {
     std::vector<double> ratios(count);
     for (double& ratio : ratios) ratio = 0.2 + random(61) / 100.0;
     std::vector<RECT> frames(count);
-    Layout::LayoutDwindle(area, gap, 0, count, ratios, g_settings.reverseDwindle, frames);
+    Layout::LayoutDwindle(area, gap, 0, count, ratios, g_settings.reverseDwindle, Layout::FirstSplitAxis(area), frames);
 
     std::vector<WorkspaceGeometryItem> items;
     for (size_t i = 0; i < count; ++i) {
@@ -837,7 +880,8 @@ static void RunDwindlePlannerDigest() {
 // including what a failed plan leaves behind (conflict reporting and admission
 // recovery read those), plus the grow, shrink and reset size steps.
 static void RunPlanningTraceDigest() {
-  constexpr uint64_t kExpectedDigest = 0xc6167a36528490e1ull;
+  // Dwindle starts stacked on portrait work areas.
+  constexpr uint64_t kExpectedDigest = 0x866af9eb719e197bull;
   const SettingsState savedSettings = g_settings;
   uint64_t digest = 1469598103934665603ull;
   auto mix = [&](uint64_t value) {
@@ -955,8 +999,9 @@ static void RunSettingsParserDigest() {
     TileLayout layout{};
     mix(Configuration::TryParseLayoutSetting(text, &layout) ? 1 + static_cast<uint64_t>(layout) : 0);
   }
-  // Recorded from the implementation as of 2026-11-04.
-  if (digest != 0x88d4c12ceb48ea3eull) {
+  // Recorded from the implementation as of 2026-11-22, when "bsp" stopped
+  // naming Dwindle and became the BSP layout.
+  if (digest != 0x96a3f72e962247d1ull) {
     std::fprintf(stderr, "FAILED: settings parser digest %016llx changed\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }
@@ -1098,6 +1143,45 @@ static void RunAdmissionPredictionTests() {
         }
       }
     }
+  }
+
+  g_settings = SettingsState{};
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
+  const HWND first = reinterpret_cast<HWND>(0x1500);
+  const HWND previous = reinterpret_cast<HWND>(0x1504);
+  const HWND latest = reinterpret_cast<HWND>(0x1508);
+  const HWND last = reinterpret_cast<HWND>(0x150C);
+  const HWND floatingWindow = reinterpret_cast<HWND>(0x1510);
+  for (TileLayout layout : {TileLayout::Dwindle, TileLayout::Bsp}) {
+    Workspace workspace;
+    workspace.SetLayout(layout);
+    for (HWND hwnd : {first, previous, latest, last}) {
+      check(workspace.AdmitTiled({.hwnd = hwnd}), "admit a focus test window");
+    }
+    check(workspace.RememberFocusedWindow(previous) && workspace.RememberFocusedWindow(latest) &&
+              !workspace.RememberFocusedWindow(incoming) && workspace.LastFocusedTiledWindow() == latest,
+          "unmanaged foreground leaves the tiled anchor alone");
+    check(workspace.Suspend(latest, SuspensionReason::Minimized) &&
+              workspace.LastFocusedTiledWindow() == previous,
+          "minimizing the last-focused tile falls back to the previous one");
+    check(workspace.Restore(latest) && workspace.LastFocusedTiledWindow() == latest,
+          "the restored window is eligible as a tiled anchor again");
+    check(workspace.Forget(latest) && !workspace.LastFocusedWindow() &&
+              workspace.LastFocusedTiledWindow() == previous,
+          "closing the last-focused tile falls back to the previous one");
+    check(workspace.AdmitFloating({.hwnd = floatingWindow}) &&
+              workspace.RememberFocusedWindow(floatingWindow) && workspace.LastFocusedTiledWindow() == previous,
+          "managed floating focus leaves the tiled anchor available");
+
+    const auto prediction = Placement::PredictAutomaticAdmission(workspace, metrics, false, true);
+    check(Reconcile::AdmitUntrackedSnapshot(workspace, {incoming}, true, true) &&
+              workspace.TiledIndex(incoming) == workspace.TiledIndex(previous) + 1,
+          "admission uses the surviving focused tile");
+    std::vector<RECT> rects;
+    check(Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects) ==
+              Layout::LayoutPlanStatus::Success &&
+              prediction.tiledFrame && EqualRect(&*prediction.tiledFrame, &rects[workspace.TiledIndex(incoming)]),
+          "the companion's prediction uses the same fallback tile");
   }
 
   // The automatic window limit, counted exactly as EnforceAutomaticWindowLimit
@@ -1344,6 +1428,52 @@ static void RunRestorePublicationTests() {
   CompanionSnapshot::AppendWorkspaceHints(desktop, unsatisfiable.get());
   check(unsatisfiable->restoreWindowCount == 1 && !unsatisfiable->restoreWindows[0].hasFrame,
         "an unsatisfiable restore publishes no frame");
+
+  Workspace bsp;
+  bsp.SetLayout(TileLayout::Bsp);
+  for (size_t i = 0; i < 3; ++i) {
+    WindowRecord record;
+    record.hwnd = windows[i];
+    record.pid = 7;
+    bsp.AdmitTiled(record);
+  }
+  check(bsp.Suspend(windows[2], SuspensionReason::Minimized) && bsp.RememberFocusedWindow(windows[1]),
+        "prepare a minimized BSP member and a focused tile");
+  g_workspaces.Save(key, bsp);
+  for (const bool splitFocused : {false, true}) {
+    g_settings.automaticNewWindowPosition = splitFocused ? AutomaticNewWindowPosition::AfterFocused
+                                                         : AutomaticNewWindowPosition::LastSlot;
+    auto bspHints = std::make_unique<CompanionAbi::SnapshotBody>();
+    CompanionSnapshot::AppendWorkspaceHints(desktop, bspHints.get());
+    const auto& arrival = bspHints->workspaces[0];
+    const auto& restore = bspHints->restoreWindows[0];
+    check(bspHints->workspaceCount == 1 && bspHints->bspWorkspaces == 1 && bspHints->bspLocalFloats == 0 &&
+              arrival.hasTiledFrame && bspHints->restoreWindowCount == 1 && restore.hasFrame,
+          "publish BSP arrival and restore frames");
+    Workspace expected = bsp;
+    WindowRecord newcomer;
+    newcomer.hwnd = windows[3];
+    newcomer.pid = 7;
+    std::vector<RECT> frames;
+    check(expected.AdmitTiledAfter(newcomer, windows[splitFocused ? 1 : 0]) &&
+              Layout::BuildWorkspaceLayoutPlan(expected, metrics.workArea, metrics.gap, &frames) ==
+                  Layout::LayoutPlanStatus::Success &&
+              EqualRect(&arrival.tiledFrame, &frames[expected.TiledIndex(newcomer.hwnd)]),
+          "the BSP arrival hint follows the selected split");
+    check(EqualRect(&restore.frame, &arrival.tiledFrame), "the minimized BSP member uses the same split");
+  }
+
+  g_settings.adaptiveDwindleSlots = 0;
+  bsp.Forget(windows[1]);
+  bsp.UpdateConstraints(windows[0], {Layout::RectWidth(metrics.workArea), Layout::RectHeight(metrics.workArea),
+                                    metrics.dpi, true});
+  g_workspaces.Save(key, bsp);
+  auto bspFloat = std::make_unique<CompanionAbi::SnapshotBody>();
+  CompanionSnapshot::AppendWorkspaceHints(desktop, bspFloat.get());
+  check(bspFloat->bspWorkspaces == 1 && bspFloat->bspLocalFloats == 1 &&
+            !bspFloat->workspaces[0].hasTiledFrame && bspFloat->workspaces[0].newWindowFloats,
+        "a BSP split that cannot fit even a minimal window publishes a local float");
+  g_settings = SettingsState{};
   std::printf("Passed %d restore publication checks.\n", checks);
 }
 
@@ -1518,11 +1648,532 @@ static void RunMaximumSizeTests() {
   std::printf("Passed %d maximum size checks.\n", checks);
 }
 
+// BSP keeps its split tree as windows arrive, leave, or are resized. A
+// maximized window keeps its leaf. When a window gives up its leaf, its sibling
+// takes its space and any splits in that subtree turn as their depth changes.
+static void RunBspLayoutTests() {
+  g_settings = SettingsState{};
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  const RECT area{0, 0, 1600, 900};
+  auto window = [](int id) { return reinterpret_cast<HWND>(static_cast<uintptr_t>(0x7000 + id * 4)); };
+  const HWND a = window(1), b = window(2), c = window(3), d = window(4), e = window(5), f = window(6);
+  auto admit = [&](Workspace& workspace, HWND hwnd, WindowConstraints constraints = {}) {
+    WindowRecord record;
+    record.hwnd = hwnd;
+    record.pid = 1;
+    record.constraints = constraints;
+    check(workspace.AdmitTiled(record), "admit BSP window");
+  };
+  auto valid = [](const Workspace& workspace) {
+    std::vector<std::wstring> errors;
+    return workspace.Validate(DesktopMonitorKey{}, L"bsp test", &errors, false);
+  };
+  // The planned frame of each listed window, in the order given.
+  auto framesIn = [&](const Workspace& workspace, const RECT& workArea, std::initializer_list<HWND> windows) {
+    std::vector<RECT> rects;
+    check(Layout::BuildWorkspaceLayoutPlan(workspace, workArea, 0, &rects) == Layout::LayoutPlanStatus::Success,
+          "BSP plan succeeds");
+    std::vector<RECT> result;
+    for (HWND hwnd : windows) result.push_back(rects[workspace.TiledIndex(hwnd)]);
+    return result;
+  };
+  auto frames = [&](const Workspace& workspace, std::initializer_list<HWND> windows) {
+    return framesIn(workspace, area, windows);
+  };
+  auto same = [](const std::vector<RECT>& actual, const std::vector<RECT>& expected) {
+    return std::equal(actual.begin(), actual.end(), expected.begin(), expected.end(),
+                      [](const RECT& x, const RECT& y) { return EqualRect(&x, &y) != FALSE; });
+  };
+
+  Workspace balanced;
+  balanced.SetLayout(TileLayout::Bsp);
+  for (HWND hwnd : {a, b, c, d}) admit(balanced, hwnd);
+  check(valid(balanced), "BSP workspace is valid");
+  check(same(frames(balanced, {a, b, c, d}),
+             {{0, 0, 800, 450}, {800, 0, 1600, 450}, {0, 450, 800, 900}, {800, 450, 1600, 900}}),
+        "each window splits the largest, and splits alternate side by side, stacked");
+  check(balanced.TiledWindows() == std::vector<HWND>({a, c, b, d}), "the tiled order follows the leaves");
+  admit(balanced, e);
+  check(same(frames(balanced, {a, e}), {{0, 0, 400, 450}, {400, 0, 800, 450}}),
+        "the fifth window splits the first of the equal quarters, side by side again");
+
+  Workspace tall;
+  tall.SetLayout(TileLayout::Bsp);
+  for (HWND hwnd : {a, b, c}) admit(tall, hwnd);
+  const RECT portrait{0, 0, 900, 1600};
+  check(same(framesIn(tall, portrait, {a, c, b}), {{0, 0, 450, 800}, {450, 0, 900, 800}, {0, 800, 900, 1600}}),
+        "a portrait work area starts stacked, then alternates");
+  Workspace tallDwindle;
+  tallDwindle.SetLayout(TileLayout::Dwindle);
+  for (HWND hwnd : {a, b}) admit(tallDwindle, hwnd);
+  check(same(framesIn(tallDwindle, portrait, {a, b}), {{0, 0, 900, 800}, {0, 800, 900, 1600}}),
+        "Dwindle also starts stacked on a portrait work area");
+
+  Workspace closed = balanced;
+  check(closed.Forget(a), "close a window");
+  check(valid(closed), "closing keeps the tree valid");
+  check(same(frames(closed, {e, b, c, d}),
+             {{0, 0, 800, 450}, {800, 0, 1600, 450}, {0, 450, 800, 900}, {800, 450, 1600, 900}}),
+        "its sibling takes its space and nobody else moves");
+
+  Workspace minimized = balanced;
+  check(minimized.Suspend(c, SuspensionReason::Minimized), "minimize a window");
+  check(valid(minimized) && !minimized.Bsp().Contains(c), "a minimized window gives up its leaf");
+  check(same(frames(minimized, {a, e, b, d}),
+             {{0, 0, 800, 450}, {0, 450, 800, 900}, {800, 0, 1600, 450}, {800, 450, 1600, 900}}),
+        "its sibling takes its space, its split turning as it moves up a level");
+  check(minimized.Restore(c), "restore the minimized window");
+  check(valid(minimized) && same(frames(minimized, {a, c}), {{0, 0, 400, 450}, {400, 0, 800, 450}}),
+        "a restored window arrives like a new one, splitting the largest");
+  Workspace followed = balanced;
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
+  check(followed.RememberFocusedWindow(d) && followed.Suspend(c, SuspensionReason::Minimized), "minimize after focusing");
+  check(followed.RememberFocusedWindow(c), "the restoring window takes focus");
+  check(followed.Restore(c) && same(frames(followed, {d, c}), {{800, 450, 1200, 900}, {1200, 450, 1600, 900}}),
+        "with Focused tile, it splits the last tiled window that had focus");
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+
+  Workspace maximized = balanced;
+  check(maximized.Suspend(c, SuspensionReason::Maximized), "maximize a window");
+  check(valid(maximized) && maximized.Bsp().Contains(c), "a maximized window keeps its leaf");
+  check(maximized.Restore(c) && same(frames(maximized, {a, e, b, c, d}), frames(balanced, {a, e, b, c, d})),
+        "un-maximizing puts it back where it was");
+  check(maximized.Suspend(c, SuspensionReason::Maximized) && maximized.Suspend(c, SuspensionReason::Minimized) &&
+            valid(maximized) && !maximized.Bsp().Contains(c),
+        "minimizing a maximized window gives up its leaf");
+
+  Workspace focused = balanced;
+  WindowRecord added;
+  added.hwnd = f;
+  added.pid = 1;
+  check(focused.AdmitTiledAfter(added, b), "admit after the focused window");
+  check(same(frames(focused, {b, f, d}), {{800, 0, 1200, 450}, {1200, 0, 1600, 450}, {800, 450, 1600, 900}}),
+        "a window inserted after the focused one splits only that window");
+
+  Workspace swapped = balanced;
+  check(swapped.SwapTiled(a, d), "swap two windows");
+  check(same(frames(swapped, {d, a}), {{0, 0, 400, 450}, {800, 450, 1600, 900}}), "swapped windows trade leaves");
+  check(valid(swapped), "swapping keeps the tree valid");
+
+  Workspace floated = balanced;
+  check(floated.Float(b), "float a window");
+  check(same(frames(floated, {d}), {{800, 0, 1600, 900}}), "a floated window's sibling takes its space");
+  check(floated.ActivateTiled(b), "tile it again");
+  check(valid(floated), "re-tiling keeps the tree valid");
+
+  // Dragging a divider changes its position and preserves split directions.
+  Workspace dragged;
+  dragged.SetLayout(TileLayout::Bsp);
+  for (HWND hwnd : {a, b, c}) admit(dragged, hwnd);
+  MoveSizeGesture gesture;
+  gesture.hasRects = true;
+  gesture.intent = MoveSizeIntent::Resize;
+  gesture.start = gesture.end = frames(dragged, {a})[0];
+  gesture.end.right += 500;
+  check(dragged.LearnBspResize(area, 0, dragged.TiledIndex(a), gesture), "learn a divider drag");
+  check(same(frames(dragged, {a, c, b}), {{0, 0, 1300, 450}, {0, 450, 1300, 900}, {1300, 0, 1600, 900}}),
+        "the dragged divider moves and the region it widened stays stacked");
+  gesture.start = gesture.end = frames(dragged, {c})[0];
+  check(!dragged.LearnBspResize(area, 0, dragged.TiledIndex(c), gesture), "an unchanged gesture saves nothing");
+  gesture.end.top -= 150;
+  check(dragged.LearnBspResize(area, 0, dragged.TiledIndex(c), gesture), "drag a nested divider by its far side");
+  check(same(frames(dragged, {a, c}), {{0, 0, 1300, 300}, {0, 300, 1300, 900}}), "the nested divider follows");
+  Workspace cycled = dragged;
+  cycled.SetLayout(TileLayout::Monocle);
+  cycled.SetLayout(TileLayout::Bsp);
+  check(same(frames(cycled, {a, b, c}), frames(dragged, {a, b, c})), "switching away and back keeps the tree");
+
+  // Adaptive splits (Adaptive Split Depth) move only as far as minimums need,
+  // within the adaptive range; the saved ratio stays.
+  Workspace constrained;
+  constrained.SetLayout(TileLayout::Bsp);
+  admit(constrained, a, {1000, 1, 96, true});
+  admit(constrained, b);
+  check(same(frames(constrained, {a, b}), {{0, 0, 1000, 900}, {1000, 0, 1600, 900}}),
+        "a minimum moves an adaptive divider just far enough");
+  check(constrained.Bsp().Nodes()[0].ratio == 0.5, "fitting keeps the saved ratio");
+  admit(constrained, c, {1, 600, 96, true});
+  check(same(frames(constrained, {a, c}), {{0, 0, 1000, 300}, {0, 300, 1000, 900}}),
+        "a split one level down adapts too");
+  std::vector<RECT> rects;
+  g_settings.adaptiveDwindleSlots = 1;
+  check(Layout::BuildWorkspaceLayoutPlan(constrained, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable,
+        "a split below the adaptive depth stays where it is");
+  g_settings.adaptiveDwindleSlots = 2;
+  g_settings.adaptiveDwindlePercentage = 10;
+  check(Layout::BuildWorkspaceLayoutPlan(constrained, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable,
+        "an adaptive split stays inside the adaptive range");
+  g_settings.adaptiveDwindlePercentage = 40;
+  Workspace impossible = constrained;
+  admit(impossible, d, {1700, 1, 96, true});
+  check(Layout::BuildWorkspaceLayoutPlan(impossible, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable,
+        "a window wider than the work area makes the plan unsatisfiable");
+
+  g_settings.adaptiveDwindleSlots = 3;
+  g_settings.adaptiveDwindlePercentage = 15;
+  for (const bool splitFocused : {false, true}) {
+    Workspace arriving;
+    arriving.SetLayout(TileLayout::Bsp);
+    for (HWND hwnd : {a, b, c}) {
+      admit(arriving, hwnd);
+      arriving.ClearInsertionPlacement(hwnd);
+    }
+    if (splitFocused) {
+      admit(arriving, d);
+      arriving.ClearInsertionPlacement(d);
+      check(arriving.RememberFocusedWindow(a), "select the smaller focused tile");
+    }
+    g_settings.automaticNewWindowPosition = splitFocused ? AutomaticNewWindowPosition::AfterFocused
+                                                         : AutomaticNewWindowPosition::LastSlot;
+    const WindowConstraints minimum = splitFocused ? WindowConstraints{700, 250, 96, true}
+                                                   : WindowConstraints{460, 600, 96, true};
+    Workspace returning = arriving;
+    WindowRecord minimizedRecord;
+    minimizedRecord.hwnd = f;
+    minimizedRecord.pid = 1;
+    minimizedRecord.constraints = minimum;
+    check(returning.AdmitInitial(minimizedRecord, SuspensionReason::Minimized), "reserve a minimized BSP arrival");
+    const Platform::Monitors::WorkspaceMetrics fallbackMetrics{area, 96, 0};
+    const auto restoreHint = Placement::PredictRestoredFrame(returning, f, fallbackMetrics);
+    admit(arriving, f, minimum);
+    const auto& tree = arriving.Bsp();
+    const size_t split = tree.Parent(tree.FindLeaf(f));
+    const HWND target = splitFocused ? a : b;
+    check(split == tree.Parent(tree.FindLeaf(target)) && tree.Nodes()[split].ratio == 0.5,
+          "an arrival starts at 50/50 in the selected tile");
+    check(Layout::BuildWorkspaceLayoutPlan(arriving, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable,
+          "the usual direction cannot fit within the adaptive range");
+    check(Layout::PlanWithNewBspSplitFallback(arriving, area, 0, &rects) == Layout::LayoutPlanStatus::Success,
+          "the alternate direction fits with adaptive movement from 50/50");
+    const RECT fitted = splitFocused ? RECT{0, 200, 800, 450} : RECT{1140, 0, 1600, 900};
+    check(EqualRect(&rects[arriving.TiledIndex(f)], &fitted) &&
+              tree.Nodes()[split].direction == (splitFocused ? Layout::Axis::Y : Layout::Axis::X) &&
+              tree.Nodes()[split].ratio == 0.5,
+          "the new direction is saved while the fitted position stays temporary");
+    check(restoreHint && EqualRect(&*restoreHint, &fitted), "the companion predicts the same alternate split on restore");
+    if (!splitFocused) {
+      Workspace provisional = arriving;
+      provisional.UpdateConstraints(f, {720, 350, 96, true});
+      check(Layout::BuildWorkspaceLayoutPlan(provisional, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable &&
+                Layout::PlanWithNewBspSplitFallback(provisional, area, 0, &rects) == Layout::LayoutPlanStatus::Success &&
+                !provisional.Bsp().Nodes()[split].direction.has_value(),
+            "an unsettled admission can return to the original direction when its minimum changes");
+    }
+    arriving.ClearInsertionPlacement(f);
+    arriving.UpdateConstraints(f, {1, 1, 96, true});
+    const RECT relaxed = splitFocused ? RECT{0, 225, 800, 450} : RECT{1200, 0, 1600, 900};
+    check(Layout::BuildWorkspaceLayoutPlan(arriving, area, 0, &rects) == Layout::LayoutPlanStatus::Success &&
+              EqualRect(&rects[arriving.TiledIndex(f)], &relaxed),
+          "relaxing the constraints returns the divider to 50/50 in its saved direction");
+  }
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+  Workspace settled;
+  settled.SetLayout(TileLayout::Bsp);
+  for (HWND hwnd : {a, b}) {
+    admit(settled, hwnd);
+    settled.ClearInsertionPlacement(hwnd);
+    settled.UpdateConstraints(hwnd, {900, 1, 96, true});
+  }
+  check(Layout::PlanWithNewBspSplitFallback(settled, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable &&
+            !settled.Bsp().Nodes()[0].direction,
+        "raising minimums cannot turn a settled divider");
+  g_settings.adaptiveDwindleSlots = 2;
+  g_settings.adaptiveDwindlePercentage = 40;
+
+  // Size steps move the nearest split that divides the window from a neighbour.
+  Workspace stepped;
+  stepped.SetLayout(TileLayout::Bsp);
+  for (HWND hwnd : {a, b}) admit(stepped, hwnd);
+  check(stepped.StepTiledSize(area, 0, stepped.TiledIndex(b), true, 5), "grow the second window");
+  check(same(frames(stepped, {a, b}), {{0, 0, 720, 900}, {720, 0, 1600, 900}}), "a step grows by 5% of the width");
+  check(stepped.ResetTiledSize(area, 0, stepped.TiledIndex(b), 0.5), "reset the window size");
+  check(same(frames(stepped, {a, b}), {{0, 0, 800, 900}, {800, 0, 1600, 900}}), "reset evens the split");
+  check(!stepped.ResetTiledSize(area, 0, stepped.TiledIndex(b), 0.5), "an even split has nothing to reset");
+
+  // Set Master trades places with the largest window, not the first one.
+  Workspace mastered;
+  mastered.SetLayout(TileLayout::Bsp);
+  for (HWND hwnd : {a, b, c}) admit(mastered, hwnd);
+  check(mastered.TiledWindows().front() == a && Commands::LargestBspWindow(mastered, a, area, 0) == b,
+        "the right half, not the first quarter, is the largest window");
+  check(Commands::LargestBspWindow(mastered, b, area, 0) == b, "the largest window is already there");
+  check(Commands::LargestBspWindow(stepped, b, area, 0) == b, "even halves don't trade places");
+  const RECT oddArea{0, 0, 1601, 900};
+  check(Commands::LargestBspWindow(stepped, a, oddArea, 0) == a, "a pixel of rounding doesn't make one larger");
+
+  // The companion's prediction runs the real admission, so it lands in the
+  // leaf the arrival rule picks.
+  const Platform::Monitors::WorkspaceMetrics metrics{area, 96, 0};
+  Workspace predicted;
+  predicted.SetLayout(TileLayout::Bsp);
+  for (HWND hwnd : {a, b}) admit(predicted, hwnd);
+  const auto prediction = Placement::PredictAutomaticAdmission(predicted, metrics, false, false);
+  const RECT expectedPrediction{0, 450, 800, 900};
+  check(prediction.tiledFrame && EqualRect(&*prediction.tiledFrame, &expectedPrediction) != FALSE,
+        "prediction splits the largest leaf");
+
+  std::printf("Passed %d BSP layout checks.\n", checks);
+}
+
+// Random BSP membership changes keep the model valid; closing or minimizing a
+// window moves only its sibling's windows; maximizing and restoring moves nothing.
+static void RunBspPropertyTests() {
+  g_settings = SettingsState{};
+  auto fail = [](const char* message, int operation) {
+    std::fprintf(stderr, "FAILED: %s (operation %d)\n", message, operation);
+    std::exit(1);
+  };
+  std::mt19937 rng(6016);
+  auto pick = [&](int low, int high) { return std::uniform_int_distribution<int>(low, high)(rng); };
+  const RECT area{0, 0, 1920, 1080};
+  auto plan = [&](const Workspace& workspace) {
+    std::map<HWND, RECT> frames;
+    std::vector<RECT> rects;
+    if (Layout::BuildWorkspaceLayoutPlan(workspace, area, 6, &rects) != Layout::LayoutPlanStatus::Success) return frames;
+    for (size_t i = 0; i < rects.size(); ++i) frames[workspace.TiledWindows()[i]] = rects[i];
+    return frames;
+  };
+  auto sameFrame = [](const RECT& x, const RECT& y) { return EqualRect(&x, &y) != FALSE; };
+  // The tiled windows whose frames may change when `leaving` gives up its leaf:
+  // its sibling's, or, when that shows none, the nearest ancestor's other side.
+  auto siblingWindows = [](const Workspace& workspace, HWND leaving) {
+    const BspTree& tree = workspace.Bsp();
+    std::set<HWND> sibling;
+    for (size_t node = tree.FindLeaf(leaving); sibling.empty();) {
+      const size_t parent = tree.Parent(node);
+      if (parent == BspTree::kNotFound) break;
+      const size_t begin = node == parent + 1 ? tree.SecondChild(parent) : parent + 1;
+      for (size_t i = begin; i < tree.SubtreeEnd(begin); ++i) {
+        if (workspace.IsTiled(tree.Nodes()[i].window)) sibling.insert(tree.Nodes()[i].window);
+      }
+      node = parent;
+    }
+    return sibling;
+  };
+  int operations = 0;
+  for (int run = 0; run < 200; ++run) {
+    Workspace workspace;
+    workspace.SetLayout(TileLayout::Bsp);
+    g_settings.automaticNewWindowPosition =
+        pick(0, 1) ? AutomaticNewWindowPosition::AfterFocused : AutomaticNewWindowPosition::LastSlot;
+    int nextId = 1;
+    for (int step = 0; step < 40; ++step, ++operations) {
+      const std::vector<HWND> tiled = workspace.TiledWindows();
+      std::vector<HWND> known;
+      for (const auto& [hwnd, record] : workspace.Records()) known.push_back(hwnd);
+      std::sort(known.begin(), known.end());
+      const HWND anyTiled = tiled.empty() ? nullptr : tiled[pick(0, static_cast<int>(tiled.size()) - 1)];
+      const HWND anyKnown = known.empty() ? nullptr : known[pick(0, static_cast<int>(known.size()) - 1)];
+      const auto before = plan(workspace);
+      switch (pick(0, 9)) {
+        case 0:
+        case 1: {
+          WindowRecord record;
+          record.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x9000 + 4 * nextId++));
+          record.pid = 1;
+          if (anyTiled && pick(0, 1)) workspace.AdmitTiledAfter(record, anyTiled);
+          else workspace.AdmitTiled(record);
+          break;
+        }
+        case 2:
+        case 3: {
+          if (!anyTiled) break;
+          const std::set<HWND> sibling = siblingWindows(workspace, anyTiled);
+          if (pick(0, 1)) workspace.Forget(anyTiled);
+          else workspace.Suspend(anyTiled, SuspensionReason::Minimized);
+          for (const auto& [hwnd, frame] : plan(workspace)) {
+            if (!sibling.count(hwnd) && !sameFrame(frame, before.at(hwnd))) fail("leaving moved a non-sibling", operations);
+          }
+          break;
+        }
+        case 4: {
+          if (!anyTiled) break;
+          Workspace maximized = workspace;
+          maximized.Suspend(anyTiled, SuspensionReason::Maximized);
+          if (pick(0, 1)) {
+            maximized.Restore(anyTiled);
+            const auto after = plan(maximized);
+            for (const auto& [hwnd, frame] : before) {
+              if (!sameFrame(frame, after.at(hwnd))) fail("maximize and restore moved a window", operations);
+            }
+          }
+          workspace = maximized;
+          break;
+        }
+        case 5:
+          for (const auto& [hwnd, record] : workspace.Records()) {
+            if (record.state == ManageState::Suspended) {
+              workspace.Restore(hwnd);
+              break;
+            }
+          }
+          break;
+        case 6:
+          if (anyKnown) workspace.Float(anyKnown);
+          break;
+        case 7:
+          if (anyKnown) workspace.ActivateTiled(anyKnown);
+          break;
+        case 8:
+          if (anyTiled) workspace.RememberFocusedWindow(anyTiled);
+          if (tiled.size() >= 2) workspace.SwapTiled(tiled.front(), tiled.back());
+          break;
+        case 9:
+          workspace.SetLayout(pick(0, 1) ? TileLayout::Monocle : TileLayout::Columns);
+          workspace.SetLayout(TileLayout::Bsp);
+          break;
+      }
+      std::vector<std::wstring> errors;
+      if (!workspace.Validate(DesktopMonitorKey{}, L"bsp property", &errors, false)) {
+        std::fwprintf(stderr, L"%ls\n", errors.front().c_str());
+        fail("BSP workspace invariant broke", operations);
+      }
+      if (workspace.ActiveCount() > 0 && plan(workspace).size() != workspace.ActiveCount()) {
+        fail("an unconstrained BSP workspace failed to plan", operations);
+      }
+    }
+  }
+  g_settings = SettingsState{};
+  std::printf("Passed BSP properties over %d random operations.\n", operations);
+}
+
+// What arrangement does with a BSP arrival of minimum `minWidth` x `minHeight`
+// admitted into `workspace` (after `anchor` when given): its tile, or no
+// value when it floats. The same steps as ArrangeWorkspace: the plan with the
+// new split turned if needed, then admission recovery, then a float.
+static std::optional<RECT> ArrangeBspArrival(Workspace workspace, const Platform::Monitors::WorkspaceMetrics& metrics,
+                                             HWND arrival, HWND anchor, LONG minWidth, LONG minHeight) {
+  WindowRecord record{.hwnd = arrival};
+  record.constraints = {minWidth, minHeight, metrics.dpi, true};
+  if (!(anchor ? workspace.AdmitTiledAfter(record, anchor) : workspace.AdmitTiled(record))) return std::nullopt;
+  std::vector<RECT> rects;
+  if (Layout::PlanWithNewBspSplitFallback(workspace, metrics.workArea, metrics.gap, &rects) !=
+      Layout::LayoutPlanStatus::Success) {
+    Layout::AdmissionRecoveryPlan recovery;
+    if (!Layout::TryRecoverPendingAdmission(workspace, metrics.workArea, metrics.gap, {{arrival, 0}}, nullptr,
+                                            &recovery)) {
+      return std::nullopt;
+    }
+    workspace = std::move(recovery.workspace);
+    rects = std::move(recovery.rects);
+  }
+  return rects[workspace.TiledIndex(arrival)];
+}
+
+// The companion's decision for the same arrival, from the published tiles
+// alone: true when it agrees exactly with `real` (the same tile, or both float).
+// No tiles at all means not even a minimal window fits, which the snapshot's
+// newWindowFloats tells the companion; the arrival must then float.
+static bool CompanionAgrees(const CompanionAbi::BspArrivalTiles& tiles, const RECT& workArea,
+                            const std::optional<RECT>& real, LONG minWidth, LONG minHeight) {
+  if (tiles.count == 0) return !real;
+  const CompanionAbi::BspArrivalChoice choice = CompanionAbi::ChooseBspArrivalTile(tiles, workArea, minWidth, minHeight);
+  if (!real) return choice.outcome == CompanionAbi::BspArrivalChoice::Outcome::Floats;
+  return choice.outcome == CompanionAbi::BspArrivalChoice::Outcome::Tile && EqualRect(&choice.tile, &*real) != FALSE;
+}
+
+// The BSP arrival tiles published to the companion let it place a new window
+// exactly where arrangement will: for windows of many minimum sizes, in fixed
+// and random workspaces, it picks the same tile at the same rectangle, adaptive
+// dividers included, and floats the same windows.
+static void RunBspArrivalTileTests() {
+  g_settings = SettingsState{};
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  const Platform::Monitors::WorkspaceMetrics metrics{{0, 0, 1600, 900}, 96, 0};
+  const HWND a = reinterpret_cast<HWND>(0x7800), b = reinterpret_cast<HWND>(0x7804);
+  const HWND c = reinterpret_cast<HWND>(0x7808), arrival = reinterpret_cast<HWND>(0x780C);
+  Workspace established;
+  established.SetLayout(TileLayout::Bsp);
+  for (HWND hwnd : {a, b, c}) check(established.AdmitTiled({.hwnd = hwnd}), "admit a BSP window");
+  // Settled, as arrangement leaves them once they hold their tiles: only the
+  // arrival's own split may then turn.
+  for (HWND hwnd : {a, b, c}) established.ClearInsertionPlacement(hwnd);
+  check(established.RememberFocusedWindow(a), "focus the top-left quarter");
+
+  const CompanionAbi::BspArrivalTiles tiles = Placement::PredictBspArrivalTiles(established, metrics, true);
+  auto same = [](const RECT& x, const RECT& y) { return EqualRect(&x, &y) != FALSE; };
+  check(tiles.count == 4 && same(tiles.tiles[0].tile, {400, 0, 800, 450}) && same(tiles.tiles[1].tile, {0, 225, 800, 450}) &&
+            same(tiles.tiles[2].tile, {800, 450, 1600, 900}) && same(tiles.tiles[3].tile, {1200, 0, 1600, 900}),
+        "the focused tile, turned, then the largest other tile, turned");
+
+  for (LONG minWidth = 50; minWidth <= 1650; minWidth += 100) {
+    for (LONG minHeight = 50; minHeight <= 950; minHeight += 75) {
+      const auto real = ArrangeBspArrival(established, metrics, arrival, a, minWidth, minHeight);
+      check(CompanionAgrees(tiles, metrics.workArea, real, minWidth, minHeight),
+            "the companion places the arrival exactly where arrangement does");
+    }
+  }
+
+  // Random workspaces: trees, saved ratios, minimum sizes, gaps, orientations
+  // and adaptive settings.
+  std::mt19937 rng(6017);
+  auto pick = [&](int low, int high) { return std::uniform_int_distribution<int>(low, high)(rng); };
+  int compared = 0;
+  for (int run = 0; run < 400; ++run) {
+    g_settings = SettingsState{};
+    g_settings.automaticNewWindowPosition =
+        pick(0, 1) ? AutomaticNewWindowPosition::AfterFocused : AutomaticNewWindowPosition::LastSlot;
+    g_settings.adaptiveDwindleSlots = static_cast<size_t>(pick(0, 3));
+    g_settings.adaptiveDwindlePercentage = pick(0, 40);
+    const bool portrait = pick(0, 3) == 0;
+    const LONG width = portrait ? pick(700, 1200) : pick(1000, 2600);
+    const LONG height = portrait ? pick(1200, 2000) : pick(600, 1500);
+    const Platform::Monitors::WorkspaceMetrics randomMetrics{{0, 0, width, height}, 96, pick(0, 16)};
+    Workspace workspace;
+    workspace.SetLayout(TileLayout::Bsp);
+    const int count = pick(1, 7);
+    std::vector<HWND> members;
+    for (int i = 0; i < count; ++i) {
+      WindowRecord record{.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x7900 + 4 * i))};
+      if (pick(0, 1)) record.constraints = {pick(1, width / 3), pick(1, height / 3), 96, true};
+      workspace.AdmitTiled(record);
+      members.push_back(record.hwnd);
+    }
+    for (int i = 0; i < 3; ++i) {
+      const size_t index = static_cast<size_t>(pick(0, count - 1));
+      workspace.StepTiledSize(randomMetrics.workArea, randomMetrics.gap, index, pick(0, 1) != 0, pick(1, 20));
+    }
+    for (HWND hwnd : members) workspace.ClearInsertionPlacement(hwnd);
+    workspace.RememberFocusedWindow(members[static_cast<size_t>(pick(0, count - 1))]);
+    std::vector<RECT> rects;
+    if (Layout::BuildWorkspaceLayoutPlan(workspace, randomMetrics.workArea, randomMetrics.gap, &rects) !=
+        Layout::LayoutPlanStatus::Success) {
+      continue;  // Arrangement would float someone before any arrival.
+    }
+    const bool afterFocused = g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused;
+    const CompanionAbi::BspArrivalTiles published = Placement::PredictBspArrivalTiles(workspace, randomMetrics, afterFocused);
+    const HWND anchor = afterFocused ? workspace.LastFocusedTiledWindow() : nullptr;
+    for (int sample = 0; sample < 12; ++sample) {
+      const LONG minWidth = pick(1, width + 50);
+      const LONG minHeight = pick(1, height + 50);
+      const auto real = ArrangeBspArrival(workspace, randomMetrics, arrival, anchor, minWidth, minHeight);
+      check(CompanionAgrees(published, randomMetrics.workArea, real, minWidth, minHeight),
+            "the companion agrees with arrangement in a random BSP workspace");
+      ++compared;
+    }
+  }
+  check(compared > 2000, "the random cross-check compares enough arrivals");
+  g_settings = SettingsState{};
+  std::printf("Passed %d BSP arrival tile checks.\n", checks);
+}
+
 int main() {
+  RunBspLayoutTests();
+  RunBspPropertyTests();
+  RunBspArrivalTileTests();
   RunMaximumSizeTests();
   RunSettingsParserDigest();
   RunRuleFieldParserTests();
-  RunAdaptiveDwindleTests();
+  RunAdaptiveSplitTests();
   RunWeightedResizeTests();
   RunFloatingPlacementTests();
   RunWindowSizeStepTests();

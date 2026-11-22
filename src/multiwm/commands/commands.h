@@ -3,6 +3,14 @@
 
 namespace Commands {
 
+enum class TileDropZone { Center, Left, Right, Top, Bottom };
+
+struct TiledDropTarget {
+  HWND window;
+  TileDropZone zone;
+  bool operator==(const TiledDropTarget&) const = default;
+};
+
 // A tiled window whose cell `candidate` (planned as `candidateRects`) would move
 // while the window is hung and shown by its ghost, or nullptr. MultiWM can't
 // move a ghost: dwm.exe owns it and refuses positioning from other processes, so
@@ -76,13 +84,39 @@ static Layout::LayoutPlanStatus PlanUserLayoutMutation(
   return status;
 }
 
+static Layout::LayoutPlanStatus PlanBspDrop(
+    Workspace& candidate, const Workspace& previous, HWND source, const TiledDropTarget& target,
+    const Platform::Monitors::WorkspaceMetrics& metrics, std::vector<RECT>& rects,
+    std::optional<RECT>& bspDropEdge) {
+  const auto cells = Model::PlanBspCells(previous, metrics.workArea, metrics.gap).rects;
+  const size_t targetIndex = previous.TiledIndex(target.window);
+  if (targetIndex >= cells.size() || IsRectEmpty(&cells[targetIndex])) {
+    return Layout::LayoutPlanStatus::Unsatisfiable;
+  }
+
+  RECT edge = cells[targetIndex];
+  const bool horizontal = target.zone == TileDropZone::Left || target.zone == TileDropZone::Right;
+  const LONG span = horizontal ? Layout::RectWidth(edge) : Layout::RectHeight(edge);
+  const LONG edgeSize = static_cast<LONG>((static_cast<int64_t>(span) * g_settings.bspSplitEdgePercent + 99) / 100);
+  switch (target.zone) {
+    case TileDropZone::Left: edge.right = edge.left + edgeSize; break;
+    case TileDropZone::Right: edge.left = edge.right - edgeSize; break;
+    case TileDropZone::Top: edge.bottom = edge.top + edgeSize; break;
+    case TileDropZone::Bottom: edge.top = edge.bottom - edgeSize; break;
+    case TileDropZone::Center: return Layout::LayoutPlanStatus::Unsatisfiable;
+  }
+  bspDropEdge = edge;
+  return Layout::PlanWithNewBspSplitFallback(candidate, metrics.workArea, metrics.gap, &rects,
+                                            Layout::BspMergeDestination{source, *bspDropEdge});
+}
+
 // User-authored geometry changes are rejected before commit when cached native
 // constraints already make them impossible. A short-lived transaction handles a
 // minimum that an application changes only during the resulting placement.
 static bool ValidateUserLayoutMutation(
-    const DesktopMonitorKey& key, HMONITOR monitor,
+    const DesktopMonitorKey& key, HMONITOR monitor, const Workspace& previous,
     Workspace& candidate, HWND subject, Placement::UserLayoutMutationKind kind,
-    const wchar_t* action) {
+    const wchar_t* action, const TiledDropTarget* mergeTarget, std::optional<RECT>& bspDropEdge) {
   // A same-DPI native minimum can change while no placement is occurring.
   // Refresh the committed workspace first, persist that application-owned state,
   // then mirror it into the geometry-mutated candidate before deciding whether
@@ -110,7 +144,11 @@ static bool ValidateUserLayoutMutation(
   bool acceptAsIs = false;
   Layout::LayoutPlanStatus status = Layout::LayoutPlanStatus::Unsatisfiable;
   if (Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) {
-    status = PlanUserLayoutMutation(candidate, kind, action, metrics, &rects, &acceptAsIs);
+    if (mergeTarget) {
+      status = PlanBspDrop(candidate, previous, subject, *mergeTarget, metrics, rects, bspDropEdge);
+    } else {
+      status = PlanUserLayoutMutation(candidate, kind, action, metrics, &rects, &acceptAsIs);
+    }
   }
   if (acceptAsIs || status == Layout::LayoutPlanStatus::NotApplicable) return true;
   if (status == Layout::LayoutPlanStatus::Success) {
@@ -145,9 +183,12 @@ static bool ValidateUserLayoutMutation(
 static bool AcceptUserLayoutMutation(
     const DesktopMonitorKey& key, HMONITOR monitor, const Workspace& previous,
     Workspace& candidate, HWND subject, Placement::UserLayoutMutationKind kind,
-    const wchar_t* action) {
-  if (!ValidateUserLayoutMutation(key, monitor, candidate, subject, kind, action)) return false;
-  Placement::RememberPendingLayoutMutation(key, previous, candidate, subject, kind, action);
+    const wchar_t* action, const TiledDropTarget* mergeTarget = nullptr) {
+  std::optional<RECT> bspDropEdge;
+  if (!ValidateUserLayoutMutation(key, monitor, previous, candidate, subject, kind, action, mergeTarget, bspDropEdge)) {
+    return false;
+  }
+  Placement::RememberPendingLayoutMutation(key, previous, candidate, subject, kind, action, bspDropEdge);
   return true;
 }
 
@@ -191,8 +232,34 @@ static void ReportNoTargetWindow(const std::optional<ForegroundWorkspace>& curre
 
 static constexpr const wchar_t* kNotInFloatingLayout = L"Not available in the Floating layout";
 
-// Promotes the foreground window, or its tiled owner, to the master slot, then
-// clears stale gesture samples for both windows and reflows the workspace.
+// BSP has no master, so Set Master trades places with the largest window as
+// shown. `focused`, a tiled window, is returned when it is the largest or
+// within 1% of it, so two even halves don't swap for nothing; ties go to the
+// first. Pure; `workArea` and `gap` are physical.
+static HWND LargestBspWindow(const Workspace& workspace, HWND focused, const RECT& workArea, LONG gap) {
+  const std::vector<RECT> cells = Model::PlanBspCells(workspace, workArea, gap).rects;
+  const size_t focusedIndex = workspace.TiledIndex(focused);
+  if (cells.empty() || focusedIndex >= cells.size()) return nullptr;
+  size_t largest = 0;
+  for (size_t i = 1; i < cells.size(); ++i) {
+    if (Layout::RectAreaLL(cells[i]) > Layout::RectAreaLL(cells[largest])) largest = i;
+  }
+  if (Layout::RectAreaLL(cells[focusedIndex]) * 100 >= Layout::RectAreaLL(cells[largest]) * 99) return focused;
+  return workspace.TiledWindows()[largest];
+}
+
+// The window Set Master swaps `resolved` with: the master (the first window),
+// or in BSP the largest one. Null when the work area can't be read.
+static HWND SetMasterPartner(const Workspace& workspace, HWND resolved, HMONITOR monitor) {
+  if (workspace.Layout() != TileLayout::Bsp) return workspace.TiledWindows().front();
+  Platform::Monitors::WorkspaceMetrics metrics;
+  if (!Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) return nullptr;
+  return LargestBspWindow(workspace, resolved, metrics.workArea, metrics.gap);
+}
+
+// Promotes the foreground window, or its tiled owner, to the master slot (in
+// BSP, the largest window's place), then clears stale gesture samples for both
+// windows and reflows the workspace.
 void SwapMaster(HWND foreground = GetForegroundWindow()) {
   ++Diagnostics::g_runtime.counters.swapMasterCommands;
   auto current = LoadForegroundWorkspace(foreground);
@@ -203,12 +270,14 @@ void SwapMaster(HWND foreground = GetForegroundWindow()) {
 
   HWND resolved = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
   if (!resolved) return ReportNoTargetWindow(current);
-  if (resolved == workspace.TiledWindows().front()) {
-    return ReportCommandRefused(L"Already the master window", current);
+  const bool bsp = workspace.Layout() == TileLayout::Bsp;
+  HWND oldMaster = SetMasterPartner(workspace, resolved, current->monitor);
+  if (!oldMaster) return;
+  if (resolved == oldMaster) {
+    return ReportCommandRefused(bsp ? L"Already the largest window" : L"Already the master window", current);
   }
   Workspace candidate = workspace;
-  HWND oldMaster = nullptr;
-  if (!candidate.MakeMaster(resolved, &oldMaster)) return;
+  if (bsp ? !candidate.SwapTiled(resolved, oldMaster) : !candidate.MakeMaster(resolved, &oldMaster)) return;
   if (!AcceptUserLayoutMutation(key, current->monitor, workspace, candidate, resolved,
                                 Placement::UserLayoutMutationKind::Order, L"Set master")) {
     return;
@@ -435,41 +504,23 @@ void ResetFocusedWindowSize() {
   CommitWindowSizeChange(*focused, std::move(candidate), L"Reset window size");
 }
 
-// Collects the windows Automatic overflow releases while it lives
-// (WmRuntime::commandReleases), so a user command can report them.
+// Collects local space-related floats so a user command can report them together.
 class CommandReleaseScope {
  public:
   CommandReleaseScope() { g_wm.commandReleases = &released_; }
   ~CommandReleaseScope() { g_wm.commandReleases = nullptr; }
   CommandReleaseScope(const CommandReleaseScope&) = delete;
   CommandReleaseScope& operator=(const CommandReleaseScope&) = delete;
-  const std::vector<std::pair<HWND, const wchar_t*>>& Released() const { return released_; }
+  const std::vector<SpaceFloat>& Released() const { return released_; }
 
  private:
-  std::vector<std::pair<HWND, const wchar_t*>> released_;
+  std::vector<SpaceFloat> released_;
 };
-
-// After a user command in Automatic mode (Tile Workspace, a layout change, a
-// reorder...): says why windows it tried to tile were floated instead. Overflow
-// keeps that quiet for automatic admission, and Manual mode's arrangement
-// already says which windows need more space.
-static void ReportCommandReleases(
-    const std::vector<std::pair<HWND, const wchar_t*>>& released, HMONITOR monitor) {
-  if (released.empty()) return;
-  std::vector<HWND> cannotFit;
-  bool limitReached = false;
-  for (const auto& [hwnd, reason] : released) {
-    if (reason == Placement::kOverflowCountLimit) limitReached = true;
-    else cannotFit.push_back(hwnd);
-  }
-  const std::wstring message = limitReached ? L"Auto-tiling limit reached" : Placement::NeedMoreSpaceMessage(cannotFit);
-  TrayUi::ShowCommandFailureFlyout(message.c_str(), monitor);
-}
 
 // Tile Workspace (hotkey or tray): reconcile membership and explicitly adopt the
 // user's current geometry. Automatic events never call this with
 // adoptCurrentGeometry=true. Like every user command, the WM thread reports any
-// window it tried to tile but had to float (ReportCommandReleases).
+// window it tried to tile but had to float.
 void TileWindows(HMONITOR monitor = nullptr) {
   ++Diagnostics::g_runtime.counters.tileCommands;
   if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
@@ -598,6 +649,91 @@ void SetCurrentWorkspaceLayout(TileLayout layout, HMONITOR monitor = nullptr) {
       static_cast<int>(layout));
 }
 
+static TileDropZone PickTileDropZone(const RECT& tile, POINT cursor, LONG edgePercent) {
+  if (edgePercent <= 0 || IsRectEmpty(&tile)) return TileDropZone::Center;
+  const double x = static_cast<double>(cursor.x - tile.left) / Layout::RectWidth(tile);
+  const double y = static_cast<double>(cursor.y - tile.top) / Layout::RectHeight(tile);
+  const std::array distances{x, 1.0 - x, y, 1.0 - y};
+  const auto nearest = std::min_element(distances.begin(), distances.end());
+  if (edgePercent < 50 && *nearest >= edgePercent / 100.0) return TileDropZone::Center;
+  constexpr std::array edges{TileDropZone::Left, TileDropZone::Right, TileDropZone::Top, TileDropZone::Bottom};
+  return edges[nearest - distances.begin()];
+}
+
+struct TiledDropFrame {
+  HWND window;
+  RECT frame;
+};
+
+static std::vector<TiledDropFrame> TiledDropFrames(const Workspace& workspace, HWND source) {
+  std::vector<TiledDropFrame> frames;
+  for (HWND window : workspace.TiledWindows()) {
+    if (window == source) continue;
+    RECT frame{};
+    if (Platform::Windows::GetDisplayedWindowFrameRect(window, &frame)) frames.push_back({window, frame});
+  }
+  return frames;
+}
+
+static std::optional<TiledDropTarget> FindTiledDropTarget(
+    const std::vector<TiledDropFrame>& frames, TileLayout layout, POINT cursor) {
+  const LONG edgePercent = layout == TileLayout::Bsp ? g_settings.bspSplitEdgePercent : 0;
+  for (const auto& [window, frame] : frames) {
+    if (PtInRect(&frame, cursor)) return TiledDropTarget{window, PickTileDropZone(frame, cursor, edgePercent)};
+  }
+  return std::nullopt;
+}
+
+// Shared by the preview and the final drop. Only the supplied trial is changed.
+static std::optional<Placement::UserLayoutMutationKind> PrepareTiledDrop(
+    Workspace& candidate, HWND source, const TiledDropTarget& target) {
+  using Kind = Placement::UserLayoutMutationKind;
+  if (candidate.Layout() == TileLayout::Bsp && g_settings.bspSplitEdgePercent > 0 &&
+      candidate.SwapBspSiblingTiles(source, target.window)) {
+    return Kind::Order;
+  }
+  if (target.zone == TileDropZone::Center) {
+    if (candidate.SwapTiled(source, target.window)) return Kind::Order;
+    return std::nullopt;
+  }
+  if (!candidate.MoveBspLeaf(source, target.window)) return std::nullopt;
+
+  const bool horizontal = target.zone == TileDropZone::Left || target.zone == TileDropZone::Right;
+  if (target.zone == TileDropZone::Left || target.zone == TileDropZone::Top) {
+    candidate.SwapTiled(source, target.window);
+  }
+  const BspTree& tree = candidate.Bsp();
+  candidate.SetBspSplitDirection(tree.Parent(tree.FindLeaf(source)), horizontal ? Layout::Axis::X : Layout::Axis::Y);
+  return Kind::BspMerge;
+}
+
+struct TiledDropPreview {
+  RECT dragged;
+  RECT affected;
+};
+
+// Uses cached constraints while the pointer is moving. A drop refreshes native limits.
+static std::optional<TiledDropPreview> PlanTiledDropPreview(
+    const Workspace& workspace, HWND source, const TiledDropTarget& target,
+    const Platform::Monitors::WorkspaceMetrics& metrics) {
+  Workspace candidate = workspace;
+  const auto kind = PrepareTiledDrop(candidate, source, target);
+  if (!kind) return std::nullopt;
+  std::vector<RECT> rects;
+  std::optional<RECT> bspDropEdge;
+  const auto status = *kind == Placement::UserLayoutMutationKind::BspMerge
+      ? PlanBspDrop(candidate, workspace, source, target, metrics, rects, bspDropEdge)
+      : Layout::BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, &rects);
+  const size_t sourceIndex = candidate.TiledIndex(source);
+  const size_t targetIndex = candidate.TiledIndex(target.window);
+  if (status != Layout::LayoutPlanStatus::Success || sourceIndex >= rects.size() || targetIndex >= rects.size() ||
+      IsRectEmpty(&rects[sourceIndex]) || IsRectEmpty(&rects[targetIndex]) ||
+      FindGhostAUserChangeWouldMove(&workspace, candidate, rects, metrics)) {
+    return std::nullopt;
+  }
+  return TiledDropPreview{rects[sourceIndex], rects[targetIndex]};
+}
+
 static void HandleUserMove(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const MoveSizeGesture& gesture) {
@@ -616,35 +752,26 @@ static void HandleUserMove(
     return;
   }
 
-  HWND target = nullptr;
   HWND preferredTiledWindow = nullptr;
-  if (workspace.IsTiled(hwnd) && gesture.hasDropPoint) {
-    for (HWND candidate : workspace.TiledWindows()) {
-      if (candidate == hwnd) continue;
-      RECT rect{};
-      if (Platform::Windows::GetDisplayedWindowFrameRect(candidate, &rect) && PtInRect(&rect, gesture.dropPoint)) {
-        target = candidate;
-        break;
-      }
-    }
-  }
-
+  const auto target = workspace.IsTiled(hwnd) && gesture.hasDropPoint
+      ? FindTiledDropTarget(TiledDropFrames(workspace, hwnd), workspace.Layout(), gesture.dropPoint) : std::nullopt;
   if (target) {
     Workspace candidate = workspace;
-    if (candidate.SwapTiled(hwnd, target) &&
-        AcceptUserLayoutMutation(key, key.ResolveMonitor(), workspace, candidate, hwnd,
-                                 Placement::UserLayoutMutationKind::Order, L"Swap")) {
+    const auto kind = PrepareTiledDrop(candidate, hwnd, *target);
+    const bool merge = kind == Placement::UserLayoutMutationKind::BspMerge;
+    const wchar_t* action = merge ? L"Merge to target tile" : L"Swap";
+    if (kind && AcceptUserLayoutMutation(key, key.ResolveMonitor(), workspace, candidate, hwnd, *kind, action,
+                                         merge ? &*target : nullptr)) {
       workspace = std::move(candidate);
       preferredTiledWindow = hwnd;
       g_workspaces.Save(key, workspace);
-      ++Diagnostics::g_runtime.counters.tiledSwapActions;
-      Wh_Log(L"User move swapped managed windows %p and %p", hwnd, target);
-      Diagnostics::RecordEvent(
-          L"user drag swapped hwnd=%p target=%p", hwnd, target);
+      if (!merge) ++Diagnostics::g_runtime.counters.tiledSwapActions;
+      Wh_Log(L"User drag applied %ls to HWND %p and target %p", action, hwnd, target->window);
+      Diagnostics::RecordEvent(L"user drag hwnd=%p target=%p action=%ls", hwnd, target->window, action);
     }
   }
 
-  // No target means the source remains tiled and simply snaps back to its slot.
+  // An empty drop or a rejected change snaps the source back to its tile.
   Placement::ArrangeWorkspace(key, preferredTiledWindow);
 }
 
@@ -684,6 +811,10 @@ static void HandleUserResize(
     case TileLayout::Dwindle:
       changed = candidate.LearnDwindleResize(
           workArea, gap, resizedIndex, gesture);
+      break;
+
+    case TileLayout::Bsp:
+      changed = candidate.LearnBspResize(workArea, gap, resizedIndex, gesture);
       break;
 
     case TileLayout::Monocle:

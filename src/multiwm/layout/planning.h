@@ -8,7 +8,7 @@ struct AdmissionRecoveryPlan {
   HWND window = nullptr;
   size_t fromIndex = 0;
   size_t toIndex = 0;
-  size_t reassignedWindows = 0;
+  std::vector<RECT> rects;
 };
 
 struct ConstraintCandidate {
@@ -26,16 +26,6 @@ enum class LayoutPlanStatus {
   Unsatisfiable,
 };
 
-// Range of ratios an adaptive Dwindle split may temporarily move to, e.g. 0.35..0.65.
-struct AdaptiveDwindleRatioEnvelope {
-  double minimum = 0.1;
-  double maximum = 0.9;
-
-  // Smallest and largest leading-side size, in pixels, inside this envelope.
-  std::pair<LONG, LONG> SpanBounds(LONG usable) const {
-    return {SplitLeadingSpan(usable, minimum), SplitLeadingSpan(usable, maximum)};
-  }
-};
 
 static std::vector<WindowConstraints> ActiveWindowConstraints(
     const Workspace& workspace) {
@@ -96,22 +86,22 @@ static bool RectsSatisfyWindowConstraints(
   return true;
 }
 
-static bool AutomaticDwindleAdaptationEnabled() {
+static bool AdaptiveSplitsEnabled() {
   return g_settings.adaptiveDwindleSlots > 0 &&
       g_settings.adaptiveDwindlePercentage > 0;
 }
 
-static AdaptiveDwindleRatioEnvelope GetAdaptiveDwindleRatioEnvelope() {
-  const double deviation =
-      static_cast<double>(std::clamp<LONG>(
-          g_settings.adaptiveDwindlePercentage, 0, 40)) /
-      100.0;
-  return {0.5 - deviation, 0.5 + deviation};
+static double GetAdaptiveSplitDeviation() {
+  return std::clamp<LONG>(g_settings.adaptiveDwindlePercentage, 0, 40) / 100.0;
+}
+
+static BspAdaptation GetBspAdaptation() {
+  if (!AdaptiveSplitsEnabled()) return {};
+  return {g_settings.adaptiveDwindleSlots, GetAdaptiveSplitDeviation()};
 }
 
 // Calculate temporary geometry from the saved divider preferences. Only the
 // configured leading splits may adapt; deeper ratios and window order stay fixed.
-// A feasible manual ratio outside the automatic envelope remains unchanged.
 // Never write fitted ratios back to the workspace: removing a constraint should
 // let the divider return to its preferred position. Only a user resize (a drag
 // or a window-size command) saves fitted ratios, by accepting the layout as
@@ -121,7 +111,7 @@ static bool BuildAdaptiveDwindleLayout(
     std::vector<RECT>* outRects,
     std::vector<DwindleSplit>* outSplits = nullptr) {
   if (workspace.Layout() != TileLayout::Dwindle || workspace.ActiveCount() < 2 ||
-      !AutomaticDwindleAdaptationEnabled()) {
+      !AdaptiveSplitsEnabled()) {
     return false;
   }
 
@@ -131,8 +121,7 @@ static bool BuildAdaptiveDwindleLayout(
   const size_t adaptiveSplitCount =
       std::min(g_settings.adaptiveDwindleSlots, ratios.size());
   if (adaptiveSplitCount == 0) return false;
-  const AdaptiveDwindleRatioEnvelope adaptiveEnvelope =
-      GetAdaptiveDwindleRatioEnvelope();
+  const double adaptiveDeviation = GetAdaptiveSplitDeviation();
 
   std::vector<SIZE> windowMinimums(windows.size(), SIZE{1, 1});
   for (size_t i = 0; i < constraints.size(); ++i) {
@@ -149,16 +138,13 @@ static bool BuildAdaptiveDwindleLayout(
       const LONG usable = UsableSplitSpan(span, gap);
       if (usable < 2) return false;
 
-      // A manually chosen ratio outside the adaptive envelope remains a legal
-      // no-op if it already satisfies both sides. Only a ratio we actually need
-      // to change must land inside the configured symmetric envelope.
       const LONG currentAllocated = SplitLeadingSpan(usable, fixedRatio);
       if (currentAllocated >= first && usable - currentAllocated >= tail) {
         return true;
       }
       if (!adaptive) return false;
 
-      const auto [minimumAdaptive, maximumAdaptive] = adaptiveEnvelope.SpanBounds(usable);
+      const auto [minimumAdaptive, maximumAdaptive] = AdaptiveSplitSpanBounds(usable, fixedRatio, adaptiveDeviation);
       const LONG lower = std::max(first, minimumAdaptive);
       const LONG upper = std::min(usable - tail, maximumAdaptive);
       return lower <= upper;
@@ -180,7 +166,7 @@ static bool BuildAdaptiveDwindleLayout(
 
   // Minimum extent of each recursive tail. Fixed descendants preserve their
   // current ratios; adaptive descendants contribute only the space they need
-  // somewhere inside the configured adaptive ratio envelope.
+  // within the permitted distance from their saved ratios.
   std::vector<SIZE> subtreeMinimums = windowMinimums;
   for (size_t splitIndex = windows.size() - 1; splitIndex-- > 0;) {
     const SIZE first = windowMinimums[splitIndex];
@@ -189,7 +175,7 @@ static bool BuildAdaptiveDwindleLayout(
         std::max(first.cx, tail.cx),
         std::max(first.cy, tail.cy)};
     const bool adaptive = splitIndex < adaptiveSplitCount;
-    if ((splitIndex % 2) == 0) {
+    if (AlternatingAxis(FirstSplitAxis(workArea), splitIndex) == Axis::X) {
       combined.cx = requiredSpan(first.cx, tail.cx, splitIndex, adaptive);
     } else {
       combined.cy = requiredSpan(first.cy, tail.cy, splitIndex, adaptive);
@@ -206,7 +192,7 @@ static bool BuildAdaptiveDwindleLayout(
   std::vector<DwindleSplit> splits;
   RECT remaining = workArea;
   for (size_t splitIndex = 0; splitIndex < adaptiveSplitCount; ++splitIndex) {
-    const bool vertical = (splitIndex % 2) == 0;
+    const bool vertical = AlternatingAxis(FirstSplitAxis(workArea), splitIndex) == Axis::X;
     const LONG span = vertical ? RectWidth(remaining) : RectHeight(remaining);
     if (span < 2) return false;
     const LONG usable = UsableSplitSpan(span, gap);
@@ -221,7 +207,8 @@ static bool BuildAdaptiveDwindleLayout(
     const LONG desired = SplitLeadingSpan(usable, ClampSplitRatio(ratios[splitIndex]));
     LONG firstSpan = desired;
     if (desired < firstMinimum || usable - desired < tailMinimum) {
-      const auto [minimumAdaptive, maximumAdaptive] = adaptiveEnvelope.SpanBounds(usable);
+      const auto [minimumAdaptive, maximumAdaptive] =
+          AdaptiveSplitSpanBounds(usable, ratios[splitIndex], adaptiveDeviation);
       const LONG lower = std::max(firstMinimum, minimumAdaptive);
       const LONG upper = std::min(usable - tailMinimum, maximumAdaptive);
       if (lower > upper) return false;
@@ -230,7 +217,7 @@ static bool BuildAdaptiveDwindleLayout(
     ratios[splitIndex] = static_cast<double>(firstSpan) / usable;
     LayoutDwindle(
         workArea, gap, 0, windows.size(), ratios,
-        g_settings.reverseDwindle, rects, &splits);
+        g_settings.reverseDwindle, FirstSplitAxis(workArea), rects, &splits);
     if (splitIndex >= splits.size()) return false;
     remaining = splits[splitIndex].remaining;
   }
@@ -258,7 +245,11 @@ static void PlanPreferredCells(
     LayoutGridWeighted(workArea, gap, count, *outRects, LayoutAxis(layout), workspace.GridWeights());
   } else if (layout == TileLayout::Dwindle) {
     LayoutDwindle(workArea, gap, 0, count, workspace.DwindleRatios(),
-                  g_settings.reverseDwindle, *outRects, outSplits);
+                  g_settings.reverseDwindle, FirstSplitAxis(workArea), *outRects, outSplits);
+  } else if (layout == TileLayout::Bsp) {
+    BspLayoutResult bsp;
+    LayoutBsp(workspace.Bsp(), workspace.TiledWindows(), workArea, gap, &bsp);
+    *outRects = std::move(bsp.rects);
   } else {  // Monocle
     outRects->assign(count, workArea);
   }
@@ -267,8 +258,8 @@ static void PlanPreferredCells(
 // Planning step 2: re-solves with the windows' native minimums (`constraints`,
 // in tiled order) as hard limits. Saved preferences are not changed, so
 // dividers return once room is available. False when nothing fits: Grid and
-// Master + Stack may then leave partial output in `outRects`; Dwindle leaves it
-// unchanged. `outWeightPerPixel` (optional) receives the Grid or Master + Stack
+// Master + Stack may then leave partial output in `outRects`; Dwindle and BSP
+// leave it unchanged. `outWeightPerPixel` (optional) receives the Grid or Master + Stack
 // allocation's weight scale; `outSplits` is as for PlanPreferredCells.
 static bool PlanConstrainedCells(
     const Workspace& workspace, const RECT& workArea, LONG gap,
@@ -287,16 +278,26 @@ static bool PlanConstrainedCells(
   if (layout == TileLayout::Dwindle) {
     return BuildAdaptiveDwindleLayout(workspace, workArea, gap, outRects, outSplits);
   }
+  if (layout == TileLayout::Bsp) {
+    BspLayoutResult bsp;
+    if (!FitBspLayout(workspace.Bsp(), workspace.TiledWindows(), workArea, gap, constraints,
+                      GetBspAdaptation(), &bsp)) {
+      return false;
+    }
+    *outRects = std::move(bsp.rects);
+    return true;
+  }
   return LayoutMonocleConstrained(workArea, constraints, outRects);  // Monocle
 }
 
 // Uses cached constraints to calculate physical screen rectangles without native
 // window queries or workspace mutation. Output is usable only on Success; other
 // outcomes may leave partial geometry, which callers must discard. Every call
-// counts toward the layoutPlansBuilt diagnostic.
+// counts toward the layoutPlansBuilt diagnostic. Skip maximum-size centering
+// when a caller needs the full tile bounds.
 static LayoutPlanStatus BuildWorkspaceLayoutPlan(
     const Workspace& workspace, const RECT& workArea, LONG gap,
-    std::vector<RECT>* outRects) {
+    std::vector<RECT>* outRects, bool centerCappedWindows = true) {
   ++Diagnostics::g_runtime.counters.layoutPlansBuilt;
   if (!outRects) return LayoutPlanStatus::Unsatisfiable;
   const TileLayout layout = workspace.Layout();
@@ -305,16 +306,67 @@ static LayoutPlanStatus BuildWorkspaceLayoutPlan(
     return LayoutPlanStatus::NotApplicable;
   }
 
-  // Every successful plan ends by centring capped windows: maximum sizes never
-  // change other windows' cells, only where a capped window sits inside its own.
+  // Maximum sizes affect where a capped window sits inside its cell.
   PlanPreferredCells(workspace, workArea, gap, outRects);
   const std::vector<WindowConstraints> constraints = ActiveWindowConstraints(workspace);
   if (!RectsSatisfyWindowConstraints(*outRects, constraints) &&
       !PlanConstrainedCells(workspace, workArea, gap, constraints, outRects)) {
     return LayoutPlanStatus::Unsatisfiable;
   }
-  CenterWithinMaximumSizes(*outRects, constraints);
+  if (centerCappedWindows) CenterWithinMaximumSizes(*outRects, constraints);
   return LayoutPlanStatus::Success;
+}
+
+struct BspMergeDestination {
+  HWND window;
+  RECT originalEdge;
+};
+
+// Turns BSP split `node` the other way. A direction that matches its depth's
+// default is stored as no direction, so the depth rule applies again.
+static void TurnBspSplit(Workspace& workspace, size_t node, const RECT& workArea) {
+  const BspTree& tree = workspace.Bsp();
+  size_t depth = 0;
+  for (size_t parent = tree.Parent(node); parent != BspTree::kNotFound; parent = tree.Parent(parent)) ++depth;
+  const Axis defaultDirection = AlternatingAxis(FirstSplitAxis(workArea), depth);
+  const Axis alternate = tree.Nodes()[node].direction.value_or(defaultDirection) == Axis::X ? Axis::Y : Axis::X;
+  workspace.SetBspSplitDirection(node, alternate == defaultDirection ? std::nullopt : std::optional{alternate});
+}
+
+// A new admission can try the perpendicular direction. An explicit edge drop
+// keeps its direction and must overlap the requested edge of the original tile.
+static LayoutPlanStatus PlanWithNewBspSplitFallback(
+    Workspace& workspace, const RECT& workArea, LONG gap, std::vector<RECT>* outRects,
+    std::optional<BspMergeDestination> merge = std::nullopt) {
+  const size_t draggedIndex = merge ? workspace.TiledIndex(merge->window) : Workspace::kNotFound;
+  auto plan = [&](const Workspace& candidate, std::vector<RECT>* rects) {
+    const auto status = BuildWorkspaceLayoutPlan(candidate, workArea, gap, rects, !merge);
+    if (status != LayoutPlanStatus::Success || !merge) return status;
+    if (draggedIndex >= rects->size()) return LayoutPlanStatus::Unsatisfiable;
+    const RECT& draggedTile = (*rects)[draggedIndex];
+    RECT intersection{};
+    if (!IntersectRect(&intersection, &draggedTile, &merge->originalEdge)) {
+      return LayoutPlanStatus::Unsatisfiable;
+    }
+    CenterWithinMaximumSizes(*rects, ActiveWindowConstraints(candidate));
+    return status;
+  };
+  const auto status = plan(workspace, outRects);
+  if (merge || !outRects || workspace.Layout() != TileLayout::Bsp || status == LayoutPlanStatus::Success) return status;
+
+  const BspTree& tree = workspace.Bsp();
+  for (size_t i = tree.Nodes().size(); i-- > 0;) {
+    if (!workspace.IsTiled(tree.Nodes()[i].pendingDirectionWindow)) continue;
+
+    Workspace trial = workspace;
+    TurnBspSplit(trial, i, workArea);
+    std::vector<RECT> fitted;
+    if (plan(trial, &fitted) != LayoutPlanStatus::Success) continue;
+    workspace = std::move(trial);
+    *outRects = std::move(fitted);
+    return LayoutPlanStatus::Success;
+  }
+  return LayoutPlanStatus::Unsatisfiable;
 }
 
 static HWND FindConstraintCulprit(
@@ -337,8 +389,8 @@ static HWND FindConstraintCulprit(
 
 // For each window, lists the slots it fits (see WindowConstraintFitsSlot).
 // With preferNearbySlots, each list is ordered closest-to-current-position first.
-// Admission recovery and conflict reporting share this and the augmenting-path
-// matcher below, so diagnostics cannot disagree with the solver.
+// Dwindle layout conversion and conflict reporting share this and the
+// augmenting-path matcher below.
 static ConstraintSlotCompatibility BuildConstraintSlotCompatibility(
     const std::vector<WindowConstraints>& constraints,
     const std::vector<RECT>& slots, bool preferNearbySlots) {
@@ -481,9 +533,9 @@ struct DwindleSearchKeyHash {
 // Splits `area` for Dwindle slot `slotIndex` with an explicit leading size.
 // False when the split is impossible or leaves no room for the remaining slots.
 static bool SplitDwindleSlot(
-    const RECT& area, size_t slotIndex, LONG firstSpan, LONG gap, RECT* first, RECT* remaining) {
+    const RECT& area, size_t slotIndex, Axis firstAxis, LONG firstSpan, LONG gap, RECT* first, RECT* remaining) {
   if (!first || !remaining) return false;
-  const bool vertical = (slotIndex % 2) == 0;
+  const bool vertical = AlternatingAxis(firstAxis, slotIndex) == Axis::X;
   const LONG span = vertical ? RectWidth(area) : RectHeight(area);
   if (span < 2) return false;
   const LONG usable = UsableSplitSpan(span, gap);
@@ -498,7 +550,7 @@ static bool SplitDwindleSlot(
 // slots of `desiredOrder` and returns true; on failure `desiredOrder` may hold
 // partial assignments that the caller discards.
 static bool MatchDwindleTail(
-    size_t slotIndex, const RECT& area, LONG gap,
+    size_t slotIndex, const RECT& area, LONG gap, Axis firstAxis,
     const std::vector<HWND>& windows, const std::vector<WindowConstraints>& constraints,
     const std::vector<double>& ratios, const std::vector<bool>& used,
     std::vector<HWND>* desiredOrder) {
@@ -514,7 +566,7 @@ static bool MatchDwindleTail(
   if (remainingWindows.size() != tailCount) return false;
 
   std::vector<RECT> allSlots(count);
-  LayoutDwindle(area, gap, slotIndex, tailCount, ratios, g_settings.reverseDwindle, allSlots);
+  LayoutDwindle(area, gap, slotIndex, tailCount, ratios, g_settings.reverseDwindle, firstAxis, allSlots);
   std::vector<RECT> tailSlots(allSlots.begin() + slotIndex, allSlots.end());
   std::vector<WindowConstraints> tailConstraints;
   tailConstraints.reserve(tailCount);
@@ -570,14 +622,14 @@ static bool ReassignDwindleLayoutConversionForConstraints(
   const std::vector<double> ratios = workspace.DwindleRatios();
   const size_t count = windows.size();
   if (constraints.size() != count || ratios.size() + 1 < count) return false;
+  const Axis firstAxis = FirstSplitAxis(workArea);
 
-  const size_t adaptiveSplitCount = AutomaticDwindleAdaptationEnabled()
+  const size_t adaptiveSplitCount = AdaptiveSplitsEnabled()
       ? std::min(
             g_settings.adaptiveDwindleSlots,
             count > 0 ? count - 1 : size_t{0})
       : 0;
-  const AdaptiveDwindleRatioEnvelope adaptiveEnvelope =
-      GetAdaptiveDwindleRatioEnvelope();
+  const double adaptiveDeviation = GetAdaptiveSplitDeviation();
   std::vector<bool> used(count, false);
   std::vector<HWND> desiredOrder(count, nullptr);
   uint64_t usedMask = 0;
@@ -604,12 +656,12 @@ static bool ReassignDwindleLayoutConversionForConstraints(
 
     if (slotIndex >= adaptiveSplitCount || slotIndex + 1 >= count) {
       const bool matched = MatchDwindleTail(
-          slotIndex, area, gap, windows, constraints, ratios, used, &desiredOrder);
+          slotIndex, area, gap, firstAxis, windows, constraints, ratios, used, &desiredOrder);
       if (!matched && canMemoize) deadStates.insert(key);
       return matched;
     }
 
-    const bool vertical = (slotIndex % 2) == 0;
+    const bool vertical = AlternatingAxis(firstAxis, slotIndex) == Axis::X;
     const LONG span = vertical ? RectWidth(area) : RectHeight(area);
     if (span < 2) {
       if (canMemoize) deadStates.insert(key);
@@ -620,8 +672,7 @@ static bool ReassignDwindleLayoutConversionForConstraints(
       if (canMemoize) deadStates.insert(key);
       return false;
     }
-    const auto [minimumAdaptive, maximumAdaptive] = adaptiveEnvelope.SpanBounds(usable);
-    const LONG currentSpan = SplitLeadingSpan(usable, ClampSplitRatio(ratios[slotIndex]));
+    const auto [minimumAdaptive, maximumAdaptive] = AdaptiveSplitSpanBounds(usable, ratios[slotIndex], adaptiveDeviation);
 
     std::vector<size_t> candidates;
     candidates.reserve(count - slotIndex);
@@ -636,23 +687,12 @@ static bool ReassignDwindleLayoutConversionForConstraints(
           ? std::max<LONG>(
                 1, vertical ? constraint.minWidth : constraint.minHeight)
           : 1;
-      LONG firstSpan = usable;
-      if (currentSpan >= primaryMinimum) {
-        // Keeping the current manual ratio is always allowed, even when it lies
-        // outside the automatic envelope.
-        firstSpan = currentSpan;
-      }
-      const LONG adaptiveSpan = std::max(primaryMinimum, minimumAdaptive);
-      if (adaptiveSpan <= maximumAdaptive) {
-        // The smallest permitted automatic span maximizes the recursive tail;
-        // with minimum-only constraints this is never worse for continuation.
-        firstSpan = std::min(firstSpan, adaptiveSpan);
-      }
-      if (firstSpan >= usable) continue;
+      const LONG firstSpan = std::max(primaryMinimum, minimumAdaptive);
+      if (firstSpan > maximumAdaptive) continue;
 
       RECT first{};
       RECT remaining{};
-      if (!SplitDwindleSlot(area, slotIndex, firstSpan, gap, &first, &remaining) ||
+      if (!SplitDwindleSlot(area, slotIndex, firstAxis, firstSpan, gap, &first, &remaining) ||
           !WindowConstraintFitsSlot(constraint, first)) {
         continue;
       }
@@ -746,76 +786,7 @@ static bool TryReorderForConstraints(
     *outWorkspace = std::move(trial);
     return true;
   }
-  return false;  // Grid and Monocle feasibility does not depend on order.
-}
-
-// Dwindle geometry belongs to slots, not applications. During admission only,
-// assign every active window to a compatible existing slot before concluding
-// that one must float. The new window stays in the candidate slot, and an
-// explicit user-mutation subject stays put.
-static bool ReassignPendingDwindleAdmissionForConstraints(
-    Workspace& workspace, const std::vector<RECT>& slots,
-    HWND pendingAdmission, HWND fixedWindow, size_t* outMovedWindowCount) {
-  if (workspace.Layout() != TileLayout::Dwindle ||
-      slots.size() != workspace.ActiveCount()) {
-    return false;
-  }
-
-  const WindowRecord* pendingRecord = workspace.Find(pendingAdmission);
-  const size_t pendingWindowIndex = workspace.TiledIndex(pendingAdmission);
-  if (!pendingRecord || !pendingRecord->pendingInsertionPlacement ||
-      pendingWindowIndex >= workspace.ActiveCount()) {
-    return false;
-  }
-
-  const std::vector<HWND> windows = workspace.TiledWindows();
-  const std::vector<WindowConstraints> constraints =
-      ActiveWindowConstraints(workspace);
-  const size_t count = windows.size();
-  const ConstraintSlotCompatibility compatibility =
-      BuildConstraintSlotCompatibility(constraints, slots, true);
-  for (const auto& compatibleSlots : compatibility.slotsByWindow) {
-    if (compatibleSlots.empty()) return false;
-  }
-
-  std::vector<size_t> slotOwner(count, kUnassignedSlot);
-  std::vector<bool> fixed(count, false);
-  auto pinWindow = [&](size_t windowIndex, size_t slotIndex) {
-    if (windowIndex >= count || slotIndex >= count ||
-        slotOwner[slotIndex] != kUnassignedSlot ||
-        !IsCompatibleSlot(compatibility, windowIndex, slotIndex)) {
-      return false;
-    }
-    slotOwner[slotIndex] = windowIndex;
-    fixed[windowIndex] = true;
-    return true;
-  };
-
-  if (!pinWindow(pendingWindowIndex, pendingWindowIndex)) return false;
-  const size_t fixedWindowIndex = workspace.TiledIndex(fixedWindow);
-  if (fixedWindow && fixedWindow != pendingAdmission &&
-      !pinWindow(fixedWindowIndex, fixedWindowIndex)) {
-    return false;
-  }
-
-  // Seed every compatible current placement. Starting with empty slots allowed
-  // later flexible windows to evict earlier ones and shuffle the whole order.
-  for (size_t i = 0; i < count; ++i) {
-    if (!fixed[i] && slotOwner[i] == kUnassignedSlot && IsCompatibleSlot(compatibility, i, i)) {
-      slotOwner[i] = i;
-    }
-  }
-  if (!CompleteSlotMatching(compatibility, slotOwner, fixed)) return false;
-
-  std::vector<HWND> desiredOrder(count);
-  size_t movedWindowCount = 0;
-  for (size_t slotIndex = 0; slotIndex < count; ++slotIndex) {
-    desiredOrder[slotIndex] = windows[slotOwner[slotIndex]];
-    if (desiredOrder[slotIndex] != windows[slotIndex]) ++movedWindowCount;
-  }
-  if (!ApplyTiledWindowOrder(workspace, desiredOrder)) return false;
-  if (outMovedWindowCount) *outMovedWindowCount = movedWindowCount;
-  return movedWindowCount > 0;
+  return false;  // Grid, Monocle and BSP (which never reorders) don't depend on order.
 }
 
 // Calls `tryIndex` with each index in [0, count) other than `origin`, nearest
@@ -830,82 +801,90 @@ static bool TryNearbyIndices(size_t origin, size_t count, TryIndex&& tryIndex) {
   return false;
 }
 
+// Moves BSP arrival `arrival` from the tile it split to a split of the largest
+// other tile, measured without the arrival. False, changing nothing, when that
+// is the tile it already split (MoveBspLeaf refuses its sibling) or there is
+// none. The new split may still turn (PlanWithNewBspSplitFallback).
+static bool MoveBspArrivalToLargestTile(Workspace& workspace, HWND arrival) {
+  BspTree without = workspace.Bsp();
+  without.Remove(arrival);
+  const HWND largest = without.LargestLeaf([&](HWND window) { return window != arrival && workspace.IsTiled(window); });
+  return largest && workspace.MoveBspLeaf(arrival, largest, true);
+}
+
+// BSP's fallback for an arrival that fits neither direction of the tile it
+// split (the focused or the largest): the largest other tile, once, in either
+// direction. When that tile is the one it already split, or doesn't fit
+// either, the window floats. Same contract as TryRecoverPendingAdmission.
+static bool TryRecoverPendingBspAdmission(
+    const Workspace& workspace, const RECT& workArea, LONG gap,
+    const std::vector<ConstraintCandidate>& candidates, HWND preferredTiledWindow,
+    AdmissionRecoveryPlan* outPlan) {
+  for (const ConstraintCandidate& candidate : candidates) {
+    const WindowRecord* record = workspace.Find(candidate.hwnd);
+    if (!record || !record->pendingInsertionPlacement || candidate.hwnd == preferredTiledWindow ||
+        !workspace.IsTiled(candidate.hwnd)) {
+      continue;
+    }
+    Workspace trial = workspace;
+    std::vector<RECT> rects;
+    if (!MoveBspArrivalToLargestTile(trial, candidate.hwnd) ||
+        PlanWithNewBspSplitFallback(trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
+      continue;
+    }
+    const size_t fromIndex = workspace.TiledIndex(candidate.hwnd);
+    const size_t toIndex = trial.TiledIndex(candidate.hwnd);
+    *outPlan = {std::move(trial), candidate.hwnd, fromIndex, toIndex, std::move(rects)};
+    return true;
+  }
+  return false;
+}
+
 // Precondition: the current order already failed its ordinary layout plan.
-// Search caller-prioritized candidates without changing the input workspace or
-// querying/placing windows. Failure also leaves outPlan untouched. Successful
-// trials are committed by ArrangeWorkspace only after preserving rollback state.
+// Search nearby slots for each pending admission, preserving the other windows' order.
+// BSP tries the largest other tile instead (TryRecoverPendingBspAdmission).
+// The input workspace and native windows are untouched.
+// A failed search leaves outPlan untouched. ArrangeWorkspace commits a
+// successful trial after preserving rollback state.
 static bool TryRecoverPendingAdmission(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     const std::vector<ConstraintCandidate>& candidates, HWND preferredTiledWindow,
     AdmissionRecoveryPlan* outPlan) {
-  // Planning already tried temporary divider fitting at the configured
-  // position. Try nearby slots before allowing broader sibling reassignment.
   const TileLayout layout = workspace.Layout();
-  const bool searchAlternateInsertion =
-      IsMasterStackLayout(layout) || IsGridLayout(layout) || layout == TileLayout::Dwindle;
-  const size_t preferredTiledIndex =
-      workspace.TiledIndex(preferredTiledWindow);
-  AdmissionRecoveryPlan plan;
+  if (layout == TileLayout::Bsp) {
+    return TryRecoverPendingBspAdmission(workspace, workArea, gap, candidates, preferredTiledWindow, outPlan);
+  }
+  if (!IsMasterStackLayout(layout) && !IsGridLayout(layout) && layout != TileLayout::Dwindle) return false;
 
-  // First try nearby slots without moving established siblings. Dwindle
-  // alone gets a second pass that may reassign compatible siblings; that
-  // pass tries nearby slots before retrying the admission's original slot.
-  if (searchAlternateInsertion) {
-    for (bool reassignSiblings : {false, true}) {
-      if (reassignSiblings && layout != TileLayout::Dwindle) break;
-      for (const ConstraintCandidate& candidate : candidates) {
-        const WindowRecord* record = workspace.Find(candidate.hwnd);
-        if (!record || !record->pendingInsertionPlacement ||
-            candidate.hwnd == preferredTiledWindow) {
-          continue;
-        }
+  const size_t preferredTiledIndex = workspace.TiledIndex(preferredTiledWindow);
+  for (const ConstraintCandidate& candidate : candidates) {
+    const WindowRecord* record = workspace.Find(candidate.hwnd);
+    if (!record || !record->pendingInsertionPlacement || candidate.hwnd == preferredTiledWindow) {
+      continue;
+    }
 
-        const size_t currentIndex = workspace.TiledIndex(candidate.hwnd);
-        if (currentIndex >= workspace.ActiveCount()) continue;
+    const size_t currentIndex = workspace.TiledIndex(candidate.hwnd);
+    if (currentIndex >= workspace.ActiveCount()) continue;
 
-        auto tryInsertionIndex = [&](size_t targetIndex) {
-          Workspace trial = workspace;
-          if (targetIndex != currentIndex &&
-              !trial.MovePendingAdmissionToIndex(candidate.hwnd, targetIndex)) {
-            return false;
-          }
-          if (preferredTiledIndex < workspace.ActiveCount() &&
-              trial.TiledIndex(preferredTiledWindow) != preferredTiledIndex) {
-            return false;
-          }
-
-          std::vector<RECT> trialRects;
-          LayoutPlanStatus trialStatus = BuildWorkspaceLayoutPlan(
-              trial, workArea, gap, &trialRects);
-          size_t movedWindowCount = 0;
-          if (trialStatus != LayoutPlanStatus::Success) {
-            if (!reassignSiblings ||
-                !ReassignPendingDwindleAdmissionForConstraints(
-                    trial, trialRects, candidate.hwnd,
-                    preferredTiledWindow, &movedWindowCount)) {
-              return false;
-            }
-            trialStatus = BuildWorkspaceLayoutPlan(
-                trial, workArea, gap, &trialRects);
-            if (trialStatus != LayoutPlanStatus::Success) return false;
-          }
-          plan.workspace = std::move(trial);
-          plan.window = candidate.hwnd;
-          plan.fromIndex = currentIndex;
-          plan.toIndex = targetIndex;
-          plan.reassignedWindows = movedWindowCount;
-          return true;
-        };
-
-        TryNearbyIndices(currentIndex, workspace.ActiveCount(), tryInsertionIndex);
-        if (!plan.window && reassignSiblings) {
-          tryInsertionIndex(currentIndex);
-        }
-        if (plan.window) {
-          *outPlan = std::move(plan);
-          return true;
-        }
+    auto trySlot = [&](size_t targetIndex) {
+      Workspace trial = workspace;
+      const bool moved = trial.MovePendingAdmissionToIndex(candidate.hwnd, targetIndex);
+      if (!moved || (preferredTiledIndex < workspace.ActiveCount() &&
+                     trial.TiledIndex(preferredTiledWindow) != preferredTiledIndex)) {
+        return false;
       }
+
+      std::vector<RECT> trialRects;
+      if (PlanWithNewBspSplitFallback(trial, workArea, gap, &trialRects) != LayoutPlanStatus::Success) {
+        return false;
+      }
+      const size_t newIndex = trial.TiledIndex(candidate.hwnd);
+      *outPlan = {std::move(trial), candidate.hwnd, currentIndex, newIndex, std::move(trialRects)};
+      return true;
+    };
+
+    if (TryNearbyIndices(currentIndex, workspace.ActiveCount(), trySlot)) {
+      return true;
     }
   }
 

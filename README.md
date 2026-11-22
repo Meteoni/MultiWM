@@ -57,11 +57,12 @@ glossary, and testing.
 - Floating
 - Master + Stack (vertical or horizontal)
 - Dwindle
+- BSP (new and restored windows split the focused or biggest tile, trying both directions, then the biggest tile, before floating; closing or minimizing a window gives its space to its neighbour)
 - Columns / Rows
 - Monocle
 
 ## Getting Started
-Move a tiled window to **float it** or **swap it with the window underneath**. 
+Move a tiled window to **float it** or **swap it with the window underneath**. In BSP, drop near an edge to split the target tile in that direction, or in the center to swap. Adaptive dividers can make room as long as the dragged pane overlaps the requested edge of the original tile. The preview fills the destination of the dragged window and outlines the destination of the other window. When a drop would snap the dragged window back, both shapes mark its original tile. Adjust **BSP Split Edge Size** under Window Behavior and customize the hint under **Appearance > Drag Preview** in Windhawk. With edge zones enabled, windows that share a divider swap sides and carry their weights.
 
 By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
 moving windows through the logical order (Alt+, / .), resizing the focused window (Alt+= / - / 0), floating a

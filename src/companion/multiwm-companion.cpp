@@ -76,6 +76,7 @@ Enable logging for this mod in Windhawk to see each placement decision.
 
 // Shared with MultiWM (src/multiwm/multiwm.cpp): rule matching and the snapshot ABI.
 #include "../shared/window_rules.h"
+#include "../shared/split_geometry.h"
 #include "../shared/companion_snapshot.h"
 #include "../shared/geometry.h"
 

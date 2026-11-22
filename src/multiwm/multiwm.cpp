@@ -40,11 +40,12 @@ continuous polling.
 - Floating
 - Master + Stack (vertical or horizontal)
 - Dwindle
+- BSP (new and restored windows split the focused or biggest tile, trying both directions, then the biggest tile, before floating; closing or minimizing a window gives its space to its neighbour)
 - Columns / Rows
 - Monocle
 
 ## Getting Started
-Move a tiled window to **float it** or **swap it with the window underneath**. 
+Move a tiled window to **float it** or **swap it with the window underneath**. In BSP, drop near an edge to split the target tile or in the center to swap. The preview fills the destination of the dragged window and outlines the destination of the other window.
 
 By default, hotkeys are available for tiling (Alt+T), changing layouts (Alt+L), setting the master window (Alt+M),
 moving windows through the logical order (Alt+, / .), resizing the focused window (Alt+= / - / 0),
@@ -77,10 +78,10 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       - automatic: Automatic
   - AutomaticNewWindowPosition: last_slot
     $name: Automatic Window Insertion Position
-    $description: Preferred position for new or moved windows in Automatic mode. Tries another position if needed.
+    $description: Where new or moved windows are tiled in Automatic mode. BSP tries both split directions in the selected tile, then in the biggest tile, before floating the window. If there is no focused tile, BSP starts with the biggest tile.
     $options:
-      - last_slot: Last slot
-      - after_focused: After focused window
+      - last_slot: Last slot / Biggest tile (BSP)
+      - after_focused: After focused / Focused tile (BSP)
   - TrayClickAction: cycle_layout
     $name: Tray Icon Click
     $description: Action when the tray icon is left-clicked.
@@ -99,9 +100,10 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       - columns: Columns
       - rows: Rows
       - dwindle: Dwindle
+      - bsp: BSP
       - monocle: Monocle (Fullscreen)
       - floating: Floating (No tiling)
-  - LayoutCycle: [master_stack, master_stack_h, dwindle, columns, rows, monocle, floating]
+  - LayoutCycle: [master_stack, master_stack_h, dwindle, columns, rows, monocle, floating, bsp]
     $name: Layout Cycle
     $description: Layouts used by Cycle Layout, in this order.
     $options:
@@ -110,6 +112,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       - columns: Columns
       - rows: Rows
       - dwindle: Dwindle
+      - bsp: BSP
       - monocle: Monocle (Fullscreen)
       - floating: Floating (No tiling)
   - InitializationRules:
@@ -123,6 +126,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
             - columns: Columns
             - rows: Rows
             - dwindle: Dwindle
+            - bsp: BSP
             - monocle: Monocle (Fullscreen)
             - floating: Floating (No tiling)
         - DesktopNameContains: ""
@@ -156,7 +160,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       $description: Maximum tiled windows per monitor on each desktop. 0 means unlimited.
     - Action: float
       $name: Overflow Action
-      $description: Applies when tiled windows exceed the limit or cannot fit. Created virtual desktops stay after their windows close or MultiWM is turned off.
+      $description: Applies when tiled windows exceed the limit or cannot fit. BSP uses Float window and can try other monitors on the current desktop when enabled. A new or returning BSP window floats in place if neither its tile nor the biggest one can fit it. Created virtual desktops stay after their windows close or MultiWM is turned off.
       $options:
         - float: Float window
         - new_desktop: New desktop after current
@@ -200,19 +204,19 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     $description: Starting screen share for the main window in Master + Stack layouts (1-99%).
   - ReverseDwindle: false
     $name: Reverse Dwindle
-    $description: Grow the Dwindle layout from the top-left instead of the bottom-right.
+    $description: Grow the Dwindle layout from the top-left instead of the bottom-right. BSP ignores this setting.
   - AdaptiveDwindleSlots: 2
-    $name: Adaptive Dwindle Slots
+    $name: Adaptive Split Depth
     #! $min: 0
     #! $max: 64
-    $description: How many splits can temporarily adjust to fit windows (0-64). Splits return when the extra space is no longer needed, unless you resize a window first; resizing keeps the layout as shown. 0 keeps all splits fixed.
+    $description: Number of split levels in Dwindle and BSP that can temporarily adjust to fit windows (0-64), starting from the first split. Splits return when the extra space is no longer needed, unless you resize a window first. Resizing keeps the layout as shown. 0 keeps all splits fixed.
   - AdaptiveDwindlePercentage: 15
-    $name: Adaptive Dwindle Percentage
+    $name: Adaptive Split Percentage
     #! $min: 0
     #! $max: 40
     #! $format: slider
     #! $hideIf: {AdaptiveDwindleSlots: 0}
-    $description: How far splits may move from the middle (0-40). 15 allows 35%-65%. 0 disables adjustment.
+    $description: How far an adaptive split may move from its saved position, in percentage points (0-40). New dividers start at 50%. For an 80% divider, 15 allows 65%-90% after applying the 10%-90% ratio limits. 0 disables adjustment.
   $name: Workspace
 
 - appearance:
@@ -234,6 +238,36 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     $name: Toast Vertical Offset (DPI-scaled pixels)
     #! $showIf: {ShowToasts: true}
     $description: Move messages up or down. Positive values move down.
+  - DragPreview:
+    - FillOpacity: 25
+      $name: Fill Opacity (%)
+      #! $min: 0
+      #! $max: 100
+      #! $format: slider
+      $description: Opacity of the filled destination for the dragged window. Set to 0 to hide the fill.
+    - OutlineOpacity: 100
+      $name: Outline Opacity (%)
+      #! $min: 0
+      #! $max: 100
+      #! $format: slider
+      $description: Opacity of the outline for the other window. Set to 0 to hide the outline.
+    - OutlineWidth: 4
+      $name: Outline Width (DPI-scaled pixels)
+      #! $min: 1
+      #! $max: 20
+      $description: Thickness of the outline (1-20).
+    - OutlineCornerRadius: 8
+      $name: Outline Corner Radius (DPI-scaled pixels)
+      #! $min: 0
+      #! $max: 32
+      $description: Outer corner radius (0-32). The inner radius is reduced by the outline width. Set to 0 for square corners.
+    - FadeDurationMs: 96
+      $name: Fade Duration (ms)
+      #! $min: 0
+      #! $max: 500
+      $description: Time for the preview to appear, disappear, or fade in at a new destination (0-500). Set to 0 for instant changes.
+    $name: Drag Preview
+    $description: Preview a tiled window drag when Tiled Window Drag Action is set to swap.
   - CustomIcons:
       - - Layout: master_stack
           $name: Layout
@@ -243,6 +277,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
             - columns: Columns
             - rows: Rows
             - dwindle: Dwindle
+            - bsp: BSP
             - monocle: Monocle
             - floating: Floating
         - Path: ""
@@ -270,7 +305,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     $description: Switch to the next layout. Blank disables this shortcut.
   - SwapMasterKey: "M"
     $name: Set Master Window
-    $description: Make the focused window the main window. Blank disables this shortcut.
+    $description: Make the focused window the main window. In BSP, it trades places with the largest window. Blank disables this shortcut.
   - PromoteWindowKey: ","
     $name: Promote Focused Window
     $description: Move the focused window one place earlier. Blank disables this shortcut.
@@ -318,6 +353,13 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
     $options:
       - float: Float moved window
       - swap: Swap with tiled window under pointer
+  - BspSplitEdgePercent: 25
+    $name: BSP Split Edge Size
+    #! $showIf: {MouseMoveBehavior: swap}
+    #! $min: 0
+    #! $max: 50
+    #! $format: slider
+    $description: Percentage of each BSP tile from an edge that triggers a split. A drop on an edge splits in that direction if both windows fit and the dragged pane overlaps that edge of the original tile. The center swaps windows. At 0 all drops swap window positions and keep the weights with the tiles. With edge zones enabled, windows sharing a divider swap sides and carry their weights.
   - FloatingDefaultSize: "960, 640"
     $name: Floating Default Size (DPI-scaled pixels)
     $description: Size of a window the first time it floats (Float Focused, a drag, the Floating layout) and of a new window that can't be tiled. Override-size rules replace it in Automatic mode. Enter width, height (100-4000).
@@ -423,17 +465,20 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 // matching, the snapshot ABI and geometry. Self-contained; no MultiWM chapter
 // needed.
 #include "../shared/window_rules.h"
+#include "../shared/split_geometry.h"
 #include "../shared/companion_snapshot.h"
 #include "../shared/geometry.h"
 
 // Shared vocabulary: platform declarations, settings, messages, model types, actor state.
 #include "core/shared_types.h"
+#include "model/bsp_tree.h"
 #include "model/workspace.h"
 #include "core/runtime_state.h"
 #include "core/forward_declarations.h"
 
 // Pure geometry and the observation/model layer.
 #include "layout/algorithms.h"
+#include "layout/bsp_layout.h"
 #include "commands/gestures.h"
 #include "app/configuration.h"
 #include "platform/monitors.h"
@@ -464,6 +509,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 #include "app/tray_ui.h"
 #include "app/diagnostics.h"
 #include "app/companion_snapshot.h"
+#include "app/drag_preview.h"
 #include "app/wm_thread.h"
 
 //=============================================================================

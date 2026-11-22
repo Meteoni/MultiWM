@@ -107,9 +107,9 @@ static std::optional<double> SolvePreference(
 
 // The smallest region each Dwindle subtree needs if its own dividers may move:
 // along a split's axis both sides' minimums plus the gap, across it the larger.
-// Index k is the subtree of windows [k, count).
+// Index k is the subtree of windows [k, count); split 0 runs along `firstAxis`.
 static std::vector<SIZE> FlexibleDwindleMinimums(
-    const std::vector<WindowConstraints>& constraints, LONG gap) {
+    const std::vector<WindowConstraints>& constraints, LONG gap, Layout::Axis firstAxis) {
   const size_t count = constraints.size();
   std::vector<SIZE> minimums(count);
   for (size_t k = count; k-- > 0;) {
@@ -119,7 +119,7 @@ static std::vector<SIZE> FlexibleDwindleMinimums(
       continue;
     }
     const SIZE tail = minimums[k + 1];
-    minimums[k] = (k % 2) == 0
+    minimums[k] = Layout::AlternatingAxis(firstAxis, k) == Layout::Axis::X
         ? SIZE{own.minWidth + gap + tail.cx, std::max(own.minHeight, tail.cy)}
         : SIZE{std::max(own.minWidth, tail.cx), own.minHeight + gap + tail.cy};
   }
@@ -136,7 +136,8 @@ static std::optional<std::pair<double, double>> DwindleSplitRoom(
   if (k + 1 >= count) return std::nullopt;
   std::vector<RECT> rects(count);
   std::vector<Layout::DwindleSplit> splits;
-  Layout::LayoutDwindle(workArea, gap, 0, count, ratios, g_settings.reverseDwindle, rects, &splits);
+  Layout::LayoutDwindle(workArea, gap, 0, count, ratios, g_settings.reverseDwindle, Layout::FirstSplitAxis(workArea),
+                        rects, &splits);
   if (k >= splits.size() || splits[k].usableSpan < 2) return std::nullopt;
   const LONG usable = splits[k].usableSpan;
   const bool alongX = splits[k].axis == Layout::Axis::X;
@@ -225,11 +226,11 @@ void Workspace::RelaxDwindlePushes(const RECT& workArea, LONG gap, size_t afterS
   std::sort(dwindlePushes_.begin(), dwindlePushes_.end(),
             [](const DwindlePush& a, const DwindlePush& b) { return a.split < b.split; });
   std::vector<RECT> rects;
-  if (!PlanSavedDwindleCells(*this, workArea, gap, &rects)) return;
+  if (!PlanSavedCells(*this, workArea, gap, &rects)) return;
   const RECT kept = rects[keepIndex];
   auto keepsWindow = [&] {
     std::vector<RECT> planned;
-    return PlanSavedDwindleCells(*this, workArea, gap, &planned) && EqualRect(&planned[keepIndex], &kept);
+    return PlanSavedCells(*this, workArea, gap, &planned) && EqualRect(&planned[keepIndex], &kept);
   };
 
   std::vector<size_t> restored;
@@ -250,8 +251,11 @@ bool Workspace::StepTiledSize(
   // puts back what accepting it changed.
   DwindleState before = SaveDwindleState();
   AcceptShownDwindleLayout(workArea, gap);
+  const BspTree bspBefore = bspTree_;
+  AcceptShownBspLayout(workArea, gap);
   if (ApplyTiledStep(workArea, gap, index, grow, stepPercent)) return true;
   RestoreDwindleState(std::move(before));
+  bspTree_ = bspBefore;
   return false;
 }
 
@@ -338,14 +342,32 @@ std::optional<Workspace::TiledStepTarget> Workspace::ChooseTiledStepTarget(
     target.preference = [splitIndex](Workspace& w) -> double& { return w.dwindleRatios_[splitIndex]; };
     // Only growing a first side squeezes the windows after it.
     if (target.increasing && grow) {
-      target.fitDeeper = [splitIndex, constraints, flexible = FlexibleDwindleMinimums(constraints, gap),
+      target.fitDeeper = [splitIndex, constraints, flexible = FlexibleDwindleMinimums(constraints, gap, Layout::FirstSplitAxis(workArea)),
                           workArea, gap](Workspace& w) {
         FitDeeperDwindleRatios(w.dwindleRatios_, splitIndex, constraints, flexible, workArea, gap);
       };
     }
+  } else if (layout_ == TileLayout::Bsp) {
+    return ChooseBspStepTarget(workArea, gap, index, constraints);
   } else {
     return std::nullopt;  // Monocle.
   }
+  return target;
+}
+
+// BSP: the nearest split that divides the window from a neighbour sizes it.
+std::optional<Workspace::TiledStepTarget> Workspace::ChooseBspStepTarget(
+    const RECT& workArea, LONG gap, size_t index, const std::vector<WindowConstraints>& constraints) const {
+  const std::vector<BspSplitAround> around =
+      BspSplitsAround(bspTree_, bspTree_.FindLeaf(windows_[index]), PlanBspCells(*this, workArea, gap).splits);
+  if (around.empty() || around.front().split.usableSpan < 2) return std::nullopt;
+  const Layout::BspSplit& split = around.front().split;
+  TiledStepTarget target;
+  target.axis = split.axis;
+  target.increasing = around.front().leafFirst;
+  target.minimum = StepMinimum(constraints[index], target.axis);
+  target.maximum = split.usableSpan;  // The solver finds how far the layout still fits.
+  target.preference = [node = split.node](Workspace& w) -> double& { return w.bspTree_.SplitNode(node).ratio; };
   return target;
 }
 
@@ -360,7 +382,7 @@ bool Workspace::ApplyTiledStep(
   auto plan = [&](const Workspace& workspace, std::vector<RECT>* rects,
                   std::vector<Layout::DwindleSplit>* splits) {
     if (IsGridLayout(layout_) || IsMasterStackLayout(layout_)) return PlanWeightedCells(workspace, workArea, gap, rects);
-    if (layout_ == TileLayout::Dwindle) return PlanSavedDwindleCells(workspace, workArea, gap, rects, splits);
+    if (layout_ == TileLayout::Dwindle || layout_ == TileLayout::Bsp) return PlanSavedCells(workspace, workArea, gap, rects, splits);
     return false;
   };
   std::vector<RECT> rects;
@@ -439,10 +461,24 @@ bool Workspace::ResetTiledSize(const RECT& workArea, LONG gap, size_t index, dou
     }
   } else if (layout_ == TileLayout::Dwindle) {
     changed = ResetDwindleSplit(workArea, gap, index);
+  } else if (layout_ == TileLayout::Bsp) {
+    changed = ResetBspSplit(workArea, gap, index);
   }
 
   if (changed) DebugValidateMutation(L"Workspace::ResetTiledSize");
   return changed;
+}
+
+// Evens the split that sizes the BSP window at `index` (see ChooseTiledStepTarget),
+// accepting the shown layout first as a step does. Changes nothing when it returns false.
+bool Workspace::ResetBspSplit(const RECT& workArea, LONG gap, size_t index) {
+  const BspTree before = bspTree_;
+  AcceptShownBspLayout(workArea, gap);
+  const std::vector<BspSplitAround> around =
+      BspSplitsAround(bspTree_, bspTree_.FindLeaf(windows_[index]), PlanBspCells(*this, workArea, gap).splits);
+  if (!around.empty() && SetPreference(bspTree_.SplitNode(around.front().split.node).ratio, 0.5)) return true;
+  bspTree_ = before;
+  return false;
 }
 
 // Resets the Dwindle split that sizes the window at `index`. Like a step, it
@@ -453,13 +489,13 @@ bool Workspace::ResetDwindleSplit(const RECT& workArea, LONG gap, size_t index) 
   DwindleState before = SaveDwindleState();
   AcceptShownDwindleLayout(workArea, gap);
   std::vector<RECT> shown;
-  if (!PlanSavedDwindleCells(*this, workArea, gap, &shown)) {
+  if (!PlanSavedCells(*this, workArea, gap, &shown)) {
     RestoreDwindleState(std::move(before));
     return false;
   }
   auto fits = [&] {
     std::vector<RECT> rects;
-    return PlanSavedDwindleCells(*this, workArea, gap, &rects);
+    return PlanSavedCells(*this, workArea, gap, &rects);
   };
   const size_t split = std::min(index, windows_.size() - 2);
   MoveRatioToward(dwindleRatios_[split], 0.5, fits);
@@ -468,7 +504,7 @@ bool Workspace::ResetDwindleSplit(const RECT& workArea, LONG gap, size_t index) 
 
   // Changed means something on screen moved, not a sub-pixel ratio change.
   std::vector<RECT> reset;
-  const bool changed = PlanSavedDwindleCells(*this, workArea, gap, &reset) &&
+  const bool changed = PlanSavedCells(*this, workArea, gap, &reset) &&
                        !std::equal(shown.begin(), shown.end(), reset.begin(), reset.end(),
                                    [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; });
   if (!changed) RestoreDwindleState(std::move(before));

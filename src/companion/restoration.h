@@ -97,7 +97,7 @@ static bool AdjustRestorePlacement(HWND hwnd, WINDOWPLACEMENT* placement, const 
     PhysicalCoordinatesScope physical;
     const auto limits = QueryFrameLimits(hwnd, workspace.dpi ? workspace.dpi : 96, margins);
     if (!limits) return false;
-    const auto fitted = FitSlotToLimits(target, workspace.workArea, *limits);
+    const auto fitted = FitSlotToLimits(target, workspace.workArea, *limits, !inputs.bspLayout);
     if (!fitted) return false;
     target = *fitted;
   }
