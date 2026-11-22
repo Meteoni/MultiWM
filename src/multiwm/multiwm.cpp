@@ -514,6 +514,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 #include "app/tray_ui.h"
 #include "app/diagnostics.h"
 #include "app/companion_snapshot.h"
+#include "app/preview_composition.h"
 #include "app/drag_preview.h"
 #include "app/wm_thread.h"
 

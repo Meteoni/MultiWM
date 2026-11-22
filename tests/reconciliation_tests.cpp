@@ -1322,6 +1322,8 @@ static void RunBspDragTests() {
           "a blocked edge neither uses nor commits a perpendicular split");
   }
 
+  // These checks read the GDI preview windows; composition has its own below.
+  DragPreview::g_allowComposition = false;
   const UINT savedFadeMs = g_settings.dragPreviewFadeMs;
   g_settings.dragPreviewFadeMs = 0;
   g_workspaces.Save(fixture.key, previewWorkspace);
@@ -1652,6 +1654,70 @@ static void RunBspDragTests() {
   check(!IsWindowVisible(draggedBadge.window) && !IsWindowVisible(affectedBadge.window) && badgeDrag.icons.empty(),
         "a zero icon size disables badges and icon queries");
   DragPreview::Shutdown();
+
+  // DirectComposition: one host window, drawn on the GPU, faded by DWM.
+  {
+    DragPreview::g_allowComposition = true;
+    g_settings.dragPreviewFillOpacity = 100;
+    g_settings.dragPreviewOutlineOpacity = 100;
+    g_settings.dragPreviewIconSizeDip = 24;
+    g_settings.dragPreviewFadeMs = 0;
+    DragPreview::DragSession composedDrag{};
+    DragPreview::Show({wideTile, narrowTile, source, target}, &composedDrag, 144);
+    const HWND host = overlay.host;
+    RECT hostFrame{}, both{};
+    UnionRect(&both, &wideTile, &narrowTile);
+    RECT covered{};
+    check(DragPreview::Composed() && host && IsWindowVisible(host) && !overlay.fill && !overlay.outline &&
+              (GetWindowLongPtrW(host, GWL_EXSTYLE) & PreviewComposition::kHostExStyle) ==
+                  PreviewComposition::kHostExStyle &&
+              GetWindowRect(host, &hostFrame) && IntersectRect(&covered, &hostFrame, &both) &&
+              EqualRect(&covered, &both) && composedDrag.icons.size() == 2,
+          "composition shows the preview in one click-through host window, with both badges");
+    for (int frame = 0; frame < 4; ++frame) DwmFlush();
+    auto screenPixel = [](POINT point) {
+      HDC screen = GetDC(nullptr);
+      HDC memory = CreateCompatibleDC(screen);
+      HBITMAP bitmap = CreateCompatibleBitmap(screen, 1, 1);
+      HGDIOBJ old = SelectObject(memory, bitmap);
+      BitBlt(memory, 0, 0, 1, 1, screen, point.x, point.y, SRCCOPY | CAPTUREBLT);
+      const COLORREF color = GetPixel(memory, 0, 0);
+      SelectObject(memory, old);
+      DeleteObject(bitmap);
+      DeleteDC(memory);
+      ReleaseDC(nullptr, screen);
+      return color;
+    };
+    const POINT inFill{wideTile.left + 30, wideTile.top + 30};
+    check(screenPixel(inFill) == overlay.accent, "the composed fill is drawn in the accent");
+    check(WindowFromPoint(inFill) != host, "the mouse goes through the composed preview");
+
+    g_settings.dragPreviewFadeMs = 96;
+    DragPreview::Show({narrowTile, wideTile, source, target}, &composedDrag, 144);
+    check(overlay.fadeFrom == 128 && overlay.fadeTo == 255 && KillTimer(host, DragPreview::kFadeTimer),
+          "a changed destination starts DWM's fade at half strength, with one timer for its end");
+    const ULONGLONG fadeStart = overlay.fadeStarted;
+    DragPreview::Show({narrowTile, wideTile, source, target}, &composedDrag, 144);
+    check(overlay.fadeStarted == fadeStart, "the same preview doesn't restart the fade");
+    DragPreview::StepFade(fadeStart + g_settings.dragPreviewFadeMs);
+    DragPreview::End();
+    check(overlay.fadeTo == 0 && IsWindowVisible(host), "ending fades the composed preview out");
+    DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+    check(!IsWindowVisible(host) && !KillTimer(host, DragPreview::kFadeTimer),
+          "the finished fade-out hides the host and stops its timer");
+    DragPreview::FadeTo(0);
+    check(!IsWindowVisible(host), "repeated fade-outs while hidden do nothing");
+
+    // A composition failure (a lost device) falls back to GDI for the session.
+    DragPreview::DisableComposition(L"test");
+    DragPreview::Show({wideTile, narrowTile, source, target}, &composedDrag, 144);
+    check(!DragPreview::Composed() && overlay.compositionFailed && overlay.fill && IsWindowVisible(overlay.outline) &&
+              !IsWindowVisible(host),
+          "after a composition failure the preview uses GDI windows");
+    DragPreview::Shutdown();
+    check(!DragPreview::Composed() && !overlay.compositionFailed && !overlay.host,
+          "shutdown releases composition; the next session tries it again");
+  }
   TrayUi::g_preferences.showToasts = savedToasts;
   std::printf("Passed %u BSP drag checks.\n", check.passed);
 }
