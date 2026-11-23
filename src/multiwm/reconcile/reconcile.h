@@ -1033,16 +1033,19 @@ static std::vector<HWND> GetTileWindowsAfterDesktopSwitch(
         if (!Platform::Windows::WindowCanBeManaged(hwnd)) return TRUE;
         if (!Platform::Windows::IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
 
+        // Monitor first: it is a local read, while the desktop query is a
+        // synchronous call into the shell. Each window is on one monitor, so a
+        // per-monitor scan asks the shell about it once, not once per monitor.
+        if (Platform::Windows::GetWindowPhysicalMonitor(hwnd) != ctx->targetMonitor) return TRUE;
+
         GUID windowDesktop{};
         if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
             !IsEqualGUID(windowDesktop, ctx->desktopId)) {
           return TRUE;
         }
 
-        if (Platform::Windows::GetWindowPhysicalMonitor(hwnd) == ctx->targetMonitor) {
-          ctx->windowList->push_back(hwnd);
-          ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
-        }
+        ctx->windowList->push_back(hwnd);
+        ++Diagnostics::g_runtime.counters.tileCandidatesCollected;
         return TRUE;
       },
       reinterpret_cast<LPARAM>(&context));

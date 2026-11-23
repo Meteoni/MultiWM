@@ -300,13 +300,14 @@ static std::vector<HWND> CollectWorkspaceWindowsForInitialization(
         if (!WindowCanBeManaged(hwnd)) return TRUE;
         if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return TRUE;
 
-        GUID windowDesktop{};
-        if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
-            !IsEqualGUID(windowDesktop, ctx->desktopId)) {
+        // Monitor first: a local read, unlike the shell desktop query.
+        if (GetWindowPhysicalMonitor(hwnd) != ctx->targetMonitor) {
           return TRUE;
         }
 
-        if (GetWindowPhysicalMonitor(hwnd) != ctx->targetMonitor) {
+        GUID windowDesktop{};
+        if (!Platform::VirtualDesktop::GetWindowDesktopIdSafe(hwnd, &windowDesktop) ||
+            !IsEqualGUID(windowDesktop, ctx->desktopId)) {
           return TRUE;
         }
 
