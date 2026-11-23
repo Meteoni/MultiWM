@@ -298,6 +298,26 @@ static void RecordPublishedState(const CompanionAbi::SnapshotBody& body) {
 
 // --- Lifetime ----------------------------------------------------------------------
 
+// An object that already exists (a reader kept it alive across a restart, or an
+// older build created it) keeps the descriptor it was made with. Reapplies ours:
+// its DACL, and an empty label list, which removes an older build's Low label.
+// MultiWM owns the object, so its handle has WRITE_DAC and WRITE_OWNER.
+static void ReapplyDescriptor(HANDLE handle, PSECURITY_DESCRIPTOR descriptor) {
+  BOOL present = FALSE;
+  BOOL defaulted = FALSE;
+  PACL dacl = nullptr;
+  ACL noLabel{};
+  DWORD error = ERROR_SUCCESS;
+  if (!GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) ||
+      !InitializeAcl(&noLabel, sizeof(noLabel), ACL_REVISION)) {
+    error = GetLastError();
+  } else {
+    error = SetSecurityInfo(handle, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+                            nullptr, nullptr, dacl, &noLabel);
+  }
+  if (error != ERROR_SUCCESS) Wh_Log(L"Companion snapshot: couldn't reapply security: %lu", error);
+}
+
 static HANDLE CreateNamedObject(const wchar_t* sddl, const auto& create) {
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor, nullptr)) {
@@ -307,9 +327,21 @@ static HANDLE CreateNamedObject(const wchar_t* sddl, const auto& create) {
   SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
   const HANDLE handle = create(&attributes);
   const DWORD error = GetLastError();
+  if (handle && error == ERROR_ALREADY_EXISTS) ReapplyDescriptor(handle, descriptor);
   LocalFree(descriptor);
   SetLastError(error);
   return handle;
+}
+
+// True when `view` is a whole snapshot's worth of committed, writable memory. A
+// section left by a different build with the same name could be smaller, and
+// one created by another process could be reserved (SEC_RESERVE) rather than
+// committed: writing the header there would crash this process.
+static bool IsWritableSnapshotView(const void* view) {
+  MEMORY_BASIC_INFORMATION region{};
+  return view && VirtualQuery(view, &region, sizeof(region)) &&
+         region.RegionSize >= sizeof(CompanionAbi::SnapshotSection) && region.State == MEM_COMMIT &&
+         (region.Protect & PAGE_READWRITE) != 0;
 }
 
 // Creates (or, after a restart, reopens) the section and the liveness event and
@@ -329,10 +361,7 @@ static bool Open() {
 
   auto* view = static_cast<CompanionAbi::SnapshotSection*>(
       MapViewOfFile(g_publisher.section, FILE_MAP_WRITE, 0, 0, 0));
-  MEMORY_BASIC_INFORMATION region{};
-  // A section left by a different build with the same name could be smaller.
-  if (!view || !VirtualQuery(view, &region, sizeof(region)) ||
-      region.RegionSize < sizeof(CompanionAbi::SnapshotSection)) {
+  if (!IsWritableSnapshotView(view)) {
     Wh_Log(L"Companion snapshot: unusable section (%lu)", GetLastError());
     if (view) UnmapViewOfFile(view);
     CloseHandle(g_publisher.section);

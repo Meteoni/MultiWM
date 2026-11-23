@@ -353,6 +353,9 @@ struct WmRuntime {
     std::vector<PendingWorkspaceArrange> pendingArranges;
     std::vector<PendingDiscoveryRetry> discoveryRetries;
     std::vector<PendingConstraintRetry> constraintRetries;
+    // Settled passes each restored window waiting for its desktop has scheduled
+    // (Reconcile::kMaxDesktopOwnershipWaits at most); dropped once it restores.
+    std::unordered_map<HWND, unsigned> desktopOwnershipWaits;
     bool retryAfterPlatformRecovery = false;  // Last pass was deferred until COM recovers.
     bool forceMonitorReconcile = false;       // Display topology changed.
   } lifecycle;

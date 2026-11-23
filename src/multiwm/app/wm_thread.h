@@ -1,6 +1,9 @@
 // Hotkeys, WM dispatch and tool-thread lifecycle.
 // Part of MultiWM's single source file; see the include order in src/multiwm/multiwm.cpp.
 
+#include <mutex>
+#include <utility>
+
 namespace RuntimeLifecycle {
 
 // Registers every hotkey with a key set, in kHotkeyBindings order. Returns the
@@ -486,6 +489,9 @@ bool StartHotkeyThread() {
   return true;
 }
 
+// How long StopHotkeyThread waits for the worker. Tests shorten it.
+static DWORD g_stopTimeoutMs = 5000;
+
 bool StopHotkeyThread() {
   if (!g_wm.thread) return true;
 
@@ -494,12 +500,15 @@ bool StopHotkeyThread() {
     Wh_Log(L"Failed to post WM_QUIT to WM thread: %lu", GetLastError());
   }
 
-  const DWORD waitResult = WaitForSingleObject(g_wm.thread, 5000);
+  const DWORD waitResult = WaitForSingleObject(g_wm.thread, g_stopTimeoutMs);
   if (waitResult != WAIT_OBJECT_0) {
-    // During settings reload, retaining these handles prevents a second WM owner.
-    // During WhTool_ModUninit, the standard tool-mod wrapper exits the dedicated
+    // The queued WM_QUIT can't be withdrawn: the worker cleans up and exits once
+    // it is free. Retaining these handles prevents a second WM owner meanwhile;
+    // a settings reload finishes when it exits (DeferUntilWorkerExits). During
+    // WhTool_ModUninit, the standard tool-mod wrapper exits the dedicated
     // process immediately after the callback returns.
-    Wh_Log(L"WM thread did not stop cleanly (wait=%lu); leaving the existing actor intact", waitResult);
+    Wh_Log(L"WM thread did not stop within %lu ms (wait=%lu); it exits once it is free",
+           g_stopTimeoutMs, waitResult);
     return false;
   }
 
@@ -511,6 +520,61 @@ bool StopHotkeyThread() {
     g_wm.readyEvent = nullptr;
   }
   return true;
+}
+
+// Who may stop or start the worker. Init, uninit, settings changes and a
+// deferred restart each hold `mutex` while they do, so there is never a second
+// worker. `deferredWait` is set while a restart waits for a worker that didn't
+// stop in time; `deferredFinish` is what it then runs.
+struct WorkerLifecycle {
+  std::mutex mutex;
+  HANDLE deferredWait = nullptr;
+  void (*deferredFinish)() = nullptr;
+};
+static WorkerLifecycle g_lifecycle;
+
+// Thread pool, once the old worker has exited: joins it and runs the deferred
+// finish. Does nothing if CancelDeferredRestart got there first.
+static void CALLBACK RunDeferredRestart(PVOID, BOOLEAN) {
+  const std::scoped_lock lock(g_lifecycle.mutex);
+  const HANDLE wait = std::exchange(g_lifecycle.deferredWait, nullptr);
+  if (!wait) return;
+  UnregisterWaitEx(wait, nullptr);  // Non-blocking, as a callback must.
+  const auto finish = std::exchange(g_lifecycle.deferredFinish, nullptr);
+  if (!StopHotkeyThread()) {
+    Wh_Log(L"Deferred restart: the exited WM thread could not be joined");
+    return;
+  }
+  Wh_Log(L"Deferred restart: the previous WM worker has exited");
+  if (finish) finish();
+}
+
+// After StopHotkeyThread timed out: runs `finish` (on a thread-pool thread,
+// holding g_lifecycle.mutex) once the old worker exits. The caller holds
+// g_lifecycle.mutex. False, deferring nothing, if the wait can't be registered.
+static bool DeferUntilWorkerExits(void (*finish)()) {
+  if (!g_wm.thread || g_lifecycle.deferredWait) return false;
+  g_lifecycle.deferredFinish = finish;
+  if (!RegisterWaitForSingleObject(&g_lifecycle.deferredWait, g_wm.thread, RunDeferredRestart, nullptr, INFINITE,
+                                   WT_EXECUTEONLYONCE | WT_EXECUTELONGFUNCTION)) {
+    Wh_Log(L"Could not wait for the WM worker to exit: %lu", GetLastError());
+    g_lifecycle.deferredWait = nullptr;
+    g_lifecycle.deferredFinish = nullptr;
+    return false;
+  }
+  return true;
+}
+
+// Drops a pending deferred restart and waits out one already running. The
+// caller must not hold g_lifecycle.mutex.
+static void CancelDeferredRestart() {
+  HANDLE wait = nullptr;
+  {
+    const std::scoped_lock lock(g_lifecycle.mutex);
+    wait = std::exchange(g_lifecycle.deferredWait, nullptr);
+    g_lifecycle.deferredFinish = nullptr;
+  }
+  if (wait) UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);
 }
 
 } // namespace RuntimeLifecycle

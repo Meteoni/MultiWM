@@ -187,20 +187,24 @@ static bool StepFloatingWindowSize(
   }
 
   const RECT& workArea = metrics.workArea;
-  const WindowConstraints& limits = record->constraints;
+  // The app's limits at this monitor's DPI, probed when the cached report is
+  // from another one: placement skips the app's own clamp (SWP_NOSENDCHANGING).
+  const std::optional<SharedGeometry::FrameLimits> limits = FloatingSizeLimits(workspace, hwnd, metrics.dpi);
   const LONG smallest = SharedGeometry::ScaleDip(100, metrics.dpi);
   auto stepSpan = [&](LONG span, LONG areaSpan, LONG minimum, LONG maximum) {
     const LONG step = std::max<LONG>(1, MulDiv(areaSpan, static_cast<int>(g_settings.resizeStepPercent), 100));
-    const LONG lowest = std::max(smallest, limits.valid ? minimum : 1);
+    const LONG lowest = std::max(smallest, limits ? minimum : 1);
     LONG highest = areaSpan;
-    if (limits.valid && maximum > 0) highest = std::min(highest, maximum);
+    if (limits && maximum > 0) highest = std::min(highest, maximum);
     return direction > 0 ? std::max(span, std::min(span + step, highest))
                          : std::min(span, std::max(span - step, lowest));
   };
   const LONG width = Layout::RectWidth(current);
   const LONG height = Layout::RectHeight(current);
-  const LONG newWidth = stepSpan(width, Layout::RectWidth(workArea), limits.minWidth, limits.maxWidth);
-  const LONG newHeight = stepSpan(height, Layout::RectHeight(workArea), limits.minHeight, limits.maxHeight);
+  const SharedGeometry::FrameLimits none{};
+  const SharedGeometry::FrameLimits& frame = limits ? *limits : none;
+  const LONG newWidth = stepSpan(width, Layout::RectWidth(workArea), frame.minWidth, frame.maxWidth);
+  const LONG newHeight = stepSpan(height, Layout::RectHeight(workArea), frame.minHeight, frame.maxHeight);
   if (newWidth == width && newHeight == height) return false;
 
   const RECT target = SharedGeometry::ClampToArea(

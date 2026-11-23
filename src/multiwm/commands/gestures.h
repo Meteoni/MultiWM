@@ -86,9 +86,13 @@ static bool IsMoveSizeGestureInProgress(HWND hwnd) {
   return started && !ended;
 }
 
+// Also ends a drag preview of `hwnd`: without its samples the gesture can't
+// complete as a drop, and its end event may never reach the preview (a window
+// that stopped being tracked mid-drag reports its end as a helper's show).
 static void ClearMoveSizeSamples(HWND hwnd) {
   RuntimeLifecycle::AssertWmThread(L"ClearMoveSizeSamples");
   g_moveSize.Forget(hwnd);
+  DragPreview::End(hwnd);
 }
 
 static void ClearAllMoveSizeSamples() {

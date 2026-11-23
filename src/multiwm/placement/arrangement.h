@@ -90,10 +90,15 @@ static void ArmConstraintRetryTimer() {
 // `hwnd`, a tiled member, didn't report its size limits: ask again after the
 // New Window Retry Delay, doubled for each retry already made, unless one is
 // already scheduled or it has had kMaxConstraintRetries. A delay of 0 disables
-// retries, as it does for new windows.
+// retries, as it does for new windows. An exhausted entry stays until the window
+// answers (ClearConstraintRetry) or is gone, so a window that never answers gets
+// its retries once, not again after every arrangement.
 static void ScheduleConstraintRetry(HWND hwnd, DWORD processId) {
   if (!hwnd || !g_settings.slowApplicationDelayMs) return;
   auto& retries = g_wm.lifecycle.constraintRetries;
+  std::erase_if(retries, [](const PendingConstraintRetry& retry) {
+    return !retry.dueTickMs && !Platform::Windows::IsSameLiveWindow(retry.hwnd, retry.processId);
+  });
   auto it = std::find_if(retries.begin(), retries.end(),
                          [&](const PendingConstraintRetry& retry) { return retry.hwnd == hwnd; });
   if (it == retries.end()) {
@@ -110,9 +115,16 @@ static void ScheduleConstraintRetry(HWND hwnd, DWORD processId) {
   ArmConstraintRetryTimer();
 }
 
+// `hwnd` reported its size limits: its retries, scheduled or exhausted, are over.
+static void ClearConstraintRetry(HWND hwnd) {
+  std::erase_if(g_wm.lifecycle.constraintRetries,
+                [hwnd](const PendingConstraintRetry& retry) { return retry.hwnd == hwnd; });
+}
+
 // Runs the due retries: arranges each window's workspace, which queries it
 // again. A retry the arrangement doesn't reschedule (the window answered, or
-// is gone or no longer tiled) is finished.
+// is gone or no longer tiled) is finished; one that has had every retry and
+// still didn't answer stays, exhausted.
 static void ProcessConstraintRetryTimer() {
   RuntimeLifecycle::AssertWmThread(L"ProcessConstraintRetryTimer");
   RuntimeLifecycle::CancelActorTimer(g_wm.timers.constraintRetry);
@@ -133,8 +145,9 @@ static void ProcessConstraintRetryTimer() {
       ArrangeWorkspace(key);
     }
   }
-  std::erase_if(g_wm.lifecycle.constraintRetries,
-                [](const PendingConstraintRetry& retry) { return !retry.dueTickMs; });
+  std::erase_if(g_wm.lifecycle.constraintRetries, [](const PendingConstraintRetry& retry) {
+    return !retry.dueTickMs && retry.attempts < kMaxConstraintRetries;
+  });
   ArmConstraintRetryTimer();
 }
 
@@ -174,7 +187,11 @@ static bool RefreshWorkspaceNativeConstraints(
     const ConstraintProbeRefresh refresh = ProbeConstraintsAgainstCache(hwnd, record->constraints);
     changed |= workspace.UpdateConstraints(hwnd, refresh.merged);
     // No answer and nothing cached: the window is tiled without a known minimum.
-    if (!refresh.merged.valid) ScheduleConstraintRetry(hwnd, record->pid);
+    if (!refresh.merged.valid) {
+      ScheduleConstraintRetry(hwnd, record->pid);
+    } else {
+      ClearConstraintRetry(hwnd);
+    }
     if (refresh.reportChanged) {
       Diagnostics::RecordEvent(
           L"native constraint report refreshed reason=%ls hwnd=%p min=%ldx%ld dpi=%u",
@@ -1027,6 +1044,9 @@ static TiledPlacementOutcome PlaceTiledWindow(
   if (Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
     return {};
   }
+  // The user is dragging or resizing it: placing it now would snap it back
+  // mid-gesture. It keeps its slot; the gesture's end arranges it.
+  if (Gestures::IsMoveSizeGestureInProgress(hwnd)) return {};
   // A hung window shown by its ghost keeps its slot but isn't placed: the app
   // can't move, and dwm.exe, which owns the ghost, refuses positioning from
   // other processes (measured, also elevated). Only the user can drag a ghost.

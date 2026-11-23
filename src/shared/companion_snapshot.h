@@ -221,12 +221,14 @@ static_assert(offsetof(SnapshotSection, body) == 24, "SnapshotSection layout");
 
 // Security for both named objects: full access for the creating user and
 // SYSTEM; read/map (section) or synchronize/query (event) for everyone,
-// including AppContainer apps; a low mandatory label with no-write-up so
-// low-integrity processes can read too.
+// including AppContainer apps. No mandatory label: an unlabeled object counts
+// as Medium with no-write-up, which already lets Low and AppContainer readers
+// in. A Low label would only let a Low process of the same user write here,
+// since it matches the owner entry.
 inline constexpr wchar_t kSectionSddl[] =
-    L"D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x0005;;;WD)(A;;0x0005;;;AC)S:(ML;;NW;;;LW)";
+    L"D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x0005;;;WD)(A;;0x0005;;;AC)";
 inline constexpr wchar_t kAliveEventSddl[] =
-    L"D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x00100001;;;WD)(A;;0x00100001;;;AC)S:(ML;;NW;;;LW)";
+    L"D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x00100001;;;WD)(A;;0x00100001;;;AC)";
 
 // --- Seqlock -------------------------------------------------------------------
 

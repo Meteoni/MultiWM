@@ -5,13 +5,28 @@ namespace Configuration {
 
 // Records a setting this load couldn't use, as one short toast line
 // (SettingsState::problems). The detail is logged where it was found.
+// Text that doesn't fit is cut off rather than dropped; a caller quoting a
+// user's value shortens it first (ShortenedSettingValue), so the cut never
+// takes the part saying what is wrong.
 static void NoteSettingProblem(PCWSTR format, ...) {
   wchar_t text[160]{};
   va_list args;
   va_start(args, format);
-  const int written = vswprintf(text, ARRAYSIZE(text), format, args);
+  _vsnwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, format, args);
   va_end(args);
-  if (written > 0) g_settings.problems.emplace_back(text);
+  if (*text) g_settings.problems.emplace_back(text);
+}
+
+// A user's setting value as a toast quotes it: at most 24 characters, else
+// its first 23 and an ellipsis.
+static std::wstring ShortenedSettingValue(PCWSTR value) {
+  constexpr size_t kMaxQuoted = 24;
+  std::wstring text = value ? value : L"";
+  if (text.size() > kMaxQuoted) {
+    text.resize(kMaxQuoted - 1);
+    text += L'…';
+  }
+  return text;
 }
 
 UINT ParseModifiers(PCWSTR str) {
@@ -50,7 +65,7 @@ T ReadHotkeySetting(PCWSTR name, PCWSTR label, Parser parser) {
     Wh_Log(
         L"Invalid %ls hotkey setting '%ls'; hotkey disabled", name,
         value.get());
-    NoteSettingProblem(L"%ls hotkey off: \"%ls\" isn't a key", label, value.get());
+    NoteSettingProblem(L"%ls hotkey off: \"%ls\" isn't a key", label, ShortenedSettingValue(value.get()).c_str());
   }
   return result;
 }

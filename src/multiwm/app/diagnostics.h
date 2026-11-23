@@ -1589,8 +1589,9 @@ static void WriteDiagnosticReport() {
   // The interval baseline is the end of a successful diagnostic operation, so
   // report-generation time is not charged to the next "since dump" period.
   g_runtime.lastReportTickMs = GetTickCount64();
-  // Writing can take a moment on a busy system; this says it has finished.
-  TrayUi::ShowStatusFlyout(L"Diagnostic report saved", nullptr);
+  // Writing can take a moment on a busy system; this says it has finished, and
+  // where, since the folder is a setting.
+  TrayUi::ShowStatusFlyout((L"Diagnostic report saved to " + outputPath).c_str(), nullptr);
 }
 }  // namespace Diagnostics
 

@@ -964,6 +964,20 @@ static void RunFloatingSizeCommandTests() {
             Layout::RectHeight(frame(hwnd)) == Layout::RectHeight(start) + stepY,
         "grow adds the step percentage of the work area to each dimension");
   check(f.Step(hwnd, -1) && Layout::RectsNear(frame(hwnd), start, 0), "shrink undoes grow");
+  {
+    // Limits cached on another monitor's DPI that would forbid any shrink here.
+    Workspace workspace = f.Load();
+    WindowConstraints otherDpi;
+    otherDpi.valid = true;
+    otherDpi.dpi = f.metrics.dpi * 2;
+    otherDpi.minWidth = otherDpi.minHeight = 4000;
+    workspace.UpdateConstraints(hwnd, otherDpi);
+    g_workspaces.Save(f.key, workspace);
+  }
+  check(f.Step(hwnd, -1) && Layout::RectWidth(frame(hwnd)) == Layout::RectWidth(start) - stepX,
+        "shrink uses the window's limits at this DPI, not ones cached at another");
+  check(f.Load().Find(hwnd)->constraints.dpi == f.metrics.dpi, "the limits at this DPI are kept");
+  check(f.Step(hwnd, 1) && Layout::RectsNear(frame(hwnd), start, 0), "grow undoes shrink");
   for (int i = 0; i < 100 && f.Step(hwnd, 1); ++i) {}
   check(!f.Step(hwnd, 1) && Layout::RectWidth(frame(hwnd)) <= Layout::RectWidth(f.workArea) &&
             Layout::RectHeight(frame(hwnd)) <= Layout::RectHeight(f.workArea),
@@ -1140,6 +1154,112 @@ static void RunFirstFloatingSizeTests() {
   }
   FloatingWindowFixture::ClearLeases();
   std::printf("Passed %u first floating size checks.\n", check.passed);
+}
+
+// Tile Workspace learns Master + Stack and grid geometry from where the windows
+// are, but never rebuilds a BSP tree (or Dwindle's ratios) from it, and adopting
+// keeps what the other layouts remember. Real invisible windows, really tiled.
+static void RunTileWorkspaceGeometryTests() {
+  CheckCounter check;
+  FloatingWindowFixture fixture(check);
+  const HWND second = fixture.CreateTestWindow(nullptr);
+  const HWND third = fixture.CreateTestWindow(nullptr);
+  g_settings.adaptiveDwindleSlots = 0;
+  g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+  const HMONITOR monitor = fixture.key.ResolveMonitor();
+  auto adopt = [&](Workspace& workspace) {
+    return Reconcile::AdoptSnapshotGeometryIfEligible(
+        workspace, workspace.TiledWindows(), fixture.workArea, fixture.metrics.gap, monitor);
+  };
+
+  fixture.Seed(TileLayout::Bsp);
+  Workspace workspace = fixture.Load();
+  for (HWND window : {second, third}) {
+    check(workspace.AdmitTiled(FloatingWindowFixture::Record(window)), "admit a Tile Workspace test window");
+    workspace.ClearInsertionPlacement(window);
+  }
+  // A split the user turned, which a rebuilt tree would put back.
+  const size_t turned = workspace.Bsp().Parent(workspace.Bsp().FindLeaf(third));
+  const Layout::Axis axis =
+      Layout::DefaultBspSplitAxis(workspace.Bsp(), turned, fixture.workArea) == Layout::Axis::X ? Layout::Axis::Y
+                                                                                              : Layout::Axis::X;
+  workspace.SetBspSplitDirection(turned, axis);
+  g_workspaces.Save(fixture.key, workspace);
+  Placement::ArrangeWorkspace(fixture.key);
+  workspace = fixture.Load();
+  const BspTree arranged = workspace.Bsp();
+  check(!adopt(workspace) && workspace.Bsp() == arranged, "Tile Workspace keeps a BSP tree as it is");
+  Workspace dwindle = workspace;
+  dwindle.SetLayout(TileLayout::Dwindle);
+  const Workspace dwindleBefore = dwindle;
+  check(!adopt(dwindle) && dwindle.HasSameLayoutStateAs(dwindleBefore), "Tile Workspace keeps Dwindle's ratios");
+
+  // Adopting Master + Stack geometry builds a new workspace; it keeps what the
+  // other layouts remember, so switching back finds the turned tree. Frames
+  // are given rather than read back, so only the merge is under test.
+  Workspace master = workspace;
+  master.SetLayout(TileLayout::MasterStack);
+  std::vector<RECT> frames;
+  check(Layout::BuildWorkspaceLayoutPlan(master, fixture.workArea, fixture.metrics.gap, &frames) ==
+            Layout::LayoutPlanStatus::Success,
+        "plan the Master + Stack frames");
+  std::vector<WorkspaceGeometryItem> items;
+  for (size_t i = 0; i < master.TiledWindows().size(); ++i) {
+    items.push_back({*master.Find(master.TiledWindows()[i]), frames[i]});
+  }
+  Workspace adopted = Workspace::AdoptGeometry(TileLayout::MasterStack, fixture.workArea, fixture.metrics.gap, 0.5,
+                                               items, master.TiledWindows().front());
+  adopted.MergeRememberedLayoutGeometryFrom(master);
+  check(adopted.TiledWindows() == master.TiledWindows(), "adopting keeps the Master + Stack order");
+  adopted.SetLayout(TileLayout::Bsp);
+  check(adopted.Bsp() == arranged, "adopting keeps the tree BSP remembers");
+  std::printf("Passed %u Tile Workspace geometry checks.\n", check.passed);
+}
+
+// An arrangement while the user drags a tiled window (another window opened, a
+// size-limit retry, a lease deadline) leaves the dragged window where it is.
+static void RunDraggedWindowPlacementTests() {
+  CheckCounter check;
+  FloatingWindowFixture fixture(check);
+  const HWND other = fixture.CreateTestWindow(nullptr);
+  fixture.Seed(TileLayout::MasterStack);
+  Workspace workspace = fixture.Load();
+  check(workspace.AdmitTiled(FloatingWindowFixture::Record(other)), "admit a second tiled window");
+  workspace.ClearInsertionPlacement(other);
+  g_workspaces.Save(fixture.key, workspace);
+  Placement::ArrangeWorkspace(fixture.key);
+
+  auto windowRect = [](HWND window) {
+    RECT rect{};
+    GetWindowRect(window, &rect);
+    return rect;
+  };
+  // Mid-drag: the gesture has started and the window is under the cursor.
+  Gestures::g_moveSize.startRects[fixture.hwnd] = windowRect(fixture.hwnd);
+  FloatingWindowFixture::AppMove(fixture.hwnd, fixture.workArea.left + 300, fixture.workArea.top + 200, 500, 400);
+  const RECT dragged = windowRect(fixture.hwnd);
+  Placement::ArrangeWorkspace(fixture.key);
+  const RECT duringDrag = windowRect(fixture.hwnd);
+  check(EqualRect(&dragged, &duringDrag), "arranging leaves a window being dragged in place");
+  check(fixture.Load().IsTiled(fixture.hwnd), "the dragged window keeps its slot");
+
+  Gestures::ClearMoveSizeSamples(fixture.hwnd);
+  Placement::ArrangeWorkspace(fixture.key);
+  const RECT afterDrag = windowRect(fixture.hwnd);
+  check(!EqualRect(&dragged, &afterDrag), "after the gesture the window returns to its tile");
+
+  // A window that stops being tracked mid-drag takes its drop preview with it:
+  // its end event may never reach the preview (Trace to owner).
+  Gestures::g_moveSize.startRects[fixture.hwnd] = afterDrag;
+  DragPreview::g_drag.emplace(DragPreview::DragSession{
+      fixture.hwnd, fixture.hwnd, fixture.key.ResolveMonitor(), fixture.key, afterDrag, {}, {}, {}, {}});
+  Reconcile::ForgetManagedWindow(other);
+  check(DragPreview::g_drag.has_value(), "another window leaving keeps the drop preview");
+  Reconcile::ForgetManagedWindow(fixture.hwnd);
+  check(!DragPreview::g_drag, "the dragged window leaving ends its drop preview");
+  Overlay::Shutdown();
+  FloatingWindowFixture::ClearLeases();
+  std::printf("Passed %u dragged window placement checks.\n", check.passed);
 }
 
 // Exercise completed BSP drags against actual displayed tiles, including
@@ -2255,18 +2375,25 @@ static void RunConstraintRetryTests() {
           "each silent retry schedules the next, twice as far off");
   }
   runDueRetry();
-  check(!retry() && g_wm.timers.constraintRetry == 0 && !limitsKnown(),
-        "retries stop after kMaxConstraintRetries");
+  auto exhausted = [&] {
+    return retry() && retry()->attempts == Placement::kMaxConstraintRetries && !retry()->dueTickMs &&
+           g_wm.timers.constraintRetry == 0;
+  };
+  check(exhausted() && !limitsKnown(), "retries stop after kMaxConstraintRetries");
 
   Placement::ArrangeWorkspace(f.key);
-  check(retry() && retry()->attempts == 1, "a later arrangement that still gets no answer starts again");
+  check(exhausted(), "a later arrangement that still gets no answer doesn't start the retries again");
   slow.slow = false;
   // Its thread may still be asleep from an earlier query; wait until it is idle.
   DWORD_PTR ignored = 0;
   SendMessageTimeoutW(slow.hwnd, WM_NULL, 0, 0, SMTO_BLOCK, 5000, &ignored);
-  runDueRetry();
+  Placement::ArrangeWorkspace(f.key);
   check(limitsKnown() && !retry() && g_wm.timers.constraintRetry == 0,
-        "the retry that gets an answer records it and ends");
+        "the arrangement that gets an answer records it and ends the retries");
+  check(Placement::ConformanceRetryDelayMs(PlacementResult::Success, 3) == 75 &&
+            Placement::ConformanceRetryDelayMs(PlacementResult::Unresponsive, 1) == 150 &&
+            Placement::ConformanceRetryDelayMs(PlacementResult::Unresponsive, 9) == 75 * 16,
+        "repairs of a window that doesn't answer back off, up to 16 times the interval");
 
   g_settings.slowApplicationDelayMs = 0;
   slow.slow = true;
@@ -2539,6 +2666,14 @@ static void RunHiddenArrivalTests() {
   check(stateIn(f.key) == ManageState::Suspended && g_workspaces.OwnersOf(hwnd).size() == 1,
         "without a desktop it is neither restored nor moved to a desktop-less workspace");
   check(Model::ContainsWindow(g_wm.lifecycle.dirtyWindows, hwnd), "the next settled pass looks again");
+  check(g_wm.timers.lifecycle != 0, "and that pass is scheduled, not left for an unrelated event");
+  for (unsigned i = 0; i < Reconcile::kMaxDesktopOwnershipWaits; ++i) {
+    RuntimeLifecycle::CancelActorTimer(g_wm.timers.lifecycle);
+    Reconcile::ReconcileSettledKnownWindows({hwnd}, false, &changed);
+  }
+  check(g_wm.timers.lifecycle == 0 && Model::ContainsWindow(g_wm.lifecycle.dirtyWindows, hwnd) &&
+            stateIn(f.key) == ManageState::Suspended,
+        "a window that never reports a desktop stops scheduling passes, and still waits");
   check(staysPut() && repairs() == repairsBefore, "it isn't placed at its old floating frame");
 
   // Assigned to the current desktop, not its owner's. The immediate pass waits;
@@ -3106,6 +3241,199 @@ static void RunComRefOwnershipTests() {
   std::printf("Passed %u COM reference ownership checks.\n", checks);
 }
 
+// A worker that doesn't stop in time must not leave MultiWM stopped: the
+// restart waits for it to exit, and an uninit in between cancels the restart.
+// The worker is a test-owned thread that ignores WM_QUIT until released, so no
+// hotkeys, tray icon or hooks are involved.
+namespace DeferredRestartFixture {
+HANDLE g_release = nullptr;
+HANDLE g_finished = nullptr;
+LONG g_finishCalls = 0;
+
+DWORD WINAPI StuckWorker(LPVOID ready) {
+  MSG msg{};
+  PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE);  // A queue, so WM_QUIT posts.
+  SetEvent(static_cast<HANDLE>(ready));
+  WaitForSingleObject(g_release, INFINITE);
+  return 0;
+}
+
+void Finish() {
+  InterlockedIncrement(&g_finishCalls);
+  SetEvent(g_finished);
+}
+
+// Installs a stuck worker as the WM thread, as StartHotkeyThread would.
+void StartStuckWorker() {
+  ResetEvent(g_release);
+  HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  DWORD id = 0;
+  g_wm.thread = CreateThread(nullptr, 0, StuckWorker, ready, 0, &id);
+  WaitForSingleObject(ready, INFINITE);
+  CloseHandle(ready);
+  g_wm.threadId.store(id, std::memory_order_release);
+}
+}  // namespace DeferredRestartFixture
+
+static void RunDeferredRestartTests() {
+  using namespace DeferredRestartFixture;
+  using namespace RuntimeLifecycle;
+  unsigned checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  check(!g_wm.thread, "no WM worker is running in the tests");
+  const DWORD savedTimeout = g_stopTimeoutMs;
+  g_stopTimeoutMs = 20;
+  g_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_finished = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+  // A reload that times out finishes once the worker exits.
+  StartStuckWorker();
+  {
+    const std::scoped_lock lock(g_lifecycle.mutex);
+    check(!StopHotkeyThread(), "a stuck worker times out");
+    check(DeferUntilWorkerExits(Finish), "the restart waits for the worker");
+    check(!DeferUntilWorkerExits(Finish), "only one restart waits at a time");
+  }
+  check(g_finishCalls == 0, "nothing restarts while the worker is alive");
+  SetEvent(g_release);
+  check(WaitForSingleObject(g_finished, 5000) == WAIT_OBJECT_0, "the restart runs once the worker exits");
+  {
+    const std::scoped_lock lock(g_lifecycle.mutex);  // The callback has returned.
+    check(g_finishCalls == 1 && !g_wm.thread && !g_lifecycle.deferredWait,
+          "the restart joined the old worker and ran once");
+  }
+
+  // Uninit cancels a waiting restart: nothing starts after the worker exits.
+  StartStuckWorker();
+  {
+    const std::scoped_lock lock(g_lifecycle.mutex);
+    check(!StopHotkeyThread() && DeferUntilWorkerExits(Finish), "a second restart waits");
+  }
+  CancelDeferredRestart();
+  check(!g_lifecycle.deferredWait, "cancelling drops the waiting restart");
+  SetEvent(g_release);
+  check(WaitForSingleObject(g_wm.thread, 5000) == WAIT_OBJECT_0, "the second worker exits");
+  check(WaitForSingleObject(g_finished, 0) == WAIT_OBJECT_0 && g_finishCalls == 1,
+        "a cancelled restart never runs");
+  check(StopHotkeyThread() && !g_wm.thread, "uninit then joins the exited worker");
+
+  CloseHandle(g_release);
+  CloseHandle(g_finished);
+  g_stopTimeoutMs = savedTimeout;
+  std::printf("Passed %u deferred restart checks.\n", checks);
+}
+
+// A setting problem whose text doesn't fit the toast line is cut off, never
+// dropped, and a quoted user value is shortened so the reason stays visible.
+static void RunSettingProblemTextTests() {
+  unsigned checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  const auto saved = g_settings.problems;
+  g_settings.problems.clear();
+  const std::wstring longValue(400, L'x');
+  Configuration::NoteSettingProblem(L"%ls", longValue.c_str());
+  check(g_settings.problems.size() == 1 && g_settings.problems.back().size() == 159,
+        "a problem longer than the line is cut off, not dropped");
+  const std::wstring quoted = Configuration::ShortenedSettingValue(longValue.c_str());
+  check(quoted.size() == 24 && quoted.back() == L'…', "a long value is shortened with an ellipsis");
+  check(Configuration::ShortenedSettingValue(L"ctrl+q") == L"ctrl+q", "a short value is quoted whole");
+  Configuration::NoteSettingProblem(L"%ls hotkey off: \"%ls\" isn't a key", L"Float Focused Window", quoted.c_str());
+  check(g_settings.problems.back().ends_with(L"isn't a key"), "the reason survives a long value");
+  g_settings.problems = saved;
+  std::printf("Passed %u setting problem text checks.\n", checks);
+}
+
+// The companion section is read in every process, elevated ones included, so a
+// Low-integrity process of the same user must be able to read it but never
+// write it or change its DACL, also when MultiWM reopens a section an older
+// build created with a Low label. Uses a test-owned name, never the live one.
+static void RunCompanionObjectSecurityTests() {
+  unsigned checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  const std::wstring name = L"Local\\MultiWM.Tests.CompanionSecurity." + std::to_wstring(GetCurrentProcessId());
+  auto createWith = [&](const wchar_t* sddl) {
+    return CompanionSnapshot::CreateNamedObject(sddl, [&](SECURITY_ATTRIBUTES* attributes) {
+      return CreateFileMappingW(INVALID_HANDLE_VALUE, attributes, PAGE_READWRITE, 0, 4096, name.c_str());
+    });
+  };
+  // What a Low-integrity token of this user can open the section with.
+  struct LowAccess { bool read = false; bool write = false; bool writeDac = false; };
+  auto probeAsLow = [&] {
+    LowAccess access;
+    HANDLE self = nullptr;
+    HANDLE low = nullptr;
+    PSID lowSid = nullptr;
+    check(OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &self) &&
+              DuplicateTokenEx(self, TOKEN_ALL_ACCESS, nullptr, SecurityImpersonation, TokenImpersonation, &low) &&
+              ConvertStringSidToSidW(L"S-1-16-4096", &lowSid),
+          "make a Low-integrity token");
+    TOKEN_MANDATORY_LABEL label{{lowSid, SE_GROUP_INTEGRITY}};
+    check(SetTokenInformation(low, TokenIntegrityLevel, &label, sizeof(label) + GetLengthSid(lowSid)) &&
+              ImpersonateLoggedOnUser(low),
+          "impersonate the Low-integrity token");
+    for (auto [rights, result] : {std::pair{DWORD{FILE_MAP_READ}, &access.read},
+                                  std::pair{DWORD{FILE_MAP_WRITE}, &access.write},
+                                  std::pair{DWORD{WRITE_DAC}, &access.writeDac}}) {
+      if (HANDLE opened = OpenFileMappingW(rights, FALSE, name.c_str())) {
+        *result = true;
+        CloseHandle(opened);
+      }
+    }
+    RevertToSelf();
+    LocalFree(lowSid);
+    CloseHandle(low);
+    CloseHandle(self);
+    return access;
+  };
+
+  HANDLE fresh = createWith(CompanionAbi::kSectionSddl);
+  check(fresh != nullptr, "create the section");
+  LowAccess access = probeAsLow();
+  check(access.read, "Low-integrity readers can read a new section");
+  check(!access.write && !access.writeDac, "Low-integrity processes can't write or re-permission a new section");
+  CloseHandle(fresh);
+
+  // An older build's descriptor, still held open by a reader.
+  constexpr wchar_t kLowLabeledSddl[] =
+      L"D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x0005;;;WD)(A;;0x0005;;;AC)S:(ML;;NW;;;LW)";
+  HANDLE older = createWith(kLowLabeledSddl);
+  check(older != nullptr && probeAsLow().write, "the old Low label let Low-integrity processes write");
+  HANDLE reopened = createWith(CompanionAbi::kSectionSddl);
+  check(reopened != nullptr && GetLastError() == ERROR_ALREADY_EXISTS, "reopen the existing section");
+  access = probeAsLow();
+  check(access.read, "Low-integrity readers can still read a reopened section");
+  check(!access.write && !access.writeDac, "reopening removes the old label's write access");
+  CloseHandle(reopened);
+  CloseHandle(older);
+
+  // Only a whole, committed, writable section takes the header. A reserved
+  // section maps writable but would fault on the first write.
+  auto viewIsWritable = [&](DWORD protect, DWORD size) {
+    const std::wstring sectionName = name + L".Usable";
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, protect, 0, size, sectionName.c_str());
+    check(section != nullptr, "create a section to map");
+    void* view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0);
+    const bool writable = CompanionSnapshot::IsWritableSnapshotView(view);
+    if (view) UnmapViewOfFile(view);
+    CloseHandle(section);
+    return writable;
+  };
+  constexpr DWORD kSnapshotSize = sizeof(CompanionAbi::SnapshotSection);
+  check(viewIsWritable(PAGE_READWRITE, kSnapshotSize), "a committed section takes the header");
+  check(!viewIsWritable(PAGE_READWRITE | SEC_RESERVE, kSnapshotSize), "a reserved section is refused");
+  check(!viewIsWritable(PAGE_READWRITE, 4096), "a smaller section is refused");
+  std::printf("Passed %u companion object security checks.\n", checks);
+}
+
 // Exercise the publisher's real border cache across native state transitions.
 // A private desktop keeps the shown test window away from live window managers.
 static void RunFrameMarginCacheTests() {
@@ -3426,10 +3754,50 @@ static void RunOverflowFloatPredictionTests() {
               predictedFloats, predictedTiles, unpredictedFloats, missedFloats);
 }
 
+// A host's work-area-sized surface is released once the host has been hidden
+// for a while, never while it shows something, and the next toast re-attaches
+// it. Overlays run on this thread (no overlay thread is started).
+static void RunOverlaySurfaceReleaseTests() {
+  CheckCounter check;
+  const auto previousDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  const HMONITOR monitor = MonitorFromPoint(POINT{}, MONITOR_DEFAULTTOPRIMARY);
+  RECT workArea{};
+  check(Platform::Monitors::GetOverlayWorkArea(monitor, &workArea), "read the overlay work area");
+  auto toast = [&] {
+    Overlay::ShowToast(Overlay::ToastRequest{monitor, L"Surface release test", TrayUi::CurrentPopupAppearance(), 0, 0, false});
+    return &Overlay::GetMonitorHost(monitor, workArea);
+  };
+  auto idleTimerFires = [](Overlay::MonitorHost& host) {
+    SendMessageW(host.window, WM_TIMER, Overlay::kSurfaceReleaseTimer, 0);
+  };
+
+  Overlay::MonitorHost* host = toast();
+  check(host->visible && host->surface.target, "a toast shows on an attached surface");
+  idleTimerFires(*host);
+  check(host->visible && host->surface.target, "a showing host keeps its surface");
+  Overlay::ClearToast(*host);
+  Overlay::DrawHost(*host);
+  check(!host->visible && host->surface.target, "hiding keeps the surface for a while");
+  idleTimerFires(*host);
+  check(!host->surface.target && host->window, "an idle host releases its surface and keeps its window");
+  host = toast();
+  check(host->visible && host->surface.target, "the next toast re-attaches a surface");
+  Overlay::Shutdown();
+  SetThreadDpiAwarenessContext(previousDpi);
+  std::printf("Passed %u overlay surface release checks.\n", check.passed);
+}
+
 int main() {
+  // This thread goes long stretches without pumping messages, so Windows would
+  // ghost its test windows as hung, and MultiWM never places a ghosted window.
+  // The ghost tests install their own ghost lookups instead.
+  DisableProcessWindowsGhosting();
   RunFrameMarginCacheTests();
   RunConstraintProbeTests();
   RunComRefOwnershipTests();
+  RunCompanionObjectSecurityTests();
+  RunSettingProblemTextTests();
+  RunDeferredRestartTests();
   RunDesktopReconciliationTests();
   RunDiscoveryResultTests();
   RunWinEventRoutingTests();
@@ -3447,6 +3815,9 @@ int main() {
   RunConstraintRetryTests();
   RunUnresponsivePlacementTest();
   RunBspDragTests();
+  RunTileWorkspaceGeometryTests();
+  RunDraggedWindowPlacementTests();
+  RunOverlaySurfaceReleaseTests();
   RunGhostWindowTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();

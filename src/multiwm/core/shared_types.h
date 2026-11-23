@@ -1,6 +1,7 @@
 // Shared platform declarations, configuration values and message types.
 // Part of MultiWM's single source file; see the include order in src/multiwm/multiwm.cpp.
 
+#include <aclapi.h>
 #include <dwmapi.h>
 #include <initguid.h>
 #include <objbase.h>

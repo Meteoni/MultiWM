@@ -121,6 +121,7 @@ static HWND ResolveGhost(DWORD event, HWND hwnd) {
 // delayed message could mistake a reused HWND value for the old window.
 static void OnWindowDestroyed(HWND hwnd, bool tracked) {
   g_wm.CancelPendingWindowMoves(hwnd);
+  g_wm.lifecycle.desktopOwnershipWaits.erase(hwnd);
   std::erase_if(g_wm.ghosts, [hwnd](const auto& ghost) { return ghost.second == hwnd; });
   const bool routingKnown = g_wm.routing.evaluated.erase(hwnd) != 0;
   const bool routingPending = g_wm.routing.pending.erase(hwnd) != 0;

@@ -160,7 +160,6 @@ void Wh_ModSettingsChanged() {
     return;
   }
 
-  
   WhTool_ModSettingsChanged();
 }
 

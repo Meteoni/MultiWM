@@ -79,6 +79,11 @@ static bool IsOverlayThread(DWORD threadId);
 }  // namespace Overlay
 
 // Defined in app/tray_ui.h.
+namespace DragPreview {
+// Defined in app/drag_preview.h.
+static void End(HWND source);
+}  // namespace DragPreview
+
 namespace TrayUi {
 static void LoadSettings();
 static bool Initialize();

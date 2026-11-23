@@ -332,10 +332,15 @@ static bool AdmitUntrackedSuspendedSnapshot(
   return changed;
 }
 
+// Tile Workspace: learns the order and weights of Master + Stack and the grid
+// layouts from where their windows are. Other layouts keep their model: the
+// geometry can't express a BSP tree or Dwindle's ratios, and rebuilding them
+// would reset every split the user made.
 static bool AdoptSnapshotGeometryIfEligible(
     Workspace& workspace, const std::vector<HWND>& snapshot,
     const RECT& workArea, LONG gap, HMONITOR monitor) {
-  if (workspace.Layout() == TileLayout::Floating || workspace.HasSuspended() ||
+  const TileLayout layout = workspace.Layout();
+  if (!(IsMasterStackLayout(layout) || IsGridLayout(layout)) || workspace.HasSuspended() ||
       !workspace.AllTiledVisible(snapshot) ||
       !Platform::Windows::SnapshotLooksTiled(workspace.TiledWindows(), workArea)) {
     return false;
@@ -356,6 +361,7 @@ static bool AdoptSnapshotGeometryIfEligible(
       geometry, preferredMaster);
   const HWND retainedFocus = workspace.LastFocusedWindow();
   captured.MergeRememberedFloatingGeometryFrom(workspace);
+  captured.MergeRememberedLayoutGeometryFrom(workspace);
   captured.MergeNonTiledRecordsFrom(workspace);
   captured.RememberFocusedWindow(retainedFocus);
   workspace = std::move(captured);
@@ -649,6 +655,10 @@ static SuspensionReason EffectiveSuspensionReason(
   return physicalReason;
 }
 
+// How many settled passes a restored window still waiting for its desktop may
+// schedule (each ReconcileDelayMs apart). The shell assigns one in about 10 ms.
+inline constexpr unsigned kMaxDesktopOwnershipWaits = 5;
+
 static void ReconcileWindowParticipation(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
@@ -693,10 +703,19 @@ static void ReconcileWindowParticipation(
       if (reason == SuspensionReason::None) {
         if (AwaitsDesktopOwnership(hwnd, ownerKey)) {
           // The next settled pass moves it to its desktop's workspace first,
-          // then restores it there (ReconcileSettledKnownWindows).
-          RequeueDirtyWindows({hwnd});
+          // then restores it there (ReconcileSettledKnownWindows). Schedule
+          // that pass rather than wait for an unrelated event, a few times:
+          // a window that never reports a desktop must not poll forever.
+          unsigned& waits = g_wm.lifecycle.desktopOwnershipWaits[hwnd];
+          if (waits < kMaxDesktopOwnershipWaits) {
+            ++waits;
+            ScheduleLifecycleReconcile(hwnd);
+          } else {
+            RequeueDirtyWindows({hwnd});
+          }
           continue;
         }
+        g_wm.lifecycle.desktopOwnershipWaits.erase(hwnd);
         const bool restored = workspace.Restore(hwnd);
         changed |= restored;
         restoredIntoFloatingLayout =

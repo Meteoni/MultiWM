@@ -1107,6 +1107,16 @@ void Workspace::MergeRememberedFloatingGeometryFrom(const Workspace& source) {
   DebugValidateMutation(L"Workspace::MergeRememberedFloatingGeometryFrom");
 }
 
+void Workspace::MergeRememberedLayoutGeometryFrom(const Workspace& source) {
+  RuntimeLifecycle::AssertWmThread(L"Workspace::MergeRememberedLayoutGeometryFrom");
+  rememberedMasterStack_ = source.rememberedMasterStack_;
+  rememberedGrid_ = source.rememberedGrid_;
+  rememberedDwindle_ = source.rememberedDwindle_;
+  rememberedBsp_ = source.rememberedBsp_;
+  if (!IsMasterStackLayout(layout_)) masterRatio_ = source.masterRatio_;
+  DebugValidateMutation(L"Workspace::MergeRememberedLayoutGeometryFrom");
+}
+
 void Workspace::MergeNonTiledRecordsFrom(const Workspace& source) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::MergeNonTiledRecordsFrom");
   for (const auto& kv : source.records_) {

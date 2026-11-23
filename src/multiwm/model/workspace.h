@@ -436,6 +436,10 @@ class Workspace {
   void AdmitMigrated(WindowRecord record, HWND anchor = nullptr);
   // Copies remembered floating frames from `source` for windows known here.
   void MergeRememberedFloatingGeometryFrom(const Workspace& source);
+  // Copies what `source` remembers for switching back to each layout (weights,
+  // Dwindle ratios, the BSP tree) and, outside Master + Stack, its master ratio:
+  // what adopting the current layout's geometry doesn't produce.
+  void MergeRememberedLayoutGeometryFrom(const Workspace& source);
   // Copies every non-tiled record from `source`, overwriting same-HWND records.
   void MergeNonTiledRecordsFrom(const Workspace& source);
   // Forgets `invalidWindows` and recreates records for tiled windows that lost

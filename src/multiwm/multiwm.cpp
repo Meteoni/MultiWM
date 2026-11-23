@@ -524,6 +524,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 //=============================================================================
 
 BOOL WhTool_ModInit() {
+  const std::scoped_lock lock(RuntimeLifecycle::g_lifecycle.mutex);
   Diagnostics::InitializeProcessRuntime();
   Wh_Log(L"MultiWM mod initializing...");
   Configuration::LoadSettings();
@@ -540,6 +541,9 @@ BOOL WhTool_ModInit() {
 
 void WhTool_ModUninit() {
   Wh_Log(L"MultiWM mod uninitializing...");
+  // A settings reload still waiting for the old worker must not start a new one.
+  RuntimeLifecycle::CancelDeferredRestart();
+  const std::scoped_lock lock(RuntimeLifecycle::g_lifecycle.mutex);
   if (!RuntimeLifecycle::StopHotkeyThread()) {
     // The standard tool-mod wrapper exits this dedicated process immediately
     // after WhTool_ModUninit returns, so never create a second owner here.
@@ -552,17 +556,13 @@ void WhTool_ModUninit() {
   Wh_Log(L"MultiWM mod uninitialized");
 }
 
-void WhTool_ModSettingsChanged() {
-  Wh_Log(L"Settings changed, reloading...");
-
-  // Join the old diagnostics/model owner before touching lifetime telemetry.
-  // If it cannot stop, keep the old worker/settings rather than allowing two WM
-  // actors to overlap inside the dedicated tool-mod process.
-  if (!RuntimeLifecycle::StopHotkeyThread()) {
-    Wh_Log(L"Settings reload aborted because the existing WM worker is still alive");
-    return;
-  }
-
+// The rest of a settings reload, once the old worker has exited: loads the
+// current settings and starts a new worker. The caller holds
+// RuntimeLifecycle::g_lifecycle.mutex. A deferred reload runs this on a
+// thread-pool thread: Windhawk's setting getters read storage afresh on each
+// call with no thread affinity, and Windhawk itself doesn't promise one thread
+// for this callback either.
+static void FinishSettingsReload() {
   ++Diagnostics::g_runtime.counters.settingsReloads;
   Diagnostics::RecordEvent(L"settings reload requested");
 
@@ -577,6 +577,28 @@ void WhTool_ModSettingsChanged() {
   if (!RuntimeLifecycle::StartHotkeyThread()) {
     Wh_Log(L"Failed to restart WM worker after settings change");
   }
+}
+
+void WhTool_ModSettingsChanged() {
+  Wh_Log(L"Settings changed, reloading...");
+  const std::scoped_lock lock(RuntimeLifecycle::g_lifecycle.mutex);
+  if (RuntimeLifecycle::g_lifecycle.deferredWait) {
+    Wh_Log(L"A reload is already waiting for the previous WM worker; it will read these settings");
+    return;
+  }
+
+  // Join the old diagnostics/model owner before touching lifetime telemetry. Two
+  // WM actors must never overlap inside the dedicated tool-mod process, so if it
+  // is still busy, finish the reload once it exits: it already has WM_QUIT.
+  if (!RuntimeLifecycle::StopHotkeyThread()) {
+    if (RuntimeLifecycle::DeferUntilWorkerExits(FinishSettingsReload)) {
+      Wh_Log(L"Settings reload deferred until the previous WM worker exits");
+    } else {
+      Wh_Log(L"Settings reload abandoned; MultiWM restarts at the next settings change");
+    }
+    return;
+  }
+  FinishSettingsReload();
 }
 
 #include "windhawk/tool_mod_launcher.h"

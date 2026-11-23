@@ -599,6 +599,15 @@ static ConformanceRepairTiming CheckConformanceRepairTiming(HWND hwnd, const Con
   return ConformanceRepairTiming::Waiting;
 }
 
+// How long until a lease's next repair after attempt `attemptNumber` gave
+// `result`: the repair interval, doubled after each attempt the window didn't
+// answer (up to 16 times the interval), since each costs a response timeout.
+static ULONGLONG ConformanceRetryDelayMs(PlacementResult result, unsigned attemptNumber) {
+  const ULONGLONG interval = g_settings.conformanceRepairIntervalMs;
+  if (result != PlacementResult::Unresponsive) return interval;
+  return interval << std::min(attemptNumber, 4u);
+}
+
 // Moves the window back onto its tile once more, after re-checking everything
 // that could have changed since the observation. Saves the workspace and may
 // float or forget the window if placement reports it cannot be managed.
@@ -627,7 +636,12 @@ static bool ReinforceConformanceTile(
   // SetWindowPos, in case that contract changed dynamically.
   // WM_GETMINMAXINFO executes target window code. Revalidate physical state
   // after that bounded call before either learning policy or reinforcing a tile.
-  const auto constraintRefresh = RefreshConformanceConstraints(hwnd, workspace, *record);
+  // A window that didn't answer the last placement skips it: the placement's own
+  // responsiveness check comes first, and once that answers the next repair
+  // re-probes. Otherwise a busy app costs two timeouts per repair.
+  const auto constraintRefresh = record->lastPlacementResult == PlacementResult::Unresponsive
+      ? ConformanceConstraintRefresh::Unchanged
+      : RefreshConformanceConstraints(hwnd, workspace, *record);
   if (constraintRefresh == ConformanceConstraintRefresh::Stale) {
     CancelConformanceLease(hwnd, lease.generation);
     return false;
@@ -684,10 +698,9 @@ static bool ReinforceConformanceTile(
     // checked attempt at the configured cadence. The hard deadline performs the
     // passive final verdict and Floats only if the HWND is still materially off
     // its current tile. AccessDenied remains an immediate terminal result above.
-    const ULONGLONG now = GetTickCount64();
     const ULONGLONG due = std::min(
         lease.expiresAtTickMs,
-        now + g_settings.conformanceRepairIntervalMs);
+        GetTickCount64() + ConformanceRetryDelayMs(placement.result, attemptNumber));
     DeferConformanceLeaseRepair(hwnd, lease.generation, due);
   }
   return true;
@@ -762,7 +775,7 @@ static bool HandleFloatingLeaseLocationChange(HWND hwnd, const ConformanceLease&
   } else if ((placement.result == PlacementResult::Refused ||
               placement.result == PlacementResult::Unresponsive) && leaseRetained) {
     const ULONGLONG due = std::min(
-        lease.expiresAtTickMs, GetTickCount64() + g_settings.conformanceRepairIntervalMs);
+        lease.expiresAtTickMs, GetTickCount64() + ConformanceRetryDelayMs(placement.result, attemptNumber));
     DeferConformanceLeaseRepair(hwnd, lease.generation, due);
   } else if (placement.result != PlacementResult::Success) {
     CancelConformanceLease(hwnd, lease.generation);  // Access denied or suppressed.

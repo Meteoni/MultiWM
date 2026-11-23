@@ -47,6 +47,12 @@ using PreviewIcon = std::shared_ptr<std::remove_pointer_t<HICON>>;
 
 constexpr UINT_PTR kFadeTimer = 1;
 constexpr UINT_PTR kToastTimer = 2;
+// Releases an idle host's surface: a work-area-sized BGRA surface (about 32 MB
+// of GPU memory at 4K) isn't kept for the whole session. The device and window
+// stay, so the next show re-attaches in a few milliseconds (measured 4-7 ms more
+// than a warm toast at 3066x1914), not the ~170 ms of a cold start.
+constexpr UINT_PTR kSurfaceReleaseTimer = 3;
+constexpr UINT kIdleSurfaceReleaseMs = 30'000;
 constexpr UINT kFadeIntervalMs = 16;
 constexpr UINT kBadgeIconReadyMessage = WM_APP + 32;
 
@@ -170,6 +176,7 @@ struct Presenter {
 // Owned by the thread that presents: the overlay thread once started, else the caller.
 static Presenter g_presenter;
 static bool DrawHost(MonitorHost& host);
+static void ReleaseHostSurface(MonitorHost& host);
 static void StepToast(MonitorHost& host);
 
 // Milliseconds on a high-resolution clock. GetTickCount64 advances in ~15.6 ms
@@ -269,6 +276,11 @@ static LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT message, WPARAM wparam
   auto* host = reinterpret_cast<MonitorHost*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   if (host && message == WM_TIMER && wparam == kToastTimer) {
     StepToast(*host);
+    return 0;
+  }
+  if (host && message == WM_TIMER && wparam == kSurfaceReleaseTimer) {
+    KillTimer(hwnd, kSurfaceReleaseTimer);
+    if (!host->visible && host->surface.target) ReleaseHostSurface(*host);
     return 0;
   }
   if (host && message == WM_PAINT) {
@@ -623,6 +635,7 @@ static bool DrawHost(MonitorHost& host) {
     }
     host.visible = true;
     host.raise = false;
+    KillTimer(host.window, kSurfaceReleaseTimer);
   }
   auto& surface = host.surface;
   if (!surface.BeginDraw()) {
@@ -676,6 +689,7 @@ static bool DrawHost(MonitorHost& host) {
   if (!visible) {
     ShowWindow(host.window, SW_HIDE);
     host.visible = false;
+    SetTimer(host.window, kSurfaceReleaseTimer, kIdleSurfaceReleaseMs, nullptr);
   }
   return true;
 }
@@ -943,9 +957,15 @@ static void KeepDesktopIcons(LPARAM payload) {
   });
 }
 
+// Warms the device, window and surface for the first preview or toast. An
+// unused surface is released like any idle one; the device stays warm.
 static void WarmMonitorHost(HMONITOR monitor) {
   RECT workArea{};
-  if (Platform::Monitors::GetOverlayWorkArea(monitor, &workArea)) GetMonitorHost(monitor, workArea);
+  if (!Platform::Monitors::GetOverlayWorkArea(monitor, &workArea)) return;
+  MonitorHost& host = GetMonitorHost(monitor, workArea);
+  if (host.window && host.surface.target && !host.visible) {
+    SetTimer(host.window, kSurfaceReleaseTimer, kIdleSurfaceReleaseMs, nullptr);
+  }
 }
 
 static void HandleOverlayMessage(const MSG& msg) {
