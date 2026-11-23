@@ -1146,6 +1146,8 @@ static void RunFirstFloatingSizeTests() {
 // the constraint preflight that restores the old layout after a rejected drop.
 static void RunBspDragTests() {
   CheckCounter check;
+  const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  check(SUCCEEDED(com), "initialize COM for the retained preview tests");
   FloatingWindowFixture fixture(check);
   const HWND source = fixture.hwnd;
   const HWND target = fixture.CreateTestWindow(nullptr);
@@ -1328,24 +1330,24 @@ static void RunBspDragTests() {
   DragPreview::DragSession previewDrag{source, source, fixture.key.ResolveMonitor(), fixture.key,
                                       originalSourceFrame, {}, {}, {}, {}};
   DragPreview::UpdateDropPreview(previewDrag, SharedGeometry::RectCenter(originalSourceFrame));
-  check(!previewDrag.target && DragPreview::g_overlay.fadeTo == 255 && DragPreview::g_overlay.shown &&
-            EqualRect(&DragPreview::g_overlay.shown->preview.dragged, &originalSourceFrame) &&
-            EqualRect(&DragPreview::g_overlay.shown->preview.affected, &originalSourceFrame),
+  check(!previewDrag.target && Overlay::g_presenter.fadeTo == 255 && Overlay::g_presenter.shown &&
+            IsEqualGUID(Overlay::g_presenter.shown->desktopId, fixture.key.desktopId) &&
+            EqualRect(&Overlay::g_presenter.shown->preview.dragged, &originalSourceFrame) &&
+            EqualRect(&Overlay::g_presenter.shown->preview.affected, &originalSourceFrame),
         "a drop away from other tiles previews both shapes at the source tile");
-  DragPreview::FadeTo(0);
+  Overlay::FadeTo(0);
   const RECT targetFrame = FloatingWindowFixture::Frame(target);
   POINT blockedPoint = SharedGeometry::RectCenter(targetFrame);
   if (landscape) blockedPoint.y = targetFrame.bottom - 1;
   else blockedPoint.x = targetFrame.right - 1;
   DragPreview::UpdateDropPreview(previewDrag, blockedPoint);
-  RECT snapBackFill{}, snapBackOutline{};
+  const auto& snapBack = Overlay::g_presenter.shown;
   check(previewDrag.target == Commands::TiledDropTarget{target, splitEdge} &&
-            IsWindowVisible(DragPreview::g_overlay.fill) && IsWindowVisible(DragPreview::g_overlay.outline) &&
-            GetWindowRect(DragPreview::g_overlay.fill, &snapBackFill) &&
-            GetWindowRect(DragPreview::g_overlay.outline, &snapBackOutline) &&
-            EqualRect(&snapBackFill, &originalSourceFrame) && EqualRect(&snapBackOutline, &originalSourceFrame),
+            snapBack && Overlay::g_presenter.previewHost->visible &&
+            EqualRect(&snapBack->preview.dragged, &originalSourceFrame) &&
+            EqualRect(&snapBack->preview.affected, &originalSourceFrame),
         "a rejected split displays both shapes at the source tile");
-  DragPreview::Shutdown();
+  DragPreview::Shutdown(); Overlay::Shutdown();
   g_settings.dragPreviewFadeMs = savedFadeMs;
 
   const auto splitPreview = Commands::PlanTiledDropPreview(previewWorkspace, source, {target, fittingEdge}, fixture.metrics);
@@ -1525,205 +1527,343 @@ static void RunBspDragTests() {
   g_settings.dragPreviewFadeMs = 96;
   const HWND previouslyFocused = GetForegroundWindow();
   DragPreview::Show({narrowTile, wideTile});
-  const auto& overlay = DragPreview::g_overlay;
+  auto& overlay = Overlay::g_presenter;
   const ULONGLONG fadeInStart = overlay.fadeStarted;
-  DragPreview::StepFade(fadeInStart + g_settings.dragPreviewFadeMs / 2);
+  Overlay::StepFade(fadeInStart + g_settings.dragPreviewFadeMs / 2);
   check(overlay.fadeAlpha == 128, "the preview fades toward the configured opacity");
   DragPreview::Show({wideTile, narrowTile});
   check(overlay.fadeStarted == fadeInStart, "changing targets does not restart a fade");
-  DragPreview::StepFade(fadeInStart + g_settings.dragPreviewFadeMs);
-  RECT displayedFill{}, displayedOutline{};
-  BYTE fillAlpha = 0, outlineAlpha = 0;
-  DWORD fillFlags = 0, outlineFlags = 0;
-  check(IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
-            GetWindowRect(overlay.fill, &displayedFill) && EqualRect(&displayedFill, &wideTile) &&
-            GetWindowRect(overlay.outline, &displayedOutline) && EqualRect(&displayedOutline, &narrowTile) &&
-            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, &fillFlags) && fillAlpha == 64 &&
-            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, &outlineFlags) && outlineAlpha == 255 &&
-            fillFlags == (LWA_COLORKEY | LWA_ALPHA) && outlineFlags == fillFlags &&
-            (GetWindowLongPtrW(overlay.fill, GWL_EXSTYLE) & WS_EX_TRANSPARENT) &&
-            (GetWindowLongPtrW(overlay.outline, GWL_EXSTYLE) & WS_EX_TRANSPARENT) &&
+  Overlay::StepFade(fadeInStart + g_settings.dragPreviewFadeMs);
+  const auto previewVisible = [&] {
+    return overlay.previewHost && IsWindowVisible(overlay.previewHost->window);
+  };
+  check(previewVisible() && overlay.shown &&
+            EqualRect(&overlay.shown->preview.dragged, &wideTile) &&
+            EqualRect(&overlay.shown->preview.affected, &narrowTile) &&
+            overlay.style.fillOpacity == 25 && overlay.style.outlineOpacity == 100 &&
             GetForegroundWindow() == previouslyFocused,
-        "the fill and transparent outline use their planned bounds and opacity without taking focus");
+        "the retained preview uses the planned rectangles and opacity settings without taking focus");
   DragPreview::Show({wideTile, narrowTile});
-  check(overlay.fadeAlpha == 255 && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
-        "the same preview rectangles do not start another fade");
+  check(overlay.fadeAlpha == 255 && !overlay.fading, "the same preview rectangles do not start another fade");
   DragPreview::Show({narrowTile, wideTile});
-  check(overlay.fadeAlpha == 128 && GetWindowRect(overlay.fill, &displayedFill) &&
-            EqualRect(&displayedFill, &narrowTile) &&
-            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 32 &&
-            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, nullptr) && outlineAlpha == 128,
+  check(overlay.fadeAlpha == 128 && EqualRect(&overlay.shown->preview.dragged, &narrowTile),
         "a changed destination appears immediately at half opacity");
   const ULONGLONG targetFadeStart = overlay.fadeStarted;
-  DragPreview::StepFade(targetFadeStart + g_settings.dragPreviewFadeMs / 2);
+  Overlay::StepFade(targetFadeStart + g_settings.dragPreviewFadeMs / 2);
   check(overlay.fadeAlpha == 192, "a changed destination fades toward full strength");
-  DragPreview::StepFade(targetFadeStart + g_settings.dragPreviewFadeMs);
+  Overlay::StepFade(targetFadeStart + g_settings.dragPreviewFadeMs);
   DragPreview::End();
   const ULONGLONG fadeOutStart = overlay.fadeStarted;
-  DragPreview::StepFade(fadeOutStart + g_settings.dragPreviewFadeMs / 2);
-  check(IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
-            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 32 &&
-            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, nullptr) && outlineAlpha == 127,
-        "the opaque outline fades out in step with the fill");
-  DragPreview::StepFade(fadeOutStart + g_settings.dragPreviewFadeMs);
-  check(!IsWindowVisible(overlay.fill) && !IsWindowVisible(overlay.outline) &&
-            !KillTimer(overlay.fill, DragPreview::kFadeTimer),
-        "the completed fade hides both overlays and stops the timer");
-  g_settings.dragPreviewFillOpacity = 10;
-  g_settings.dragPreviewOutlineOpacity = 60;
-  g_settings.dragPreviewFadeMs = 160;
-  DragPreview::Show({wideTile, narrowTile});
-  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
-  check(GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 26 &&
-            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, nullptr) && outlineAlpha == 153,
-        "fill and outline opacities are independently configurable");
-  DragPreview::End();
-  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
-
+  Overlay::StepFade(fadeOutStart + g_settings.dragPreviewFadeMs / 2);
+  check(previewVisible() && overlay.fadeAlpha == 127,
+        "the retained preview stays visible while the fade is in progress");
+  Overlay::StepFade(fadeOutStart + g_settings.dragPreviewFadeMs);
+  check(!previewVisible() && !overlay.fading, "the completed fade hides the preview");
   g_settings.dragPreviewFillOpacity = 0;
   g_settings.dragPreviewFadeMs = 0;
   DragPreview::Show({wideTile, narrowTile});
-  check(g_settings.DragPreviewEnabled() && !IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
-            GetLayeredWindowAttributes(overlay.outline, nullptr, &outlineAlpha, nullptr) && outlineAlpha == 153,
-        "zero fill opacity and zero fade duration show only the outline immediately");
-  DragPreview::Show({narrowTile, wideTile});
-  check(overlay.fadeAlpha == 255 && GetWindowRect(overlay.outline, &displayedOutline) &&
-            EqualRect(&displayedOutline, &wideTile) && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
-        "zero fade duration moves the preview immediately without dimming");
+  check(g_settings.DragPreviewEnabled() && previewVisible() && overlay.style.fillOpacity == 0 &&
+            overlay.style.outlineOpacity == 100 && overlay.fadeAlpha == 255 && !overlay.fading,
+        "an outline-only preview with zero fade duration shows immediately");
   DragPreview::End();
-  check(!IsWindowVisible(overlay.outline) && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
-        "zero fade duration also hides the preview immediately without a timer");
-  check(!DragPreview::EnsurePreviewThread() && !DragPreview::g_previewThread.handle,
-        "a synchronous fallback keeps ownership of its preview windows");
-
-  // Check the GDI corners in a private bitmap so the active desktop is irrelevant.
-  {
-    const LONG savedRadius = g_settings.dragPreviewOutlineRadiusDip;
-    g_settings.dragPreviewFillOpacity = 25;
-    g_settings.dragPreviewOutlineRadiusDip = 12;
-    DragPreview::Show({wideTile, narrowTile});
-    HDC dc = CreateCompatibleDC(nullptr);
-    BITMAPINFO bitmapInfo{};
-    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmapInfo.bmiHeader.biWidth = 128;
-    bitmapInfo.bmiHeader.biHeight = 128;
-    bitmapInfo.bmiHeader.biPlanes = 1;
-    bitmapInfo.bmiHeader.biBitCount = 32;
-    void* pixels = nullptr;
-    HBITMAP bitmap = CreateDIBSection(dc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    HGDIOBJ original = SelectObject(dc, bitmap);
-    HBRUSH accent = CreateSolidBrush(overlay.accent);
-    check(dc && bitmap && original && original != HGDI_ERROR && accent, "create the GDI preview test bitmap");
-    const RECT update{0, 0, 128, 128};
-    DragPreview::PaintPreviewShape(overlay.fill, dc, update, accent);
-    check(GetPixel(dc, 0, 0) == overlay.colorKey && GetPixel(dc, 32, 32) == overlay.accent,
-          "the GDI fill has a transparent rounded corner and an accented interior");
-    DragPreview::PaintPreviewShape(overlay.outline, dc, update, accent);
-    check(GetPixel(dc, 0, 0) == overlay.colorKey && GetPixel(dc, 64, 0) == overlay.accent,
-          "the GDI outline shares the fill's corner radius");
-
-    g_settings.dragPreviewOutlineRadiusDip = 0;
-    DragPreview::Show({narrowTile, wideTile});
-    DragPreview::PaintPreviewShape(overlay.fill, dc, update, accent);
-    check(GetPixel(dc, 0, 0) == overlay.accent, "a zero radius gives the GDI fill square corners");
-    DeleteObject(accent);
-    SelectObject(dc, original);
-    DeleteObject(bitmap);
-    DeleteDC(dc);
-    DragPreview::End();
-    g_settings.dragPreviewOutlineRadiusDip = savedRadius;
-  }
+  check(!previewVisible() && !overlay.fading, "zero fade duration also hides the preview immediately");
 
   const HICON sourceIcon = LoadIconW(nullptr, IDI_INFORMATION);
   const HICON targetIcon = LoadIconW(nullptr, IDI_WARNING);
   SendMessageW(source, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(sourceIcon));
   SendMessageW(target, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(targetIcon));
+  auto waitForIcon = [&](auto&& condition, bool dispatchCompletions = true) {
+    // Pump the icon replies, leaving fade steps under the test's control.
+    const auto deadline = GetTickCount64() + 3000;
+    do {
+      MSG message{};
+      PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+      while (dispatchCompletions && PeekMessageW(&message, nullptr, Overlay::kBadgeIconReadyMessage,
+                                                 Overlay::kBadgeIconReadyMessage, PM_REMOVE)) {
+        DispatchMessageW(&message);
+      }
+      if (condition()) return true;
+      const DWORD wake = dispatchCompletions ? QS_SENDMESSAGE | QS_POSTMESSAGE : QS_SENDMESSAGE;
+      MsgWaitForMultipleObjectsEx(0, nullptr, 10, wake, MWMO_INPUTAVAILABLE);
+    } while (GetTickCount64() < deadline);
+    return false;
+  };
   g_settings.dragPreviewFillOpacity = 25;
   g_settings.dragPreviewIconSizeDip = 24;
   g_settings.dragPreviewFadeMs = 96;
-  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144);
-  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs / 2);
+  const GUID& desktopId = fixture.key.desktopId;
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
   const auto& draggedBadge = overlay.draggedBadge;
   const auto& affectedBadge = overlay.affectedBadge;
-  RECT badgeFrame{};
-  BYTE badgeAlpha = 0;
+  check(previewVisible() && !draggedBadge.icon && !affectedBadge.icon,
+        "the cold preview shows the shapes before either icon lookup finishes");
+  auto& lookup = *overlay.iconLookup;
+  for (const auto& [window, icon] : {std::pair{source, sourceIcon}, std::pair{target, targetIcon}}) {
+    check(waitForIcon([&] { return lookup.state.load() == Overlay::BadgeIconLookup::State::Ready; }, false) &&
+              lookup.key.window == window,
+          "the icon worker completes each queued badge");
+    // The test owns both apps and the renderer on this thread, so presenting
+    // the first frame can delay its own WM_GETICON reply past the timeout.
+    if (lookup.queryFailed) {
+      lookup.icon = Overlay::PreviewIcon(CopyIcon(icon), DestroyIcon);
+      lookup.queryFailed = false;
+    }
+    Overlay::UpdateBadgesAfterIconLookup();
+  }
+  auto& desktopIcons = overlay.iconsByDesktop.at(desktopId);
+  Overlay::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs / 2);
   const POINT tileCenter = SharedGeometry::RectCenter(narrowTile);
-  check(IsWindowVisible(draggedBadge.window) && IsWindowVisible(affectedBadge.window) &&
-            draggedBadge.icon && affectedBadge.icon && draggedBadge.icon != affectedBadge.icon &&
-            overlay.icons.size() == 2 && draggedBadge.iconSize == 36 &&
-            GetWindowRect(draggedBadge.window, &badgeFrame) && Layout::RectWidth(badgeFrame) == 48 &&
-            SharedGeometry::RectCenter(badgeFrame).x == tileCenter.x &&
-            SharedGeometry::RectCenter(badgeFrame).y == tileCenter.y &&
-            GetLayeredWindowAttributes(draggedBadge.window, nullptr, &badgeAlpha, nullptr) && badgeAlpha == 128 &&
-            GetLayeredWindowAttributes(overlay.fill, nullptr, &fillAlpha, nullptr) && fillAlpha == 32 &&
-            SendMessageW(draggedBadge.window, WM_NCHITTEST, 0, 0) == HTTRANSPARENT,
-        "badges use DPI-scaled sizes and fade independently of the fill opacity");
+  const POINT badgeCenter = SharedGeometry::RectCenter(draggedBadge.frame);
+  check(previewVisible() && draggedBadge.icon && affectedBadge.icon && draggedBadge.icon != affectedBadge.icon &&
+            desktopIcons.size() == 2 && draggedBadge.iconSize == 36 && Layout::RectWidth(draggedBadge.frame) == 48 &&
+            badgeCenter.x == tileCenter.x && badgeCenter.y == tileCenter.y && overlay.fadeAlpha == 128,
+        "badges use DPI-scaled sizes and remain centered during a fade");
   const auto cachedIcon = draggedBadge.icon;
   const bool savedLightTheme = TrayUi::g_session.systemLightTheme;
   const bool actualLightTheme = TrayUi::ReadSystemLightTheme();
   TrayUi::g_session.systemLightTheme = !actualLightTheme;
   const COLORREF oldBadgeColor = TrayUi::FlyoutBackgroundColor();
-  ValidateRect(draggedBadge.window, nullptr);
-  ValidateRect(affectedBadge.window, nullptr);
   const ULONGLONG badgeFadeStart = overlay.fadeStarted;
   TrayUi::TrayWindowProc(nullptr, WM_THEMECHANGED, 0, 0);
   check(TrayUi::g_session.systemLightTheme == actualLightTheme &&
-            TrayUi::FlyoutBackgroundColor() != oldBadgeColor &&
-            GetUpdateRect(draggedBadge.window, nullptr, FALSE) &&
-            GetUpdateRect(affectedBadge.window, nullptr, FALSE) &&
-            draggedBadge.icon == cachedIcon && overlay.fadeStarted == badgeFadeStart &&
-            GetLayeredWindowAttributes(draggedBadge.window, nullptr, &badgeAlpha, nullptr) && badgeAlpha == 128,
-        "a theme change repaints both visible badges without restarting the fade or clearing their icons");
+            overlay.style.badgeAppearance.background != oldBadgeColor &&
+            overlay.style.badgeAppearance.light == actualLightTheme &&
+            draggedBadge.icon == cachedIcon && overlay.fadeStarted == badgeFadeStart && overlay.fadeAlpha == 128,
+        "a theme change updates the badge appearance without restarting the fade or clearing the icons");
   TrayUi::g_session.systemLightTheme = savedLightTheme;
   SendMessageW(source, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(targetIcon));
-  DragPreview::Show({wideTile, narrowTile, source, target}, true, 144);
-  check(draggedBadge.icon == cachedIcon && overlay.icons.size() == 2,
+  DragPreview::Show({wideTile, narrowTile, source, target}, true, 144, desktopId);
+  check(draggedBadge.icon == cachedIcon && desktopIcons.size() == 2,
         "moving the preview keeps the cached window icons");
-  DragPreview::Show({wideTile, wideTile, source}, true, 144);
-  check(IsWindowVisible(draggedBadge.window) && !IsWindowVisible(affectedBadge.window),
+  DragPreview::Show({wideTile, wideTile, source}, true, 144, desktopId);
+  check(draggedBadge.icon && !affectedBadge.icon,
         "a snap-back shows only the dragged app badge");
   DragPreview::End();
-  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
-  check(!IsWindowVisible(draggedBadge.window) && !draggedBadge.icon, "the badge hides and releases its icon after the fade");
-  DragPreview::g_overlay.icons.clear();
+  Overlay::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  check(!previewVisible() && !draggedBadge.icon, "the badge hides and releases its icon after the fade");
+  Overlay::HandleOverlayMessage(MSG{.message = Overlay::kNewDragMessage});
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  check(draggedBadge.icon == cachedIcon && affectedBadge.icon && desktopIcons.size() == 2,
+        "the next drag reuses both cached icons");
+  const auto cachedSource = std::ranges::find_if(desktopIcons, [source](const auto& entry) {
+    return entry.key.window == source;
+  });
+  // Deliver a timed-out refresh without depending on scheduler timing.
+  lookup.key = cachedSource->key;
+  lookup.desktopId = desktopId;
+  lookup.queryFailed = true;
+  lookup.state.store(Overlay::BadgeIconLookup::State::Ready);
+  Overlay::UpdateBadgesAfterIconLookup();
+  check(cachedSource->icon == cachedIcon && cachedSource->retry && draggedBadge.icon == cachedIcon,
+        "a failed refresh keeps the last good icon visible and retries on a later drag");
+
+  for (auto& entry : desktopIcons) entry.loadedAt -= 60'000;
+  SendMessageW(target, WM_SETICON, ICON_SMALL, 0);
+  DragPreview::End();
+  Overlay::HandleOverlayMessage(MSG{.message = Overlay::kNewDragMessage});
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  check(draggedBadge.icon == cachedIcon && affectedBadge.icon,
+        "aging icons remain visible while a refresh runs");
+  // The cache must apply successful results independently of the native
+  // window-message timeout, which has its own coverage above.
+  for (HWND window : {source, target}) {
+    check(waitForIcon([&] { return lookup.state.load() == Overlay::BadgeIconLookup::State::Ready; }, false) &&
+              lookup.key.window == window,
+          "the aged badge is queued for a new lookup");
+    lookup.icon = window == source ? Overlay::PreviewIcon(CopyIcon(targetIcon), DestroyIcon)
+                                   : Overlay::PreviewIcon{};
+    lookup.queryFailed = false;
+    Overlay::UpdateBadgesAfterIconLookup();
+  }
+  check(draggedBadge.icon && draggedBadge.icon != cachedIcon && !affectedBadge.icon,
+        "a later drag refreshes the changed icon and clears the one the app removed");
+  DragPreview::OnWindowEvent(EVENT_OBJECT_DESTROY, target);
+  check(desktopIcons.size() == 1, "destroy notification evicts the target icon");
   g_settings.dragPreviewIconSizeDip = 0;
-  DragPreview::Show({wideTile, narrowTile, source, target}, true, 144);
-  check(!IsWindowVisible(draggedBadge.window) && !IsWindowVisible(affectedBadge.window) && overlay.icons.empty(),
+  DragPreview::Show({wideTile, narrowTile, source, target}, true, 144, desktopId);
+  check(!draggedBadge.icon && !affectedBadge.icon && desktopIcons.size() == 1,
         "a zero icon size disables badges and icon queries");
 
   g_settings.dragPreviewIconSizeDip = 24;
-  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144);
-  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  DragPreview::Show({wideTile, narrowTile, source, target}, true, 144, desktopId);
+  check(waitForIcon([&] {
+          return desktopIcons.size() == 2 && overlay.iconLookup &&
+              overlay.iconLookup->state.load() == Overlay::BadgeIconLookup::State::Idle;
+        }) && !affectedBadge.icon,
+        "a missing icon leaves the affected badge empty");
+  SendMessageW(target, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(targetIcon));
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  check(overlay.iconLookup->state.load() == Overlay::BadgeIconLookup::State::Idle && !affectedBadge.icon,
+        "another hover during the same drag does not repeat the miss");
+  Overlay::HandleOverlayMessage(MSG{.message = Overlay::kNewDragMessage});
+  DragPreview::Show({wideTile, narrowTile, source, target}, true, 144, desktopId);
+  check(waitForIcon([&] { return lookup.state.load() == Overlay::BadgeIconLookup::State::Ready; }, false) &&
+            lookup.key.window == target,
+        "the next drag queues the missing icon again");
+  lookup.icon = Overlay::PreviewIcon(CopyIcon(targetIcon), DestroyIcon);
+  lookup.queryFailed = false;
+  Overlay::UpdateBadgesAfterIconLookup();
+  check(affectedBadge.icon != nullptr,
+        "the next drag retries the missing icon and shows it when available");
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  Overlay::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
   DragPreview::End();
-  check(IsWindowVisible(draggedBadge.window) && IsWindowVisible(affectedBadge.window) &&
-            DestroyWindow(overlay.outline),
-        "both badges are visible when a GDI window is lost during fade-out");
-  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs / 2);
-  check(!IsWindowVisible(overlay.fill) && !IsWindowVisible(draggedBadge.window) &&
-            !IsWindowVisible(affectedBadge.window) && !draggedBadge.icon && !affectedBadge.icon &&
-            !overlay.fading && !KillTimer(overlay.fill, DragPreview::kFadeTimer),
-        "a GDI fade failure hides the preview and both badges immediately");
-  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144);
-  DragPreview::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
-  check(IsWindowVisible(overlay.fill) && IsWindowVisible(overlay.outline) &&
-            IsWindowVisible(draggedBadge.window) && IsWindowVisible(affectedBadge.window),
-        "the next preview recreates the missing GDI window and shows both badges");
-  DragPreview::Shutdown();
+  Overlay::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  check(!previewVisible() && !draggedBadge.icon && !affectedBadge.icon,
+        "the completed fade clears the preview and both badges");
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  HWND previewHost = overlay.previewHost->window;
+  Overlay::ResetHostSurface(*overlay.previewHost);
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  check(previewVisible() && overlay.previewHost->window == previewHost,
+        "a preview update rebuilds a reset surface in the same host window");
 
-  // On its own thread: the preview's windows belong to that thread, which
-  // MultiWM ignores like its own; GDI fades are paced by DWM there.
+  // A window that goes topmost while the host is still on screen (a preview
+  // fading out, a toast) stays beneath the next preview.
+  const HWND laterTopmost = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"",
+                                            WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  auto isAbove = [](HWND upper, HWND lower) {
+    for (HWND window = GetWindow(lower, GW_HWNDPREV); window; window = GetWindow(window, GW_HWNDPREV)) {
+      if (window == upper) return true;
+    }
+    return false;
+  };
+  Overlay::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  DragPreview::End();
+  Overlay::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs / 2);
+  check(laterTopmost && previewVisible() &&
+            SetWindowPos(laterTopmost, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) &&
+            isAbove(laterTopmost, previewHost),
+        "another topmost window can rise above the fading host");
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  check(previewVisible() && isAbove(previewHost, laterTopmost),
+        "a new preview raises its visible host above later topmost windows");
+  DragPreview::End();
+  Overlay::StepFade(overlay.fadeStarted + g_settings.dragPreviewFadeMs);
+  check(!previewVisible() &&
+            SetWindowPos(laterTopmost, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) &&
+            isAbove(laterTopmost, previewHost),
+        "another topmost window can rise above the hidden host");
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  check(previewVisible() && isAbove(previewHost, laterTopmost),
+        "showing a hidden host raises it above later topmost windows");
+  if (laterTopmost) DestroyWindow(laterTopmost);
+
+  // A monitor that disappeared gives up its host window and surface.
+  {
+    const auto goneMonitor = reinterpret_cast<HMONITOR>(static_cast<uintptr_t>(0x7ffe));
+    auto& gone = overlay.hosts[goneMonitor];
+    gone = std::make_unique<Overlay::MonitorHost>();
+    gone->window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, Overlay::kOverlayClassName, L"", WS_POPUP,
+                                   0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), gone.get());
+    const HWND goneWindow = gone->window;
+    const size_t hosts = overlay.hosts.size();
+    Overlay::NotifyDisplayChanged();
+    check(goneWindow && !IsWindow(goneWindow) && !overlay.hosts.contains(goneMonitor) &&
+              overlay.hosts.size() == hosts - 1 && previewVisible(),
+          "a display change frees a vanished monitor's host and keeps the live preview");
+  }
+
+  GUID otherDesktopId = desktopId;
+  otherDesktopId.Data1 ^= 1;
+  const auto firstDesktopIcon = draggedBadge.icon;
+  Overlay::HandleOverlayMessage(MSG{.message = Overlay::kNewDragMessage});
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, otherDesktopId);
+  check(!draggedBadge.icon, "a cold desktop does not display the previous desktop's cached badge");
+  check(waitForIcon([&] {
+          const auto desktop = overlay.iconsByDesktop.find(otherDesktopId);
+          return desktop != overlay.iconsByDesktop.end() && desktop->second.size() == 2 &&
+              overlay.iconLookup->state.load() == Overlay::BadgeIconLookup::State::Idle;
+        }), "the same preview on a different desktop completes its own lookups");
+
+  auto& otherDesktopIcons = overlay.iconsByDesktop.at(otherDesktopId);
+  auto oldestKey = otherDesktopIcons.front().key;
+  oldestKey.size = 1000;
+  for (LONG size = oldestKey.size; otherDesktopIcons.size() < 128; ++size) {
+    auto key = oldestKey;
+    key.size = size;
+    otherDesktopIcons.push_back({.key = key});
+  }
+  SendMessageW(sibling, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(sourceIcon));
+  DragPreview::Show({wideTile, wideTile, sibling}, true, 144, otherDesktopId);
+  check(waitForIcon([&] { return overlay.iconLookup->state.load() == Overlay::BadgeIconLookup::State::Idle; }) &&
+            otherDesktopIcons.size() == 128 &&
+            std::ranges::any_of(otherDesktopIcons, [sibling](const auto& entry) { return entry.key.window == sibling; }) &&
+            std::ranges::find(otherDesktopIcons, oldestKey, &Overlay::CachedBadgeIcon::key) == otherDesktopIcons.end(),
+        "a full desktop evicts its oldest entry to load a new badge");
+  DragPreview::Show({narrowTile, wideTile, source, target}, true, 144, desktopId);
+  check(draggedBadge.icon == firstDesktopIcon && desktopIcons.size() == 2,
+        "filling another desktop does not evict this desktop's icons");
+  DragPreview::OnWindowEvent(EVENT_OBJECT_DESTROY, target);
+  check(desktopIcons.size() == 1 && otherDesktopIcons.size() == 127,
+        "destroying a window removes its icons across desktops");
+  Overlay::HandleOverlayMessage(MSG{.message = Overlay::kDesktopListMessage,
+      .lParam = reinterpret_cast<LPARAM>(new std::vector<GUID>{desktopId})});
+  check(overlay.iconsByDesktop.size() == 1 && overlay.iconsByDesktop.contains(desktopId),
+        "a refreshed desktop list evicts the removed desktop's whole cache");
+  DragPreview::Shutdown(); Overlay::Shutdown();
+
+  // Use this thread's queue to make the publisher faster than the consumer.
+  {
+    MSG message{};
+    PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    Overlay::g_overlayThread.id.store(GetCurrentThreadId());
+    auto style = DragPreview::CurrentStyle();
+    style.fadeMs = 0;
+    Overlay::PublishPreview(Overlay::PresentRequest{{narrowTile, wideTile}, style});
+    Overlay::PublishPreview(Overlay::PresentRequest{{wideTile, narrowTile}, style});
+    check(Overlay::PostToOverlayThread(Overlay::kNewDragMessage), "queue a drag boundary");
+    Overlay::PublishPreview(Overlay::PresentRequest{{narrowTile, wideTile}, style});
+    Overlay::PublishPreview(std::nullopt);
+    Overlay::g_overlayThread.id.store(0);
+
+    const HWND threadMessages = reinterpret_cast<HWND>(-1);
+    check(PeekMessageW(&message, threadMessages, Overlay::kPreviewUpdateMessage,
+                       Overlay::kDesktopListMessage, PM_REMOVE) &&
+              message.message == Overlay::kPreviewUpdateMessage,
+          "the first batch queues one preview update");
+    Overlay::HandleOverlayMessage(message);
+    check(overlay.shown && EqualRect(&overlay.shown->preview.dragged, &wideTile),
+          "the renderer takes the newest target in the batch");
+    check(PeekMessageW(&message, threadMessages, Overlay::kPreviewUpdateMessage,
+                       Overlay::kDesktopListMessage, PM_REMOVE) &&
+              message.message == Overlay::kNewDragMessage,
+          "a new drag separates pending preview updates");
+    Overlay::HandleOverlayMessage(message);
+    check(PeekMessageW(&message, threadMessages, Overlay::kPreviewUpdateMessage,
+                       Overlay::kDesktopListMessage, PM_REMOVE) &&
+              message.message == Overlay::kPreviewUpdateMessage,
+          "the second batch queues one preview update");
+    Overlay::HandleOverlayMessage(message);
+    check(overlay.fadeTo == 0 && !previewVisible() &&
+              !Overlay::g_overlayThread.pendingUpdate &&
+              !PeekMessageW(&message, threadMessages, Overlay::kPreviewUpdateMessage,
+                            Overlay::kDesktopListMessage, PM_REMOVE),
+          "a pending hide supersedes a stale target and leaves the queue empty");
+    DragPreview::Shutdown(); Overlay::Shutdown();
+  }
+
+  // A preview and solid toast share the same retained host on the renderer.
   {
     auto threadWindows = [](DWORD thread) {
       std::vector<HWND> windows;
       EnumThreadWindows(thread, [](HWND hwnd, LPARAM list) WINAPI -> BOOL {
-        reinterpret_cast<std::vector<HWND>*>(list)->push_back(hwnd);
+        wchar_t className[64]{};
+        GetClassNameW(hwnd, className, ARRAYSIZE(className));
+        if (std::wstring_view(className) == Overlay::kOverlayClassName) {
+          reinterpret_cast<std::vector<HWND>*>(list)->push_back(hwnd);
+        }
         return TRUE;
       }, reinterpret_cast<LPARAM>(&windows));
       return windows;
     };
     auto waitFor = [](auto&& condition) {
       const ULONGLONG deadline = GetTickCount64() + 3000;
-      while (!condition() && GetTickCount64() < deadline) Sleep(5);
+      while (!condition() && GetTickCount64() < deadline) {
+        MSG message{};
+        PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        MsgWaitForMultipleObjectsEx(0, nullptr, 5, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE);
+      }
       return condition();
     };
     auto noneVisible = [&](DWORD thread) {
@@ -1737,34 +1877,63 @@ static void RunBspDragTests() {
     g_settings.dragPreviewOutlineOpacity = 100;
     g_settings.dragPreviewIconSizeDip = 0;
     g_settings.dragPreviewFadeMs = 96;
-    check(DragPreview::EnsurePreviewThread(), "start the preview thread");
-    const DWORD previewThread = DragPreview::g_previewThread.id.load();
-    auto gdiFillAt = [&](BYTE alpha) {
-      for (HWND window : threadWindows(previewThread)) {
+    check(Overlay::EnsureOverlayThread(), "start the overlay thread");
+    const DWORD overlayThread = Overlay::g_overlayThread.id.load();
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    check(GetMonitorInfoW(fixture.key.ResolveMonitor(), &monitorInfo), "resolve the test monitor's bounds");
+    const RECT overlayWorkArea = SharedGeometry::KeepTilesOffWholeMonitor(monitorInfo.rcWork, monitorInfo.rcMonitor);
+    HWND host = nullptr;
+    auto findHost = [&] {
+      for (HWND window : threadWindows(overlayThread)) {
         RECT frame{};
-        BYTE shown = 0;
-        if (IsWindowVisible(window) && GetWindowRect(window, &frame) && EqualRect(&frame, &wideTile) &&
-            GetLayeredWindowAttributes(window, nullptr, &shown, nullptr) && shown == alpha) {
+        if (IsWindowVisible(window) && (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) &&
+            GetWindowRect(window, &frame) && EqualRect(&frame, &overlayWorkArea)) {
+          host = window;
           return true;
         }
       }
       return false;
     };
     DragPreview::Show({wideTile, narrowTile});
-    check(waitFor([&] { return gdiFillAt(64); }), "the preview thread shows the GDI fill and fades it in fully");
-    const auto windows = threadWindows(previewThread);
-    check(!windows.empty() && DragPreview::IsPreviewThread(GetWindowThreadProcessId(windows.front(), nullptr)) &&
-              Platform::WindowEvents::IsOwnWindow(windows.front()) && !DragPreview::IsPreviewThread(GetCurrentThreadId()),
-          "MultiWM treats the preview thread's windows as its own");
+    check(waitFor(findHost), "the overlay thread shows a retained work-area host");
+    check(GetPropW(host, L"NonRudeHWND") == reinterpret_cast<HANDLE>(TRUE),
+          "the retained host opts out of the Shell's fullscreen detection");
+    check(Overlay::IsOverlayThread(GetWindowThreadProcessId(host, nullptr)) &&
+              Platform::WindowEvents::IsOwnWindow(host) && !Overlay::IsOverlayThread(GetCurrentThreadId()),
+          "MultiWM treats the overlay thread's windows as its own");
+    const POINT hitPoint{overlayWorkArea.left + 32, overlayWorkArea.top + 32};
+    const HWND behindPreview = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"STATIC", L"", WS_POPUP | SS_BLACKRECT | SS_NOTIFY, hitPoint.x - 10, hitPoint.y - 10, 20, 20,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    check(behindPreview && SetWindowPos(behindPreview, host, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE) &&
+              WindowFromPoint(hitPoint) == behindPreview,
+          "the overlay leaves hit testing to the window beneath it");
+    DestroyWindow(behindPreview);
+    g_settings.dragPreviewIconSizeDip = 24;
+    DragPreview::Show({wideTile, narrowTile, source, target}, true, 144, desktopId);
     DragPreview::Hide();
-    check(waitFor([&] { return noneVisible(previewThread); }), "hiding fades the GDI preview out on its thread");
-    DragPreview::Shutdown();
-    check(!DragPreview::g_previewThread.handle && !DragPreview::g_previewThread.stopEvent &&
-              !DragPreview::IsPreviewThread(previewThread) && threadWindows(previewThread).empty(),
+    check(waitFor([&] { return noneVisible(overlayThread); }), "the retained preview fades out on its thread");
+    TrayUi::g_preferences.showToasts = true;
+    const HWND savedTrayWindow = std::exchange(TrayUi::g_session.trayWindow, source);
+    const int savedOffset = std::exchange(TrayUi::g_preferences.flyoutOffsetXDip, 100000);
+    TrayUi::ShowStatusFlyout(L"Retained status", fixture.key.ResolveMonitor());
+    TrayUi::g_session.trayWindow = savedTrayWindow;
+    TrayUi::g_preferences.flyoutOffsetXDip = savedOffset;
+    check(waitFor([&] { return IsWindowVisible(host); }) && threadWindows(overlayThread).size() == 1,
+          "a toast with an out-of-bounds offset still uses the same preview host");
+    DragPreview::Show({wideTile, narrowTile, source, target}, true, 144, desktopId);
+    DragPreview::Hide();
+    check(waitFor([&] { return noneVisible(overlayThread); }) && threadWindows(overlayThread).size() == 1,
+          "the shared host hides after the preview and toast finish");
+    DragPreview::Shutdown(); Overlay::Shutdown();
+    check(!Overlay::g_overlayThread.handle && !Overlay::g_overlayThread.stopEvent &&
+              !Overlay::IsOverlayThread(overlayThread) && threadWindows(overlayThread).empty(),
           "shutdown joins the thread, which destroys its windows");
 
   }
   TrayUi::g_preferences.showToasts = savedToasts;
+  CoUninitialize();
   std::printf("Passed %u BSP drag checks.\n", check.passed);
 }
 

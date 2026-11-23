@@ -1,13 +1,12 @@
 //
-// UI boundary for the tool mod. This subsystem is Win32/GDI-only: no Explorer
-// hooks, XAML, WinUI, or Windows App SDK dependency. The tray uses two-letter
-// mode abbreviations that are fitted to the full icon canvas. The flyout is a
-// small non-activating card shown only after an explicit layout change.
+// UI boundary for the tool mod: no Explorer hooks, XAML, WinUI, or Windows App
+// SDK dependency. The tray uses two-letter mode abbreviations that are fitted to
+// the full icon canvas. Status flyouts are toasts that Overlay (app/overlay.h)
+// draws; this chapter decides their text, monitor, position and theme.
 
 namespace TrayUi {
 
 constexpr wchar_t kTrayWindowClassName[] = L"WindhawkMultiWMTrayWindow";
-constexpr wchar_t kFlyoutWindowClassName[] = L"WindhawkMultiWMStatusFlyout";
 constexpr UINT kTrayCallbackMessage = WM_APP + 20;
 constexpr UINT kIconId = 1;
 constexpr UINT kContextTileWorkspace = 41001;
@@ -15,21 +14,9 @@ constexpr UINT kContextToggleMode = 41002;
 constexpr UINT kContextLayoutBase = 41100;
 constexpr int kIconCanvasSize = 32;
 constexpr int kTrayFontHeight = 26;
-constexpr UINT_PTR kFlyoutTimerId = 1;
 constexpr DWORD kFlyoutHoldMs = 850;
-constexpr DWORD kFlyoutFadeMs = 180;
-
+constexpr wchar_t kPersonalizeSettings[] = LR"(Software\Microsoft\Windows\CurrentVersion\Themes\Personalize)";
 using LayoutIconSet = std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>;
-
-// One status card per monitor. GWLP_USERDATA of `hwnd` points at this object, so
-// it must outlive its window: Shutdown destroys the window before the object.
-struct FlyoutInstance {
-  HWND hwnd = nullptr;
-  HMONITOR monitor = nullptr;
-  std::wstring text;
-  DWORD shownTick = 0;
-  DWORD holdMs = kFlyoutHoldMs;
-};
 
 // User choices read by LoadSettings. They survive Shutdown so a settings reload
 // applies them to the next session.
@@ -48,7 +35,6 @@ struct TrayPreferences {
 struct TraySession {
   HWND trayWindow = nullptr;
   ATOM trayWindowClass = 0;
-  ATOM flyoutWindowClass = 0;
   UINT taskbarCreatedMessage = 0;
   bool iconAdded = false;
   bool systemLightTheme = false;
@@ -58,8 +44,6 @@ struct TraySession {
   HMONITOR displayedMonitor = nullptr;
   NOTIFYICONDATAW notifyData{};
   LayoutIconSet icons{};
-  // unique_ptr keeps each instance at a stable address for GWLP_USERDATA.
-  std::vector<std::unique_ptr<FlyoutInstance>> flyouts;
 };
 
 static TrayPreferences g_preferences;
@@ -115,7 +99,7 @@ static bool ReadSystemLightTheme() {
   DWORD size = sizeof(value);
   if (RegGetValueW(
           HKEY_CURRENT_USER,
-          L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+          kPersonalizeSettings,
           L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value,
           &size) == ERROR_SUCCESS) {
     return value != 0;
@@ -124,12 +108,13 @@ static bool ReadSystemLightTheme() {
   return GetRValue(fallback) + GetGValue(fallback) + GetBValue(fallback) >= 384;
 }
 
-static COLORREF ForegroundColor() {
-  return g_session.systemLightTheme ? RGB(24, 24, 24) : RGB(255, 255, 255);
-}
-
 static COLORREF FlyoutBackgroundColor() {
   return g_session.systemLightTheme ? RGB(243, 243, 243) : RGB(36, 36, 36);
+}
+
+// The colors of toasts and drag-preview badge cards for the current theme.
+static Overlay::PopupAppearance CurrentPopupAppearance() {
+  return {FlyoutBackgroundColor(), g_session.systemLightTheme};
 }
 
 static HICON CreateTextIcon(TileLayout layout) {
@@ -168,7 +153,7 @@ static HICON CreateTextIcon(TileLayout layout) {
   GdiFlush();
 
   auto* pixels = static_cast<uint32_t*>(bits);
-  COLORREF fg = ForegroundColor();
+  COLORREF fg = Overlay::CardTextColor(g_session.systemLightTheme);
   uint32_t r = GetRValue(fg), g = GetGValue(fg), b = GetBValue(fg);
   for (int i = 0; i < kIconCanvasSize * kIconCanvasSize; ++i) {
     uint32_t p = pixels[i];
@@ -396,159 +381,16 @@ static void RebuildIcons() {
   DestroyIconSet(old);
 }
 
-static int ScaleForDpi(int value, UINT dpi) {
-  return MulDiv(value, static_cast<int>(dpi ? dpi : 96), 96);
-}
-
-static HFONT CreateFlyoutFont(UINT dpi) {
-  return CreateFontW(-ScaleForDpi(14, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
-                     FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                     DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-}
-
-static FlyoutInstance* GetFlyoutInstance(HWND hwnd) {
-  return reinterpret_cast<FlyoutInstance*>(
-      GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-}
-
-static LRESULT CALLBACK FlyoutWindowProc(HWND hwnd, UINT message, WPARAM wParam,
-                                         LPARAM lParam) {
-  if (message == WM_NCCREATE) {
-    auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-    auto* instance = create
-        ? reinterpret_cast<FlyoutInstance*>(create->lpCreateParams)
-        : nullptr;
-    if (instance) {
-      instance->hwnd = hwnd;
-      SetWindowLongPtrW(
-          hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(instance));
-    }
-  }
-
-  FlyoutInstance* instance = GetFlyoutInstance(hwnd);
-  switch (message) {
-    case WM_NCHITTEST:
-      return HTTRANSPARENT;
-    case WM_ERASEBKGND:
-      return 1;
-    case WM_PAINT: {
-      PAINTSTRUCT ps{};
-      HDC dc = BeginPaint(hwnd, &ps);
-      RECT client{};
-      GetClientRect(hwnd, &client);
-      HBRUSH background = CreateSolidBrush(FlyoutBackgroundColor());
-      FillRect(dc, &client, background);
-      DeleteObject(background);
-
-      HFONT font = CreateFlyoutFont(GetDpiForWindow(hwnd));
-      HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
-      SetBkMode(dc, TRANSPARENT);
-      SetTextColor(dc, ForegroundColor());
-      const wchar_t* text = instance ? instance->text.c_str() : L"";
-      DrawTextW(dc, text, -1, &client,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-      if (oldFont) SelectObject(dc, oldFont);
-      if (font) DeleteObject(font);
-      EndPaint(hwnd, &ps);
-      return 0;
-    }
-    case WM_TIMER:
-      if (wParam == kFlyoutTimerId && instance) {
-        DWORD elapsed = GetTickCount() - instance->shownTick;
-        if (elapsed >= instance->holdMs + kFlyoutFadeMs) {
-          KillTimer(hwnd, kFlyoutTimerId);
-          ShowWindow(hwnd, SW_HIDE);
-          return 0;
-        }
-        BYTE alpha = 255;
-        if (elapsed > instance->holdMs) {
-          alpha = static_cast<BYTE>(255 - std::min<DWORD>(
-              255, ((elapsed - instance->holdMs) * 255) / kFlyoutFadeMs));
-        }
-        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
-        return 0;
-      }
-      break;
-    case WM_NCDESTROY:
-      SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-      break;
-  }
-  return DefWindowProcW(hwnd, message, wParam, lParam);
-}
-
-static FlyoutInstance* FindFlyoutForMonitor(HMONITOR monitor) {
-  for (const auto& instance : g_session.flyouts) {
-    if (instance->monitor == monitor && instance->hwnd) return instance.get();
-  }
-  return nullptr;
-}
-
-static FlyoutInstance* GetOrCreateFlyoutForMonitor(HMONITOR monitor) {
-  if (!monitor) return nullptr;
-  if (FlyoutInstance* existing = FindFlyoutForMonitor(monitor)) return existing;
-
-  auto instance = std::unique_ptr<FlyoutInstance>(new (std::nothrow) FlyoutInstance);
-  if (!instance) return nullptr;
-  instance->monitor = monitor;
-
-  HINSTANCE module = GetModuleHandleW(nullptr);
-  instance->hwnd = CreateWindowExW(
-      WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-      kFlyoutWindowClassName, L"", WS_POPUP, 0, 0, 0, 0,
-      nullptr, nullptr, module, instance.get());
-  if (!instance->hwnd) return nullptr;
-  const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
-  DwmSetWindowAttribute(instance->hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
-
-  g_session.flyouts.push_back(std::move(instance));
-  return g_session.flyouts.back().get();
-}
-
 static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
-  if (!g_preferences.showToasts || !text || !*text) return;
+  if ((!g_session.trayWindowClass && !g_session.trayWindow) || !g_preferences.showToasts || !text || !*text) return;
   if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
-  RECT workArea{};
-  if (!monitor || !Platform::Monitors::GetMonitorWorkArea(monitor, &workArea)) return;
-
-  FlyoutInstance* instance = GetOrCreateFlyoutForMonitor(monitor);
-  if (!instance || !instance->hwnd) return;
-  instance->text = text;
-
-  UINT dpi = Platform::Monitors::GetMonitorEffectiveDpi(monitor);
-  HFONT font = CreateFlyoutFont(dpi);
-  HDC dc = GetDC(instance->hwnd);
-  HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
-  SIZE textSize{};
-  GetTextExtentPoint32W(dc, instance->text.c_str(),
-                        static_cast<int>(instance->text.size()), &textSize);
-  if (oldFont) SelectObject(dc, oldFont);
-  if (font) DeleteObject(font);
-  ReleaseDC(instance->hwnd, dc);
-
-  int width = std::max(ScaleForDpi(128, dpi),
-                       static_cast<int>(textSize.cx) + ScaleForDpi(48, dpi));
-  int height = ScaleForDpi(48, dpi);
-  int x = workArea.left + ((workArea.right - workArea.left) - width) / 2 +
-          ScaleForDpi(g_preferences.flyoutOffsetXDip, dpi);
-  int edgeGap = ScaleForDpi(16, dpi);
-  int y = g_preferences.flyoutAtTop ? workArea.top + edgeGap
-                      : workArea.bottom - height - edgeGap;
-  y += ScaleForDpi(g_preferences.flyoutOffsetYDip, dpi);
-
-  instance->shownTick = GetTickCount();
+  if (!monitor) return;
+  Overlay::ToastRequest request{monitor, text, CurrentPopupAppearance(), g_preferences.flyoutOffsetXDip,
+                                g_preferences.flyoutOffsetYDip, g_preferences.flyoutAtTop};
   // Allow roughly 75 ms per character, retaining the minimum for short hints.
-  instance->holdMs = static_cast<DWORD>(std::max<size_t>(
-      kFlyoutHoldMs, std::min<size_t>(instance->text.size(), 1000000) * 75));
-  SetLayeredWindowAttributes(instance->hwnd, 0, 255, LWA_ALPHA);
-  SetWindowPos(instance->hwnd, HWND_TOPMOST, x, y, width, height,
-               SWP_NOACTIVATE | SWP_SHOWWINDOW);
-  InvalidateRect(instance->hwnd, nullptr, TRUE);
-  UpdateWindow(instance->hwnd);
-  if (!SetTimer(instance->hwnd, kFlyoutTimerId, 16, nullptr)) {
-    // A cosmetic timer failure must not leave a permanently visible overlay.
-    ShowWindow(instance->hwnd, SW_HIDE);
-  }
+  request.holdMs = static_cast<DWORD>(std::max<size_t>(
+      kFlyoutHoldMs, std::min<size_t>(request.text.size(), 1000000) * 75));
+  Overlay::PublishToast(std::move(request));
 }
 
 static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor) {
@@ -722,16 +564,11 @@ static void RefreshForCurrentWorkspace() {
 }
 
 static void HandleThemeChanged() {
-  bool light = ReadSystemLightTheme();
+  const bool light = ReadSystemLightTheme();
   if (light == g_session.systemLightTheme) return;
   g_session.systemLightTheme = light;
   RebuildIcons();
-  DragPreview::RefreshBadgeTheme();
-  for (const auto& instance : g_session.flyouts) {
-    if (instance->hwnd && IsWindowVisible(instance->hwnd)) {
-      InvalidateRect(instance->hwnd, nullptr, TRUE);
-    }
-  }
+  Overlay::RefreshAppearance(CurrentPopupAppearance());
 }
 
 static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
@@ -808,23 +645,10 @@ static bool Initialize() {
   g_session.trayWindowClass = RegisterClassW(&trayClass);
   if (!g_session.trayWindowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
-  WNDCLASSW flyoutClass{};
-  flyoutClass.lpfnWndProc = FlyoutWindowProc;
-  flyoutClass.hInstance = instance;
-  flyoutClass.lpszClassName = kFlyoutWindowClassName;
-  g_session.flyoutWindowClass = RegisterClassW(&flyoutClass);
-  const bool haveFlyoutClass = g_session.flyoutWindowClass != 0 ||
-                               GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
-
   g_session.trayWindow = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayWindowClassName, L"",
                                  WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
                                  instance, nullptr);
   if (!g_session.trayWindow) return false;
-
-  if (!haveFlyoutClass) {
-    Wh_Log(L"Status flyout window class unavailable; tray indicator remains active");
-  }
-
   g_session.taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
   g_session.displayedLayout = g_settings.defaultLayout;
   RefreshForCurrentWorkspace();
@@ -837,15 +661,6 @@ static void Shutdown() {
     Shell_NotifyIconW(NIM_DELETE, &g_session.notifyData);
   }
   g_session.iconAdded = false;
-  // Destroy each window before its instance: WM_NCDESTROY clears GWLP_USERDATA.
-  for (const auto& instance : g_session.flyouts) {
-    if (instance->hwnd) {
-      KillTimer(instance->hwnd, kFlyoutTimerId);
-      DestroyWindow(instance->hwnd);
-      instance->hwnd = nullptr;
-    }
-  }
-  g_session.flyouts.clear();
   if (g_session.trayWindow) {
     DestroyWindow(g_session.trayWindow);
     g_session.trayWindow = nullptr;
@@ -855,7 +670,6 @@ static void Shutdown() {
   HINSTANCE instance = GetModuleHandleW(nullptr);
   // Unregister by name even after recovering from ERROR_CLASS_ALREADY_EXISTS,
   // where RegisterClassW didn't return an ATOM for us to remember.
-  UnregisterClassW(kFlyoutWindowClassName, instance);
   UnregisterClassW(kTrayWindowClassName, instance);
   g_session = {};
 }

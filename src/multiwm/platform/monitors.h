@@ -13,12 +13,13 @@ static bool IsLiveMonitorHandle(HMONITOR monitor) {
   return GetMonitorInfoW(monitor, &monitorInfo) != FALSE;
 }
 
-static bool GetMonitorWorkArea(HMONITOR monitor, RECT* outRect) {
+static bool GetOverlayWorkArea(HMONITOR monitor, RECT* outRect) {
   if (!monitor || !outRect) return false;
   MONITORINFO monitorInfo = {sizeof(monitorInfo)};
   if (!GetMonitorInfoW(monitor, &monitorInfo)) return false;
-  *outRect = monitorInfo.rcWork;
-  return true;
+  // The work area can cover the monitor when the taskbar auto-hides.
+  *outRect = SharedGeometry::KeepTilesOffWholeMonitor(monitorInfo.rcWork, monitorInfo.rcMonitor);
+  return !IsRectEmpty(outRect);
 }
 
 static UINT GetMonitorEffectiveDpi(HMONITOR monitor) {

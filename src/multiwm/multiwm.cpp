@@ -233,11 +233,11 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
   - FlyoutOffsetX: 0
     $name: Toast Horizontal Offset (DPI-scaled pixels)
     #! $showIf: {ShowToasts: true}
-    $description: Move messages left or right. Positive values move right.
+    $description: Move messages left or right. Positive values move right. Messages stay inside the monitor's work area.
   - FlyoutOffsetY: 0
     $name: Toast Vertical Offset (DPI-scaled pixels)
     #! $showIf: {ShowToasts: true}
-    $description: Move messages up or down. Positive values move down.
+    $description: Move messages up or down. Positive values move down. Messages stay inside the monitor's work area, clear of the taskbar.
   - DragPreview:
     - FillOpacity: 25
       $name: Fill Opacity (%)
@@ -510,6 +510,8 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 #include "platform/virtual_desktop.h"
 
 // Process lifetime, presentation and the WM thread's message loop.
+#include "app/popup_surface.h"
+#include "app/overlay.h"
 #include "app/runtime_lifecycle.h"
 #include "app/tray_ui.h"
 #include "app/diagnostics.h"

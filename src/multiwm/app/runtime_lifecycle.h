@@ -142,6 +142,7 @@ void NotifyDisplayTopologyChanged() {
   Diagnostics::RecordEvent(L"display/work-area topology changed");
   Platform::Monitors::ClearMonitorIdentityCache();
   CompanionSnapshot::NotifyDisplayChanged();
+  Overlay::NotifyDisplayChanged();
 
   // Every existing lease was computed against the old work-area/monitor topology.
   // Cancel it before Windows' own topology-induced LOCATIONCHANGE burst arrives.

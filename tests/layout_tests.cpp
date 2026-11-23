@@ -2165,7 +2165,93 @@ static void RunBspArrivalTileTests() {
   std::printf("Passed %d BSP arrival tile checks.\n", checks);
 }
 
+// What the overlays draw, with literal numbers: the toast's frame, the preview's
+// fill and outline opacities, and the badges' cards and icons (app/overlay.h).
+static void RunOverlayGeometryTests() {
+  int checks = 0;
+  auto check = [&](bool passed, const char* message) {
+    if (!passed) { std::fprintf(stderr, "FAILED: %s\n", message); std::exit(1); }
+    ++checks;
+  };
+  auto same = [](const D2D1_RECT_F& a, float left, float top, float right, float bottom) {
+    return a.left == left && a.top == top && a.right == right && a.bottom == bottom;
+  };
+  auto approx = [](float a, float b) { return std::fabs(a - b) < 1e-6f; };
+  auto sameRect = [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; };
+
+  // Toasts on a 1920x1040 work area.
+  const SIZE work{1920, 1040};
+  Overlay::ToastRequest toast;
+  auto frame = Overlay::ToastFrame(toast, work, 96, 200.3f);
+  check(frame && same(*frame, 835, 976, 1084, 1024),
+        "a bottom toast is centred, as wide as its text plus 48 DIP, 16 DIP above the bottom");
+  toast.atTop = true;
+  frame = Overlay::ToastFrame(toast, work, 96, 200.3f);
+  check(frame && same(*frame, 835, 16, 1084, 64), "a top toast sits 16 DIP below the top");
+  toast.atTop = false;
+  frame = Overlay::ToastFrame(toast, work, 96, 10);
+  check(frame && frame->right - frame->left == 128, "short text keeps the 128 DIP minimum width");
+  frame = Overlay::ToastFrame(toast, work, 96, 5000);
+  check(frame && same(*frame, 0, 976, 1920, 1024), "text wider than the work area is clipped to its width");
+  toast.xOffsetDip = 100;
+  toast.yOffsetDip = -20;
+  frame = Overlay::ToastFrame(toast, work, 96, 200.3f);
+  check(frame && same(*frame, 935, 956, 1184, 1004), "offsets move the toast");
+  toast.xOffsetDip = 100000;
+  toast.yOffsetDip = 500;
+  frame = Overlay::ToastFrame(toast, work, 96, 200.3f);
+  check(frame && same(*frame, 1671, 992, 1920, 1040), "offsets past the work area stop at its edges");
+  toast.xOffsetDip = -100000;
+  frame = Overlay::ToastFrame(toast, work, 96, 200.3f);
+  check(frame && frame->left == 0, "a large negative offset stops at the left edge");
+  toast = {};
+  frame = Overlay::ToastFrame(toast, work, 144, 200);
+  check(frame && frame->bottom - frame->top == 72 && frame->right - frame->left == 272 && frame->top == 1040 - 72 - 24,
+        "toast sizes and gaps scale with DPI");
+  check(!Overlay::ToastFrame(toast, SIZE{800, 40}, 96, 50), "a work area shorter than a toast shows none");
+
+  // Preview opacities: fill and outline each at their own share of the fade.
+  Overlay::PreviewStyle style;
+  style.fillOpacity = 25;
+  style.outlineOpacity = 100;
+  auto opacity = Overlay::PreviewOpacitiesAt(style, 255);
+  check(approx(opacity.fill, 0.25f) && approx(opacity.outline, 1.0f) && approx(opacity.badge, 1.0f),
+        "a fully faded-in preview uses the configured opacities");
+  opacity = Overlay::PreviewOpacitiesAt(style, 128);
+  check(approx(opacity.fill, 0.25f * 128 / 255) && approx(opacity.outline, 128 / 255.0f) &&
+            approx(opacity.badge, 128 / 255.0f),
+        "fill, outline and badges fade together");
+  style.fillOpacity = 10;
+  style.outlineOpacity = 60;
+  opacity = Overlay::PreviewOpacitiesAt(style, 255);
+  check(approx(opacity.fill, 0.10f) && approx(opacity.outline, 0.60f), "fill and outline opacities are independent");
+  style.fillOpacity = 0;
+  opacity = Overlay::PreviewOpacitiesAt(style, 255);
+  check(opacity.fill == 0 && approx(opacity.outline, 0.60f), "zero fill opacity draws only the outline");
+  check(Overlay::PreviewOpacitiesAt(style, 0).outline == 0, "a faded-out preview draws nothing");
+
+  // Badges: a card the icon plus 4 DIP each side, centred on the tile.
+  const RECT tile{0, 0, 400, 300};
+  auto badge = Overlay::BadgeGeometryFor(tile, 32, 96);
+  check(badge && badge->iconSize == 32 && badge->badgeSize == 40 && sameRect(badge->frame, RECT{180, 130, 220, 170}),
+        "a badge is centred on its tile");
+  badge = Overlay::BadgeGeometryFor(tile, 32, 144);
+  check(badge && badge->iconSize == 48 && badge->badgeSize == 60 && sameRect(badge->frame, RECT{170, 120, 230, 180}),
+        "badge sizes scale with DPI");
+  check(!Overlay::BadgeGeometryFor(tile, 0, 96), "an icon size of 0 shows no badge");
+  check(!Overlay::BadgeGeometryFor(RECT{0, 0, 39, 300}, 32, 96) && Overlay::BadgeGeometryFor(RECT{0, 0, 40, 40}, 32, 96),
+        "a badge shows only on a tile it fits");
+  check(same(Overlay::BadgeIconRect(D2D1::RectF(180, 130, 220, 170), 40, 32), 184, 134, 216, 166),
+        "the icon is centred in its card");
+  check(same(Overlay::BadgeIconRect(D2D1::RectF(0, 0, 61, 61), 61, 48), 6.5f, 6.5f, 54.5f, 54.5f),
+        "an odd margin centres the icon on a half pixel");
+  check(same(Overlay::ToHostRect(RECT{1930, 10, 2030, 110}, RECT{1920, 0, 3840, 1040}), 10, 10, 110, 110),
+        "screen rectangles map to the host's own coordinates");
+  std::printf("Passed %d overlay geometry checks.\n", checks);
+}
+
 int main() {
+  RunOverlayGeometryTests();
   RunBspLayoutTests();
   RunBspPropertyTests();
   RunBspArrivalTileTests();

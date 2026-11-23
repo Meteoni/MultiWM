@@ -73,11 +73,10 @@ namespace CompanionSnapshot {
 static void NotifyDisplayChanged();
 }  // namespace CompanionSnapshot
 
-// Defined in app/drag_preview.h.
-namespace DragPreview {
-static void RefreshBadgeTheme();
-static bool IsPreviewThread(DWORD threadId);
-}  // namespace DragPreview
+// Defined in app/overlay.h.
+namespace Overlay {
+static bool IsOverlayThread(DWORD threadId);
+}  // namespace Overlay
 
 // Defined in app/tray_ui.h.
 namespace TrayUi {

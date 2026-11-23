@@ -194,6 +194,7 @@ static WmMessageDisposition DispatchWmThreadMessage(const MSG& msg) {
     case WM_APP_VIRTUAL_DESKTOP_CHANGED:
       DragPreview::End();
       Reconcile::HandleVirtualDesktopChanged();
+      Overlay::PruneDesktopIcons();
       return WmMessageDisposition::Handled;
 
     case WM_APP_FOREGROUND_CHANGED: {
@@ -365,6 +366,7 @@ static void CleanupWmThread() {
   UnregisterConfiguredHotkeys();
   DragPreview::Shutdown();
   TrayUi::Shutdown();
+  Overlay::Shutdown();  // After both of its clients.
   Platform::WindowEvents::RemoveWinEventHooks();
   Platform::VirtualDesktop::CleanupVirtualDesktopAPI();
 
@@ -428,6 +430,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   if (!TrayUi::Initialize()) {
     Wh_Log(L"Tiling layout tray icon unavailable; window management remains active");
   }
+  if (g_settings.DragPreviewEnabled() || TrayUi::g_preferences.showToasts) Overlay::WarmPrimaryMonitor();
   ReportStartupProblems(unavailableHotkeys);
 
   CompanionSnapshot::PublishIfChanged();
