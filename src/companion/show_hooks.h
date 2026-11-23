@@ -247,7 +247,8 @@ static std::optional<RECT> AdjustPositionForHint(WINDOWPOS& position, const char
   const RECT settlingApp = g_settling.appRect;
   if (const auto proposed = ProposedPhysicalWindowRect(position, settling ? &settlingApp : nullptr)) {
     *appRect = *proposed;
-    const auto prediction = PredictWindowPlacement(hwnd, *proposed, path);
+    NoHint noHint = NoHint::Unmanaged;
+    const auto prediction = PredictWindowPlacement(hwnd, *proposed, path, &noHint);
     const auto target = prediction ? ConvertScreenRect(hwnd, prediction->windowRect,
                                                        PhysicalToLogicalPointForPerMonitorDPI) : std::nullopt;
     if (target) {
@@ -263,10 +264,17 @@ static std::optional<RECT> AdjustPositionForHint(WINDOWPOS& position, const char
       if (!prediction->keepSize) return prediction->windowRect;
     }
     // A settling window this show finds ineligible gets the app's whole request,
-    // including what the hold kept from it.
+    // including what the hold kept from it. One the snapshot can't place yet
+    // stays held, with the request remembered for a later release.
     if (!prediction && hwnd == g_settling.hwnd) {
-      EndSettling();
-      SetWindowPosFrame(position, *proposed);
+      if (noHint == NoHint::Undecided) {
+        g_settling.appRect = *proposed;
+        SetWindowPosFrame(position, g_settling.windowRect);
+        LogDecision(hwnd, path, "no hint yet: kept at the held frame");
+      } else {
+        EndSettling();
+        SetWindowPosFrame(position, *proposed);
+      }
     }
   }
   return std::nullopt;

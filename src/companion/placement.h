@@ -217,27 +217,43 @@ static std::optional<SharedGeometry::FloatingPlacement> PredictFloatingPlacement
   return SharedGeometry::PlanFloatingPlacement(request);
 }
 
+// Why there is no hint, which decides what happens to a window the companion
+// is holding (settling) when a later show finds none:
+//  - Unmanaged: MultiWM won't tile the window as asked (fullscreen, fixed-size,
+//    a rule, Manual mode, a float), so the hold ends at the app's own frame;
+//  - Undecided: a running MultiWM's snapshot can't say yet (another BSP
+//    arrival is unsettled, the snapshot or a measurement is incomplete), and
+//    MultiWM will still place the window, so the hold stays.
+// A reason not known to be undecided counts as unmanaged, as every one did before.
+enum class NoHint { Unmanaged, Undecided };
+
 // The frame MultiWM will give `hwnd` (currently at `frame`), using its restore
 // hint when known or Automatic discovery otherwise, and how MultiWM applies the
 // window's size limits to it (`*kind`). `*floating` is the floating placement
 // behind a floating frame, which the limits are fitted to. For a tiled slot it
 // is the fallback if its minimum turns out larger than the work area and
 // MultiWM floats it locally. Returns nothing, with `*reason` set, when MultiWM
-// won't manage it or the snapshot can't say where it goes.
+// won't manage it or the snapshot can't say where it goes; `*noHint` (optional)
+// says which.
 static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const HintInputs& inputs, TargetKind* kind,
                                         std::optional<SharedGeometry::FloatingPlacement>* floating,
-                                        const char** reason) {
+                                        const char** reason, NoHint* noHint = nullptr) {
   using namespace CompanionAbi;
   *kind = TargetKind::Tile;
   floating->reset();
+  if (noHint) *noHint = NoHint::Unmanaged;
   auto reject = [&](const char* why) -> std::optional<RECT> {
     *reason = why;
     return std::nullopt;
   };
+  auto undecided = [&](const char* why) -> std::optional<RECT> {
+    if (noHint) *noHint = NoHint::Undecided;
+    return reject(why);
+  };
   constexpr uint32_t kComplete = kFlagRunning | kFlagRulesComplete | kFlagTrackedComplete;
-  if ((inputs.flags & kComplete) != kComplete || !inputs.rules) return reject("no complete snapshot");
+  if ((inputs.flags & kComplete) != kComplete || !inputs.rules) return undecided("no complete snapshot");
   if (!(inputs.flags & kFlagAutomaticMode)) return reject("Manual mode");
-  if (!inputs.workspace) return reject("no workspace on this monitor");
+  if (!inputs.workspace) return undecided("no workspace on this monitor");
 
   const std::vector<SnapshotRule>& rules = *inputs.rules;
   SharedRules::LazyWindowFacts facts(hwnd, CurrentProcessName);
@@ -249,11 +265,11 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
   if (inputs.tracked) {
     if (inputs.intent == PlacementIntent::KeepFloating) return reject("retaining this window's floating treatment");
     if (inputs.intent != PlacementIntent::Restore && inputs.intent != PlacementIntent::Arrival) {
-      return reject("known window has no usable ownership or treatment");
+      return undecided("known window has no usable ownership or treatment");
     }
     if (workspace.floatingLayout) return reject("known window's destination uses the Floating layout");
     if (!inputs.restoreFrameMargins || inputs.restoreMarginsDpi != workspace.dpi) {
-      return reject("no current restore border measurement");
+      return undecided("no current restore border measurement");
     }
     if (inputs.intent == PlacementIntent::Arrival) {
       // Migration retains treatment and uses the same destination insertion as
@@ -335,18 +351,25 @@ struct PredictedPlacement {
 // applies the window's `limits`: tiles by FitSlotToLimits, floating frames by
 // the rule both mods share, and a BSP arrival (new, or moved here) in the first
 // tile MultiWM tries that fits it. Restores already carry their exact tile. No
-// value, with `*reason` set, when the companion should give no hint; a float
-// MultiWM will fall back to sets `*reason` too.
+// value, with `*reason` and `*why` set, when the companion should give no hint;
+// a float MultiWM will fall back to sets `*reason` too.
 static std::optional<RECT> FitTargetToLimits(
     const RECT& target, TargetKind kind, const std::optional<SharedGeometry::FloatingPlacement>& floating,
-    const HintInputs& inputs, const SharedGeometry::FrameLimits& limits, const char** reason) {
+    const HintInputs& inputs, const SharedGeometry::FrameLimits& limits, const char** reason, NoHint* why) {
   const RECT& workArea = inputs.workspace->workArea;
-  auto floatLocally = [&](const char* why) -> std::optional<RECT> {
-    *reason = why;
+  auto floatLocally = [&](const char* reasonText) -> std::optional<RECT> {
+    *reason = reasonText;
     return SharedGeometry::FitFloatingPlacementToLimits(*floating, limits);
   };
-  auto noHint = [&](const char* why) -> std::optional<RECT> {
-    *reason = why;
+  auto noHint = [&](const char* reasonText) -> std::optional<RECT> {
+    *reason = reasonText;
+    *why = NoHint::Unmanaged;
+    return std::nullopt;
+  };
+  // MultiWM will still tile it once arrangement plans with its limits.
+  auto undecided = [&](const char* reasonText) -> std::optional<RECT> {
+    *reason = reasonText;
+    *why = NoHint::Undecided;
     return std::nullopt;
   };
   if (kind == TargetKind::Float) return SharedGeometry::FitFloatingPlacementToLimits(*floating, limits);
@@ -361,11 +384,11 @@ static std::optional<RECT> FitTargetToLimits(
       SharedGeometry::CenterWithinMaximumSize(choice.tile.top, choice.tile.bottom, limits.maxHeight);
       return choice.tile;
     }
-    if (choice.outcome == BspArrivalChoice::Outcome::Unknown) return noHint("BSP tile depends on another arrival");
+    if (choice.outcome == BspArrivalChoice::Outcome::Unknown) return undecided("BSP tile depends on another arrival");
     return floating && !inputs.tracked ? floatLocally("no BSP tile fits: floats locally") : noHint("no BSP tile fits");
   }
   if (const auto fitted = FitSlotToLimits(target, workArea, limits, !inputs.bspLayout)) return fitted;
-  if (inputs.bspLayout && FitsMinimum(workArea, limits)) return noHint("BSP tile needs a new layout plan");
+  if (inputs.bspLayout && FitsMinimum(workArea, limits)) return undecided("BSP tile needs a new layout plan");
   if (floating) return floatLocally("minimum larger than the work area: floats locally");
   return noHint("minimum larger than the work area; no floating hint");
 }
@@ -375,8 +398,13 @@ static std::optional<RECT> FitTargetToLimits(
 // new windows; known members use the published measured borders and restore tile.
 // Caller holds PlacementScope on the window's
 // own thread, so application callbacks cannot recursively predict another show.
+// With no placement, `*noHint` (optional) says whether MultiWM won't tile the
+// window as asked or the snapshot can't say yet (NoHint).
 static std::optional<PredictedPlacement> PredictWindowPlacement(
-    HWND hwnd, const RECT& proposed, const char* path) {
+    HWND hwnd, const RECT& proposed, const char* path, NoHint* noHint = nullptr) {
+  NoHint unused = NoHint::Unmanaged;
+  NoHint& why = noHint ? *noHint : unused;
+  why = NoHint::Unmanaged;
   PhysicalCoordinatesScope physical;
   RECT windowRect{};
   if (!GetWindowRect(hwnd, &windowRect)) return std::nullopt;
@@ -399,17 +427,21 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
 
   HintInputs inputs;
   if (!ReadHintInputs(hwnd, monitorInfo.rcMonitor, &inputs)) {
-    LogDecision(hwnd, path, "no snapshot (MultiWM not running?)");
+    LogDecision(hwnd, path, "no snapshot (MultiWM not running?)");  // Nothing will tile it: unmanaged.
     return std::nullopt;
   }
-  if (inputs.tracked && IsWindowVisible(hwnd)) return std::nullopt;
+  // MultiWM already has this window; it places it, not the app's frame.
+  if (inputs.tracked && IsWindowVisible(hwnd)) {
+    why = NoHint::Undecided;
+    return std::nullopt;
+  }
   // Known hidden members use the same measured borders as minimized restores;
   // a hidden window's current DWM bounds can be missing or stale.
   if (inputs.tracked && inputs.restoreFrameMargins) margins = *inputs.restoreFrameMargins;
   TargetKind kind = TargetKind::Tile;
   std::optional<SharedGeometry::FloatingPlacement> floating;
   const char* reason = nullptr;
-  const std::optional<RECT> target = PredictFrame(hwnd, frame, inputs, &kind, &floating, &reason);
+  const std::optional<RECT> target = PredictFrame(hwnd, frame, inputs, &kind, &floating, &reason, &why);
   if (!target) {
     LogDecision(hwnd, path, reason);
     return std::nullopt;
@@ -421,8 +453,9 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   if (kind != TargetKind::KeepSize) {
     const UINT dpi = inputs.workspace->dpi ? inputs.workspace->dpi : 96;
     const auto limits = QueryFrameLimits(hwnd, dpi, margins);
+    // The window changed while answering, possibly into one MultiWM won't tile.
     if (!limits) return std::nullopt;
-    const auto fitted = FitTargetToLimits(*target, kind, floating, inputs, *limits, &reason);
+    const auto fitted = FitTargetToLimits(*target, kind, floating, inputs, *limits, &reason, &why);
     if (!fitted) {
       LogDecision(hwnd, path, reason);
       return std::nullopt;
@@ -532,21 +565,31 @@ static bool PlaceAtPredictedFrame(HWND hwnd, const char* path) {
     ReleaseIneligibleSettling(hwnd, path);
     return false;
   }
-  const auto prediction = PredictWindowPlacement(hwnd, current, path);
+  NoHint noHint = NoHint::Unmanaged;
+  const auto prediction = PredictWindowPlacement(hwnd, current, path, &noHint);
   if (!prediction) {
-    ReleaseIneligibleSettling(hwnd, path);
+    // Undecided: MultiWM will still tile it, so it stays where the hold has it.
+    if (noHint == NoHint::Unmanaged) ReleaseIneligibleSettling(hwnd, path);
     return false;
   }
 
   const RECT& placement = prediction->windowRect;
-  UINT flags = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE;
-  if (prediction->keepSize) flags |= SWP_NOSIZE;
-  const BOOL moved = g_setWindowPosForOwnMoves(hwnd, nullptr, placement.left, placement.top,
-                                               Width(placement), Height(placement), flags);
-  LogDecision(hwnd, path, moved ? "placed at MultiWM's frame" : "SetWindowPos failed");
+  const bool samePosition = placement.left == current.left && placement.top == current.top;
+  const bool keepCurrentSize = prediction->keepSize ||
+                               (Width(placement) == Width(current) && Height(placement) == Height(current));
+  bool placed = true;
+  if (samePosition && keepCurrentSize) {
+    LogDecision(hwnd, path, "already at MultiWM's frame");
+  } else {
+    UINT flags = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE;
+    if (keepCurrentSize) flags |= SWP_NOSIZE;
+    placed = g_setWindowPosForOwnMoves(hwnd, nullptr, placement.left, placement.top,
+                                     Width(placement), Height(placement), flags) != FALSE;
+    LogDecision(hwnd, path, placed ? "placed at MultiWM's frame" : "SetWindowPos failed");
+  }
   // A window MultiWM only centres (keepSize) has no exact frame to hold.
-  if (moved && !prediction->keepSize) BeginSettling(hwnd, placement, AppFrameBeforePlacing(hwnd, current));
-  return moved != FALSE;
+  if (placed && !prediction->keepSize) BeginSettling(hwnd, placement, AppFrameBeforePlacing(hwnd, current));
+  return placed;
 }
 
 }  // namespace Companion

@@ -219,15 +219,55 @@ int main() {
   check(positionCalls.empty() && limits.probes == 0 && asyncCommands == std::vector<int>{SW_RESTORE},
         "cross-thread async show passes through without placement or probing");
 
-  // A real hint rewrites the original call. A minimum grows the window from the
-  // slot's corner on the work-area boundary; a maximum centres it in the slot,
-  // as MultiWM's planner will. The app's other arguments and flags survive.
   RECT current{}, currentFrame{};
   GetWindowRect(hwnd, &current);
   if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &currentFrame, sizeof(currentFrame))) ||
       currentFrame.right <= currentFrame.left || currentFrame.bottom <= currentFrame.top) currentFrame = current;
   const RECT testMargins{currentFrame.left - current.left, currentFrame.top - current.top,
                          current.right - currentFrame.right, current.bottom - currentFrame.bottom};
+  {
+    const RECT savedTile = workspace.tiledFrame;
+    const BOOL savedResult = nativeResult;
+    nativeResult = TRUE;
+    workspace.tiledFrame = currentFrame;
+    ++body.generation;
+    positionCalls.clear();
+    showCommands.clear();
+    Companion::ShowWindowHook(hwnd, SW_SHOWNOACTIVATE);
+    check(positionCalls.empty() && showCommands == std::vector<int>{SW_SHOWNOACTIVATE},
+          "a window already in its tile shows without a companion positioning call");
+    check(Companion::g_settling.hwnd == hwnd && EqualRect(&Companion::g_settling.windowRect, &current),
+          "an already tiled window still settles at its exact frame");
+    Companion::EndSettling();
+
+    OffsetRect(&workspace.tiledFrame, 40, 30);
+    ++body.generation;
+    Companion::ShowWindowHook(hwnd, SW_SHOWNOACTIVATE);
+    RECT movedFrame = current;
+    OffsetRect(&movedFrame, 40, 30);
+    check(positionCalls.size() == 1 && positionCalls[0].x == movedFrame.left &&
+              positionCalls[0].y == movedFrame.top && (positionCalls[0].flags & SWP_NOSIZE),
+          "moving to a tile of the same size uses a move-only positioning call");
+    check(Companion::g_settling.hwnd == hwnd && EqualRect(&Companion::g_settling.windowRect, &movedFrame),
+          "a move-only placement still settles at its exact frame");
+    Companion::EndSettling();
+
+    workspace.tiledFrame.right += 20;
+    ++body.generation;
+    positionCalls.clear();
+    Companion::ShowWindowHook(hwnd, SW_SHOWNOACTIVATE);
+    check(positionCalls.size() == 1 && !(positionCalls[0].flags & SWP_NOSIZE) &&
+              positionCalls[0].width == Companion::Width(current) + 20,
+          "a tile with a different size still resizes the window");
+    Companion::EndSettling();
+    workspace.tiledFrame = savedTile;
+    nativeResult = savedResult;
+    ++body.generation;
+  }
+
+  // A real hint rewrites the original call. A minimum grows the window from the
+  // slot's corner on the work-area boundary; a maximum centres it in the slot,
+  // as MultiWM's planner will. The app's other arguments and flags survive.
   const LONG hintedLeft = workspace.tiledFrame.left - testMargins.left;
   const LONG hintedTop = workspace.tiledFrame.top - testMargins.top;
   for (bool enforceMinimum : {true, false}) {
@@ -636,6 +676,33 @@ int main() {
     positionCalls.clear();
     Companion::DefWindowProcWHook(hwnd, WM_STYLECHANGED, GWL_STYLE, reinterpret_cast<LPARAM>(&styles));
     check(positionCalls.empty() && heldAt(appMove(hwnd), testMargins), "a style change that keeps it eligible keeps the hold");
+
+    // A later show the snapshot can't place yet (here an incomplete snapshot, as
+    // while another BSP arrival is unsettled) keeps the hold: MultiWM will still
+    // tile the window, so going to the app's frame would only add a jump.
+    showPlaced();
+    check(heldAt(appMove(hwnd), testMargins), "the app's move is held");
+    body.flags = completeFlags & ~CompanionAbi::kFlagRulesComplete;
+    ++body.generation;
+    positionCalls.clear();
+    Companion::ShowWindowHook(hwnd, SW_SHOWNORMAL);
+    check(positionCalls.empty(), "a show the snapshot can't place yet doesn't release the hold");
+    positionCalls.clear();
+    Companion::SetWindowPosHook(hwnd, nullptr, 210, 220, 710, 510, SWP_SHOWWINDOW | moveFlags);
+    check(positionCalls.size() == 1 && positionCalls[0].x == slot.left - testMargins.left &&
+              positionCalls[0].y == slot.top - testMargins.top &&
+              positionCalls[0].width == Companion::Width(slot) + testMargins.left + testMargins.right,
+          "a positioned show the snapshot can't place yet stays at the held frame");
+    check(heldAt(appMove(hwnd), testMargins), "the hold continues after an undecided show");
+    // Once the window turns ineligible, the release honours the request the
+    // undecided show made, not an older one.
+    body.flags = completeFlags;
+    ++body.generation;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle & ~WS_SIZEBOX);
+    positionCalls.clear();
+    Companion::DefWindowProcWHook(hwnd, WM_STYLECHANGED, GWL_STYLE, reinterpret_cast<LPARAM>(&styles));
+    SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle);
+    check(positionCalls.size() == 1, "an ineligible window is released after an undecided show");
 
     Companion::EndSettling();
     nativeResult = savedResult;
