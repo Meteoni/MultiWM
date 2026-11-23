@@ -128,7 +128,7 @@ class BspTree {
         return;
       }
       // A side with nothing shown gives the whole share to the other, as the layout does.
-      const double ratio = std::clamp(nodes_[node].ratio, 0.1, 0.9);
+      const double ratio = SharedSplits::ClampSplitRatio(nodes_[node].ratio);
       const size_t second = SecondChild(node);
       self(self, node + 1, AnyLeaf(second, shown) ? share * ratio : share);
       self(self, second, AnyLeaf(node + 1, shown) ? share * (1.0 - ratio) : share);
@@ -169,8 +169,17 @@ class BspTree {
 
   void Clear() { nodes_.clear(); }
 
-  // Splits only; the leaves' windows are changed through the operations above.
-  BspNode& SplitNode(size_t node) { return nodes_[node]; }
+  // A split's saved first-side share. Only ratio and direction can be changed
+  // in place; which window a leaf holds changes through the operations above,
+  // so the shape of the tree stays valid.
+  double& SplitRatio(size_t node) {
+    assert(node < nodes_.size() && IsSplit(nodes_[node]));
+    return nodes_[node].ratio;
+  }
+  void SetSplitDirection(size_t node, std::optional<Layout::Axis> direction) {
+    assert(node < nodes_.size() && IsSplit(nodes_[node]));
+    nodes_[node].direction = direction;
+  }
 
  private:
   std::vector<BspNode> nodes_;

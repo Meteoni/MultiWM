@@ -174,7 +174,9 @@ static void AppendWorkspaceHints(const GUID& desktop, CompanionAbi::SnapshotBody
     if (workspace.Layout() == TileLayout::Bsp) {
       const auto workspaceBit = static_cast<uint16_t>(1u << workspaceIndex);
       body->bspWorkspaces |= workspaceBit;
-      if (prediction.newWindowFloats && (!limitReached || !Placement::AutomaticOverflowRoutes(false))) {
+      const bool overflowRoutes =
+          Placement::AutomaticOverflowRoutes(LayoutPolicyOf(workspace.Layout()).overflowMayCreateDesktop);
+      if (prediction.newWindowFloats && (!limitReached || !overflowRoutes)) {
         body->bspLocalFloats |= workspaceBit;
       }
     }

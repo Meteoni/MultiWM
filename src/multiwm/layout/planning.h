@@ -336,9 +336,14 @@ static void TurnBspSplit(Workspace& workspace, size_t node, const RECT& workArea
   workspace.SetBspSplitDirection(node, alternate == defaultDirection ? std::nullopt : std::optional{alternate});
 }
 
-// A new admission can try the perpendicular direction. An explicit edge drop
-// keeps its direction and must overlap the requested edge of the original tile.
-static LayoutPlanStatus PlanWithNewBspSplitFallback(
+// Plans `workspace` (BuildWorkspaceLayoutPlan). In BSP, when that is
+// unsatisfiable, turns the split of a still-settling arrival to its
+// perpendicular direction, trying the newest first, and keeps the first turn
+// that fits: `workspace` then holds the turned split. Unchanged otherwise. An
+// explicit edge drop (`merge`) never turns: it keeps its direction and must
+// overlap the requested edge of the original tile. `outRects` as for
+// BuildWorkspaceLayoutPlan.
+static LayoutPlanStatus PlanOrTurnNewBspSplit(
     Workspace& workspace, const RECT& workArea, LONG gap, std::vector<RECT>* outRects,
     std::optional<BspMergeDestination> merge = std::nullopt) {
   const size_t draggedIndex = merge ? workspace.TiledIndex(merge->window) : Workspace::kNotFound;
@@ -807,7 +812,7 @@ static bool TryNearbyIndices(size_t origin, size_t count, TryIndex&& tryIndex) {
 // Moves BSP arrival `arrival` from the tile it split to a split of the largest
 // other tile, measured without the arrival. False, changing nothing, when that
 // is the tile it already split (MoveBspLeaf refuses its sibling) or there is
-// none. The new split may still turn (PlanWithNewBspSplitFallback).
+// none. The new split may still turn (PlanOrTurnNewBspSplit).
 static bool MoveBspArrivalToLargestTile(Workspace& workspace, HWND arrival) {
   BspTree without = workspace.Bsp();
   without.Remove(arrival);
@@ -832,7 +837,7 @@ static bool TryRecoverPendingBspAdmission(
     Workspace trial = workspace;
     std::vector<RECT> rects;
     if (!MoveBspArrivalToLargestTile(trial, candidate.hwnd) ||
-        PlanWithNewBspSplitFallback(trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
+        PlanOrTurnNewBspSplit(trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
       continue;
     }
     const size_t fromIndex = workspace.TiledIndex(candidate.hwnd);
@@ -878,7 +883,7 @@ static bool TryRecoverPendingAdmission(
       }
 
       std::vector<RECT> trialRects;
-      if (PlanWithNewBspSplitFallback(trial, workArea, gap, &trialRects) != LayoutPlanStatus::Success) {
+      if (PlanOrTurnNewBspSplit(trial, workArea, gap, &trialRects) != LayoutPlanStatus::Success) {
         return false;
       }
       const size_t newIndex = trial.TiledIndex(candidate.hwnd);

@@ -147,7 +147,7 @@ bool Workspace::LearnMasterStackResize(
     const RECT& workArea, LONG gap, size_t resizedIndex,
     const MoveSizeGesture& gesture) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::LearnMasterStackResize");
-  EnsureWeights();
+  SyncLayoutState();
   // Callers dispatch here only for Master + Stack layouts.
   const auto axis = layout_ == TileLayout::MasterStackH ? Layout::Axis::Y : Layout::Axis::X;
   const bool alongY = axis == Layout::Axis::Y;
@@ -222,7 +222,7 @@ bool Workspace::LearnGridResize(
     const RECT& workArea, LONG gap, size_t resizedIndex,
     const MoveSizeGesture& gesture) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::LearnGridResize");
-  EnsureWeights();
+  SyncLayoutState();
   const auto axis = layout_ == TileLayout::Rows ? Layout::Axis::Y : Layout::Axis::X;
   const bool alongY = axis == Layout::Axis::Y;
   const std::vector<WindowConstraints> constraints =
@@ -287,7 +287,7 @@ bool Workspace::LearnDwindleResize(
     const RECT& workArea, LONG gap, size_t resizedIndex,
     const MoveSizeGesture& gesture) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::LearnDwindleResize");
-  EnsureWeights();
+  SyncLayoutState();
   if (layout_ != TileLayout::Dwindle || windows_.size() < 2 ||
       resizedIndex >= windows_.size()) {
     return false;
@@ -399,7 +399,7 @@ bool Workspace::AcceptShownBspLayout(const RECT& workArea, LONG gap) {
   if (layout_ != TileLayout::Bsp) return false;
   bool changed = false;
   for (const Layout::BspSplit& split : PlanBspCells(*this, workArea, gap).splits) {
-    double& ratio = bspTree_.SplitNode(split.node).ratio;
+    double& ratio = bspTree_.SplitRatio(split.node);
     if (split.usableSpan < 2 || Layout::SplitLeadingSpan(split.usableSpan, Layout::ClampSplitRatio(ratio)) == split.firstSpan) {
       continue;
     }
@@ -434,7 +434,7 @@ static std::vector<BspSplitAround> BspSplitsAround(
 bool Workspace::LearnBspResize(
     const RECT& workArea, LONG gap, size_t resizedIndex, const MoveSizeGesture& gesture) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::LearnBspResize");
-  EnsureWeights();
+  SyncLayoutState();
   if (layout_ != TileLayout::Bsp || windows_.size() < 2 || resizedIndex >= windows_.size()) return false;
 
   // A drag that changes a divider accepts the shown layout, as in Dwindle.
@@ -474,7 +474,7 @@ bool Workspace::LearnBspResize(
     const LONG minimumSpan = std::min<LONG>(kMinLearnedResizeSpan, std::max<LONG>(1, (split.usableSpan - 1) / 2));
     // Either edge moving by `delta` grows the first side by it.
     const LONG newFirstSpan = std::clamp<LONG>(split.firstSpan + edge.delta, minimumSpan, split.usableSpan - minimumSpan);
-    double& ratio = bspTree_.SplitNode(split.node).ratio;
+    double& ratio = bspTree_.SplitRatio(split.node);
     const double saved = ratio;
     MoveRatioToward(ratio, Layout::ClampSplitRatio(static_cast<double>(newFirstSpan) / split.usableSpan), fits);
     if (Layout::SplitLeadingSpan(split.usableSpan, Layout::ClampSplitRatio(ratio)) == split.firstSpan) {

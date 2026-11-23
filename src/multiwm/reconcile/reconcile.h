@@ -287,9 +287,7 @@ static bool AdmitUntrackedSnapshot(
     changed = true;
     if (admittedWindows) admittedWindows->push_back(hwnd);
 
-    // Preserve enumeration order in linear layouts. BSP keeps splitting the
-    // focused leaf throughout the burst.
-    if (afterFocused && workspace.Layout() != TileLayout::Bsp) anchor = hwnd;
+    if (afterFocused && LayoutPolicyOf(workspace.Layout()).burstChainsArrivals) anchor = hwnd;
   }
   return changed;
 }

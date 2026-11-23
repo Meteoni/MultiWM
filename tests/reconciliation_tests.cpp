@@ -2775,7 +2775,7 @@ static void RunSettledWindowRecoveryTests() {
         workspace.AdmitMigrated(std::move(returning));
       }
       std::vector<RECT> rects;
-      check(Layout::PlanWithNewBspSplitFallback(workspace, metrics.workArea, metrics.gap, &rects) ==
+      check(Layout::PlanOrTurnNewBspSplit(workspace, metrics.workArea, metrics.gap, &rects) ==
                 Layout::LayoutPlanStatus::Unsatisfiable, "neither direction of the selected BSP split fits");
       if (!splitFocused) {
         // The first try was already the largest tile, so there is no fallback.

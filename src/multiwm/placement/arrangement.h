@@ -557,10 +557,10 @@ static bool FloatAutomaticOverflowWindow(
   const DWORD processId = record->pid;
   const bool monitorFixed = record->automaticOverflowMonitorFixed;
   const uint64_t generation = record->tilingGeneration;
-  const bool allowNewDesktop = workspace.Layout() != TileLayout::Bsp;
+  const LayoutPolicy& policy = LayoutPolicyOf(workspace.Layout());
+  const bool allowNewDesktop = policy.overflowMayCreateDesktop;
   const bool route = AutomaticOverflowRoutes(allowNewDesktop);
-  // Only BSP's can't-fit floats speak up; the auto-tiling limit stays quiet.
-  const bool announce = workspace.Layout() == TileLayout::Bsp && reason != SpaceFloatReason::CountLimit;
+  const bool announce = policy.announcesSpaceFloats && reason != SpaceFloatReason::CountLimit;
   CancelConformanceLease(hwnd);
   DiscardPendingAdmissionRecovery(hwnd);
   if (!(route ? workspace.Float(hwnd) : FloatWindowAfterFailure(key, workspace, hwnd))) return false;
@@ -902,8 +902,8 @@ static void ApplyAdmissionRecovery(
   g_workspaces.Save(key, workspace);
 }
 
-// Floats the chosen window and saves. A BSP admission floats in place once
-// all candidate tiles have failed.
+// Floats the chosen window and saves. In a layout whose rejected arrivals
+// float in place (BSP), an admission does so once all candidate tiles failed.
 static ArrangementStep ReleaseConstraintVictim(
     Workspace& workspace, ArrangementContext& context, const std::vector<RECT>& rects,
     const std::vector<WindowConstraints>& activeConstraints, const ConstraintVictim& victim,
@@ -912,8 +912,9 @@ static ArrangementStep ReleaseConstraintVictim(
   RecordConstraintRemoval(workspace, rects, activeConstraints, victimRecord, victim.hwnd,
                           victim.reason, context.preferredTiledWindow);
   CancelConformanceLease(victim.hwnd);
-  const bool rejectedBspAdmission = workspace.Layout() == TileLayout::Bsp && victimRecord.pendingInsertionPlacement;
-  const bool useOverflow = RuntimeLifecycle::IsAutomaticMode() && !rejectedBspAdmission;
+  const bool rejectedArrival = LayoutPolicyOf(workspace.Layout()).rejectedArrivalFloatsInPlace &&
+                               victimRecord.pendingInsertionPlacement;
+  const bool useOverflow = RuntimeLifecycle::IsAutomaticMode() && !rejectedArrival;
   DiscardPendingAdmissionRecovery(victim.hwnd);
   const bool floated = useOverflow
       ? FloatAutomaticOverflowWindow(key, workspace, victim.hwnd, SpaceFloatReason::CannotFit, context.localFloats)
@@ -923,7 +924,7 @@ static ArrangementStep ReleaseConstraintVictim(
     return ArrangementStep::Finished;
   }
   if (!useOverflow) {
-    const auto reason = rejectedBspAdmission ? SpaceFloatReason::NoBspTileFits : SpaceFloatReason::CannotFit;
+    const auto reason = rejectedArrival ? SpaceFloatReason::NoBspTileFits : SpaceFloatReason::CannotFit;
     context.localFloats.push_back({victim.hwnd, reason});
   }
   ++Diagnostics::g_runtime.counters.constraintFloats;
@@ -1188,7 +1189,7 @@ static void ArrangeWorkspace(
     if (pending && pending->bspDropEdge) merge = Layout::BspMergeDestination{pending->subject, *pending->bspDropEdge};
     const auto planStatus = pending && pending->kind == UserLayoutMutationKind::BspRotate
         ? Layout::BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects)
-        : Layout::PlanWithNewBspSplitFallback(workspace, workArea, gap, &rects, merge);
+        : Layout::PlanOrTurnNewBspSplit(workspace, workArea, gap, &rects, merge);
     if (planStatus == Layout::LayoutPlanStatus::NotApplicable) {
       g_workspaces.Save(key, workspace);
       break;

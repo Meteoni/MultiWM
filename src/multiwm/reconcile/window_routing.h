@@ -615,7 +615,7 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
   }
   auto fits = [&](Workspace& candidate) {
     std::vector<RECT> rects;
-    if (Layout::PlanWithNewBspSplitFallback(candidate, metrics.workArea, metrics.gap, &rects) != Layout::LayoutPlanStatus::Success) return false;
+    if (Layout::PlanOrTurnNewBspSplit(candidate, metrics.workArea, metrics.gap, &rects) != Layout::LayoutPlanStatus::Success) return false;
     const size_t index = candidate.TiledIndex(hwnd);
     if (index >= rects.size()) return false;
     destination.frame = rects[index];
@@ -919,7 +919,9 @@ static OverflowRequestResult ProcessOverflowRequest(
 
   OverflowRequestResult result{OverflowOutcome::NoDestination};
   // Try source capacity first, then other monitors, then at most one new desktop.
-  const bool allowNewDesktop = request.allowNewDesktop && source.workspace.Layout() != TileLayout::Bsp;
+  // The source may have changed layout since the release.
+  const bool allowNewDesktop =
+      request.allowNewDesktop && LayoutPolicyOf(source.workspace.Layout()).overflowMayCreateDesktop;
   const size_t candidateCount = monitors.size() + (allowNewDesktop && g_settings.overflowCreateDesktop ? 1 : 0);
   for (size_t index = 0; index < candidateCount; ++index) {
     const bool createDesktop = index == monitors.size();

@@ -253,6 +253,56 @@ inline const LayoutNames* FindLayoutNames(TileLayout layout) {
   return index < std::size(kLayoutNames) ? &kLayoutNames[index] : nullptr;
 }
 
+// What the layout action hotkey (Alt+M by default) does in a layout.
+enum class LayoutAction { None, PromoteToMaster, RotateSplit };
+
+// How layouts differ in admission, overflow and commands: the choices code
+// outside layout/ and model/ would otherwise make by naming a layout. A new
+// layout states them here once. In TileLayout order (kLayoutPolicies).
+struct LayoutPolicy {
+  // A burst of new windows inserted after the focused one chains: each goes
+  // after the previous arrival, preserving enumeration order. Otherwise every
+  // arrival splits the same anchor (BSP keeps splitting the focused leaf).
+  bool burstChainsArrivals = true;
+  // A pending admission that no tile fits floats where it is (and says so)
+  // instead of going to Automatic overflow.
+  bool rejectedArrivalFloatsInPlace = false;
+  // Automatic overflow's can't-fit floats are toasted even outside a user
+  // command. The auto-tiling limit's floats stay quiet in every layout.
+  bool announcesSpaceFloats = false;
+  // Automatic overflow may create a new desktop for a released window. Without
+  // it, overflow may still try other monitors.
+  bool overflowMayCreateDesktop = true;
+  // Drops near a tile's edge (BSP Split Edge Size) split it instead of swapping.
+  bool edgeDropZones = false;
+  // Companion hints for a new or restored window whose first slot can't fit
+  // use the slot admission recovery moves it to. Otherwise they give no tile.
+  bool predictsRecoveredTile = false;
+  LayoutAction layoutAction = LayoutAction::PromoteToMaster;
+};
+
+inline constexpr LayoutPolicy kLayoutPolicies[] = {
+    {},  // MasterStack
+    {},  // Columns
+    {},  // Rows
+    {},  // MasterStackH
+    {},  // Dwindle
+    {},  // Monocle
+    {.layoutAction = LayoutAction::None},  // Floating
+    {.burstChainsArrivals = false, .rejectedArrivalFloatsInPlace = true, .announcesSpaceFloats = true,
+     .overflowMayCreateDesktop = false, .edgeDropZones = true, .predictsRecoveredTile = true,
+     .layoutAction = LayoutAction::RotateSplit},  // Bsp
+};
+static_assert(std::size(kLayoutPolicies) == static_cast<size_t>(TileLayout::COUNT),
+              "kLayoutPolicies needs one entry per TileLayout");
+
+// `layout`'s policy; the defaults for COUNT and out-of-range values.
+inline const LayoutPolicy& LayoutPolicyOf(TileLayout layout) {
+  static constexpr LayoutPolicy kDefault{};
+  const auto index = static_cast<size_t>(layout);
+  return index < std::size(kLayoutPolicies) ? kLayoutPolicies[index] : kDefault;
+}
+
 // Master + Stack in either orientation: one master window plus a weighted stack.
 constexpr bool IsMasterStackLayout(TileLayout layout) {
   return layout == TileLayout::MasterStack || layout == TileLayout::MasterStackH;

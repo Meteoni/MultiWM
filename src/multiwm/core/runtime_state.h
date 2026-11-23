@@ -240,7 +240,8 @@ struct PendingWindowOverflow {
   std::wstring sourceMonitorId;
   bool monitorFixed = false;
   uint64_t tilingGeneration = 0;
-  bool allowNewDesktop = true;  // False for releases from BSP, even after rebasing.
+  // The releasing layout's LayoutPolicy::overflowMayCreateDesktop, kept even after rebasing.
+  bool allowNewDesktop = true;
   SpaceFloatReason reason = SpaceFloatReason::CannotFit;
   bool announceLocalFloat = false;  // SpaceFloat::announce if routing ends in a local float.
 };

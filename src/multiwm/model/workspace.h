@@ -516,7 +516,13 @@ class Workspace {
   // Merge observations without replacing participation/admission bookkeeping.
   WindowRecord& UpsertRecord(WindowRecord record);
   WindowRecord* FindMutable(HWND hwnd);
-  void EnsureWeights();
+  // Brings the current layout's saved state in step with membership: one weight
+  // or ratio per slot, and the other layouts' state cleared. In BSP the split
+  // tree owns the order: leaves of departed windows go, arrivals get leaves
+  // (SyncBspTree), and the tiled order becomes the leaves' order. On a workspace
+  // that already meets the invariants (Validate) it changes nothing, so tiled
+  // indices callers hold across it stay valid.
+  void SyncLayoutState();
   void RemoveActiveAt(size_t index, SuspendedSlot* saved = nullptr);
   size_t ActiveIndexToLogicalIndex(size_t activeIndex) const;
   size_t LogicalIndexToActiveIndex(size_t logicalIndex, HWND restoringHwnd) const;
@@ -579,7 +585,7 @@ class Workspace {
       const RECT& workArea, LONG gap, size_t index, const std::vector<WindowConstraints>& constraints) const;
   bool ResetBspSplit(const RECT& workArea, LONG gap, size_t index);
   // BSP: keeps the tree in step with the records, then orders the tiled windows
-  // as their leaves are (EnsureWeights calls it). Tiled and maximized windows
+  // as their leaves are (SyncLayoutState calls it). Tiled and maximized windows
   // have leaves; any other window loses its own. One without a leaf gets one
   // by InsertBspLeaf.
   void SyncBspTree();

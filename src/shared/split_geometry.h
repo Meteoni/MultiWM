@@ -104,12 +104,6 @@ struct BspPathSplit {
 };
 static_assert(sizeof(BspPathSplit) == 24, "BspPathSplit layout");
 
-// The tile a new BSP window with minimum `minWidth` x `minHeight` gets in
-// `area`, below `path` (count splits, root first): every split along the path
-// fits as MultiWM's planner fits it (FitSplitFirstSpan), with the window's own
-// minimum and the other sides' published ones. The width depends on the side-
-// by-side splits only and the height on the stacked ones, so the result is the
-// planner's exactly. No value when the window can't fit there. Pure.
 namespace Detail {
 
 inline constexpr uint32_t kMaximumPathDepth = 64;
@@ -159,6 +153,12 @@ inline bool CutTowardWindow(RECT& region, const BspPathSplit& split, LONG gap, d
 
 }  // namespace Detail
 
+// The tile a new BSP window with minimum `minWidth` x `minHeight` gets in
+// `area`, below `path` (count splits, root first): every split along the path
+// fits as MultiWM's planner fits it (FitSplitFirstSpan), with the window's own
+// minimum and the other sides' published ones. The width depends on the side-
+// by-side splits only and the height on the stacked ones, so the result is the
+// planner's exactly. No value when the window can't fit there. Pure.
 inline std::optional<RECT> SolveBspPath(const RECT& area, LONG gap, double deviation, const BspPathSplit* path,
                                         uint32_t count, LONG minWidth, LONG minHeight) {
   if (count > Detail::kMaximumPathDepth) return std::nullopt;

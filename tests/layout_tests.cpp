@@ -1857,7 +1857,7 @@ static void RunBspLayoutTests() {
           "an arrival starts at 50/50 in the selected tile");
     check(Layout::BuildWorkspaceLayoutPlan(arriving, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable,
           "the usual direction cannot fit within the adaptive range");
-    check(Layout::PlanWithNewBspSplitFallback(arriving, area, 0, &rects) == Layout::LayoutPlanStatus::Success,
+    check(Layout::PlanOrTurnNewBspSplit(arriving, area, 0, &rects) == Layout::LayoutPlanStatus::Success,
           "the alternate direction fits with adaptive movement from 50/50");
     const RECT fitted = splitFocused ? RECT{0, 200, 800, 450} : RECT{1140, 0, 1600, 900};
     check(EqualRect(&rects[arriving.TiledIndex(f)], &fitted) &&
@@ -1869,7 +1869,7 @@ static void RunBspLayoutTests() {
       Workspace provisional = arriving;
       provisional.UpdateConstraints(f, {720, 350, 96, true});
       check(Layout::BuildWorkspaceLayoutPlan(provisional, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable &&
-                Layout::PlanWithNewBspSplitFallback(provisional, area, 0, &rects) == Layout::LayoutPlanStatus::Success &&
+                Layout::PlanOrTurnNewBspSplit(provisional, area, 0, &rects) == Layout::LayoutPlanStatus::Success &&
                 !provisional.Bsp().Nodes()[split].direction.has_value(),
             "an unsettled admission can return to the original direction when its minimum changes");
     }
@@ -1888,7 +1888,7 @@ static void RunBspLayoutTests() {
     settled.ClearInsertionPlacement(hwnd);
     settled.UpdateConstraints(hwnd, {900, 1, 96, true});
   }
-  check(Layout::PlanWithNewBspSplitFallback(settled, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable &&
+  check(Layout::PlanOrTurnNewBspSplit(settled, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable &&
             !settled.Bsp().Nodes()[0].direction,
         "raising minimums cannot turn a settled divider");
   g_settings.adaptiveDwindleSlots = 2;
@@ -2050,7 +2050,7 @@ static std::optional<RECT> ArrangeBspArrival(Workspace workspace, const Platform
   record.constraints = {minWidth, minHeight, metrics.dpi, true};
   if (!(anchor ? workspace.AdmitTiledAfter(record, anchor) : workspace.AdmitTiled(record))) return std::nullopt;
   std::vector<RECT> rects;
-  if (Layout::PlanWithNewBspSplitFallback(workspace, metrics.workArea, metrics.gap, &rects) !=
+  if (Layout::PlanOrTurnNewBspSplit(workspace, metrics.workArea, metrics.gap, &rects) !=
       Layout::LayoutPlanStatus::Success) {
     Layout::AdmissionRecoveryPlan recovery;
     if (!Layout::TryRecoverPendingAdmission(workspace, metrics.workArea, metrics.gap, {{arrival, 0}}, nullptr,

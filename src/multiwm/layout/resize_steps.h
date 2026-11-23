@@ -246,7 +246,7 @@ void Workspace::RelaxDwindlePushes(const RECT& workArea, LONG gap, size_t afterS
 bool Workspace::StepTiledSize(
     const RECT& workArea, LONG gap, size_t index, bool grow, LONG stepPercent) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::StepTiledSize");
-  EnsureWeights();
+  SyncLayoutState();
   // A Dwindle step works on the layout as shown. A step that changes nothing
   // puts back what accepting it changed.
   DwindleState before = SaveDwindleState();
@@ -367,7 +367,7 @@ std::optional<Workspace::TiledStepTarget> Workspace::ChooseBspStepTarget(
   target.increasing = around.front().leafFirst;
   target.minimum = StepMinimum(constraints[index], target.axis);
   target.maximum = split.usableSpan;  // The solver finds how far the layout still fits.
-  target.preference = [node = split.node](Workspace& w) -> double& { return w.bspTree_.SplitNode(node).ratio; };
+  target.preference = [node = split.node](Workspace& w) -> double& { return w.bspTree_.SplitRatio(node); };
   return target;
 }
 
@@ -444,7 +444,7 @@ bool Workspace::ApplyTiledStep(
 
 bool Workspace::ResetTiledSize(const RECT& workArea, LONG gap, size_t index, double defaultMasterRatio) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::ResetTiledSize");
-  EnsureWeights();
+  SyncLayoutState();
   const size_t count = windows_.size();
   if (count < 2 || index >= count) return false;
 
@@ -476,7 +476,7 @@ bool Workspace::ResetBspSplit(const RECT& workArea, LONG gap, size_t index) {
   AcceptShownBspLayout(workArea, gap);
   const std::vector<BspSplitAround> around =
       BspSplitsAround(bspTree_, bspTree_.FindLeaf(windows_[index]), PlanBspCells(*this, workArea, gap).splits);
-  if (!around.empty() && SetPreference(bspTree_.SplitNode(around.front().split.node).ratio, 0.5)) return true;
+  if (!around.empty() && SetPreference(bspTree_.SplitRatio(around.front().split.node), 0.5)) return true;
   bspTree_ = before;
   return false;
 }

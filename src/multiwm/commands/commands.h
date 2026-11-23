@@ -106,7 +106,7 @@ static Layout::LayoutPlanStatus PlanBspDrop(
     case TileDropZone::Center: return Layout::LayoutPlanStatus::Unsatisfiable;
   }
   bspDropEdge = edge;
-  return Layout::PlanWithNewBspSplitFallback(candidate, metrics.workArea, metrics.gap, &rects,
+  return Layout::PlanOrTurnNewBspSplit(candidate, metrics.workArea, metrics.gap, &rects,
                                             Layout::BspMergeDestination{source, *bspDropEdge});
 }
 
@@ -238,13 +238,14 @@ void ApplyLayoutAction(HWND foreground = GetForegroundWindow()) {
   auto current = LoadForegroundWorkspace(foreground);
   if (!current) return ReportNoTargetWindow(current);
   const Workspace& workspace = current->workspace;
-  if (workspace.Layout() == TileLayout::Floating) return ReportCommandRefused(kNotInFloatingLayout, current);
+  const LayoutAction layoutAction = LayoutPolicyOf(workspace.Layout()).layoutAction;
+  if (layoutAction == LayoutAction::None) return ReportCommandRefused(kNotInFloatingLayout, current);
 
   const HWND focused = Platform::Windows::ResolveToTiledWindow(current->foreground, workspace.TiledWindows());
   if (!focused) return ReportNoTargetWindow(current);
   Workspace candidate = workspace;
   using Kind = Placement::UserLayoutMutationKind;
-  const bool rotate = workspace.Layout() == TileLayout::Bsp;
+  const bool rotate = layoutAction == LayoutAction::RotateSplit;
   const auto kind = rotate ? Kind::BspRotate : Kind::Order;
   const wchar_t* action = rotate ? L"Rotate split" : L"Set master";
   const BspTree& tree = workspace.Bsp();
@@ -668,7 +669,7 @@ static std::vector<TiledDropFrame> TiledDropFrames(const Workspace& workspace, H
 
 static std::optional<TiledDropTarget> FindTiledDropTarget(
     const std::vector<TiledDropFrame>& frames, TileLayout layout, POINT cursor) {
-  const LONG edgePercent = layout == TileLayout::Bsp ? g_settings.bspSplitEdgePercent : 0;
+  const LONG edgePercent = LayoutPolicyOf(layout).edgeDropZones ? g_settings.bspSplitEdgePercent : 0;
   for (const auto& [window, frame] : frames) {
     if (PtInRect(&frame, cursor)) return TiledDropTarget{window, PickTileDropZone(frame, cursor, edgePercent)};
   }
