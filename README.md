@@ -42,7 +42,8 @@ src/
     reconcile/    discovery, ownership repair, window routing and overflow
     commands/     hotkey/tray commands and drag/resize gestures
     platform/     Windows APIs: windows, monitors, WinEvents, virtual desktops
-    app/          settings loading, tray UI, diagnostics, WM thread lifecycle
+    app/          settings loading, tray UI, overlays (drag preview, toasts),
+                  diagnostics, WM thread lifecycle
     windhawk/     Windhawk's standard tool-mod launcher
   companion/      MultiWM Companion entry point, snapshot reader and show hooks
   shared/         rule matching, companion snapshot layout, geometry and size limits
@@ -88,8 +89,8 @@ follow the configured destination insertion position, including after focus.
 A new window the companion moves onto its tile keeps the frame the app asked for
 on the window, so floating it later (Alt+F, a drag, the Floating layout) still uses
 the app's own size rather than the tile.
-Both mods must use snapshot ABI major 5: update MultiWM to 1.15.0 and Companion to
-0.3.0 together. Older major versions give no companion hints.
+Both mods must use snapshot ABI major 6: update MultiWM to 1.16.1 and Companion to
+0.3.2 together. Older major versions give no companion hints.
 
 Build the companion separately; WHAM produces
 `output/companion/multiwm-companion.wh.cpp`. The companion requires a running

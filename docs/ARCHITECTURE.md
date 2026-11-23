@@ -37,10 +37,44 @@ except the sibling `shared/` and `companion/` roots.
 | `reconcile/` | `Reconcile` | Turning observed OS state into model changes: discovery, ownership repair, initial-placement rules, overflow |
 | `commands/` | `Commands`, `Gestures` | Hotkey/tray commands and interpreting user drags and resizes |
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |
-| `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot`, `DragPreview` | Settings loading, tray icon, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot, the drag preview (planned on the WM thread and drawn as layered GDI windows on a dedicated preview thread) |
+| `app/` | `Configuration`, `TrayUi`, `Diagnostics`, `RuntimeLifecycle`, `CompanionSnapshot`, `DragPreview`, `Overlay` | Settings loading, tray icon and the toasts' text and theme, diagnostic reports, the WM thread and its message loop, publishing the companion snapshot, the drag session and what its preview shows (`DragPreview`, WM thread), and drawing every overlay (`Overlay`, see below) |
 | `windhawk/` | — | Windhawk's stock tool-mod launcher. Not MultiWM logic. |
 | `shared/` | `SharedRules`, `CompanionAbi`, `SharedGeometry` | Code compiled by both mods, so both decide alike: window-rule matching, the window-shape checks and process-name read behind it, the companion snapshot layout, geometry/size-limit and frame-border arithmetic, and the split arithmetic both mods fit BSP minimum sizes with (`SharedSplits`). Windows and the standard library only. |
 | `companion/` | `Companion` | The separate MultiWM Companion mod (`src/companion/multiwm-companion.cpp`). Never included by MultiWM. |
+
+## Overlays: drag preview and toasts
+
+`app/overlay.h` (`Overlay`) draws everything MultiWM shows on screen besides the
+tray icon: the drag preview's fill, outline and app-icon badges, and toasts. It
+owns the overlay thread and everything that thread uses. Its two clients
+call it from the WM thread and depend on it, never on each other:
+
+- `DragPreview` (`app/drag_preview.h`) follows the drag and plans the drop, then
+  calls `Overlay::ShowPreview` / `HidePreview`.
+- `TrayUi` decides a toast's text, monitor, offsets and theme, then calls
+  `Overlay::PublishToast`. A theme change calls `Overlay::RefreshAppearance`.
+
+Each monitor has one host window holding a retained Direct2D surface that
+DirectComposition composes (`app/popup_surface.h` wraps the device and surface).
+The preview and a toast on the same monitor share it. GDI layered windows were
+tried and measured far slower for these overlays; the retained surface follows
+PowerToys FancyZones and cut rendering delay noticeably. Keep this path.
+
+The overlay thread steps fades at the compositor's refresh cadence. A newer
+preview replaces one still queued, so a fast drag never builds a backlog. If the
+thread can't start, the WM thread draws instead with window timers. Hosts are
+raised above other topmost windows whenever they show something new. A host for
+a monitor that disappears is freed on the next display change.
+
+## Layout policy
+
+Code outside `layout/` and `model/` asks `LayoutPolicyOf(layout)`
+(`core/shared_types.h`) rather than naming a layout. For example: may overflow
+create a desktop? Does a rejected arrival float in place? Are can't-fit floats
+announced? Do drops have edge zones? Do companion hints follow admission recovery
+to another tile? What does the layout action do?
+A new layout states these once in `kLayoutPolicies`. The planner and the model
+still branch by layout, because how a layout divides space is theirs.
 
 ## The companion mod
 
@@ -145,11 +179,12 @@ overflow can route to another monitor on the current desktop when enabled.
 General routed-overflow destinations and full geometry-based admission prediction
 remain deferred (see [the plan](VFX_COMPANION_PLAN.md)).
 
-ABI 5.1 uses fixed-width structures with layout assertions for x86 and x64. Bounds
+ABI 6.0 uses fixed-width structures with layout assertions for x86 and x64. Bounds
 are 16 workspaces, 2048 tracked HWNDs, 128 restore hints and 32 KiB of encoded rules.
 The reader caches the body by generation and writer PID and decodes rules only
-when their bytes change. ABI 5 uses 64-byte tracked entries and 32-byte restore
-entries; its fixed snapshot section is 169160 bytes. Ownership publication walks
+when their bytes change. ABI 6 uses 64-byte tracked entries and 32-byte restore
+entries, and adds each workspace's BSP arrival tiles (up to 4 tiles of up to 16
+splits, 1656 bytes per workspace); its fixed snapshot section is 195656 bytes. Ownership publication walks
 repository metadata and validates cached borders, without planning inactive
 workspaces. The larger body is copied only on generation/writer changes.
 A major-version mismatch gives no hint; both mods must be updated together.
@@ -209,8 +244,9 @@ anything. When you see a check repeated after a native call, that is why.
 
 | You want to… | Start in |
 | --- | --- |
-| Add a layout or change how one divides space | `layout/algorithms.h`, then `layout/planning.h` (`BuildWorkspaceLayoutPlan`) |
-| Change the BSP layout | `model/bsp_tree.h` (the stored split tree: insertion, removal), `layout/bsp_layout.h` (its rectangles), `Workspace::SyncBspTree` (keeping it in step with membership) |
+| Add a layout or change how one divides space | `layout/algorithms.h`, then `layout/planning.h` (`BuildWorkspaceLayoutPlan`); a new layout also adds its `kLayoutNames` and `kLayoutPolicies` entries in `core/shared_types.h` |
+| Change the drag preview or toasts | `app/drag_preview.h` (what to show during a drag), `app/tray_ui.h` (toast text and theme), `app/overlay.h` (drawing, fades, the overlay thread) |
+| Change the BSP layout | `model/bsp_tree.h` (the stored split tree: insertion, removal), `layout/bsp_layout.h` (its rectangles), `Workspace::SyncBspTree` (keeping it in step with membership; the tree owns BSP's tiled order, and `Workspace::SyncLayoutState` reorders the tiled windows to match) |
 | Change what happens when a window appears | `reconcile/reconcile.h` (admission helpers near the top) |
 | Change a window rule's effect | `app/configuration.h` (parsing) and `platform/native_windows.h` (`FindMatchingWindowRule`) |
 | Add a hotkey or tray command | `core/shared_types.h` (IDs), `app/wm_thread.h`, `commands/commands.h` |
