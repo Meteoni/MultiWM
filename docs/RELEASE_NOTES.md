@@ -13,3 +13,6 @@
 - The tray icon is drawn at the taskbar's icon size with its own smoothing, so
   it stays sharp at 125-175% scaling, in light mode, and with font smoothing
   off (as in many VMs).
+- Companion skips Explorer's virtual-desktop switcher windows, which Explorer
+  creates at the start of every touchpad swipe and Ctrl+Win+Arrow switch, so
+  it no longer delays the swipe's finger tracking.

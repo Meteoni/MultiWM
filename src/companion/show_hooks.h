@@ -361,8 +361,13 @@ static BOOL WINAPI SetWindowPlacementHook(HWND hwnd, const WINDOWPLACEMENT* plac
 
 // Visible creation can show inside the kernel. Adjust as soon as creation
 // returns; apps that paint during creation may already have exposed a frame.
-static void PlaceIfCreatedVisible(HWND hwnd, DWORD style) {
-  if (hwnd && (style & WS_VISIBLE) && !(style & WS_CHILD)) PlaceAtPredictedFrame(hwnd, "CreateWindowEx");
+// `className` is the creation's class argument when it is a Unicode string: a
+// desktop switcher (kDesktopSwitcherClasses) named there is passed over without
+// reading the window. An atom, or the ANSI path, leaves it to RejectStructurally.
+static void PlaceIfCreatedVisible(HWND hwnd, DWORD style, LPCWSTR className = nullptr) {
+  if (!hwnd || !(style & WS_VISIBLE) || (style & WS_CHILD)) return;
+  if (className && !IS_INTRESOURCE(className) && IsDesktopSwitcherClass(className)) return;
+  PlaceAtPredictedFrame(hwnd, "CreateWindowEx");
 }
 
 static HWND WINAPI CreateWindowExWHook(DWORD exStyle, LPCWSTR className, LPCWSTR windowName, DWORD style, int x,
@@ -370,7 +375,7 @@ static HWND WINAPI CreateWindowExWHook(DWORD exStyle, LPCWSTR className, LPCWSTR
                                        LPVOID param) {
   const HWND hwnd = g_unhookedCreateWindowExW(exStyle, className, windowName, style, x, y, width, height, parent,
                                               menu, instance, param);
-  PlaceIfCreatedVisible(hwnd, style);
+  PlaceIfCreatedVisible(hwnd, style, className);
   return hwnd;
 }
 

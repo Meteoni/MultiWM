@@ -219,6 +219,36 @@ int main() {
   check(positionCalls.empty() && limits.probes == 0 && asyncCommands == std::vector<int>{SW_RESTORE},
         "cross-thread async show passes through without placement or probing");
 
+  // Explorer's virtual-desktop switchers get no hint and no size probe, whether
+  // told by the window's class or by the class a visible creation names.
+  for (const wchar_t* switcherClass : Companion::kDesktopSwitcherClasses) {
+    WNDCLASSW switcherWindowClass = windowClass;
+    switcherWindowClass.lpszClassName = switcherClass;
+    check(RegisterClassW(&switcherWindowClass) != 0, "register a desktop switcher class");
+    WindowLimits switcherLimits;
+    const HWND switcher = CreateWindowExW(0, switcherClass, L"", WS_OVERLAPPEDWINDOW, 100, 100, 800, 600, nullptr,
+                                          nullptr, windowClass.hInstance, &switcherLimits);
+    check(switcher != nullptr, "create a hidden desktop switcher");
+    switcherLimits.probes = 0;
+    positionCalls.clear();
+    showCommands.clear();
+    Companion::ShowWindowHook(switcher, SW_SHOWNORMAL);
+    Companion::SetWindowPosHook(switcher, nullptr, 210, 220, 710, 510, showFlags);
+    check(positionCalls.size() == 1 && positionCalls[0].x == 210 && positionCalls[0].width == 710 &&
+              showCommands == std::vector<int>{SW_SHOWNORMAL} && switcherLimits.probes == 0,
+          "a desktop switcher's show passes through without placement or probing");
+    DestroyWindow(switcher);
+    UnregisterClassW(switcherClass, windowClass.hInstance);
+    // The class argument alone decides, so an otherwise eligible window is left alone.
+    positionCalls.clear();
+    limits.probes = 0;
+    Companion::PlaceIfCreatedVisible(hwnd, WS_OVERLAPPEDWINDOW | WS_VISIBLE, switcherClass);
+    check(positionCalls.empty() && limits.probes == 0, "a visible creation naming a switcher class is passed over");
+  }
+  positionCalls.clear();
+  Companion::PlaceIfCreatedVisible(hwnd, WS_OVERLAPPEDWINDOW | WS_VISIBLE, windowClass.lpszClassName);
+  check(positionCalls.size() == 1, "a visible creation of another class is still placed");
+
   RECT current{}, currentFrame{};
   GetWindowRect(hwnd, &current);
   if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &currentFrame, sizeof(currentFrame))) ||

@@ -78,6 +78,28 @@ static RECT FrameOf(HWND hwnd, const RECT& windowRect) {
 
 // --- Decision -----------------------------------------------------------------------
 
+// Explorer's virtual-desktop switchers. twinui.pcshell creates a new one on
+// Explorer's UI thread as each switch starts: VirtualDesktopGestureSwitcher for
+// a touchpad swipe, VirtualDesktopHotkeySwitcher for Ctrl+Win+Arrow (measured on
+// 26100). Work on it there delays the swipe's finger tracking, and it is no app
+// window to place, so the companion turns it away by class before anything else.
+static constexpr const wchar_t* kDesktopSwitcherClasses[] = {
+    L"VirtualDesktopGestureSwitcher",
+    L"VirtualDesktopHotkeySwitcher",
+};
+
+static bool IsDesktopSwitcherClass(const wchar_t* className) {
+  for (const wchar_t* switcher : kDesktopSwitcherClasses) {
+    if (_wcsicmp(className, switcher) == 0) return true;
+  }
+  return false;
+}
+
+static bool IsDesktopSwitcher(HWND hwnd) {
+  wchar_t className[32];
+  return GetClassNameW(hwnd, className, ARRAYSIZE(className)) && IsDesktopSwitcherClass(className);
+}
+
 // Cheap checks that need no snapshot: the structural part of MultiWM's
 // WindowCanBeManaged, plus the companion's own limits. Returns nullptr when the
 // window is a candidate, else the reason it isn't.
@@ -86,6 +108,7 @@ static const char* RejectStructurally(HWND hwnd, bool allowSuspended = false) {
   const DWORD threadId = GetWindowThreadProcessId(hwnd, &processId);
   // Moving another thread's window would wait on that thread mid-show.
   if (processId != GetCurrentProcessId() || threadId != GetCurrentThreadId()) return "not shown by its own thread";
+  if (IsDesktopSwitcher(hwnd)) return "virtual desktop switcher";
   if (const char* reason = SharedRules::RejectNonTopLevel(hwnd)) return reason;
   if (!allowSuspended && (GetWindowLongPtrW(hwnd, GWL_STYLE) & (WS_MINIMIZE | WS_MAXIMIZE))) {
     return "minimized or maximized";
