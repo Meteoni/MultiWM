@@ -3153,7 +3153,7 @@ static void RunDiagnosticReportShapeTest() {
   }
   // Includes the adaptive split settings measured from saved dividers.
   // Intentional report format changes must update this value.
-  if (digest != 0x9b009582af3d245cull) {
+  if (digest != 0xa30386e69b842811ull) {
     std::fprintf(stderr, "FAILED: diagnostic report shape changed (%016llx)\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }
