@@ -44,10 +44,12 @@ struct TestWindowDesktops final : IVirtualDesktopManager {
   GUID desktop{};
   bool fail = false;
   unsigned queries = 0;
+  unsigned onCurrentQueries = 0;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
   ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
   ULONG STDMETHODCALLTYPE Release() override { return 1; }
   HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND, BOOL* current) override {
+    ++onCurrentQueries;
     *current = TRUE;
     return S_OK;
   }
@@ -3859,6 +3861,55 @@ static void RunToastIconTests() {
   std::printf("Passed %u toast icon checks.\n", check.passed);
 }
 
+// A settled pass asks the shell which desktop a dirty window is on only when it
+// could start a workspace: never for an unknown hidden, tool or shell window,
+// such as the switcher windows Explorer shows at every desktop switch.
+static void RunDirtyWindowShellQueryTests() {
+  CheckCounter check;
+  TestWindowDesktops windows;
+  IVirtualDesktopManager* const savedManager = g_vd.desktopManager;
+  const bool savedInitialized = g_vd.initialized;
+  const bool savedForce = g_wm.lifecycle.forceMonitorReconcile;
+  g_vd.initialized = true;
+  g_vd.desktopManager = &windows;
+  g_wm.lifecycle.forceMonitorReconcile = false;
+  GUID desktop{};
+  desktop.Data1 = 0xD1E7;
+  // Transparent and never drawn, so a live MultiWM ignores them too.
+  auto create = [](DWORD exStyle) {
+    const HWND window = CreateWindowExW(exStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT, L"STATIC",
+                                        L"MultiWM shell query test", WS_POPUP | WS_THICKFRAME, 40, 40, 400, 300,
+                                        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetLayeredWindowAttributes(window, 0, 0, LWA_ALPHA);
+    return window;
+  };
+  const HWND hidden = create(0);
+  const HWND tool = create(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+  const HWND candidate = create(0);
+  const BOOL cloak = TRUE;
+  check(hidden && tool && candidate &&
+            SUCCEEDED(DwmSetWindowAttribute(candidate, DWMWA_CLOAK, &cloak, sizeof(cloak))),
+        "create the test windows");
+  ShowWindow(tool, SW_SHOWNOACTIVATE);
+  ShowWindow(candidate, SW_SHOWNOACTIVATE);
+  auto queriesFor = [&](HWND hwnd) {
+    const unsigned before = windows.onCurrentQueries;
+    std::vector<DesktopMonitorKey> changed;
+    Reconcile::CollectMonitorsForPass(desktop, false, {hwnd}, &changed);
+    return windows.onCurrentQueries - before;
+  };
+  check(queriesFor(hidden) == 0, "an unknown hidden window isn't asked about");
+  check(queriesFor(tool) == 0, "an unknown tool window isn't asked about");
+  check(queriesFor(candidate) == 1, "an unknown window that could be admitted is still asked about");
+  DestroyWindow(candidate);
+  DestroyWindow(tool);
+  DestroyWindow(hidden);
+  g_vd.desktopManager = savedManager;
+  g_vd.initialized = savedInitialized;
+  g_wm.lifecycle.forceMonitorReconcile = savedForce;
+  std::printf("Passed %u dirty window shell query checks.\n", check.passed);
+}
+
 int main() {
   // This thread goes long stretches without pumping messages, so Windows would
   // ghost its test windows as hung, and MultiWM never places a ghosted window.
@@ -3891,6 +3942,7 @@ int main() {
   RunDraggedWindowPlacementTests();
   RunOverlaySurfaceReleaseTests();
   RunToastIconTests();
+  RunDirtyWindowShellQueryTests();
   RunGhostWindowTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();

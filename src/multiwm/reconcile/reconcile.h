@@ -1247,10 +1247,22 @@ static void RecordMissedDesktopSwitch(const GUID& currentDesktop) {
   }
 }
 
+// True for an unknown window this pass's discovery can't admit, told by local
+// reads alone: hidden, not its own top-level root, or a tool window or shell
+// surface (WindowCanBeManaged rejects these whatever the rules say). It can't
+// start a workspace, so there is no need to ask the shell where it is. Explorer
+// shows such windows at every desktop switch. A window still acquiring its final
+// styles is looked at again by its discovery retry.
+static bool CannotStartWorkspace(HWND hwnd) {
+  return !IsWindowVisible(hwnd) || SharedRules::RejectNonTopLevel(hwnd) ||
+         SharedRules::RejectToolOrShellWindow(hwnd);
+}
+
 // Chooses the monitors this pass must discover on. After a desktop switch or a
 // display change, that is every connected monitor (and existing workspaces are
 // re-arranged); otherwise only monitors with a known workspace. Either way, add
-// monitors showing a dirty window, so a new desktop+monitor workspace can start.
+// monitors showing a dirty window, so a new desktop+monitor workspace can start:
+// a tracked one, or an unknown one that could be admitted (CannotStartWorkspace).
 // May reconcile monitor ownership (topology changes) into `globallyChanged`.
 static std::vector<HMONITOR> CollectMonitorsForPass(
     const GUID& currentDesktop, bool desktopSwitched, const std::vector<HWND>& dirtyWindows,
@@ -1276,6 +1288,8 @@ static std::vector<HMONITOR> CollectMonitorsForPass(
 
   for (HWND hwnd : dirtyWindows) {
     if (!hwnd || !IsWindow(hwnd)) continue;
+    // Local reads first: the desktop query is a synchronous call into the shell.
+    if (!Platform::Windows::IsWindowTrackedInAnyState(hwnd) && CannotStartWorkspace(hwnd)) continue;
     BOOL onCurrent = FALSE;
     if (!Platform::VirtualDesktop::IsWindowOnCurrentDesktopSafe(hwnd, &onCurrent) || !onCurrent) continue;
     AddUniqueMonitor(monitors, Platform::Windows::GetWindowPhysicalMonitor(hwnd));
