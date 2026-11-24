@@ -37,12 +37,14 @@ instead of implementing a separate desktop system.
 continuous polling.
 
 ## Layouts
-- Floating
-- Master + Stack (vertical or horizontal)
-- Dwindle
-- BSP
-- Columns / Rows
-- Monocle
+- **Floating**: no tiling. 
+- **Master + Stack**: one main window, the others stacked beside it. 
+- **Columns / Rows**: windows side by side. 
+- **Monocle**: every window fills the screen.
+- **Dwindle**: each new window takes half of the previous window's space.
+- **BSP**: a new window splits a specified tile in half.
+  - Drag a window onto a tile's edge to split, or onto its center to swap. For two windows sharing a divider, a perpendicular edge rotates their split.
+  - Alt+M rotates the focused window's split.
 
 ## Getting Started
 Move a tiled window to **float it** or **swap it with the window underneath**. In BSP, drop near an edge to split the target tile or in the center to swap. Windows sharing a divider swap on center and parallel edge drops, and rotate on perpendicular edge drops. The preview fills the destination of the dragged window and outlines the destination of the other window.
@@ -92,8 +94,8 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 
 - workspace:
   - DefaultLayout: master_stack
-    $name: Fallback Layout
-    $description: Starting layout when no rule matches.
+    $name: Default Layout
+    $description: The layout each desktop starts with on each monitor, unless an Initialization Rule gives it another. 
     $options:
       - master_stack: Master + Stack (Vertical)
       - master_stack_h: Master + Stack (Horizontal)
@@ -152,7 +154,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
           #! $showIf: {Monitor: specific}
           $description: Paste a monitor ID from diagnostics. Blank disables this rule.
     $name: Initialization Rules
-    $description: Special handling rules for specific virtual desktops / monitors.
+    $description: Start specific desktops or monitors in another layout than the Default Layout. The first matching rule applies.
   - Overflow:
     - WindowLimit: 0
       $name: Auto-tiling Limit
