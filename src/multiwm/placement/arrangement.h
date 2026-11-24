@@ -329,30 +329,47 @@ static std::wstring ProcessDisplayName(HWND hwnd) {
   return name;
 }
 
-// "Firefox needs more space", "Firefox and Code need more space in this layout".
-// `windows` named once each; an unnamed one is "A window".
-static std::wstring NeedMoreSpaceMessage(const std::vector<HWND>& windows) {
+// A toast about apps: its text, and one window of each app it names, whose
+// icons go before the text. Empty text shows nothing.
+struct AppToast {
+  std::wstring text;
+  std::vector<HWND> apps;
+};
+
+static void ShowAppToast(const AppToast& toast, HMONITOR monitor) {
+  TrayUi::ShowAppFlyout(toast.text, toast.apps, monitor);
+}
+
+// The first of `windows` from each app (process name; the unnamed count as
+// one), so a toast shows each app's icon once.
+static std::vector<HWND> OneWindowPerApp(const std::vector<HWND>& windows) {
+  std::vector<HWND> apps;
   std::vector<std::wstring> names;
   for (HWND hwnd : windows) {
     std::wstring name = ProcessDisplayName(hwnd);
-    if (name.empty()) name = L"A window";
-    if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(std::move(name));
+    if (std::ranges::find(names, name) != names.end()) continue;
+    names.push_back(std::move(name));
+    apps.push_back(hwnd);
   }
-  std::wstring message;
-  for (size_t i = 0; i < names.size(); ++i) {
-    if (i) message += i + 1 == names.size() ? L" and " : L", ";
-    message += names[i];
+  return apps;
+}
+
+// "Firefox needs more space", "Firefox and Code need more space". `windows`
+// named once each; an unnamed one is "A window".
+static AppToast NeedMoreSpaceToast(const std::vector<HWND>& windows) {
+  AppToast toast{.apps = OneWindowPerApp(windows)};
+  for (size_t i = 0; i < toast.apps.size(); ++i) {
+    std::wstring name = ProcessDisplayName(toast.apps[i]);
+    if (i) toast.text += i + 1 == toast.apps.size() ? L" and " : L", ";
+    toast.text += name.empty() ? L"A window" : name;
   }
-  if (names.empty()) message = L"A window";
-  message += names.size() > 1 ? L" need more space in this layout" : L" needs more space";
-  return message;
+  if (toast.apps.empty()) toast.text = L"A window";
+  toast.text += toast.apps.size() > 1 ? L" need more space" : L" needs more space";
+  return toast;
 }
 
 static std::wstring SpaceFloatMessage(const std::vector<SpaceFloat>& floats) {
   if (floats.empty()) return {};
-  if (floats.size() == 1 && floats.front().reason == SpaceFloatReason::NoBspTileFits) {
-    return L"No BSP tile has enough space. Window floated.";
-  }
   const auto countLimited = static_cast<size_t>(std::count_if(floats.begin(), floats.end(), [](const SpaceFloat& item) {
     return item.reason == SpaceFloatReason::CountLimit;
   }));
@@ -360,6 +377,9 @@ static std::wstring SpaceFloatMessage(const std::vector<SpaceFloat>& floats) {
                                            : std::to_wstring(floats.size()) + L" windows";
   if (message.empty()) message = L"A window";
   message += L" floated";
+  if (floats.size() == 1 && floats.front().reason == SpaceFloatReason::NoBspTileFits) {
+    return message + L" because no tile fits";
+  }
   if (countLimited == floats.size()) return message + L" at the auto-tiling limit";
   if (countLimited) return message + L" due to space or the auto-tiling limit";
   return message + (floats.size() == 1 ? L" because it needs more space" : L" because they need more space");
@@ -367,8 +387,9 @@ static std::wstring SpaceFloatMessage(const std::vector<SpaceFloat>& floats) {
 
 static void ShowSpaceFloatToast(const std::vector<SpaceFloat>& floats, HMONITOR monitor) {
   if (floats.empty()) return;
-  const std::wstring message = SpaceFloatMessage(floats);
-  TrayUi::ShowCommandFailureFlyout(message.c_str(), monitor);
+  std::vector<HWND> windows;
+  for (const SpaceFloat& item : floats) windows.push_back(item.window);
+  ShowAppToast({SpaceFloatMessage(floats), OneWindowPerApp(windows)}, monitor);
 }
 
 // A user command reports every float it caused; otherwise only the ones that
@@ -384,25 +405,23 @@ static void ReportSpaceFloats(const std::vector<SpaceFloat>& floats, HMONITOR mo
   ShowSpaceFloatToast(announced, monitor);
 }
 
-// NeedMoreSpaceMessage for the tiled windows `involved` marks; `fallback` is the
+// NeedMoreSpaceToast for the tiled windows `involved` marks; `fallback` is the
 // window to blame when none is marked, if it can be named.
-static std::wstring ConstraintConflictMessage(
+static AppToast ConstraintConflictToast(
     const Workspace& workspace, const std::vector<bool>& involved, HWND fallback) {
   std::vector<HWND> windows;
   for (size_t i = 0; i < involved.size(); ++i) {
     if (involved[i]) windows.push_back(workspace.TiledWindows()[i]);
   }
   if (windows.empty() && fallback && !ProcessDisplayName(fallback).empty()) windows.push_back(fallback);
-  return NeedMoreSpaceMessage(windows);
+  return NeedMoreSpaceToast(windows);
 }
 
 // Tells the user which windows don't fit `rects`, the rejected plan.
 static void ShowWindowConstraintConflict(
     const Workspace& workspace, const std::vector<RECT>& rects,
     HWND fallback, HMONITOR monitor) {
-  const std::wstring message =
-      ConstraintConflictMessage(workspace, FindConflictingWindows(workspace, rects), fallback);
-  TrayUi::ShowCommandFailureFlyout(message.c_str(), monitor);
+  ShowAppToast(ConstraintConflictToast(workspace, FindConflictingWindows(workspace, rects), fallback), monitor);
 }
 
 static void ReportRejectedLayoutMutation(
@@ -428,7 +447,7 @@ static void ReportRejectedLayoutMutation(
       rejectedWorkspace, rejectedRects, subject);
   if (!culprit) culprit = culpritHint;
   if (kind == UserLayoutMutationKind::BspMerge) {
-    TrayUi::ShowCommandFailureFlyout(L"Not enough room for a split on that edge.", monitor);
+    TrayUi::ShowCommandFailureFlyout(L"Not enough space to split that tile", monitor);
   } else {
     ShowWindowConstraintConflict(rejectedWorkspace, rejectedRects, culprit, monitor);
   }
@@ -698,7 +717,7 @@ struct ArrangementContext {
   const Platform::Monitors::WorkspaceMetrics& metrics;
   HWND preferredTiledWindow;
   std::vector<SpaceFloat> localFloats;
-  std::wstring unresolvedConstraint;
+  AppToast unresolvedConstraint;  // Shown once the arrangement ends, unless something floated.
 };
 
 enum class ArrangementStep { Replan, Finished };
@@ -1009,7 +1028,7 @@ static ArrangementStep RecoverUnsatisfiableLayout(
   if (!victimRecord) {
     // No removal can make this layout fit: keep everyone, tell the user once.
     const HWND culprit = Layout::FindConstraintCulprit(workspace, rects, context.preferredTiledWindow);
-    context.unresolvedConstraint = ConstraintConflictMessage(workspace, FindConflictingWindows(workspace, rects), culprit);
+    context.unresolvedConstraint = ConstraintConflictToast(workspace, FindConflictingWindows(workspace, rects), culprit);
     Diagnostics::RecordEvent(
         L"constraint conflict left membership unchanged; no single settled removal is sufficient desktop=%08X",
         key.desktopId.Data1);
@@ -1228,7 +1247,7 @@ static void ArrangeWorkspace(
     ClearSettledLayoutMutation(key, workspace);
   }
   if (context.localFloats.empty()) {
-    TrayUi::ShowCommandFailureFlyout(context.unresolvedConstraint.c_str(), monitor);
+    ShowAppToast(context.unresolvedConstraint, monitor);
   } else {
     ReportSpaceFloats(context.localFloats, monitor);
   }

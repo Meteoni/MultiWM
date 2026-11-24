@@ -2518,6 +2518,13 @@ static void RunCommandReleaseTests() {
   check(Placement::SpaceFloatMessage({{nullptr, SpaceFloatReason::CountLimit}, {nullptr, SpaceFloatReason::CannotFit}}) ==
             L"2 windows floated due to space or the auto-tiling limit",
         "one summary covers both release reasons");
+  {
+    const HWND sameApp = f.CreateTestWindow(nullptr);
+    const std::wstring name = Placement::ProcessDisplayName(hwnd);
+    const Placement::AppToast toast = Placement::NeedMoreSpaceToast({hwnd, sameApp});
+    check(!name.empty() && toast.text == name + L" needs more space" && toast.apps == std::vector<HWND>{hwnd},
+          "two windows of one app are named once, with one icon");
+  }
 
   f.Seed(TileLayout::Columns);
   Workspace crowded = f.Load();
@@ -2941,7 +2948,7 @@ static void RunSettledWindowRecoveryTests() {
       check(recover(workspace) == Placement::ArrangementStep::Replan &&
                 localFloats.size() == 1 && localFloats[0].window == d &&
                 localFloats[0].reason == SpaceFloatReason::NoBspTileFits &&
-                Placement::SpaceFloatMessage(localFloats) == L"No BSP tile has enough space. Window floated.",
+                Placement::SpaceFloatMessage(localFloats) == L"A window floated because no tile fits",
             "a BSP admission reports a single toast after every split fails");
       const WindowRecord* rejected = workspace.Find(d);
       check(rejected && rejected->state == ManageState::Floating && !g_wm.overflow.windows.contains(d) &&
@@ -3042,7 +3049,7 @@ static void RunConstraintRecoveryDigest() {
     };
     mix(iteration);
     mix(static_cast<uint64_t>(step));
-    mix(!context.localFloats.empty() || !context.unresolvedConstraint.empty());
+    mix(!context.localFloats.empty() || !context.unresolvedConstraint.text.empty());
     mixWorkspace(workspace);
     Workspace saved;
     mix(g_workspaces.Load(key, &saved));
@@ -3787,6 +3794,71 @@ static void RunOverlaySurfaceReleaseTests() {
   std::printf("Passed %u overlay surface release checks.\n", check.passed);
 }
 
+// A toast naming an app shows once a worker has loaded the app's icon, which
+// goes before the text at the small-icon size; a later toast on the monitor
+// replaces one still waiting. Overlays run on this thread.
+static void RunToastIconTests() {
+  CheckCounter check;
+  const auto previousDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  const HMONITOR monitor = MonitorFromPoint(POINT{}, MONITOR_DEFAULTTOPRIMARY);
+  RECT workArea{};
+  check(Platform::Monitors::GetOverlayWorkArea(monitor, &workArea), "read the overlay work area");
+  WNDCLASSW windowClass{};
+  windowClass.lpfnWndProc = DefWindowProcW;
+  windowClass.hInstance = GetModuleHandleW(nullptr);
+  windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  windowClass.lpszClassName = L"MultiWMToastIconTest";
+  check(RegisterClassW(&windowClass) != 0, "register an app window class with an icon");
+  const HWND app = CreateWindowExW(WS_EX_TOOLWINDOW, windowClass.lpszClassName, L"", WS_POPUP, 0, 0, 10, 10,
+                                   nullptr, nullptr, windowClass.hInstance, nullptr);
+  DWORD processId = 0;
+  const DWORD threadId = GetWindowThreadProcessId(app, &processId);
+  auto request = [&](const wchar_t* text, bool namesApp) {
+    Overlay::ToastRequest toast{monitor, text, TrayUi::CurrentPopupAppearance(), 0, 0, false, 5000};
+    if (namesApp) toast.apps.push_back({.window = app, .processId = processId, .threadId = threadId});
+    return toast;
+  };
+  // Answers this thread's messages, the worker's WM_GETICON among them.
+  auto pumpUntil = [](auto done) {
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    MSG msg{};
+    while (!done() && GetTickCount64() < deadline) {
+      while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+      if (!done()) MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+    }
+    return done();
+  };
+
+  Overlay::ShowToast(request(L"Toast icon test", true));
+  Overlay::MonitorHost* host = &Overlay::GetMonitorHost(monitor, workArea);
+  check(!host->toast, "a toast naming an app waits for its icon");
+  check(pumpUntil([&] { return host->toast && host->toast->text == L"Toast icon test"; }),
+        "it shows once the icon has loaded");
+  const float iconSize = SharedGeometry::ScaleDip(Overlay::kToastIconDip, Platform::Monitors::GetMonitorEffectiveDpi(monitor));
+  const bool oneIcon = host->toastIcons.size() == 1;
+  check(oneIcon && host->toastIcons[0].rect.right - host->toastIcons[0].rect.left == iconSize &&
+            host->toastIcons[0].rect.bottom - host->toastIcons[0].rect.top == iconSize,
+        "the app's icon is drawn at the small-icon size");
+  check(oneIcon && host->toastIcons[0].rect.left > host->toastFrame.left &&
+            host->toastIcons[0].rect.right < host->toastTextOrigin.x &&
+            host->toastIcons[0].rect.top > host->toastFrame.top &&
+            host->toastIcons[0].rect.bottom < host->toastFrame.bottom,
+        "the icon goes before the text, inside the toast");
+
+  Overlay::ShowToast(request(L"Replaced toast", true));
+  Overlay::ShowToast(request(L"Plain toast", false));
+  check(host->toast && host->toast->text == L"Plain toast" && host->toastIcons.empty(),
+        "a toast without apps shows at once");
+  check(pumpUntil([] { return Overlay::g_presenter.toastIconJobs.empty(); }) && host->toast &&
+            host->toast->text == L"Plain toast",
+        "icons arriving for a replaced toast show nothing");
+  Overlay::Shutdown();
+  DestroyWindow(app);
+  UnregisterClassW(windowClass.lpszClassName, windowClass.hInstance);
+  SetThreadDpiAwarenessContext(previousDpi);
+  std::printf("Passed %u toast icon checks.\n", check.passed);
+}
+
 int main() {
   // This thread goes long stretches without pumping messages, so Windows would
   // ghost its test windows as hung, and MultiWM never places a ghosted window.
@@ -3818,6 +3890,7 @@ int main() {
   RunTileWorkspaceGeometryTests();
   RunDraggedWindowPlacementTests();
   RunOverlaySurfaceReleaseTests();
+  RunToastIconTests();
   RunGhostWindowTests();
   RunSettledWindowRecoveryTests();
   RunConstraintRecoveryDigest();

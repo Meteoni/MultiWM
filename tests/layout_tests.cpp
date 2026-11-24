@@ -2210,6 +2210,62 @@ static void RunOverlayGeometryTests() {
         "toast sizes and gaps scale with DPI");
   check(!Overlay::ToastFrame(toast, SIZE{800, 40}, 96, 50), "a work area shorter than a toast shows none");
 
+  // A toast's icons and text, centred as one row.
+  auto whole = [](const D2D1_RECT_F& r) {
+    return r.left == std::floor(r.left) && r.top == std::floor(r.top) && r.right == std::floor(r.right) &&
+           r.bottom == std::floor(r.bottom);
+  };
+  check(Overlay::ToastIconsWidth(0, 16, 96) == 0 && Overlay::ToastIconsWidth(1, 16, 96) == 24 &&
+            Overlay::ToastIconsWidth(3, 24, 144) == 3 * 24 + 2 * 6 + 12,
+        "icons are 4 DIP apart and 8 DIP before the text");
+  frame = Overlay::ToastFrame(toast, work, 96, Overlay::ToastIconsWidth(1, 16, 96) + 200.3f);
+  auto content = Overlay::LayOutToastContent(*frame, 1, 16, 96, 200.3f, 24.6f);
+  check(frame && frame->right - frame->left == 273 && content.icons.size() == 1 &&
+            content.icons[0].left - frame->left == 24 && frame->right - (content.textLeft + content.textWidth) == 24 &&
+            content.textLeft - content.icons[0].right == 8 && content.textWidth == 201,
+        "an icon and its text keep 24 DIP from either side of the toast");
+  check(whole(content.icons[0]) && content.icons[0].right - content.icons[0].left == 16 &&
+            content.icons[0].top == std::round(frame->top + 24.6f - 8),
+        "the icon sits on whole pixels, centred on the text's capitals");
+  frame = Overlay::ToastFrame(toast, work, 144, Overlay::ToastIconsWidth(3, 24, 144) + 300);
+  content = Overlay::LayOutToastContent(*frame, 3, 24, 144, 300, 36);
+  check(content.icons.size() == 3 && content.icons[1].left - content.icons[0].right == 6 &&
+            content.icons[2].left - content.icons[1].right == 6 && content.textLeft - content.icons[2].right == 12 &&
+            std::ranges::all_of(content.icons, whole),
+        "several icons scale their spacing with DPI");
+  frame = Overlay::ToastFrame(toast, work, 96, 200.3f);
+  content = Overlay::LayOutToastContent(*frame, 0, 16, 96, 200.3f, 24);
+  check(content.icons.empty() && content.textLeft - frame->left == 24 && content.textWidth == 201,
+        "without icons the text is centred as before");
+  frame = Overlay::ToastFrame(toast, work, 96, Overlay::ToastIconsWidth(1, 16, 96) + 5000);
+  content = Overlay::LayOutToastContent(*frame, 1, 16, 96, 5000, 24);
+  check(content.icons[0].left == frame->left && content.textLeft + content.textWidth == frame->right,
+        "text wider than the work area is cut at the toast's edge, after its icon");
+
+  // The tray icon: drawn at the requested size, with smooth edges whatever the
+  // system's font smoothing.
+  for (const int size : {16, 20, 24, 32}) {
+    const HICON icon = TrayUi::CreateTextIcon(TileLayout::Bsp, size);
+    ICONINFO info{};
+    BITMAP bitmap{};
+    std::vector<uint32_t> pixels(static_cast<size_t>(size) * size);
+    BITMAPINFO bmi{};
+    bmi.bmiHeader = {sizeof(BITMAPINFOHEADER), size, -size, 1, 32, BI_RGB};
+    const HDC dc = GetDC(nullptr);
+    const bool read = icon && GetIconInfo(icon, &info) && info.hbmColor &&
+                      GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap) && bitmap.bmWidth == size &&
+                      bitmap.bmHeight == size &&
+                      GetDIBits(dc, info.hbmColor, 0, size, pixels.data(), &bmi, DIB_RGB_COLORS) == size;
+    ReleaseDC(nullptr, dc);
+    const auto alpha = [](uint32_t pixel) { return pixel >> 24; };
+    check(read && std::ranges::any_of(pixels, [&](uint32_t p) { return alpha(p) == 255; }) &&
+              std::ranges::any_of(pixels, [&](uint32_t p) { return alpha(p) > 0 && alpha(p) < 255; }),
+          "the tray icon is drawn at its size with opaque strokes and partly covered edges");
+    if (info.hbmColor) DeleteObject(info.hbmColor);
+    if (info.hbmMask) DeleteObject(info.hbmMask);
+    if (icon) DestroyIcon(icon);
+  }
+
   // Preview opacities: fill and outline each at their own share of the fade.
   Overlay::PreviewStyle style;
   style.fillOpacity = 25;

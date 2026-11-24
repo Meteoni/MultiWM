@@ -364,7 +364,7 @@ struct WmRuntime {
   struct DesktopTracking {
     GUID reconciled{};
     ReconciledDesktopState state = ReconciledDesktopState::Unknown;
-    bool pendingSwitchFlyouts = false;  // Show "desktop N" toasts after the next pass.
+    bool pendingSwitchFlyouts = false;  // Show each monitor's layout toast after the next pass.
   } desktop;
 
   struct Maintenance {

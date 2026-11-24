@@ -78,12 +78,12 @@ namespace Overlay {
 static bool IsOverlayThread(DWORD threadId);
 }  // namespace Overlay
 
-// Defined in app/tray_ui.h.
 namespace DragPreview {
 // Defined in app/drag_preview.h.
 static void End(HWND source);
 }  // namespace DragPreview
 
+// Defined in app/tray_ui.h.
 namespace TrayUi {
 static void LoadSettings();
 static bool Initialize();
@@ -91,6 +91,7 @@ static void Shutdown();
 static void UpdateIcon(TileLayout layout, HMONITOR monitor = nullptr);
 static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor = nullptr);
 static void ShowCommandFailureFlyout(const wchar_t* text, HMONITOR monitor = nullptr);
+static void ShowAppFlyout(const std::wstring& text, const std::vector<HWND>& apps, HMONITOR monitor = nullptr);
 static void ShowManagementModeFlyout(bool automatic);
 static void ShowDesktopSwitchFlyouts(const GUID& desktopId);
 static void RefreshForMonitor(HMONITOR monitor);

@@ -12,8 +12,8 @@ constexpr ULONGLONG kOverflowFollowTimeoutMs = 2000;
 static void ReportMissingRouteTarget(HWND hwnd, const wchar_t* target) {
   std::wstring name = Placement::ProcessDisplayName(hwnd);
   if (name.empty()) name = L"A window";
-  const std::wstring text = name + L": Open-on rule's " + target + L" not found";
-  TrayUi::ShowCommandFailureFlyout(text.c_str(), Platform::Windows::GetWindowPhysicalMonitor(hwnd));
+  TrayUi::ShowAppFlyout(name + L": rule's " + target + L" not found", {hwnd},
+                        Platform::Windows::GetWindowPhysicalMonitor(hwnd));
 }
 
 // Freezes a matching initial-placement rule into a pending request. Native
@@ -414,7 +414,11 @@ static void RollbackOverflowMove(const PendingDesktopFollow& pending) {
       [](const DesktopMonitorKey& key) { Placement::ArrangeWorkspace(key); });
   Platform::VirtualDesktop::RemoveEmptyOverflowDesktop(pending.targetDesktop, pending.sourceDesktop);
   Diagnostics::RecordEvent(L"overflow rollback hwnd=%p returned=%d", pending.hwnd, returned ? 1 : 0);
-  if (!returned) TrayUi::ShowCommandFailureFlyout(L"Could not return the window to its desktop.");
+  if (!returned) {
+    std::wstring name = Placement::ProcessDisplayName(pending.hwnd);
+    if (name.empty()) name = L"a window";
+    TrayUi::ShowAppFlyout(L"Couldn't return " + name + L" to its desktop", {pending.hwnd});
+  }
 }
 
 // Polls an existing follow request; returns whether its arrival still needs a timer.

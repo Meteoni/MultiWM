@@ -18,6 +18,8 @@ static Function LoadExport(const wchar_t* library, const char* name) {
   return module ? reinterpret_cast<Function>(GetProcAddress(module, name)) : nullptr;
 }
 
+constexpr wchar_t kTextFont[] = L"Segoe UI";
+
 static D2D1_COLOR_F Color(COLORREF color, float alpha) {
   return D2D1::ColorF(GetRValue(color) / 255.0f, GetGValue(color) / 255.0f, GetBValue(color) / 255.0f, alpha);
 }
@@ -27,6 +29,7 @@ struct Device {
   ComPtr<IDCompositionDevice> composition;
   ComPtr<IDWriteFactory> text;
   ComPtr<IWICImagingFactory> imaging;
+  float capHeightRatio = 0;  // CapHeightRatio's cached answer; 0 until read.
 
   bool InitializeDrawing() {
     if (composition) return true;
@@ -65,7 +68,7 @@ struct Device {
     }
     ComPtr<IDWriteTextFormat> format;
     ComPtr<IDWriteTextLayout> layout;
-    if (FAILED(text->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    if (FAILED(text->CreateTextFormat(kTextFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
                                       DWRITE_FONT_STRETCH_NORMAL, size, L"", &format))) return {};
     format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -73,6 +76,30 @@ struct Device {
     if (FAILED(text->CreateTextLayout(label.c_str(), static_cast<UINT32>(label.size()), format.Get(),
                                       maxWidth, height, &layout))) return {};
     return layout;
+  }
+
+  // The text font's capital height as a share of its size, for lining icons up
+  // with text; a typical 0.7 until LayoutText has made the factory, or when the
+  // font can't be read.
+  float CapHeightRatio() {
+    if (capHeightRatio > 0) return capHeightRatio;
+    ComPtr<IDWriteFontCollection> fonts;
+    ComPtr<IDWriteFontFamily> family;
+    ComPtr<IDWriteFont> font;
+    UINT32 index = 0;
+    BOOL exists = FALSE;
+    DWRITE_FONT_METRICS metrics{};
+    if (!text || FAILED(text->GetSystemFontCollection(&fonts)) ||
+        FAILED(fonts->FindFamilyName(kTextFont, &index, &exists)) || !exists ||
+        FAILED(fonts->GetFontFamily(index, &family)) ||
+        FAILED(family->GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                            DWRITE_FONT_STYLE_NORMAL, &font))) {
+      return 0.7f;
+    }
+    font->GetMetrics(&metrics);
+    if (!metrics.designUnitsPerEm || !metrics.capHeight) return 0.7f;
+    capHeightRatio = static_cast<float>(metrics.capHeight) / metrics.designUnitsPerEm;
+    return capHeightRatio;
   }
 
   ComPtr<ID2D1Bitmap> IconBitmap(ID2D1RenderTarget& target, HICON icon) {

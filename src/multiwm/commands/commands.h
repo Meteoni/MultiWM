@@ -51,8 +51,7 @@ static bool RefuseMovingAGhost(
   if (!ghosted) return false;
   std::wstring name = Placement::ProcessDisplayName(ghosted);
   if (name.empty()) name = L"A window";
-  const std::wstring text = name + L" isn't responding and can't be moved";
-  TrayUi::ShowCommandFailureFlyout(text.c_str(), monitor);
+  TrayUi::ShowAppFlyout(name + L" isn't responding and can't be moved", {ghosted}, monitor);
   Diagnostics::RecordEvent(L"layout mutation rejected action=%ls: hung window can't move hwnd=%p",
                            action ? action : L"Layout mutation", ghosted);
   return true;

@@ -10,8 +10,8 @@
 // draws the fill, outline, badges and toasts. GDI layered windows measured far
 // slower for these overlays; the retained surface follows PowerToys
 // FancyZones. The overlay thread steps opacity at the compositor's refresh
-// cadence and can wake early for a new target. A thread-pool worker loads app
-// icons so the preview can draw while a window answers.
+// cadence and can wake early for a new target. Thread-pool workers load app
+// icons, for the preview's badges and toasts, so drawing never waits on an app.
 
 #include <mutex>
 
@@ -25,6 +25,27 @@ struct PopupAppearance {
 
 constexpr DWORD kToastFadeMs = 180;
 constexpr UINT kToastFadeIntervalMs = 16;
+// A toast's app icons: at most this many, each the small-icon size (16 DIP:
+// 16, 20, 24 or 32 pixels at the common scales, sizes apps ship) beside 14 DIP
+// text, as in Windows' own lists.
+constexpr size_t kMaxToastIcons = 3;
+constexpr LONG kToastIconDip = 16;
+
+// A window whose icon is wanted, identified so a reused handle isn't mistaken
+// for it, and the DPI and size in pixels to load the icon at.
+struct BadgeIconKey {
+  HWND window = nullptr;
+  DWORD processId = 0;
+  DWORD threadId = 0;
+  UINT dpi = 0;
+  LONG size = 0;
+  bool operator==(const BadgeIconKey&) const = default;
+
+  bool IsLive() const {
+    DWORD liveProcessId = 0;
+    return GetWindowThreadProcessId(window, &liveProcessId) == threadId && liveProcessId == processId;
+  }
+};
 
 // One status toast, centred on `monitor`'s work area unless offset.
 struct ToastRequest {
@@ -35,6 +56,9 @@ struct ToastRequest {
   int yOffsetDip = 0;
   bool atTop = false;
   DWORD holdMs = 0;  // Fully shown this long, then it fades over kToastFadeMs.
+  // The apps the text names, one window each, for their icons before the text
+  // (at most kMaxToastIcons are shown). ShowToast sets the DPI and size.
+  std::vector<BadgeIconKey> apps;
 };
 
 // Text on a card of the light or dark theme.
@@ -55,6 +79,7 @@ constexpr UINT_PTR kSurfaceReleaseTimer = 3;
 constexpr UINT kIdleSurfaceReleaseMs = 30'000;
 constexpr UINT kFadeIntervalMs = 16;
 constexpr UINT kBadgeIconReadyMessage = WM_APP + 32;
+constexpr UINT kToastIconsReadyMessage = WM_APP + 33;  // wParam: ToastIconJob::id.
 
 // The settings a preview is drawn with, read on the WM thread.
 struct PreviewStyle {
@@ -85,20 +110,6 @@ struct IconBadge {
   void Hide() { icon.reset(); }
 };
 
-struct BadgeIconKey {
-  HWND window = nullptr;
-  DWORD processId = 0;
-  DWORD threadId = 0;
-  UINT dpi = 0;
-  LONG size = 0;
-  bool operator==(const BadgeIconKey&) const = default;
-
-  bool IsLive() const {
-    DWORD liveProcessId = 0;
-    return GetWindowThreadProcessId(window, &liveProcessId) == threadId && liveProcessId == processId;
-  }
-};
-
 struct CachedBadgeIcon {
   BadgeIconKey key;
   PreviewIcon icon;
@@ -126,6 +137,28 @@ struct BadgeIconLookup {
   }
 };
 
+// A toast waiting for its app icons. Asking an app for its icon can wait on the
+// app, so a thread-pool worker loads them, sets `done` and posts
+// kToastIconsReadyMessage to `notifyWindow`; the presenter then shows the toast
+// (ShowToastWithIcons). Owned by the presenter; destroying a job waits for its
+// worker.
+struct ToastIconJob {
+  PTP_WORK work = nullptr;
+  uint64_t id = 0;
+  HWND notifyWindow = nullptr;
+  ToastRequest request;
+  std::vector<PreviewIcon> icons;  // The worker's result, one per request.apps entry.
+  std::atomic<bool> posted{false};  // The worker's message went out (before `done`).
+  std::atomic<bool> done{false};
+
+  ~ToastIconJob() {
+    if (work) {
+      WaitForThreadpoolWorkCallbacks(work, TRUE);
+      CloseThreadpoolWork(work);
+    }
+  }
+};
+
 struct MonitorHost {
   HWND window = nullptr;
   RECT workArea{};
@@ -143,6 +176,12 @@ struct MonitorHost {
   std::optional<ToastRequest> toast;
   PopupSurface::ComPtr<IDWriteTextLayout> toastText;
   D2D1_RECT_F toastFrame{};
+  D2D1_POINT_2F toastTextOrigin{};
+  struct ToastIcon {
+    PopupSurface::ComPtr<ID2D1Bitmap> bitmap;
+    D2D1_RECT_F rect{};
+  };
+  std::vector<ToastIcon> toastIcons;
   UINT toastDpi = 96;
   ULONGLONG toastStarted = 0;
   float toastAlpha = 1.0f;
@@ -168,6 +207,10 @@ struct Presenter {
   std::unordered_map<GUID, std::vector<CachedBadgeIcon>, Model::GuidHash, Model::GuidEqual> iconsByDesktop;
   uint64_t iconDrag = 1;
   std::unique_ptr<BadgeIconLookup> iconLookup;
+  std::vector<std::unique_ptr<ToastIconJob>> toastIconJobs;
+  // The latest toast for each monitor; a job for an older one shows nothing.
+  std::unordered_map<HMONITOR, uint64_t> latestToasts;
+  uint64_t lastToastId = 0;
   PopupSurface::Device device;
   std::unordered_map<HMONITOR, std::unique_ptr<MonitorHost>> hosts;
   MonitorHost* previewHost = nullptr;
@@ -258,6 +301,7 @@ static void FadeTo(BYTE alpha, bool restart = false) {
 }
 
 static void UpdateBadgesAfterIconLookup();
+static void FinishToastIconJob(uint64_t id);
 
 static LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
   if (message == WM_NCCREATE) {
@@ -271,6 +315,10 @@ static LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT message, WPARAM wparam
   if (message == WM_ERASEBKGND) return 1;
   if (message == kBadgeIconReadyMessage) {
     UpdateBadgesAfterIconLookup();
+    return 0;
+  }
+  if (message == kToastIconsReadyMessage) {
+    FinishToastIconJob(static_cast<uint64_t>(wparam));
     return 0;
   }
   auto* host = reinterpret_cast<MonitorHost*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -471,6 +519,7 @@ static void ClearToast(MonitorHost& host) {
   if (host.window) KillTimer(host.window, kToastTimer);
   host.toast.reset();
   host.toastText.Reset();
+  host.toastIcons.clear();
 }
 
 // Hides the host and releases its surface; the window stays for the next attach.
@@ -507,6 +556,7 @@ static void PruneDisconnectedMonitors() {
   std::erase_if(g_presenter.hosts, [](auto& entry) {
     auto& [monitor, host] = entry;
     if (Platform::Monitors::IsLiveMonitorHandle(monitor)) return false;
+    g_presenter.latestToasts.erase(monitor);  // Its waiting toast, if any, is dropped.
     if (host.get() == g_presenter.previewHost) ClearPreview();
     if (host->window) KillTimer(host->window, kFadeTimer);
     ReleaseHostSurface(*host);
@@ -596,18 +646,19 @@ static D2D1_RECT_F BadgeIconRect(const D2D1_RECT_F& card, LONG badgeSize, LONG i
   return D2D1::RectF(card.left + inset, card.top + inset, card.left + inset + iconSize, card.top + inset + iconSize);
 }
 
-// Where a toast whose text is `textWidth` pixels wide goes on a host the size
-// of `workSize` (the work area), in the host's coordinates: 48 DIP tall, as
-// wide as its text plus 48 DIP (at least 128 DIP, at most the work area),
-// centred, 16 DIP from the top or bottom edge, moved by the request's offsets
-// but kept inside the work area. Nothing when the work area is shorter than a toast.
-static std::optional<D2D1_RECT_F> ToastFrame(const ToastRequest& request, SIZE workSize, UINT dpi, float textWidth) {
+// Where a toast whose content (icons and text) is `contentWidth` pixels wide
+// goes on a host the size of `workSize` (the work area), in the host's
+// coordinates: 48 DIP tall, as wide as its content plus 48 DIP (at least 128
+// DIP, at most the work area), centred, 16 DIP from the top or bottom edge,
+// moved by the request's offsets but kept inside the work area. Nothing when
+// the work area is shorter than a toast.
+static std::optional<D2D1_RECT_F> ToastFrame(const ToastRequest& request, SIZE workSize, UINT dpi, float contentWidth) {
   const float available = static_cast<float>(workSize.cx);
   const float workHeight = static_cast<float>(workSize.cy);
   const float height = static_cast<float>(SharedGeometry::ScaleDip(48, dpi));
   if (height > workHeight) return std::nullopt;
   const float width = std::min(available, std::max<float>(
-      SharedGeometry::ScaleDip(128, dpi), std::ceil(textWidth) + SharedGeometry::ScaleDip(48, dpi)));
+      SharedGeometry::ScaleDip(128, dpi), std::ceil(contentWidth) + SharedGeometry::ScaleDip(48, dpi)));
   const float left = (available - width) / 2 + SharedGeometry::ScaleDip(request.xOffsetDip, dpi);
   const float gap = static_cast<float>(SharedGeometry::ScaleDip(16, dpi));
   const float top = (request.atTop ? gap : workHeight - height - gap) +
@@ -615,6 +666,44 @@ static std::optional<D2D1_RECT_F> ToastFrame(const ToastRequest& request, SIZE w
   const float x = std::floor(std::clamp(left, 0.0f, available - width));
   const float y = std::clamp(top, 0.0f, workHeight - height);
   return D2D1::RectF(x, y, x + width, y + height);
+}
+
+// The width of a toast's icons and the gap before its text: `iconCount` icons
+// `iconSize` pixels wide, 4 DIP apart, then 8 DIP. 0 without icons.
+static float ToastIconsWidth(size_t iconCount, LONG iconSize, UINT dpi) {
+  if (iconCount == 0) return 0;
+  const LONG count = static_cast<LONG>(iconCount);
+  return static_cast<float>(count * iconSize + (count - 1) * SharedGeometry::ScaleDip(4, dpi) +
+                            SharedGeometry::ScaleDip(8, dpi));
+}
+
+// Where a toast's icons and text go inside its frame, in host coordinates.
+struct ToastContentLayout {
+  std::vector<D2D1_RECT_F> icons;
+  float textLeft = 0;
+  float textWidth = 0;  // The text box, at most the room left in the frame.
+};
+
+// Lays out `iconCount` icons (ToastIconsWidth) and then text `textWidth` wide
+// as one row centred in `frame`. Each icon sits on whole pixels, so one drawn
+// at its own size isn't resampled, centred on `iconMiddle` pixels below the
+// frame's top (the middle of the text's capitals, so it lines up with the
+// words rather than with their descenders).
+static ToastContentLayout LayOutToastContent(const D2D1_RECT_F& frame, size_t iconCount, LONG iconSize, UINT dpi,
+                                             float textWidth, float iconMiddle) {
+  ToastContentLayout layout;
+  const float iconsWidth = ToastIconsWidth(iconCount, iconSize, dpi);
+  const float frameWidth = frame.right - frame.left;
+  const float left = frame.left + std::floor(std::max(0.0f, (frameWidth - iconsWidth - std::ceil(textWidth)) / 2));
+  const float top = std::round(frame.top + iconMiddle - iconSize / 2.0f);
+  const float step = static_cast<float>(iconSize + SharedGeometry::ScaleDip(4, dpi));
+  for (size_t i = 0; i < iconCount; ++i) {
+    const float iconLeft = left + step * i;
+    layout.icons.push_back(D2D1::RectF(iconLeft, top, iconLeft + iconSize, top + iconSize));
+  }
+  layout.textLeft = left + iconsWidth;
+  layout.textWidth = std::max(0.0f, std::min(std::ceil(textWidth), frame.right - layout.textLeft));
+  return layout;
 }
 
 // --- Drawing -----------------------------------------------------------------------
@@ -678,9 +767,14 @@ static bool DrawHost(MonitorHost& host) {
   if (host.toastText) {
     const auto& toast = *host.toast;
     drawSolidCard(host.toastFrame, host.toastDpi, toast.appearance, host.toastAlpha);
+    for (const auto& icon : host.toastIcons) {
+      // At its own size the cubic filter changes nothing; it is for an app
+      // that has no icon of that size.
+      target.DrawBitmap(icon.bitmap.Get(), &icon.rect, host.toastAlpha, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+    }
     surface.brush->SetColor(PopupSurface::Color(CardTextColor(toast.appearance.light), host.toastAlpha));
-    target.DrawTextLayout(D2D1::Point2F(host.toastFrame.left, host.toastFrame.top),
-                          host.toastText.Get(), surface.brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    target.DrawTextLayout(host.toastTextOrigin, host.toastText.Get(), surface.brush.Get(),
+                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
   }
   if (!surface.EndDraw(g_presenter.device)) {
     ResetHostSurface(host);
@@ -694,23 +788,51 @@ static bool DrawHost(MonitorHost& host) {
   return true;
 }
 
-static void ShowToast(ToastRequest request) {
+// The middle of `text`'s capitals, in pixels below the top of its layout box;
+// the box's middle when the line can't be measured.
+static float TextCapMiddle(IDWriteTextLayout& text, const DWRITE_TEXT_METRICS& metrics, float fontSize) {
+  DWRITE_LINE_METRICS line{};
+  UINT32 lines = 0;
+  if (FAILED(text.GetLineMetrics(&line, 1, &lines)) || lines != 1) return metrics.top + metrics.height / 2;
+  return metrics.top + line.baseline - g_presenter.device.CapHeightRatio() * fontSize / 2;
+}
+
+// Lays out and shows `request` on its monitor, replacing the toast there, with
+// `icons` (loaded for request.apps) before the text. Missing icons, and any
+// Direct2D can't take, are left out.
+static void ShowToastWithIcons(ToastRequest request, const std::vector<PreviewIcon>& icons) {
   RECT workArea{};
   if (!Platform::Monitors::GetOverlayWorkArea(request.monitor, &workArea)) return;
   const UINT dpi = Platform::Monitors::GetMonitorEffectiveDpi(request.monitor);
   auto& host = GetMonitorHost(request.monitor, workArea);
   if (!host.surface.target) return;
+  std::vector<MonitorHost::ToastIcon> shownIcons;
+  for (const PreviewIcon& icon : icons) {
+    if (shownIcons.size() == kMaxToastIcons) break;
+    if (!icon) continue;
+    if (auto bitmap = g_presenter.device.IconBitmap(*host.surface.target.Get(), icon.get())) {
+      shownIcons.push_back({std::move(bitmap)});
+    }
+  }
   const SIZE workSize{Layout::RectWidth(workArea), Layout::RectHeight(workArea)};
-  auto text = g_presenter.device.LayoutText(request.text, SharedGeometry::ScaleDip(14, dpi),
-                                            static_cast<float>(workSize.cx),
+  const float fontSize = static_cast<float>(SharedGeometry::ScaleDip(14, dpi));
+  auto text = g_presenter.device.LayoutText(request.text, fontSize, static_cast<float>(workSize.cx),
                                             static_cast<float>(SharedGeometry::ScaleDip(48, dpi)));
   DWRITE_TEXT_METRICS metrics{};
   if (!text || FAILED(text->GetMetrics(&metrics))) return;
-  const auto frame = ToastFrame(request, workSize, dpi, metrics.width);
-  if (!frame || FAILED(text->SetMaxWidth(frame->right - frame->left))) return;
+  const LONG iconSize = SharedGeometry::ScaleDip(kToastIconDip, dpi);
+  const auto frame =
+      ToastFrame(request, workSize, dpi, ToastIconsWidth(shownIcons.size(), iconSize, dpi) + metrics.width);
+  if (!frame) return;
+  const ToastContentLayout content = LayOutToastContent(*frame, shownIcons.size(), iconSize, dpi, metrics.width,
+                                                        TextCapMiddle(*text.Get(), metrics, fontSize));
+  if (FAILED(text->SetMaxWidth(content.textWidth))) return;
+  for (size_t i = 0; i < shownIcons.size(); ++i) shownIcons[i].rect = content.icons[i];
   host.toast = std::move(request);
   host.toastText = std::move(text);
+  host.toastIcons = std::move(shownIcons);
   host.toastFrame = *frame;
+  host.toastTextOrigin = D2D1::Point2F(content.textLeft, frame->top);
   host.toastDpi = dpi;
   host.toastStarted = GetTickCount64();
   host.toastAlpha = 1.0f;
@@ -720,6 +842,67 @@ static void ShowToast(ToastRequest request) {
     ClearToast(host);
     DrawHost(host);
   }
+}
+
+// Thread pool: loads a ToastIconJob's icons, then tells the presenter.
+static void CALLBACK LoadToastIcons(PTP_CALLBACK_INSTANCE, void* context, PTP_WORK) {
+  auto& job = *static_cast<ToastIconJob*>(context);
+  for (const BadgeIconKey& app : job.request.apps) {
+    bool queryFailed = false;
+    job.icons.push_back(app.IsLive() ? LoadBadgeIcon(app.window, app.dpi, app.size, queryFailed) : PreviewIcon{});
+  }
+  job.posted.store(PostMessageW(job.notifyWindow, kToastIconsReadyMessage, static_cast<WPARAM>(job.id), 0) != FALSE,
+                   std::memory_order_relaxed);
+  job.done.store(true, std::memory_order_release);
+}
+
+// Shows `request` on its monitor, replacing the toast there. A toast naming
+// apps first waits for their icons (ToastIconJob), typically a millisecond or
+// two; without a worker it shows at once, without them.
+static void ShowToast(ToastRequest request) {
+  const uint64_t id = ++g_presenter.lastToastId;
+  g_presenter.latestToasts[request.monitor] = id;
+  // Drop jobs that will show nothing: replaced, or unable to say they're done.
+  std::erase_if(g_presenter.toastIconJobs, [](const std::unique_ptr<ToastIconJob>& job) {
+    if (!job->done.load(std::memory_order_acquire)) return false;
+    const auto latest = g_presenter.latestToasts.find(job->request.monitor);
+    return !job->posted.load(std::memory_order_relaxed) || latest == g_presenter.latestToasts.end() ||
+           latest->second != job->id;
+  });
+  RECT workArea{};
+  if (request.apps.empty() || !Platform::Monitors::GetOverlayWorkArea(request.monitor, &workArea)) {
+    return ShowToastWithIcons(std::move(request), {});
+  }
+  const HWND notifyWindow = GetMonitorHost(request.monitor, workArea).window;
+  if (!notifyWindow) return;
+  const UINT dpi = Platform::Monitors::GetMonitorEffectiveDpi(request.monitor);
+  if (request.apps.size() > kMaxToastIcons) request.apps.resize(kMaxToastIcons);
+  for (BadgeIconKey& app : request.apps) {
+    app.dpi = dpi;
+    app.size = SharedGeometry::ScaleDip(kToastIconDip, dpi);
+  }
+  auto job = std::make_unique<ToastIconJob>();
+  job->id = id;
+  job->notifyWindow = notifyWindow;
+  job->request = std::move(request);
+  job->work = CreateThreadpoolWork(LoadToastIcons, job.get(), nullptr);
+  if (!job->work) return ShowToastWithIcons(std::move(job->request), {});
+  SubmitThreadpoolWork(job->work);
+  g_presenter.toastIconJobs.push_back(std::move(job));
+}
+
+// kToastIconsReadyMessage: shows job `id`'s toast with its icons, unless a
+// later toast on that monitor replaced it, and drops the job.
+static void FinishToastIconJob(uint64_t id) {
+  auto& jobs = g_presenter.toastIconJobs;
+  const auto entry = std::ranges::find(jobs, id, [](const std::unique_ptr<ToastIconJob>& job) { return job->id; });
+  if (entry == jobs.end()) return;
+  const std::unique_ptr<ToastIconJob> job = std::move(*entry);
+  jobs.erase(entry);
+  WaitForThreadpoolWorkCallbacks(job->work, FALSE);  // The worker posted just before returning.
+  const auto latest = g_presenter.latestToasts.find(job->request.monitor);
+  if (latest == g_presenter.latestToasts.end() || latest->second != id) return;
+  ShowToastWithIcons(std::move(job->request), job->icons);
 }
 
 static void StepToast(MonitorHost& host) {
@@ -854,7 +1037,9 @@ static void RepaintCards(PopupAppearance appearance) {
 }
 
 static void DestroyHosts() {
-  g_presenter.iconLookup.reset();  // Join the lookup before destroying its notification window.
+  // Join the icon workers before destroying the windows they notify.
+  g_presenter.iconLookup.reset();
+  g_presenter.toastIconJobs.clear();
   for (auto& [monitor, host] : g_presenter.hosts) {
     if (host->window) DestroyWindow(host->window);
   }

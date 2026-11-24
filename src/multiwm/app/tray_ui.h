@@ -12,8 +12,12 @@ constexpr UINT kIconId = 1;
 constexpr UINT kContextTileWorkspace = 41001;
 constexpr UINT kContextToggleMode = 41002;
 constexpr UINT kContextLayoutBase = 41100;
-constexpr int kIconCanvasSize = 32;
+// The tray text's height for an icon kTrayTextDesignSize pixels square; it
+// scales with the icon.
+constexpr int kTrayTextDesignSize = 32;
 constexpr int kTrayFontHeight = 26;
+// Each icon pixel averages this many aliased samples per axis (TextCoverage).
+constexpr int kTraySupersample = 8;
 constexpr DWORD kFlyoutHoldMs = 850;
 constexpr wchar_t kPersonalizeSettings[] = LR"(Software\Microsoft\Windows\CurrentVersion\Themes\Personalize)";
 using LayoutIconSet = std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>;
@@ -44,6 +48,7 @@ struct TraySession {
   HMONITOR displayedMonitor = nullptr;
   NOTIFYICONDATAW notifyData{};
   LayoutIconSet icons{};
+  int iconSize = 0;  // The icons' size in pixels (TrayIconSize when built).
 };
 
 static TrayPreferences g_preferences;
@@ -117,79 +122,110 @@ static Overlay::PopupAppearance CurrentPopupAppearance() {
   return {FlyoutBackgroundColor(), g_session.systemLightTheme};
 }
 
-static HICON CreateTextIcon(TileLayout layout) {
-  BITMAPINFO bmi{};
-  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-  bmi.bmiHeader.biWidth = kIconCanvasSize;
-  bmi.bmiHeader.biHeight = -kIconCanvasSize;
-  bmi.bmiHeader.biPlanes = 1;
-  bmi.bmiHeader.biBitCount = 32;
-  bmi.bmiHeader.biCompression = BI_RGB;
+// The tray's icon size: the small-icon size at the taskbar's DPI, so the shell
+// shows the icon as drawn rather than resizing it.
+static int TrayIconSize() {
+  const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+  UINT dpi = taskbar ? GetDpiForWindow(taskbar) : 0;
+  if (!dpi) dpi = Platform::Monitors::GetMonitorEffectiveDpi(MonitorFromPoint({}, MONITOR_DEFAULTTOPRIMARY));
+  const int size = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+  return size > 0 ? size : 16;
+}
 
+// How much of each pixel of a `size`-pixel square icon `text` covers, 0..255,
+// row by row; empty on failure. GDI draws the text aliased on a canvas
+// kTraySupersample times larger and each pixel averages its block, so the
+// edges are smooth whatever the system's font smoothing (which GDI's own
+// antialiasing follows; with it off, as in many VMs, the icon was pixel art).
+static std::vector<BYTE> TextCoverage(const wchar_t* text, int size) {
+  const int canvas = size * kTraySupersample;
+  BITMAPINFO bmi{};
+  bmi.bmiHeader = {sizeof(BITMAPINFOHEADER), canvas, -canvas, 1, 32, BI_RGB};
   void* bits = nullptr;
-  HBITMAP color = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits,
-                                   nullptr, 0);
-  HDC dc = color ? CreateCompatibleDC(nullptr) : nullptr;
-  if (!color || !dc || !bits) {
+  const HBITMAP bitmap = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+  const HDC dc = bitmap ? CreateCompatibleDC(nullptr) : nullptr;
+  if (!bitmap || !dc || !bits) {
     if (dc) DeleteDC(dc);
-    if (color) DeleteObject(color);
-    return nullptr;
+    if (bitmap) DeleteObject(bitmap);
+    return {};
   }
 
-  HGDIOBJ oldBitmap = SelectObject(dc, color);
-  RECT rect{0, 0, kIconCanvasSize, kIconCanvasSize};
-  FillRect(dc, &rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-  HFONT font = CreateFontW(-kTrayFontHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE,
-                           FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                           FIXED_PITCH | FF_MODERN, L"Cascadia Mono");
-  HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+  const HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+  RECT rect{0, 0, canvas, canvas};
+  FillRect(dc, &rect, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+  const HFONT font = CreateFontW(-MulDiv(kTrayFontHeight, canvas, kTrayTextDesignSize), 0, 0, 0, FW_BOLD, FALSE,
+                                 FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 NONANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Mono");
+  const HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
   SetBkMode(dc, TRANSPARENT);
   SetTextColor(dc, RGB(255, 255, 255));
-  DrawTextW(dc, LayoutTrayText(layout), -1, &rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+  DrawTextW(dc, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
   if (oldFont) SelectObject(dc, oldFont);
   if (font) DeleteObject(font);
   GdiFlush();
 
-  auto* pixels = static_cast<uint32_t*>(bits);
-  COLORREF fg = Overlay::CardTextColor(g_session.systemLightTheme);
-  uint32_t r = GetRValue(fg), g = GetGValue(fg), b = GetBValue(fg);
-  for (int i = 0; i < kIconCanvasSize * kIconCanvasSize; ++i) {
-    uint32_t p = pixels[i];
-    uint32_t a = std::max({p & 0xFFu, (p >> 8) & 0xFFu,
-                           (p >> 16) & 0xFFu});
-    pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
+  std::vector<BYTE> coverage(static_cast<size_t>(size) * size);
+  const auto* samples = static_cast<const uint32_t*>(bits);
+  constexpr int kSamples = kTraySupersample * kTraySupersample;
+  for (int y = 0; y < size; ++y) {
+    for (int x = 0; x < size; ++x) {
+      int covered = 0;
+      for (int dy = 0; dy < kTraySupersample; ++dy) {
+        const uint32_t* row = samples + static_cast<size_t>(y * kTraySupersample + dy) * canvas + x * kTraySupersample;
+        for (int dx = 0; dx < kTraySupersample; ++dx) covered += (row[dx] & 0xFF) >= 128;
+      }
+      coverage[static_cast<size_t>(y) * size + x] = static_cast<BYTE>((covered * 255 + kSamples / 2) / kSamples);
+    }
   }
-
   SelectObject(dc, oldBitmap);
   DeleteDC(dc);
+  DeleteObject(bitmap);
+  return coverage;
+}
 
-  constexpr int maskStride = ((kIconCanvasSize + 31) / 32) * 4;
-  std::array<BYTE, maskStride * kIconCanvasSize> maskBits{};
-  HBITMAP mask = CreateBitmap(kIconCanvasSize, kIconCanvasSize, 1, 1,
-                              maskBits.data());
+// `layout`'s two letters as a `size`-pixel icon in the theme's text color.
+static HICON CreateTextIcon(TileLayout layout, int size) {
+  const std::vector<BYTE> coverage = TextCoverage(LayoutTrayText(layout), size);
+  if (coverage.empty()) return nullptr;
+  BITMAPINFO bmi{};
+  bmi.bmiHeader = {sizeof(BITMAPINFOHEADER), size, -size, 1, 32, BI_RGB};
+  void* bits = nullptr;
+  const HBITMAP color = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+  if (!color || !bits) {
+    if (color) DeleteObject(color);
+    return nullptr;
+  }
+  // Every pixel carries the text color, the transparent ones too, so the shell
+  // can't blend a fringe of another color into the edges.
+  const COLORREF fg = Overlay::CardTextColor(g_session.systemLightTheme);
+  const uint32_t rgb = (GetRValue(fg) << 16) | (GetGValue(fg) << 8) | GetBValue(fg);
+  auto* pixels = static_cast<uint32_t*>(bits);
+  for (size_t i = 0; i < coverage.size(); ++i) pixels[i] = (static_cast<uint32_t>(coverage[i]) << 24) | rgb;
+
+  const std::vector<BYTE> maskBits(static_cast<size_t>((size + 15) / 16) * 2 * size);  // Word-aligned rows.
+  const HBITMAP mask = CreateBitmap(size, size, 1, 1, maskBits.data());
   ICONINFO info{TRUE, 0, 0, mask, color};
-  HICON icon = mask ? CreateIconIndirect(&info) : nullptr;
+  const HICON icon = mask ? CreateIconIndirect(&info) : nullptr;
   if (mask) DeleteObject(mask);
   DeleteObject(color);
   return icon;
 }
 
-// Returns an owned icon, preferring the configured file and falling back to
-// generated text. The icon must eventually be released with DestroyIcon.
-static HICON CreateLayoutIcon(TileLayout layout) {
+// Returns an owned `size`-pixel icon, preferring the configured file (its
+// closest frame) and falling back to generated text. The icon must eventually
+// be released with DestroyIcon.
+static HICON CreateLayoutIcon(TileLayout layout, int size) {
   size_t index = static_cast<size_t>(layout);
   const auto& customIconPaths = g_preferences.customIconPaths;
   if (index < customIconPaths.size() && !customIconPaths[index].empty()) {
     HICON icon = static_cast<HICON>(LoadImageW(
         nullptr, customIconPaths[index].c_str(), IMAGE_ICON,
-        kIconCanvasSize, kIconCanvasSize, LR_LOADFROMFILE));
+        size, size, LR_LOADFROMFILE));
     if (icon) return icon;
     Wh_Log(L"Failed to load custom tray icon, using text fallback: %s",
            customIconPaths[index].c_str());
   }
-  return CreateTextIcon(layout);
+  return CreateTextIcon(layout, size);
 }
 
 static void DestroyIconSet(LayoutIconSet& icons) {
@@ -368,20 +404,31 @@ static void RecreateIconInShell() {
 
 // Repoints the live tray entry to a complete new icon set before destroying the
 // old handles, so the shell never observes an HICON after it has been released.
+// Builds them at the tray's current size (TrayIconSize).
 static void RebuildIcons() {
+  const int size = TrayIconSize();
   LayoutIconSet icons{};
   for (size_t i = 0; i < icons.size(); ++i) {
-    icons[i] = CreateLayoutIcon(static_cast<TileLayout>(i));
+    icons[i] = CreateLayoutIcon(static_cast<TileLayout>(i), size);
   }
   auto old = g_session.icons;
   g_session.icons = icons;
+  g_session.iconSize = size;
   if (g_session.displayedLayout != TileLayout::COUNT) {
     UpdateIcon(g_session.displayedLayout, g_session.displayedMonitor);
   }
   DestroyIconSet(old);
 }
 
-static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
+// After a display, DPI or taskbar change: rebuilds the icons if the tray's
+// icon size changed, so they stay unresized.
+static void RebuildIconsIfResized() {
+  if (TrayIconSize() != g_session.iconSize) RebuildIcons();
+}
+
+// Shows `text` on `monitor` (else the command monitor), with the icons of
+// `apps`, the windows of the apps it names, one each, before it.
+static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor, const std::vector<HWND>& apps = {}) {
   if ((!g_session.trayWindowClass && !g_session.trayWindow) || !g_preferences.showToasts || !text || !*text) return;
   if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
   if (!monitor) return;
@@ -390,6 +437,13 @@ static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor) {
   // Allow roughly 75 ms per character, retaining the minimum for short hints.
   request.holdMs = static_cast<DWORD>(std::max<size_t>(
       kFlyoutHoldMs, std::min<size_t>(request.text.size(), 1000000) * 75));
+  for (HWND hwnd : apps) {
+    if (request.apps.size() == Overlay::kMaxToastIcons) break;
+    DWORD processId = 0;
+    if (const DWORD threadId = GetWindowThreadProcessId(hwnd, &processId)) {
+      request.apps.push_back({.window = hwnd, .processId = processId, .threadId = threadId});
+    }
+  }
   Overlay::PublishToast(std::move(request));
 }
 
@@ -402,6 +456,11 @@ static void ShowCommandFailureFlyout(
     const wchar_t* text, HMONITOR monitor) {
   if (!text || !*text) return;
   ShowStatusFlyout(text, monitor);
+}
+
+// A toast about apps (Placement::AppToast): its text after their icons.
+static void ShowAppFlyout(const std::wstring& text, const std::vector<HWND>& apps, HMONITOR monitor) {
+  ShowStatusFlyout(text.c_str(), monitor, apps);
 }
 
 static void ShowManagementModeFlyout(bool automatic) {
@@ -574,6 +633,7 @@ static void HandleThemeChanged() {
 static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
                                        LPARAM lParam) {
   if (g_session.taskbarCreatedMessage && message == g_session.taskbarCreatedMessage) {
+    RebuildIconsIfResized();  // The new taskbar may run at another DPI.
     RecreateIconInShell();
     RuntimeLifecycle::NotifyShellRestarted();
     return 0;
@@ -615,12 +675,14 @@ static LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam,
   switch (message) {
     case WM_DISPLAYCHANGE:
     case WM_DPICHANGED:
+      RebuildIconsIfResized();
       RuntimeLifecycle::NotifyDisplayTopologyChanged();
       return 0;
 
     case WM_SETTINGCHANGE:
       HandleThemeChanged();
       if (wParam == SPI_SETWORKAREA) {
+        RebuildIconsIfResized();
         RuntimeLifecycle::NotifyDisplayTopologyChanged();
       }
       return 0;
