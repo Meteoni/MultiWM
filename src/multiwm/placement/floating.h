@@ -52,9 +52,17 @@ static bool PlaceFloatingWindow(
   return true;
 }
 
+static std::optional<SharedGeometry::FrameLimits> FloatingFrameLimits(
+    WindowConstraints constraints, UINT dpi) {
+  if (!constraints.valid || !constraints.dpi) return std::nullopt;
+  constraints = Model::RescaleConstraintsToDpi(constraints, dpi);
+  return SharedGeometry::FrameLimits{
+      constraints.minWidth, constraints.minHeight, constraints.maxWidth, constraints.maxHeight};
+}
+
 // `hwnd`'s size limits as visible-frame sizes at `dpi`: its cached report, or a
-// fresh one (stored in `workspace`) when none was taken at that DPI. No value
-// when the window has never answered. The probe runs application code.
+// fresh one (stored in `workspace`) when none was taken at that DPI. The probe
+// runs application code.
 static std::optional<SharedGeometry::FrameLimits> FloatingSizeLimits(
     Workspace& workspace, HWND hwnd, UINT dpi) {
   const WindowRecord* record = workspace.Find(hwnd);
@@ -65,10 +73,12 @@ static std::optional<SharedGeometry::FrameLimits> FloatingSizeLimits(
         constraints, Platform::Windows::ProbeWindowConstraints(hwnd));
     workspace.UpdateConstraints(hwnd, constraints);
   }
-  if (!constraints.valid || !constraints.dpi) return std::nullopt;
-  constraints = Model::RescaleConstraintsToDpi(constraints, dpi);
-  return SharedGeometry::FrameLimits{
-      constraints.minWidth, constraints.minHeight, constraints.maxWidth, constraints.maxHeight};
+  return FloatingFrameLimits(constraints, dpi);
+}
+
+static SIZE FloatingDefaultSizeAtDpi(UINT dpi) {
+  return {SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.width, dpi),
+          SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.height, dpi)};
 }
 
 // What `intent` sizes a floating window by (SharedGeometry::FloatingSizeSource).
@@ -116,8 +126,7 @@ static bool RepairFloatingGeometry(
   request.workArea = workArea;
   request.canResize = record->canResize;
   request.honorPreserveSize = hint.intent != FloatingPlacementIntent::FailureCenter;
-  request.defaultSize = SIZE{SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.width, targetDpi),
-                             SharedGeometry::ScaleDip(g_settings.floatingDefaultSizeDip.height, targetDpi)};
+  request.defaultSize = FloatingDefaultSizeAtDpi(targetDpi);
   RECT current{};
   if (Platform::Windows::GetWindowFrameRect(hwnd, &current) && current.right > current.left &&
       current.bottom > current.top) {
@@ -166,10 +175,33 @@ static bool RepairFloatingGeometry(
   return PlaceFloatingWindow(workspace, hwnd, targetDpi, target, placement->moveOnly);
 }
 
-// Grows (direction > 0) or shrinks a floating window (a Floating-layout member
-// or a per-window floating record) by one step around its center. Each dimension changes by the step percentage of the work area's,
-// within the app's size limits and the work area. A window already past a limit
-// is not pushed further in that direction. False when nothing changes.
+// One grow or shrink step around the current center. Each dimension changes by
+// a percentage of the work area's span, within the app and work-area limits.
+static std::optional<RECT> PlanFloatingSizeStep(
+    const RECT& current, const Platform::Monitors::WorkspaceMetrics& metrics,
+    const std::optional<SharedGeometry::FrameLimits>& limits, int direction) {
+  const RECT& workArea = metrics.workArea;
+  const LONG smallest = SharedGeometry::ScaleDip(100, metrics.dpi);
+  auto stepSpan = [&](LONG span, LONG areaSpan, LONG minimum, LONG maximum) {
+    const LONG step = std::max<LONG>(1, MulDiv(areaSpan, static_cast<int>(g_settings.resizeStepPercent), 100));
+    const LONG lowest = std::max(smallest, limits ? minimum : 1);
+    LONG highest = areaSpan;
+    if (limits && maximum > 0) highest = std::min(highest, maximum);
+    return direction > 0 ? std::max(span, std::min(span + step, highest))
+                         : std::min(span, std::max(span - step, lowest));
+  };
+  const LONG width = Layout::RectWidth(current);
+  const LONG height = Layout::RectHeight(current);
+  const SharedGeometry::FrameLimits none{};
+  const SharedGeometry::FrameLimits& frame = limits ? *limits : none;
+  const LONG newWidth = stepSpan(width, Layout::RectWidth(workArea), frame.minWidth, frame.maxWidth);
+  const LONG newHeight = stepSpan(height, Layout::RectHeight(workArea), frame.minHeight, frame.maxHeight);
+  if (newWidth == width && newHeight == height) return std::nullopt;
+
+  return SharedGeometry::ClampToArea(
+      SharedGeometry::CenteredRect(SharedGeometry::RectCenter(current), newWidth, newHeight), workArea);
+}
+
 static bool StepFloatingWindowSize(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd, int direction) {
   const WindowRecord* record = workspace.Find(hwnd);
@@ -186,30 +218,37 @@ static bool StepFloatingWindowSize(
     return false;
   }
 
-  const RECT& workArea = metrics.workArea;
-  // The app's limits at this monitor's DPI, probed when the cached report is
-  // from another one: placement skips the app's own clamp (SWP_NOSENDCHANGING).
-  const std::optional<SharedGeometry::FrameLimits> limits = FloatingSizeLimits(workspace, hwnd, metrics.dpi);
-  const LONG smallest = SharedGeometry::ScaleDip(100, metrics.dpi);
-  auto stepSpan = [&](LONG span, LONG areaSpan, LONG minimum, LONG maximum) {
-    const LONG step = std::max<LONG>(1, MulDiv(areaSpan, static_cast<int>(g_settings.resizeStepPercent), 100));
-    const LONG lowest = std::max(smallest, limits ? minimum : 1);
-    LONG highest = areaSpan;
-    if (limits && maximum > 0) highest = std::min(highest, maximum);
-    return direction > 0 ? std::max(span, std::min(span + step, highest))
-                         : std::min(span, std::max(span - step, lowest));
-  };
-  const LONG width = Layout::RectWidth(current);
-  const LONG height = Layout::RectHeight(current);
-  const SharedGeometry::FrameLimits none{};
-  const SharedGeometry::FrameLimits& frame = limits ? *limits : none;
-  const LONG newWidth = stepSpan(width, Layout::RectWidth(workArea), frame.minWidth, frame.maxWidth);
-  const LONG newHeight = stepSpan(height, Layout::RectHeight(workArea), frame.minHeight, frame.maxHeight);
-  if (newWidth == width && newHeight == height) return false;
+  const auto target = PlanFloatingSizeStep(
+      current, metrics, FloatingSizeLimits(workspace, hwnd, metrics.dpi), direction);
+  return target && PlaceFloatingWindow(workspace, hwnd, metrics.dpi, *target, false);
+}
 
-  const RECT target = SharedGeometry::ClampToArea(
-      SharedGeometry::CenteredRect(SharedGeometry::RectCenter(current), newWidth, newHeight), workArea);
-  return PlaceFloatingWindow(workspace, hwnd, metrics.dpi, target, false);
+// An explicit resize of a window outside the workspace model. A zero direction
+// resets it to the configured floating size at the center of its work area.
+static bool ResizeUnmanagedWindow(HWND hwnd, HMONITOR monitor, int direction) {
+  const WindowRecord window = Platform::Windows::MakeWindowRecord(hwnd);
+  Platform::Monitors::WorkspaceMetrics metrics;
+  RECT current{};
+  if (!window.canMove || !window.canResize || Platform::Windows::GhostWindowOf(hwnd) ||
+      !Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics) ||
+      !Platform::Windows::GetWindowFrameRect(hwnd, &current)) {
+    return false;
+  }
+
+  const auto limits = FloatingFrameLimits(Platform::Windows::ProbeWindowConstraints(hwnd), metrics.dpi);
+  std::optional<RECT> target;
+  if (direction) {
+    target = PlanFloatingSizeStep(current, metrics, limits, direction);
+  } else {
+    const auto placement = SharedGeometry::PlanFloatingPlacement({
+        .workArea = metrics.workArea, .defaultSize = FloatingDefaultSizeAtDpi(metrics.dpi)});
+    if (!placement) return false;
+    target = limits ? SharedGeometry::FitFloatingPlacementToLimits(*placement, *limits) : placement->frame;
+  }
+  if (!target || !Platform::Windows::IsSameLiveWindow(hwnd, window.pid)) return false;
+
+  const auto result = Platform::Windows::PlaceWindowChecked(hwnd, window.canMove, *target).result;
+  return result == PlacementResult::Success || result == PlacementResult::AdjustedByWindow;
 }
 
 static bool RememberCurrentFloatingGeometry(

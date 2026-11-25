@@ -385,20 +385,37 @@ struct FocusedMember {
   bool floating = false;
 };
 
-static std::optional<FocusedMember> LoadFocusedMember() {
-  auto current = LoadForegroundWorkspace();
+static std::optional<FocusedMember> LoadFocusedMember(std::optional<ForegroundWorkspace>& current) {
   if (!current) return std::nullopt;
+  const HWND target = ResolveSizeCommandTarget(current->workspace, current->foreground);
+  if (!target) return std::nullopt;
+
   FocusedMember focused;
   focused.key = std::move(current->key);
   focused.monitor = current->monitor;
   focused.workspace = std::move(current->workspace);
-  focused.hwnd = ResolveSizeCommandTarget(focused.workspace, current->foreground);
-  if (!focused.hwnd) return std::nullopt;
+  focused.hwnd = target;
   const WindowRecord* record = focused.workspace.Find(focused.hwnd);
   focused.floating = focused.workspace.Layout() == TileLayout::Floating ||
                      (record && record->state == ManageState::Floating);
   if (!focused.floating) Placement::RefreshWorkspaceGhostSizes(focused.workspace);
   return focused;
+}
+
+static void ResizeUnmanagedFocusedWindow(
+    HWND foreground, int direction, const wchar_t* action,
+    const std::optional<ForegroundWorkspace>& current) {
+  if (!foreground || Platform::Windows::IsWindowTrackedInAnyState(foreground)) {
+    return ReportNoTargetWindow(current);
+  }
+  const HMONITOR monitor = Platform::Windows::GetCurrentManagedWindowMonitor(foreground);
+  if (!monitor) return ReportNoTargetWindow(current);
+
+  if (Placement::ResizeUnmanagedWindow(foreground, monitor, direction)) {
+    Diagnostics::RecordEvent(L"%ls unmanaged hwnd=%p", action, foreground);
+  } else {
+    TrayUi::ShowCommandFailureFlyout(L"Couldn't resize this window", monitor);
+  }
 }
 
 // Commits a tiled window-size change like a resize drag: validated against
@@ -420,9 +437,12 @@ void StepFocusedWindowSize(bool grow) {
   } else {
     ++Diagnostics::g_runtime.counters.shrinkWindowCommands;
   }
-  auto focused = LoadFocusedMember();
-  if (!focused) return ReportNoTargetWindow(LoadForegroundWorkspace());
   const wchar_t* action = grow ? L"Grow window" : L"Shrink window";
+  const HWND foreground = GetForegroundWindow();
+  auto current = LoadForegroundWorkspace(foreground);
+  auto focused = LoadFocusedMember(current);
+  if (!focused) return ResizeUnmanagedFocusedWindow(foreground, grow ? 1 : -1, action, current);
+
   // A press that can't move the window says why, rather than doing nothing
   // silently. Rejections by the layout check report their own message.
   auto reportNoRoom = [&] {
@@ -465,8 +485,10 @@ void StepFocusedWindowSize(bool grow) {
 // size, else the default floating size; a preserve-size rule keeps its size.
 void ResetFocusedWindowSize() {
   ++Diagnostics::g_runtime.counters.resetWindowSizeCommands;
-  auto focused = LoadFocusedMember();
-  if (!focused) return ReportNoTargetWindow(LoadForegroundWorkspace());
+  const HWND foreground = GetForegroundWindow();
+  auto current = LoadForegroundWorkspace(foreground);
+  auto focused = LoadFocusedMember(current);
+  if (!focused) return ResizeUnmanagedFocusedWindow(foreground, 0, L"Reset window size", current);
 
   if (focused->floating) {
     Placement::FloatingPlacementHint hint;
