@@ -1250,6 +1250,17 @@ static void RunDraggedWindowPlacementTests() {
   const RECT afterDrag = windowRect(fixture.hwnd);
   check(!EqualRect(&dragged, &afterDrag), "after the gesture the window returns to its tile");
 
+  // A layout change while the window is dragged moves its tile, so it ends the
+  // drag: the window goes to its new tile instead of waiting for a stale drop.
+  Gestures::g_moveSize.startRects[fixture.hwnd] = afterDrag;
+  FloatingWindowFixture::AppMove(fixture.hwnd, fixture.workArea.left + 300, fixture.workArea.top + 200, 500, 400);
+  const RECT draggedBeforeLayoutChange = windowRect(fixture.hwnd);
+  Commands::SetCurrentWorkspaceLayout(TileLayout::Rows, fixture.key.ResolveMonitor());
+  const RECT afterLayoutChange = windowRect(fixture.hwnd);
+  check(fixture.Load().Layout() == TileLayout::Rows && !Gestures::IsMoveSizeGestureInProgress(fixture.hwnd) &&
+            !EqualRect(&draggedBeforeLayoutChange, &afterLayoutChange),
+        "a layout change mid-drag ends the drag of a window whose tile it moves");
+
   // A window that stops being tracked mid-drag takes its drop preview with it:
   // its end event may never reach the preview (Trace to owner).
   Gestures::g_moveSize.startRects[fixture.hwnd] = afterDrag;

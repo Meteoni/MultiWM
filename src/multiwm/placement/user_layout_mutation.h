@@ -268,23 +268,53 @@ static bool ValidateUserLayoutMutation(
   return false;
 }
 
+// The windows whose tiles `candidate` moves from where `previous` has them:
+// tiled in only one of the two, or planned elsewhere. Every tiled window when
+// either can't be planned (the Floating layout has no tiles).
+static std::vector<HWND> WindowsWhoseTilesChange(
+    const Workspace& previous, const Workspace& candidate, HMONITOR monitor) {
+  Platform::Monitors::WorkspaceMetrics metrics;
+  std::vector<RECT> before;
+  std::vector<RECT> after;
+  const bool planned =
+      Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics) &&
+      Layout::BuildWorkspaceLayoutPlan(previous, metrics.workArea, metrics.gap, &before) ==
+          Layout::LayoutPlanStatus::Success &&
+      Layout::BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, &after) ==
+          Layout::LayoutPlanStatus::Success;
+  std::vector<HWND> moved;
+  for (size_t i = 0; i < candidate.TiledWindows().size(); ++i) {
+    const HWND hwnd = candidate.TiledWindows()[i];
+    const size_t was = previous.TiledIndex(hwnd);
+    if (!planned || was >= before.size() || i >= after.size() || !Layout::RectsNear(before[was], after[i])) {
+      moved.push_back(hwnd);
+    }
+  }
+  for (HWND hwnd : previous.TiledWindows()) {
+    if (!candidate.IsTiled(hwnd)) moved.push_back(hwnd);
+  }
+  return moved;
+}
+
 // Commits `candidate`, the result of `mutation`. First refreshes the tiled
 // windows' native minimums, saving the committed workspace if they changed, and
 // plans the candidate with them. A plan that fails, or that would move a hung
 // window's ghost, is rejected: the user is told why, nothing else is saved and
 // nothing is arranged. Otherwise keeps `mutation.previous` so the change can be
 // rolled back if the windows refuse their new tiles, applies entering or leaving
-// the Floating layout, saves the candidate, clears the move/size samples of
-// `staleGestures`, and arranges with `mutation.subject` preferred. Validation may
-// replace `candidate` (refreshed minimums, or a Dwindle reassignment for a layout
-// change). True when committed. WM thread only.
-static bool CommitUserLayoutMutation(
-    const UserLayoutMutation& mutation, Workspace candidate, const std::vector<HWND>& staleGestures = {}) {
+// the Floating layout, saves the candidate, ends any drag or resize in progress
+// on a window whose tile it moves (that gesture started from the old tile, so
+// the window goes to its new one and the gesture's drop is ignored), and arranges
+// with `mutation.subject` preferred. Validation may replace `candidate`
+// (refreshed minimums, or a Dwindle reassignment for a layout change). True when
+// committed. WM thread only.
+static bool CommitUserLayoutMutation(const UserLayoutMutation& mutation, Workspace candidate) {
   const DesktopMonitorKey& key = mutation.key;
   std::optional<RECT> bspDropEdge;
   if (!ValidateUserLayoutMutation(mutation, candidate, bspDropEdge)) return false;
   RememberPendingLayoutMutation(key, mutation.previous, candidate, mutation.subject, mutation.kind, mutation.action,
                                 bspDropEdge);
+  const std::vector<HWND> movedTiles = WindowsWhoseTilesChange(mutation.previous, candidate, mutation.monitor);
 
   const bool wasFloating = mutation.previous.Layout() == TileLayout::Floating;
   const bool isFloating = candidate.Layout() == TileLayout::Floating;
@@ -297,7 +327,7 @@ static bool CommitUserLayoutMutation(
   }
 
   g_workspaces.Save(key, candidate);
-  for (HWND hwnd : staleGestures) Gestures::ClearMoveSizeSamples(hwnd);
+  for (HWND hwnd : movedTiles) Gestures::ClearMoveSizeSamples(hwnd);
   ArrangeWorkspace(key, mutation.subject);
   return true;
 }

@@ -65,15 +65,6 @@ static void ReportNoTargetWindow(const std::optional<ForegroundWorkspace>& curre
 
 static constexpr const wchar_t* kNotInFloatingLayout = L"Not available in the Floating layout";
 
-// The windows in the subtree of `tree`'s split `node`: those a turn of it moves.
-static std::vector<HWND> WindowsUnderBspSplit(const BspTree& tree, size_t node) {
-  std::vector<HWND> windows;
-  for (size_t i = node + 1, end = tree.SubtreeEnd(node); i < end; ++i) {
-    if (HWND window = tree.Nodes()[i].window) windows.push_back(window);
-  }
-  return windows;
-}
-
 // Promote the focused window, or rotate its immediate divider in BSP.
 void ApplyLayoutAction(HWND foreground = GetForegroundWindow()) {
   ++Diagnostics::g_runtime.counters.layoutActionCommands;
@@ -108,10 +99,8 @@ void ApplyLayoutAction(HWND foreground = GetForegroundWindow()) {
     if (!candidate.MakeMaster(focused, &oldMaster)) return;
   }
 
-  const std::vector<HWND> staleGestures =
-      rotate ? WindowsUnderBspSplit(tree, divider) : std::vector<HWND>{oldMaster, focused};
   if (!Placement::CommitUserLayoutMutation({current->key, current->monitor, workspace, focused, kind, action},
-                                           std::move(candidate), staleGestures)) {
+                                           std::move(candidate))) {
     return;
   }
   if (rotate) {
@@ -154,7 +143,7 @@ static void MoveFocusedWindowOneSlot(bool promote, HWND foreground) {
   if (!Placement::CommitUserLayoutMutation(
           {key, current->monitor, workspace, resolved, Placement::UserLayoutMutationKind::Order,
            promote ? L"Promote" : L"Demote"},
-          std::move(candidate), {resolved, other})) {
+          std::move(candidate))) {
     return;
   }
 
