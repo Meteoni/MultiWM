@@ -33,7 +33,7 @@ except the sibling `shared/` and `companion/` roots.
 | `core/` | (global), `Diagnostics`, `RuntimeLifecycle` | Settings struct, message IDs, enums, the WM actor state `g_wm`, model invariants |
 | `model/` | `Model` | `Workspace` (membership, order, saved ratios) and `WorkspaceRepository` (all workspaces, who owns which window) |
 | `layout/` | `Layout` | Pure rectangle math, planning with minimum sizes, learning ratios from resize gestures. No Win32 calls. |
-| `placement/` | `Placement` | Applying a plan to real windows, floating geometry, and conformance leases |
+| `placement/` | `Placement` | Applying a plan to real windows, floating geometry, conformance leases, and committing or rolling back user layout mutations (`placement/user_layout_mutation.h`) |
 | `reconcile/` | `Reconcile` | Turning observed OS state into model changes: discovery, ownership repair, initial-placement rules, overflow |
 | `commands/` | `Commands`, `Gestures` | Hotkey/tray commands and interpreting user drags and resizes |
 | `platform/` | `Platform::*` | The only code that talks to Windows: windows, monitors, WinEvent hooks, private virtual-desktop COM |

@@ -630,9 +630,10 @@ struct DueConformanceWork {
 // leases, user layout mutations awaiting settlement, and admission-recovery
 // baselines. All three describe the same unproven arrangement, so they share one
 // owner and one reset (Clear). The store keeps generations and expiry rules;
-// repair, rollback and float policy stay in placement/arrangement.h and
-// placement/conformance.h, which define these members. WM thread only. Callers
-// pass `nowMs` so every decision in one operation uses the same tick.
+// repair, rollback and float policy stay in placement/user_layout_mutation.h,
+// placement/arrangement.h and placement/conformance.h (which defines these
+// members). WM thread only. Callers pass `nowMs` so every decision in one
+// operation uses the same tick.
 class PendingProofs {
  public:
   // --- Conformance leases ---

@@ -28,6 +28,10 @@ struct FloatingPlacementHint {
 };
 // Defined in placement/arrangement.h.
 static void ArrangeWorkspace(const DesktopMonitorKey& key, HWND preferredTiledWindow = nullptr);
+static bool RefreshWorkspaceNativeConstraints(Workspace& workspace, bool forceAll, const wchar_t* reason);
+static std::wstring ProcessDisplayName(HWND hwnd);
+static void ShowWindowConstraintConflict(
+    const Workspace& workspace, const std::vector<RECT>& rects, HWND fallback, HMONITOR monitor);
 // Defined in placement/conformance.h.
 static void BeginConformanceLease(
     HWND hwnd, const RECT& expectedRect, bool scheduleRepair = false,

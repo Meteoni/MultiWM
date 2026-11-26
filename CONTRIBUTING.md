@@ -90,6 +90,7 @@ These practices draw on the [C++ Core Guidelines](https://isocpp.github.io/CppCo
 | Preferred geometry | Durable user intent, expressed by ratios or weights. | A divider prefers 50% even while a large minimum temporarily requires 65%. |
 | Observed geometry | The native window frame sampled from Windows. | An application reports a 700-pixel frame after a 650-pixel placement request. |
 | Conformance lease | A bounded period for a window to settle on its assigned tile, or, in the Floating layout, on the frame MultiWM just gave it. | A snap-back can trigger a repair; expiry checks the current tile before floating a persistently displaced window. A floating lease's expiry instead keeps the app's frame. |
+| User layout mutation | A change the user asks for to a workspace's order, weights or layout. It applies at once, but is rolled back if the windows refuse their new tiles. | Promoting a window whose app then refuses its new tile puts the previous order back and names the app in a toast. |
 
 ## Verification and review tools
 

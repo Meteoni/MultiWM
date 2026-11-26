@@ -11,184 +11,18 @@ struct TiledDropTarget {
   bool operator==(const TiledDropTarget&) const = default;
 };
 
-// A tiled window whose cell `candidate` (planned as `candidateRects`) would move
-// while the window is hung and shown by its ghost, or nullptr. MultiWM can't
-// move a ghost: dwm.exe owns it and refuses positioning from other processes, so
-// only the ghost itself can move, when the user drags it. A cell may stay where
-// `current` plans it, or land exactly where the ghost is shown.
-static HWND FindGhostAUserChangeWouldMove(
-    const Workspace* current, const Workspace& candidate, const std::vector<RECT>& candidateRects,
-    const Platform::Monitors::WorkspaceMetrics& metrics) {
-  std::vector<RECT> currentRects;
-  bool currentPlanned = false;
-  for (size_t i = 0; i < candidate.TiledWindows().size() && i < candidateRects.size(); ++i) {
-    const HWND hwnd = candidate.TiledWindows()[i];
-    const WindowRecord* record = candidate.Find(hwnd);
-    if (!record || record->ghostSize.cx <= 0 || record->ghostSize.cy <= 0) continue;
-    const RECT& planned = candidateRects[i];
-    if (current && !currentPlanned) {
-      currentPlanned = true;
-      if (Layout::BuildWorkspaceLayoutPlan(*current, metrics.workArea, metrics.gap, &currentRects) !=
-          Layout::LayoutPlanStatus::Success) {
-        currentRects.clear();
-      }
-    }
-    const size_t was = current ? current->TiledIndex(hwnd) : Workspace::kNotFound;
-    if (was < currentRects.size() && Layout::RectsNear(planned, currentRects[was])) continue;
-    RECT shown{};
-    if (Platform::Windows::GetDisplayedWindowFrameRect(hwnd, &shown) && Layout::RectsNear(planned, shown)) continue;
-    return hwnd;
-  }
-  return nullptr;
-}
-
-// True, after telling the user, when `candidate` would move a hung window's
-// ghost (FindGhostAUserChangeWouldMove).
-static bool RefuseMovingAGhost(
-    const Workspace* current, const Workspace& candidate, const std::vector<RECT>& rects,
-    const Platform::Monitors::WorkspaceMetrics& metrics, HMONITOR monitor, const wchar_t* action) {
-  const HWND ghosted = FindGhostAUserChangeWouldMove(current, candidate, rects, metrics);
-  if (!ghosted) return false;
-  std::wstring name = Placement::ProcessDisplayName(ghosted);
-  if (name.empty()) name = L"A window";
-  TrayUi::ShowAppFlyout(name + L" isn't responding and can't be moved", {ghosted}, monitor);
-  Diagnostics::RecordEvent(L"layout mutation rejected action=%ls: hung window can't move hwnd=%p",
-                           action ? action : L"Layout mutation", ghosted);
-  return true;
-}
-
-// Plans `candidate`, a user change of `kind`, into `rects`. A layout change to
-// Dwindle that doesn't fit as is may reassign windows to slots that fit, which
-// replaces `candidate`. That reassignment was always accepted unplanned, so
-// `*acceptAsIs` is set when it can't then be planned for the checks that follow.
-static Layout::LayoutPlanStatus PlanUserLayoutMutation(
-    Workspace& candidate, Placement::UserLayoutMutationKind kind, const wchar_t* action,
-    const Platform::Monitors::WorkspaceMetrics& metrics, std::vector<RECT>* rects, bool* acceptAsIs) {
-  Layout::LayoutPlanStatus status = Layout::BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, rects);
-  if (status != Layout::LayoutPlanStatus::Unsatisfiable || candidate.Layout() != TileLayout::Dwindle ||
-      kind != Placement::UserLayoutMutationKind::LayoutChange) {
-    return status;
-  }
-  Workspace reassigned = candidate;
-  size_t movedWindowCount = 0;
-  if (!Layout::ReassignDwindleLayoutConversionForConstraints(reassigned, metrics.workArea, metrics.gap,
-                                                              &movedWindowCount)) {
-    return status;
-  }
-  candidate = std::move(reassigned);
-  Diagnostics::RecordEvent(L"dwindle layout conversion reassigned windows action=%ls moved=%zu",
-                           action ? action : L"Change layout", movedWindowCount);
-  status = Layout::BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, rects);
-  *acceptAsIs = status != Layout::LayoutPlanStatus::Success;
-  return status;
-}
-
-static Layout::LayoutPlanStatus PlanBspDrop(
-    Workspace& candidate, const Workspace& previous, HWND source, const TiledDropTarget& target,
-    const Platform::Monitors::WorkspaceMetrics& metrics, std::vector<RECT>& rects,
-    std::optional<RECT>& bspDropEdge) {
-  const auto cells = Model::PlanBspCells(previous, metrics.workArea, metrics.gap).rects;
-  const size_t targetIndex = previous.TiledIndex(target.window);
-  if (targetIndex >= cells.size() || IsRectEmpty(&cells[targetIndex])) {
-    return Layout::LayoutPlanStatus::Unsatisfiable;
-  }
-
-  RECT edge = cells[targetIndex];
-  const bool horizontal = target.zone == TileDropZone::Left || target.zone == TileDropZone::Right;
-  const LONG span = horizontal ? Layout::RectWidth(edge) : Layout::RectHeight(edge);
-  const LONG edgeSize = static_cast<LONG>((static_cast<int64_t>(span) * g_settings.bspSplitEdgePercent + 99) / 100);
+// The edge a drop onto `target` splits, as a merge's edge drop. No value for a
+// center drop, which never merges.
+static std::optional<Placement::BspEdgeDrop> MergeEdgeDrop(const TiledDropTarget& target) {
+  using Placement::TileEdge;
   switch (target.zone) {
-    case TileDropZone::Left: edge.right = edge.left + edgeSize; break;
-    case TileDropZone::Right: edge.left = edge.right - edgeSize; break;
-    case TileDropZone::Top: edge.bottom = edge.top + edgeSize; break;
-    case TileDropZone::Bottom: edge.top = edge.bottom - edgeSize; break;
-    case TileDropZone::Center: return Layout::LayoutPlanStatus::Unsatisfiable;
+    case TileDropZone::Left: return Placement::BspEdgeDrop{target.window, TileEdge::Left};
+    case TileDropZone::Right: return Placement::BspEdgeDrop{target.window, TileEdge::Right};
+    case TileDropZone::Top: return Placement::BspEdgeDrop{target.window, TileEdge::Top};
+    case TileDropZone::Bottom: return Placement::BspEdgeDrop{target.window, TileEdge::Bottom};
+    case TileDropZone::Center: break;
   }
-  bspDropEdge = edge;
-  return Layout::PlanOrTurnNewBspSplit(candidate, metrics.workArea, metrics.gap, &rects,
-                                            Layout::BspMergeDestination{source, *bspDropEdge});
-}
-
-// User-authored geometry changes are rejected before commit when cached native
-// constraints already make them impossible. A short-lived transaction handles a
-// minimum that an application changes only during the resulting placement.
-static bool ValidateUserLayoutMutation(
-    const DesktopMonitorKey& key, HMONITOR monitor, const Workspace& previous,
-    Workspace& candidate, HWND subject, Placement::UserLayoutMutationKind kind,
-    const wchar_t* action, const TiledDropTarget* mergeTarget, std::optional<RECT>& bspDropEdge) {
-  // A same-DPI native minimum can change while no placement is occurring.
-  // Refresh the committed workspace first, persist that application-owned state,
-  // then mirror it into the geometry-mutated candidate before deciding whether
-  // the user's operation is feasible.
-  Workspace current;
-  bool committedConstraintsChanged = false;
-  const bool haveCurrent = g_workspaces.Load(key, &current);
-  if (haveCurrent) {
-    committedConstraintsChanged =
-        Placement::RefreshWorkspaceNativeConstraints(current, true, L"user mutation");
-    if (committedConstraintsChanged) {
-      g_workspaces.Save(key, current);
-    }
-    for (HWND hwnd : candidate.TiledWindows()) {
-      const WindowRecord* currentRecord = current.Find(hwnd);
-      if (currentRecord) {
-        candidate.UpdateConstraints(hwnd, currentRecord->constraints);
-        candidate.UpdateGhostSize(hwnd, currentRecord->ghostSize);
-      }
-    }
-  }
-
-  Platform::Monitors::WorkspaceMetrics metrics;
-  std::vector<RECT> rects;
-  bool acceptAsIs = false;
-  Layout::LayoutPlanStatus status = Layout::LayoutPlanStatus::Unsatisfiable;
-  if (Platform::Monitors::GetWorkspaceMetrics(monitor, &metrics)) {
-    if (mergeTarget) {
-      status = PlanBspDrop(candidate, previous, subject, *mergeTarget, metrics, rects, bspDropEdge);
-    } else {
-      status = PlanUserLayoutMutation(candidate, kind, action, metrics, &rects, &acceptAsIs);
-    }
-  }
-  if (acceptAsIs || status == Layout::LayoutPlanStatus::NotApplicable) return true;
-  if (status == Layout::LayoutPlanStatus::Success) {
-    return !RefuseMovingAGhost(haveCurrent ? &current : nullptr, candidate, rects, metrics, monitor, action);
-  }
-
-  Placement::ReportRejectedLayoutMutation(
-      key, monitor, kind, action ? action : L"Layout mutation", subject,
-      candidate, rects);
-  // If the rejection exposed a changed native contract, reconcile the committed
-  // layout only when that existing layout is itself no longer feasible. Avoid an
-  // unnecessary reflow merely because the rejected candidate needed fresh data.
-  if (committedConstraintsChanged) {
-    Platform::Monitors::WorkspaceMetrics committedMetrics;
-    std::vector<RECT> committedRects;
-    if (Platform::Monitors::GetWorkspaceMetrics(monitor, &committedMetrics)) {
-      if (Layout::BuildWorkspaceLayoutPlan(
-              current, committedMetrics.workArea, committedMetrics.gap,
-              &committedRects) == Layout::LayoutPlanStatus::Unsatisfiable) {
-        Placement::ArrangeWorkspace(key);
-      }
-    }
-  }
-  return false;
-}
-
-// Validates `candidate`, a user change to `previous`, and on success keeps
-// `previous` so the change can be rolled back if the windows refuse their new
-// tiles. Validation may update `candidate` (refreshed native minimums, or a
-// Dwindle reassignment for a layout change). Saving the candidate stays with
-// the caller. False when the change is rejected; the user was told why.
-static bool AcceptUserLayoutMutation(
-    const DesktopMonitorKey& key, HMONITOR monitor, const Workspace& previous,
-    Workspace& candidate, HWND subject, Placement::UserLayoutMutationKind kind,
-    const wchar_t* action, const TiledDropTarget* mergeTarget = nullptr) {
-  std::optional<RECT> bspDropEdge;
-  if (!ValidateUserLayoutMutation(key, monitor, previous, candidate, subject, kind, action, mergeTarget, bspDropEdge)) {
-    return false;
-  }
-  Placement::RememberPendingLayoutMutation(key, previous, candidate, subject, kind, action, bspDropEdge);
-  return true;
+  return std::nullopt;
 }
 
 // The foreground window with a copy of the workspace that owns its desktop and
@@ -231,6 +65,15 @@ static void ReportNoTargetWindow(const std::optional<ForegroundWorkspace>& curre
 
 static constexpr const wchar_t* kNotInFloatingLayout = L"Not available in the Floating layout";
 
+// The windows in the subtree of `tree`'s split `node`: those a turn of it moves.
+static std::vector<HWND> WindowsUnderBspSplit(const BspTree& tree, size_t node) {
+  std::vector<HWND> windows;
+  for (size_t i = node + 1, end = tree.SubtreeEnd(node); i < end; ++i) {
+    if (HWND window = tree.Nodes()[i].window) windows.push_back(window);
+  }
+  return windows;
+}
+
 // Promote the focused window, or rotate its immediate divider in BSP.
 void ApplyLayoutAction(HWND foreground = GetForegroundWindow()) {
   ++Diagnostics::g_runtime.counters.layoutActionCommands;
@@ -265,20 +108,17 @@ void ApplyLayoutAction(HWND foreground = GetForegroundWindow()) {
     if (!candidate.MakeMaster(focused, &oldMaster)) return;
   }
 
-  const DesktopMonitorKey& key = current->key;
-  if (!AcceptUserLayoutMutation(key, current->monitor, workspace, candidate, focused, kind, action)) return;
-  g_workspaces.Save(key, candidate);
+  const std::vector<HWND> staleGestures =
+      rotate ? WindowsUnderBspSplit(tree, divider) : std::vector<HWND>{oldMaster, focused};
+  if (!Placement::CommitUserLayoutMutation({current->key, current->monitor, workspace, focused, kind, action},
+                                           std::move(candidate), staleGestures)) {
+    return;
+  }
   if (rotate) {
-    for (size_t i = divider + 1, end = tree.SubtreeEnd(divider); i < end; ++i) {
-      if (HWND window = tree.Nodes()[i].window) Gestures::ClearMoveSizeSamples(window);
-    }
     Diagnostics::RecordEvent(L"BSP split rotated hwnd=%p", focused);
   } else {
-    Gestures::ClearMoveSizeSamples(oldMaster);
-    Gestures::ClearMoveSizeSamples(focused);
     Diagnostics::RecordEvent(L"Swap Master old=%p new=%p", oldMaster, focused);
   }
-  Placement::ArrangeWorkspace(key, focused);
 }
 
 // Moves the focused tiled window one slot toward or away from the front of the
@@ -311,15 +151,12 @@ static void MoveFocusedWindowOneSlot(bool promote, HWND foreground) {
   HWND other = workspace.TiledWindows()[otherIndex];
   Workspace candidate = workspace;
   if (!candidate.SwapTiled(resolved, other)) return;
-  if (!AcceptUserLayoutMutation(key, current->monitor, workspace, candidate, resolved,
-                                Placement::UserLayoutMutationKind::Order,
-                                promote ? L"Promote" : L"Demote")) {
+  if (!Placement::CommitUserLayoutMutation(
+          {key, current->monitor, workspace, resolved, Placement::UserLayoutMutationKind::Order,
+           promote ? L"Promote" : L"Demote"},
+          std::move(candidate), {resolved, other})) {
     return;
   }
-  g_workspaces.Save(key, candidate);
-  Gestures::ClearMoveSizeSamples(resolved);
-  Gestures::ClearMoveSizeSamples(other);
-  Placement::ArrangeWorkspace(key, resolved);
 
   Diagnostics::RecordEvent(
       promote ? L"Promote Window hwnd=%p from=%zu to=%zu"
@@ -421,12 +258,12 @@ static void ResizeUnmanagedFocusedWindow(
 // Commits a tiled window-size change like a resize drag: validated against
 // cached minimums, kept for rollback, then arranged with the window preferred.
 static void CommitWindowSizeChange(FocusedMember& focused, Workspace candidate, const wchar_t* action) {
-  if (!AcceptUserLayoutMutation(focused.key, focused.monitor, focused.workspace, candidate,
-                                focused.hwnd, Placement::UserLayoutMutationKind::Resize, action)) {
+  if (!Placement::CommitUserLayoutMutation(
+          {focused.key, focused.monitor, focused.workspace, focused.hwnd, Placement::UserLayoutMutationKind::Resize,
+           action},
+          std::move(candidate))) {
     return;
   }
-  g_workspaces.Save(focused.key, candidate);
-  Placement::ArrangeWorkspace(focused.key, focused.hwnd);
   Diagnostics::RecordEvent(L"%ls hwnd=%p", action, focused.hwnd);
 }
 
@@ -558,32 +395,19 @@ void TileWindows(HMONITOR monitor = nullptr) {
   Diagnostics::RecordEvent(L"Tile Workspace command completed monitor=%p", monitor);
 }
 
-// Validate the candidate, retain rollback geometry, then commit and present it.
-// Rejection keeps the user's layout; validation may still refresh native reports.
+// Commits the layout change `candidate` as a user layout mutation, then presents
+// it. Rejection keeps the user's layout; validation may still refresh native reports.
 static bool CommitWorkspaceLayoutChange(
     const DesktopMonitorKey& key, HMONITOR monitor,
-    Workspace& workspace, Workspace candidate) {
-  const TileLayout previousLayout = workspace.Layout();
-  if (!AcceptUserLayoutMutation(key, monitor, workspace, candidate, nullptr,
-                                Placement::UserLayoutMutationKind::LayoutChange, L"Change layout")) {
+    const Workspace& workspace, Workspace candidate) {
+  const TileLayout layout = candidate.Layout();
+  if (!Placement::CommitUserLayoutMutation(
+          {key, monitor, workspace, nullptr, Placement::UserLayoutMutationKind::LayoutChange, L"Change layout"},
+          std::move(candidate))) {
     return false;
   }
-  if (previousLayout == TileLayout::Floating && candidate.Layout() != TileLayout::Floating) {
-    Placement::RememberFloatingLayoutFrames(candidate, Platform::Monitors::GetMonitorEffectiveDpi(monitor));
-  }
-  workspace = std::move(candidate);
-  if (previousLayout != TileLayout::Floating &&
-      workspace.Layout() == TileLayout::Floating) {
-    Placement::RestoreWorkspaceFloatingGeometry(key, workspace);
-  } else if (previousLayout == TileLayout::Floating &&
-             workspace.Layout() != TileLayout::Floating) {
-    // Floating leases end with the layout; tiling places every window afresh.
-    for (HWND hwnd : workspace.TiledWindows()) Placement::CancelConformanceLease(hwnd);
-  }
-  g_workspaces.Save(key, workspace);
-  Placement::ArrangeWorkspace(key);
-  TrayUi::UpdateIcon(workspace.Layout(), monitor);
-  TrayUi::ShowLayoutFlyout(workspace.Layout(), monitor);
+  TrayUi::UpdateIcon(layout, monitor);
+  TrayUi::ShowLayoutFlyout(layout, monitor);
   return true;
 }
 
@@ -611,12 +435,13 @@ void CycleCurrentWorkspaceLayout(HMONITOR monitor = nullptr) {
   const TileLayout previousLayout = state.Layout();
   Workspace candidate = state;
   if (!candidate.CycleLayout(g_settings.layoutCycle)) return;
+  const TileLayout layout = candidate.Layout();
   if (!CommitWorkspaceLayoutChange(key, monitor, state, std::move(candidate))) return;
-  Wh_Log(L"Workspace layout changed to %d", static_cast<int>(state.Layout()));
+  Wh_Log(L"Workspace layout changed to %d", static_cast<int>(layout));
   Diagnostics::RecordEvent(
       L"layout cycle desktop=%08X monitorId=%ls from=%d to=%d", key.desktopId.Data1,
       key.monitor.deviceId.c_str(), static_cast<int>(previousLayout),
-      static_cast<int>(state.Layout()));
+      static_cast<int>(layout));
 }
 
 // Direct layout selection used by the tray context menu. This is intentionally
@@ -746,19 +571,19 @@ static std::optional<TiledDropPreview> PlanTiledDropPreview(
   Workspace candidate = workspace;
   const auto kind = PrepareTiledDrop(candidate, source, target, metrics.workArea);
   if (!kind) return std::nullopt;
-  std::vector<RECT> rects;
-  std::optional<RECT> bspDropEdge;
-  const auto status = *kind == Placement::UserLayoutMutationKind::BspMerge
-      ? PlanBspDrop(candidate, workspace, source, target, metrics, rects, bspDropEdge)
-      : Layout::BuildWorkspaceLayoutPlan(candidate, metrics.workArea, metrics.gap, &rects);
+  const bool merge = *kind == Placement::UserLayoutMutationKind::BspMerge;
+  const auto rects = Placement::PlanUserLayoutMutation(
+      {.previous = workspace, .subject = source, .kind = *kind,
+       .edgeDrop = merge ? MergeEdgeDrop(target) : std::nullopt},
+      candidate, metrics);
+  if (!rects) return std::nullopt;
   const size_t sourceIndex = candidate.TiledIndex(source);
   const size_t targetIndex = candidate.TiledIndex(target.window);
-  if (status != Layout::LayoutPlanStatus::Success || sourceIndex >= rects.size() || targetIndex >= rects.size() ||
-      IsRectEmpty(&rects[sourceIndex]) || IsRectEmpty(&rects[targetIndex]) ||
-      FindGhostAUserChangeWouldMove(&workspace, candidate, rects, metrics)) {
+  if (sourceIndex >= rects->size() || targetIndex >= rects->size() ||
+      IsRectEmpty(&(*rects)[sourceIndex]) || IsRectEmpty(&(*rects)[targetIndex])) {
     return std::nullopt;
   }
-  return TiledDropPreview{rects[sourceIndex], rects[targetIndex], source, target.window};
+  return TiledDropPreview{(*rects)[sourceIndex], (*rects)[targetIndex], source, target.window};
 }
 
 static void HandleUserMove(
@@ -779,7 +604,6 @@ static void HandleUserMove(
     return;
   }
 
-  HWND preferredTiledWindow = nullptr;
   const auto target = workspace.IsTiled(hwnd) && gesture.hasDropPoint
       ? FindTiledDropTarget(TiledDropFrames(workspace, hwnd), workspace.Layout(), gesture.dropPoint) : std::nullopt;
   if (target) {
@@ -788,19 +612,19 @@ static void HandleUserMove(
     using Kind = Placement::UserLayoutMutationKind;
     const bool merge = kind == Kind::BspMerge;
     const wchar_t* action = merge ? L"Merge to target tile" : kind == Kind::BspRotate ? L"Rotate split" : L"Swap";
-    if (kind && AcceptUserLayoutMutation(key, key.ResolveMonitor(), workspace, candidate, hwnd, *kind, action,
-                                         merge ? &*target : nullptr)) {
-      workspace = std::move(candidate);
-      preferredTiledWindow = hwnd;
-      g_workspaces.Save(key, workspace);
+    if (kind && Placement::CommitUserLayoutMutation(
+                    {key, key.ResolveMonitor(), workspace, hwnd, *kind, action,
+                     merge ? MergeEdgeDrop(*target) : std::nullopt},
+                    std::move(candidate))) {
       if (*kind == Kind::Order) ++Diagnostics::g_runtime.counters.tiledSwapActions;
       Wh_Log(L"User drag applied %ls to HWND %p and target %p", action, hwnd, target->window);
       Diagnostics::RecordEvent(L"user drag hwnd=%p target=%p action=%ls", hwnd, target->window, action);
+      return;
     }
   }
 
   // An empty drop or a rejected change snaps the source back to its tile.
-  Placement::ArrangeWorkspace(key, preferredTiledWindow);
+  Placement::ArrangeWorkspace(key);
 }
 
 static void HandleUserResize(
@@ -851,18 +675,18 @@ static void HandleUserResize(
   }
 
   if (changed) {
-    if (!AcceptUserLayoutMutation(key, key.ResolveMonitor(), workspace, candidate, hwnd,
-                                  Placement::UserLayoutMutationKind::Resize, L"Resize")) {
+    if (!Placement::CommitUserLayoutMutation(
+            {key, key.ResolveMonitor(), workspace, hwnd, Placement::UserLayoutMutationKind::Resize, L"Resize"},
+            std::move(candidate))) {
       Placement::ArrangeWorkspace(key, hwnd);
       return;
     }
-    workspace = std::move(candidate);
-    g_workspaces.Save(key, workspace);
     ++Diagnostics::g_runtime.counters.dividerUpdates;
     Wh_Log(L"User resize updated local divider state for %p", hwnd);
     Diagnostics::RecordEvent(L"user resize updated divider hwnd=%p", hwnd);
+    return;
   }
-  Placement::ArrangeWorkspace(key, changed ? hwnd : nullptr);
+  Placement::ArrangeWorkspace(key);
 }
 
 // Consumes one completed user gesture and routes it to the move or resize policy.

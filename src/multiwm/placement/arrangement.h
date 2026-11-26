@@ -202,20 +202,6 @@ static bool RefreshWorkspaceNativeConstraints(
   return changed;
 }
 
-static void RememberPendingLayoutMutation(
-    const DesktopMonitorKey& key, const Workspace& previous,
-    const Workspace& candidate, HWND subject, UserLayoutMutationKind kind,
-    const wchar_t* action, std::optional<RECT> bspDropEdge = std::nullopt) {
-  PendingLayoutMutation mutation;
-  mutation.previous = previous;
-  mutation.candidate = candidate;
-  mutation.subject = subject;
-  mutation.kind = kind;
-  mutation.bspDropEdge = bspDropEdge;
-  mutation.action = action ? action : L"Layout mutation";
-  g_pendingProofs.RememberLayoutMutation(key, std::move(mutation));
-}
-
 static void DiscardPendingAdmissionRecovery(HWND hwnd) {
   if (hwnd) g_pendingProofs.DiscardAdmissionRecovery(hwnd);
 }
@@ -422,120 +408,6 @@ static void ShowWindowConstraintConflict(
     const Workspace& workspace, const std::vector<RECT>& rects,
     HWND fallback, HMONITOR monitor) {
   ShowAppToast(ConstraintConflictToast(workspace, FindConflictingWindows(workspace, rects), fallback), monitor);
-}
-
-static void ReportRejectedLayoutMutation(
-    const DesktopMonitorKey& key, HMONITOR monitor,
-    UserLayoutMutationKind kind, const wchar_t* action, HWND subject,
-    const Workspace& rejectedWorkspace, const std::vector<RECT>& rejectedRects,
-    HWND culpritHint = nullptr) {
-  switch (kind) {
-    case UserLayoutMutationKind::Resize:
-      ++Diagnostics::g_runtime.counters.rejectedResizeGestures;
-      break;
-    case UserLayoutMutationKind::Order:
-    case UserLayoutMutationKind::BspMerge:
-    case UserLayoutMutationKind::BspRotate:
-      ++Diagnostics::g_runtime.counters.rejectedOrderCommands;
-      break;
-    case UserLayoutMutationKind::LayoutChange:
-      ++Diagnostics::g_runtime.counters.rejectedLayoutChanges;
-      break;
-  }
-
-  HWND culprit = Layout::FindConstraintCulprit(
-      rejectedWorkspace, rejectedRects, subject);
-  if (!culprit) culprit = culpritHint;
-  if (kind == UserLayoutMutationKind::BspMerge) {
-    TrayUi::ShowCommandFailureFlyout(L"Not enough space to split that tile", monitor);
-  } else {
-    ShowWindowConstraintConflict(rejectedWorkspace, rejectedRects, culprit, monitor);
-  }
-  Wh_Log(
-      L"%ls rejected by layout constraints subject=%p culprit=%p",
-      action, subject, culprit);
-  Diagnostics::RecordEvent(
-      L"layout mutation rejected action=%ls subject=%p culprit=%p desktop=%08X",
-      action, subject, culprit, key.desktopId.Data1);
-}
-
-static bool TryRollbackPendingLayoutMutation(
-    const DesktopMonitorKey& key, HMONITOR monitor, Workspace* workspace,
-    const std::vector<RECT>& rejectedRects, HWND culpritHint = nullptr) {
-  if (!workspace) return false;
-  const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
-  if (!pending) return false;
-  // Constraint learning and admission recovery are allowed to adjust ratios or
-  // reorder pending admissions downstream of the user's command. Those are part
-  // of the same delayed transaction, not evidence that the transaction is stale.
-  // Only a membership/participation change makes the saved rollback snapshot
-  // unsafe to apply.
-  if (!workspace->HasSameWindowMembershipAs(pending->candidate)) {
-    Diagnostics::RecordEvent(
-        L"discarded stale layout mutation rollback after membership change action=%ls desktop=%08X",
-        pending->action, key.desktopId.Data1);
-    g_pendingProofs.DiscardLayoutMutation(key);
-    return false;
-  }
-
-  // Work from a copy: every exit below discards the stored mutation.
-  const PendingLayoutMutation mutation = *pending;
-  Workspace restored = *workspace;
-  if (!restored.RestoreLayoutStateFrom(mutation.previous)) {
-    g_pendingProofs.DiscardLayoutMutation(key);
-    return false;
-  }
-
-  Platform::Monitors::WorkspaceMetrics rollbackMetrics;
-  if (!Platform::Monitors::GetWorkspaceMetrics(monitor, &rollbackMetrics)) {
-    g_pendingProofs.DiscardLayoutMutation(key);
-    return false;
-  }
-  // A rejected split change restores its previous geometry even if that
-  // layout now needs constraint recovery of its own.
-  if (mutation.kind != UserLayoutMutationKind::BspMerge && mutation.kind != UserLayoutMutationKind::BspRotate) {
-    std::vector<RECT> restoredRects;
-    const auto restoredStatus = Layout::BuildWorkspaceLayoutPlan(
-        restored, rollbackMetrics.workArea, rollbackMetrics.gap, &restoredRects);
-    if (restoredStatus == Layout::LayoutPlanStatus::Unsatisfiable) {
-      Diagnostics::RecordEvent(
-          L"layout mutation rollback no longer feasible action=%ls desktop=%08X",
-          mutation.action, key.desktopId.Data1);
-      g_pendingProofs.DiscardLayoutMutation(key);
-      return false;
-    }
-  }
-
-  for (HWND hwnd : workspace->TiledWindows()) CancelConformanceLease(hwnd);
-  if (restored.Layout() == TileLayout::Floating) {
-    RestoreWorkspaceFloatingGeometry(key, restored);
-  }
-  ReportRejectedLayoutMutation(
-      key, monitor, mutation.kind, mutation.action, mutation.subject,
-      *workspace, rejectedRects, culpritHint);
-  g_workspaces.Save(key, restored);
-  *workspace = std::move(restored);
-  g_pendingProofs.DiscardLayoutMutation(key);
-  TrayUi::UpdateIcon(workspace->Layout(), monitor);
-  return true;
-}
-
-static void ClearSettledLayoutMutation(
-    const DesktopMonitorKey& key, const Workspace& workspace) {
-  const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
-  if (!pending) return;
-  if (!workspace.HasSameWindowMembershipAs(pending->candidate)) {
-    Diagnostics::RecordEvent(
-        L"discarded stale layout mutation settle after membership change action=%ls desktop=%08X",
-        pending->action, key.desktopId.Data1);
-    g_pendingProofs.DiscardLayoutMutation(key);
-    return;
-  }
-  if (HasOutstandingConformanceLease(workspace)) return;
-  Diagnostics::RecordEvent(
-      L"layout mutation settled action=%ls desktop=%08X",
-      pending->action, key.desktopId.Data1);
-  g_pendingProofs.DiscardLayoutMutation(key);
 }
 
 static bool FloatWindowAfterFailure(
@@ -1193,13 +1065,8 @@ static void ArrangeWorkspace(
   ObserveAndRepairWorkspaceForArrangement(workspace);
   ArrangementContext context{key, monitor, metrics, preferredTiledWindow};
   EnforceAutomaticWindowLimit(key, workspace, monitor, context.localFloats);
-  if (const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
-      pending && !workspace.HasSameWindowMembershipAs(pending->candidate)) {
-    Diagnostics::RecordEvent(
-        L"discarded stale layout mutation before arrangement after membership change action=%ls desktop=%08X",
-        pending->action, key.desktopId.Data1);
-    g_pendingProofs.DiscardLayoutMutation(key);
-  }
+  // Drops a pending user layout mutation whose windows have changed since.
+  CurrentLayoutMutation(key, workspace, L"before arrangement");
   // Native reports are cached between arrangements. The first pass below probes
   // missing/stale reports and pending admissions/restores before geometry is solved.
   const size_t maxPasses = workspace.ActiveCount() * 5 + 8;
@@ -1223,12 +1090,7 @@ static void ArrangeWorkspace(
     }
 
     std::vector<RECT> rects;
-    const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
-    std::optional<Layout::BspMergeDestination> merge;
-    if (pending && pending->bspDropEdge) merge = Layout::BspMergeDestination{pending->subject, *pending->bspDropEdge};
-    const auto planStatus = pending && pending->kind == UserLayoutMutationKind::BspRotate
-        ? Layout::BuildWorkspaceLayoutPlan(workspace, workArea, gap, &rects)
-        : Layout::PlanOrTurnNewBspSplit(workspace, workArea, gap, &rects, merge);
+    const auto planStatus = PlanWithPendingLayoutMutation(key, workspace, workArea, gap, &rects);
     if (planStatus == Layout::LayoutPlanStatus::NotApplicable) {
       g_workspaces.Save(key, workspace);
       break;

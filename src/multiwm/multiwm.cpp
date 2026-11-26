@@ -498,6 +498,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
 #include "layout/planning.h"
 #include "layout/resize_learning.h"
 #include "layout/resize_steps.h"
+#include "placement/user_layout_mutation.h"
 #include "placement/arrangement.h"
 #include "placement/conformance.h"
 #include "placement/admission_prediction.h"
