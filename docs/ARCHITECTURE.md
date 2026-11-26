@@ -108,7 +108,7 @@ while MultiWM places the window without them.
 The snapshot holds each current-desktop workspace's next-admission tile and default
 floating frame, definite overflow-float predictions, known window ownership/treatment, rules and per-window
 restore frames. A BSP workspace adds the tiles an arrival tries, in arrangement's order:
-the split tile, that split turned, then the largest other tile both ways, each with the splits above
+the split tile, that split turned, then each other tile in its fallback order (ADR 0004) both ways, each with the splits above
 it and the other sides' minimums. The companion fits the window's live minimum to them with the
 planner's own arithmetic (`shared/split_geometry.h`), so its tile and rectangle are MultiWM's. Prediction uses MultiWM's layout planner with the monitor's physical
 work area, DPI-scaled insets and gap. The companion starts from the application's
@@ -176,18 +176,18 @@ it does not prove every application uses default handling. Restore-to-maximized,
 Floating workspaces, unsupported thread contexts and unavailable hints pass through.
 
 Local overflow-float hints cover definite capacity overflow and a minimum larger
-than the work area when the window will float in place. BSP also publishes a
-local float when none of its tiles can fit even a minimal new window. BSP
-overflow can route to another monitor on the current desktop when enabled.
+than the work area when the window will float in place. A BSP arrival that fits
+none of the published tiles goes to overflow like any other; when more tiles
+exist than fit in the snapshot, the companion gives no hint instead.
 General routed-overflow destinations and full geometry-based admission prediction
 remain deferred (see [the plan](VFX_COMPANION_PLAN.md)).
 
-ABI 6.0 uses fixed-width structures with layout assertions for x86 and x64. Bounds
+ABI 7.0 uses fixed-width structures with layout assertions for x86 and x64. Bounds
 are 16 workspaces, 2048 tracked HWNDs, 128 restore hints and 32 KiB of encoded rules.
 The reader caches the body by generation and writer PID and decodes rules only
-when their bytes change. ABI 6 uses 64-byte tracked entries and 32-byte restore
-entries, and adds each workspace's BSP arrival tiles (up to 4 tiles of up to 16
-splits, 1656 bytes per workspace); its fixed snapshot section is 195656 bytes. Ownership publication walks
+when their bytes change. ABI 7 uses 64-byte tracked entries and 32-byte restore
+entries, and adds each workspace's BSP arrival tiles (up to 16 tiles of up to 16
+splits, 6552 bytes per workspace); its fixed snapshot section is 273992 bytes. Ownership publication walks
 repository metadata and validates cached borders, without planning inactive
 workspaces. The larger body is copied only on generation/writer changes.
 A major-version mismatch gives no hint; both mods must be updated together.

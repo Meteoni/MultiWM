@@ -337,17 +337,16 @@ static std::optional<RECT> PredictFrame(HWND hwnd, const RECT& frame, const Hint
     return (*floating)->frame;
   }
 
-  // FailureCenter uses the default floating size for a new window. BSP floats
-  // a failed split locally, while a release at the window limit uses overflow.
-  if ((inputs.flags & kFlagOverflowCentersFloat) || inputs.bspFloatsLocally ||
-      (inputs.bspLayout && workspace.hasTiledFrame)) {
+  // FailureCenter uses the default floating size for a new window: where
+  // overflow puts a window it floats rather than routes.
+  if (inputs.flags & kFlagOverflowCentersFloat) {
     *floating = PredictFloatingPlacement(workspace, sizeRule, frame, resizable, FloatingSizeSource::Fallback, true);
   }
   if (!workspace.hasTiledFrame) {
     if (!workspace.newWindowFloats) return reject("no free tiled slot");
     if (!*floating) return reject("overflow routes the window");
     *kind = TargetKind::Float;
-    *reason = inputs.bspFloatsLocally ? "BSP floats it locally" : "overflow floats it";
+    *reason = "overflow floats it";
     return (*floating)->frame;
   }
   return workspace.tiledFrame;
@@ -396,11 +395,12 @@ static std::optional<RECT> FitTargetToLimits(
     return std::nullopt;
   };
   if (kind == TargetKind::Float) return SharedGeometry::FitFloatingPlacementToLimits(*floating, limits);
-  const bool bspArrival = inputs.bspArrivals.count > 0 && (!inputs.tracked || inputs.intent == PlacementIntent::Arrival);
+  const bool bspArrival = inputs.bspArrivals && inputs.bspArrivals->count > 0 &&
+                          (!inputs.tracked || inputs.intent == PlacementIntent::Arrival);
   if (bspArrival) {
     using CompanionAbi::BspArrivalChoice;
     BspArrivalChoice choice =
-        CompanionAbi::ChooseBspArrivalTile(inputs.bspArrivals, workArea, limits.minWidth, limits.minHeight);
+        CompanionAbi::ChooseBspArrivalTile(*inputs.bspArrivals, workArea, limits.minWidth, limits.minHeight);
     if (choice.outcome == BspArrivalChoice::Outcome::Tile) {
       // A capped window is centred in its tile, as MultiWM's planner centres it.
       SharedGeometry::CenterWithinMaximumSize(choice.tile.left, choice.tile.right, limits.maxWidth);
@@ -408,7 +408,8 @@ static std::optional<RECT> FitTargetToLimits(
       return choice.tile;
     }
     if (choice.outcome == BspArrivalChoice::Outcome::Unknown) return undecided("BSP tile depends on another arrival");
-    return floating && !inputs.tracked ? floatLocally("no BSP tile fits: floats locally") : noHint("no BSP tile fits");
+    return floating && !inputs.tracked ? floatLocally("no BSP tile fits: overflow floats it")
+                                       : noHint("no BSP tile fits: overflow decides");
   }
   if (const auto fitted = FitSlotToLimits(target, workArea, limits, !inputs.bspLayout)) return fitted;
   if (inputs.bspLayout && FitsMinimum(workArea, limits)) return undecided("BSP tile needs a new layout plan");

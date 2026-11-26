@@ -412,7 +412,7 @@ static bool EnsureWorkspaceFromSnapshot(
   }
 
   g_workspaces.Save(key, workspace);
-  Placement::ArrangeWorkspace(key);
+  Placement::ArrangeWorkspace(key, nullptr, adoptCurrentGeometry);
   return true;
 }
 

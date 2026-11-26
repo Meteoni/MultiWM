@@ -265,15 +265,9 @@ struct LayoutPolicy {
   // after the previous arrival, preserving enumeration order. Otherwise every
   // arrival splits the same anchor (BSP keeps splitting the focused leaf).
   bool burstChainsArrivals = true;
-  // A settling window that no tile fits floats where it is (and says so)
-  // instead of going to Automatic overflow.
-  bool rejectedArrivalFloatsInPlace = false;
   // Automatic overflow's can't-fit floats are toasted even outside a user
   // command. The auto-tiling limit's floats stay quiet in every layout.
   bool announcesSpaceFloats = false;
-  // Automatic overflow may create a new desktop for a released window. Without
-  // it, overflow may still try other monitors.
-  bool overflowMayCreateDesktop = true;
   // Drops near a tile's edge (BSP Split Edge Size) split it instead of swapping.
   bool edgeDropZones = false;
   // Companion hints for a new or restored window whose first slot can't fit
@@ -290,9 +284,8 @@ inline constexpr LayoutPolicy kLayoutPolicies[] = {
     {},  // Dwindle
     {},  // Monocle
     {.layoutAction = LayoutAction::None},  // Floating
-    {.burstChainsArrivals = false, .rejectedArrivalFloatsInPlace = true, .announcesSpaceFloats = true,
-     .overflowMayCreateDesktop = false, .edgeDropZones = true, .predictsRecoveredTile = true,
-     .layoutAction = LayoutAction::RotateSplit},  // Bsp
+    {.burstChainsArrivals = false, .announcesSpaceFloats = true, .edgeDropZones = true,
+     .predictsRecoveredTile = true, .layoutAction = LayoutAction::RotateSplit},  // Bsp
 };
 static_assert(std::size(kLayoutPolicies) == static_cast<size_t>(TileLayout::COUNT),
               "kLayoutPolicies needs one entry per TileLayout");

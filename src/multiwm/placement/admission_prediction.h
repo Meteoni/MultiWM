@@ -16,9 +16,8 @@ struct AdmissionPrediction {
   // new window goes in the Floating layout (NewWindowCenter), and where a window
   // that overflow floats is centred (FailureCenter), before size rules.
   std::optional<RECT> floatingFrame;
-  // Non-Floating layouts: a new window will float regardless of its size.
-  // BSP floats locally when it finds no fitting tile. Automatic overflow can
-  // route other releases (AutomaticOverflowRoutes).
+  // Non-Floating layouts: a new window will go to overflow regardless of its
+  // size, which floats it or routes it (AutomaticOverflowRoutes).
   bool newWindowFloats = false;
 };
 
@@ -126,9 +125,10 @@ static bool BspArrivalsSettled(const Workspace& workspace) {
 
 // The tiles the next Automatic arrival in BSP `workspace` tries, in
 // arrangement's order (CompanionAbi::BspArrivalTiles): the tile admission
-// splits, then that split turned (PlanOrTurnNewBspSplit), then the same
-// two at the largest other tile (TryRecoverSettlingBspWindow). Empty for
-// other layouts. Pure; a few plans, published for the companion. WM thread only.
+// splits, then that split turned (PlanOrTurnNewBspSplit), then the same two at
+// each tile of Layout::BspFallbackTiles (TryRecoverSettlingBspWindow), as many
+// as fit (`truncated` when some don't). Empty for other layouts. Pure; two
+// plans a tile, published for the companion. WM thread only.
 static CompanionAbi::BspArrivalTiles PredictBspArrivalTiles(
     const Workspace& workspace, const Platform::Monitors::WorkspaceMetrics& metrics, bool insertAfterFocused) {
   CompanionAbi::BspArrivalTiles tiles{};
@@ -153,7 +153,14 @@ static CompanionAbi::BspArrivalTiles PredictBspArrivalTiles(
     add(turned);
   };
   addBothDirections(admitted);
-  if (Layout::MoveBspArrivalToLargestTile(admitted, kPredictedWindow)) addBothDirections(admitted);
+  for (HWND tile : Layout::BspFallbackTiles(admitted, kPredictedWindow)) {
+    if (tiles.count + 2 > CompanionAbi::kMaxBspArrivalTiles) {
+      tiles.truncated = 1;
+      break;
+    }
+    Workspace moved = admitted;
+    if (moved.MoveBspLeaf(kPredictedWindow, tile, true)) addBothDirections(moved);
+  }
   return tiles;
 }
 

@@ -27,20 +27,21 @@ namespace CompanionAbi {
 
 // The section exists while MultiWM or any reader holds a handle, so it outlives a
 // MultiWM restart; a restarted MultiWM reopens it and rewrites the header.
-inline constexpr wchar_t kSectionName[] = L"Local\\MultiWM.Companion.Snapshot.v6";
+inline constexpr wchar_t kSectionName[] = L"Local\\MultiWM.Companion.Snapshot.v7";
 // Held open by MultiWM only. Readers probe it to tell a live MultiWM from a
 // section that only their own handles keep alive.
-inline constexpr wchar_t kAliveEventName[] = L"Local\\MultiWM.Companion.Alive.v6";
+inline constexpr wchar_t kAliveEventName[] = L"Local\\MultiWM.Companion.Alive.v7";
 
 inline constexpr uint32_t kMagic = 0x5343574D;  // "MWCS"
-inline constexpr uint16_t kAbiMajor = 6;
+inline constexpr uint16_t kAbiMajor = 7;
 inline constexpr uint16_t kAbiMinor = 0;
 
 inline constexpr uint32_t kMaxWorkspaces = 16;
 inline constexpr uint32_t kMaxTrackedWindows = 2048;
 inline constexpr uint32_t kRulesCapacity = 32768;
 inline constexpr uint32_t kMaxRestoreWindows = 128;
-inline constexpr uint32_t kMaxBspArrivalTiles = 4;
+// Two per tile (both split directions): about 8 tiles a workspace.
+inline constexpr uint32_t kMaxBspArrivalTiles = 16;
 inline constexpr uint32_t kMaxBspPathSplits = 16;
 
 enum SnapshotFlags : uint32_t {
@@ -125,16 +126,18 @@ struct BspArrivalTile {
 };
 
 // The tiles MultiWM tries for the next arrival on a BSP workspace, in its order:
-// the split tile (focused or largest), that split turned, the largest other
-// tile, and that split turned. A window takes the first one that fits it and
-// floats when none does.
+// the split tile (focused or largest), that split turned, then each other tile
+// in its fallback order (ADR 0004), each followed by its split turned. A window
+// takes the first one that fits it; when none does, it goes to overflow.
 struct BspArrivalTiles {
   uint32_t count;  // Up to kMaxBspArrivalTiles.
   // 0 while another arrival hasn't settled: arrangement may then turn that one's
   // split instead, so only the first tile, which needs no turn, is certain.
   uint32_t othersSettled;
   int32_t gap;           // The gap MultiWM plans with, physical pixels.
-  uint32_t reserved0;
+  // 1 when MultiWM tries more tiles than fit here: one that fits none of these
+  // may still fit a later one.
+  uint32_t truncated;
   double adaptiveDeviation;  // How far adaptive splits may move (SharedSplits::SplitFit).
   BspArrivalTile tiles[kMaxBspArrivalTiles];
 };
@@ -148,9 +151,11 @@ struct BspArrivalChoice {
 // Decides as MultiWM's arrangement does: tries `tiles` in its order, fitting
 // the minimum to each one's published splits with the planner's own arithmetic
 // (SharedSplits::SolveBspPath). The first that fits is MultiWM's tile exactly;
-// none means MultiWM floats the window. Unknown when the snapshot can't say: no
-// tiles, a path too deep to publish, or a later tile while another arrival
-// hasn't settled (arrangement may turn that one's split instead). Pure.
+// none means the window goes to overflow (Floats: where overflow puts it is the
+// caller's to work out). Unknown when the snapshot can't say: no tiles, a path
+// too deep to publish, a later tile while another arrival hasn't settled
+// (arrangement may turn that one's split instead), or none fitting a truncated
+// list. Pure.
 inline BspArrivalChoice ChooseBspArrivalTile(const BspArrivalTiles& tiles, const RECT& workArea, LONG minWidth,
                                              LONG minHeight) {
   const uint32_t count = tiles.count < kMaxBspArrivalTiles ? tiles.count : kMaxBspArrivalTiles;
@@ -162,7 +167,7 @@ inline BspArrivalChoice ChooseBspArrivalTile(const BspArrivalTiles& tiles, const
       return {BspArrivalChoice::Outcome::Tile, *frame};
     }
   }
-  if (count == 0 || !tiles.othersSettled) return {};
+  if (count == 0 || !tiles.othersSettled || tiles.truncated) return {};
   return {BspArrivalChoice::Outcome::Floats, {}};
 }
 
@@ -176,7 +181,7 @@ struct SnapshotBody {
   uint32_t restoreWindowCount;
   // One bit per workspace. Zero from older writers.
   uint16_t bspWorkspaces;  // BSP tile hints may require the full tree to refit.
-  uint16_t bspLocalFloats; // Definite BSP admission floats that stay on this monitor.
+  uint16_t reserved0;
   WorkspaceHint workspaces[kMaxWorkspaces];
   // Every known window, including owners on other desktops. HWND values are
   // 32-bit significant on Windows. Duplicate owners publish Unknown treatment.

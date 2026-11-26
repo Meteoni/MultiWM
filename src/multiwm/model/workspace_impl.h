@@ -1390,6 +1390,15 @@ bool Workspace::MoveBspLeaf(HWND source, HWND target, bool allowAlternateDirecti
   return true;
 }
 
+bool Workspace::RebuildBspTree() {
+  RuntimeLifecycle::AssertWmThread(L"Workspace::RebuildBspTree");
+  if (layout_ != TileLayout::Bsp) return false;
+  bspTree_.Clear();
+  SyncBspTree();
+  DebugValidateMutation(L"Workspace::RebuildBspTree");
+  return true;
+}
+
 bool Workspace::MoveSettlingWindowToIndex(HWND hwnd, size_t targetIndex) {
   RuntimeLifecycle::AssertWmThread(L"Workspace::MoveSettlingWindowToIndex");
   if (layout_ == TileLayout::Bsp) return false;

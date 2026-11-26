@@ -363,8 +363,9 @@ static std::wstring SpaceFloatMessage(const std::vector<SpaceFloat>& floats) {
                                            : std::to_wstring(floats.size()) + L" windows";
   if (message.empty()) message = L"A window";
   message += L" floated";
-  if (floats.size() == 1 && floats.front().reason == SpaceFloatReason::NoBspTileFits) {
-    return message + L" because no tile fits";
+  if (floats.size() == 1 && floats.front().reason == SpaceFloatReason::CannotFit) {
+    if (floats.front().shortSide == ShortSide::Width) return message + L": no tile is wide enough";
+    if (floats.front().shortSide == ShortSide::Height) return message + L": no tile is tall enough";
   }
   if (countLimited == floats.size()) return message + L" at the auto-tiling limit";
   if (countLimited) return message + L" due to space or the auto-tiling limit";
@@ -445,12 +446,12 @@ static size_t AutomaticWindowLimitForMonitor(const Model::MonitorId& monitor) {
 // True when Automatic overflow routes a window it releases to another monitor or
 // an allowed new desktop (it floats in place meanwhile). Otherwise it floats
 // and centres the window. The companion snapshot publishes this policy.
-static bool AutomaticOverflowRoutes(bool allowNewDesktop = true) {
+static bool AutomaticOverflowRoutes() {
   // With exactly one display, monitor-only routing has no destination. The
   // inexpensive count query also keeps the publisher current after hot-plug.
   // A zero/unknown count retains routing rather than promising a float hint.
   return RuntimeLifecycle::IsAutomaticMode() && Platform::WindowEvents::g_hooks.hideDestroy &&
-         ((allowNewDesktop && g_settings.overflowCreateDesktop) ||
+         (g_settings.overflowCreateDesktop ||
           (g_settings.overflowTryOtherMonitors && GetSystemMetrics(SM_CMONITORS) != 1));
 }
 
@@ -459,27 +460,25 @@ static bool AutomaticOverflowRoutes(bool allowNewDesktop = true) {
 // midway through admission. A failed route therefore already has a safe fallback.
 static bool FloatAutomaticOverflowWindow(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
-    SpaceFloatReason reason, std::vector<SpaceFloat>& localFloats) {
+    SpaceFloatReason reason, std::vector<SpaceFloat>& localFloats, ShortSide shortSide = ShortSide::Unknown) {
   const WindowRecord* record = workspace.Find(hwnd);
   if (!record) return false;
   const DWORD processId = record->pid;
   const bool monitorFixed = record->automaticOverflowMonitorFixed;
   const uint64_t generation = record->tilingGeneration;
-  const LayoutPolicy& policy = LayoutPolicyOf(workspace.Layout());
-  const bool allowNewDesktop = policy.overflowMayCreateDesktop;
-  const bool route = AutomaticOverflowRoutes(allowNewDesktop);
-  const bool announce = policy.announcesSpaceFloats && reason != SpaceFloatReason::CountLimit;
+  const bool route = AutomaticOverflowRoutes();
+  const bool announce = LayoutPolicyOf(workspace.Layout()).announcesSpaceFloats && reason != SpaceFloatReason::CountLimit;
   CancelConformanceLease(hwnd);
   DiscardPendingSettlingRecovery(hwnd);
   if (!(route ? workspace.Float(hwnd) : FloatWindowAfterFailure(key, workspace, hwnd))) return false;
   if (route) {
     g_wm.overflow.windows.insert(hwnd);
     g_wm.overflow.queue.push_back(
-        {hwnd, processId, key.desktopId, key.monitor.deviceId, monitorFixed, generation, allowNewDesktop, reason,
-         announce});
+        {hwnd, processId, key.desktopId, key.monitor.deviceId, monitorFixed, generation, reason, announce,
+         shortSide});
     Reconcile::ScheduleLifecycleReconcile(nullptr);
   } else {
-    localFloats.push_back({hwnd, reason, announce});
+    localFloats.push_back({hwnd, reason, announce, shortSide});
   }
   Diagnostics::RecordEvent(L"automatic overflow hwnd=%p reason=%ls route=%d", hwnd,
                            reason == SpaceFloatReason::CountLimit ? L"count limit" : L"cannot fit", route ? 1 : 0);
@@ -590,6 +589,9 @@ struct ArrangementContext {
   HWND preferredTiledWindow;
   std::vector<SpaceFloat> localFloats;
   AppToast unresolvedConstraint;  // Shown once the arrangement ends, unless something floated.
+  // Tile Workspace: BSP may lay its tree out afresh, once, before a window
+  // goes to overflow (TryRebuildBspTree).
+  bool mayRebuildBspTree = false;
 };
 
 enum class ArrangementStep { Replan, Finished };
@@ -810,8 +812,29 @@ static void ApplySettlingRecovery(
   g_workspaces.Save(key, workspace);
 }
 
-// Floats the chosen window and saves. In a layout whose rejected arrivals
-// float in place (BSP), an admission does so once all candidate tiles failed.
+// Which of `hwnd`'s minimums keeps it out of `workspace`: Width when it would
+// fit, by the same plan and tile search arrangement uses, with no minimum width,
+// Height likewise; Unknown when either or neither would do. Plans only.
+static ShortSide FindShortSide(const Workspace& workspace, HWND hwnd, const RECT& workArea, LONG gap) {
+  const WindowRecord* record = workspace.Find(hwnd);
+  if (!record || !record->constraints.valid) return ShortSide::Unknown;
+  auto fitsWithout = [&](LONG WindowConstraints::*minimum) {
+    Workspace trial = workspace;
+    WindowConstraints relaxed = record->constraints;
+    relaxed.*minimum = 1;
+    trial.UpdateConstraints(hwnd, relaxed);
+    std::vector<RECT> rects;
+    Layout::SettlingRecoveryPlan recovery;
+    return Layout::PlanOrTurnNewBspSplit(trial, workArea, gap, &rects) == Layout::LayoutPlanStatus::Success ||
+           Layout::TryRecoverSettlingWindow(trial, workArea, gap, {{hwnd, 0}}, nullptr, &recovery);
+  };
+  const bool tooWide = fitsWithout(&WindowConstraints::minWidth);
+  if (tooWide == fitsWithout(&WindowConstraints::minHeight)) return ShortSide::Unknown;
+  return tooWide ? ShortSide::Width : ShortSide::Height;
+}
+
+// Floats the chosen window and saves: through Automatic overflow in Automatic
+// mode, in place in Manual mode.
 static ArrangementStep ReleaseConstraintVictim(
     Workspace& workspace, ArrangementContext& context, const std::vector<RECT>& rects,
     const std::vector<WindowConstraints>& activeConstraints, const ConstraintVictim& victim,
@@ -820,28 +843,57 @@ static ArrangementStep ReleaseConstraintVictim(
   RecordConstraintRemoval(workspace, rects, activeConstraints, victimRecord, victim.hwnd,
                           victim.reason, context.preferredTiledWindow);
   CancelConformanceLease(victim.hwnd);
-  const bool rejectedArrival = LayoutPolicyOf(workspace.Layout()).rejectedArrivalFloatsInPlace &&
-                               victimRecord.settling;
-  const bool useOverflow = RuntimeLifecycle::IsAutomaticMode() && !rejectedArrival;
+  const bool useOverflow = RuntimeLifecycle::IsAutomaticMode();
+  const ShortSide shortSide = FindShortSide(workspace, victim.hwnd, context.metrics.workArea, context.metrics.gap);
   DiscardPendingSettlingRecovery(victim.hwnd);
   const bool floated = useOverflow
-      ? FloatAutomaticOverflowWindow(key, workspace, victim.hwnd, SpaceFloatReason::CannotFit, context.localFloats)
+      ? FloatAutomaticOverflowWindow(key, workspace, victim.hwnd, SpaceFloatReason::CannotFit, context.localFloats,
+                                     shortSide)
       : FloatWindowAfterFailure(key, workspace, victim.hwnd);
   if (!floated) {
     g_workspaces.Save(key, workspace);
     return ArrangementStep::Finished;
   }
   if (!useOverflow) {
-    const auto reason = rejectedArrival ? SpaceFloatReason::NoBspTileFits : SpaceFloatReason::CannotFit;
-    context.localFloats.push_back({victim.hwnd, reason});
+    context.localFloats.push_back({victim.hwnd, SpaceFloatReason::CannotFit, true, shortSide});
   }
   ++Diagnostics::g_runtime.counters.constraintFloats;
   g_workspaces.Save(key, workspace);
   return workspace.NoTiledWindows() ? ArrangementStep::Finished : ArrangementStep::Replan;
 }
 
+// Tile Workspace's last try in BSP before a window goes to overflow (ADR 0004):
+// the tree laid out afresh (Workspace::RebuildBspTree), kept only if every
+// window then fits, moving settling windows to other tiles if need be. It resets
+// the user's splits, so only when the alternative is losing a window. Once per
+// arrangement. Saves when it keeps the new tree.
+static bool TryRebuildBspTree(Workspace& workspace, ArrangementContext& context) {
+  if (!context.mayRebuildBspTree || workspace.Layout() != TileLayout::Bsp) return false;
+  context.mayRebuildBspTree = false;
+  const RECT& workArea = context.metrics.workArea;
+  const LONG gap = context.metrics.gap;
+  Workspace rebuilt = workspace;
+  if (!rebuilt.RebuildBspTree()) return false;
+  std::vector<RECT> rects;
+  if (Layout::PlanOrTurnNewBspSplit(rebuilt, workArea, gap, &rects) != Layout::LayoutPlanStatus::Success) {
+    Layout::SettlingRecoveryPlan recovery;
+    if (!Layout::TryRecoverSettlingWindow(rebuilt, workArea, gap,
+                                          OrderRemovalCandidates(rebuilt, context.preferredTiledWindow),
+                                          context.preferredTiledWindow, &recovery)) {
+      return false;
+    }
+    rebuilt = std::move(recovery.workspace);
+  }
+  workspace = std::move(rebuilt);
+  Wh_Log(L"Tile Workspace rebuilt the BSP tree so every window fits");
+  Diagnostics::RecordEvent(L"bsp tree rebuilt by Tile Workspace desktop=%08X", context.key.desktopId.Data1);
+  g_workspaces.Save(context.key, workspace);
+  return true;
+}
+
 // Handles one failed plan, trying in order: roll back a provisional user change;
 // float a window that can never fit; move a settling window to a slot it fits;
+// in Tile Workspace's BSP, rebuild the tree (TryRebuildBspTree);
 // unless a settling window introduced the conflict, reorder the existing
 // windows so all of them fit; float one window chosen by ChooseConstraintVictim. Saves are explicit; Replan
 // means the next arrangement pass must plan again from the resulting workspace.
@@ -877,6 +929,7 @@ static ArrangementStep RecoverUnsatisfiableLayout(
       ApplySettlingRecovery(key, workspace, settlingRecoveryBaseline, recovery);
       return ArrangementStep::Replan;
     }
+    if (TryRebuildBspTree(workspace, context)) return ArrangementStep::Replan;
     const HWND introducingSettlingWindow =
         FindIntroducingSettlingWindow(workspace, candidates, workArea, gap);
     // Not a newcomer's fault: reorder the windows already here rather than float
@@ -1046,8 +1099,9 @@ static ArrangementStep ApplyWorkspacePlacements(
 // refresh a native constraint or select one constraint-removal candidate.
 // WM thread only. Commits snapshots and native placement; a failed pass may have
 // repaired ownership/geometry or released a member before the next replan.
+// `mayRebuildBspTree`: Tile Workspace (ArrangementContext::mayRebuildBspTree).
 static void ArrangeWorkspace(
-    const DesktopMonitorKey& key, HWND preferredTiledWindow) {
+    const DesktopMonitorKey& key, HWND preferredTiledWindow, bool mayRebuildBspTree) {
   ++Diagnostics::g_runtime.counters.arrangeCalls;
   if (!IsWorkspaceOnActiveDesktop(key)) return;
 
@@ -1064,6 +1118,7 @@ static void ArrangeWorkspace(
 
   ObserveAndRepairWorkspaceForArrangement(workspace);
   ArrangementContext context{key, monitor, metrics, preferredTiledWindow};
+  context.mayRebuildBspTree = mayRebuildBspTree;
   EnforceAutomaticWindowLimit(key, workspace, monitor, context.localFloats);
   DropStaleLayoutMutation(key, workspace, L"before arrangement");
   // Native reports are cached between arrangements. The first pass below probes

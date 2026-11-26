@@ -223,7 +223,11 @@ struct PendingWorkspaceArrange {
   HMONITOR monitor = nullptr;
 };
 
-enum class SpaceFloatReason { CannotFit, CountLimit, NoBspTileFits };
+enum class SpaceFloatReason { CannotFit, CountLimit };
+
+// The one of a window's minimums that kept it out of every tile, so a toast can
+// say which (Placement::FindShortSide). Unknown when both or neither did.
+enum class ShortSide { Unknown, Width, Height };
 
 struct SpaceFloat {
   HWND window;
@@ -231,6 +235,7 @@ struct SpaceFloat {
   // Toasted even outside a user command. Automatic overflow floats quietly, as
   // it was set up to; BSP's can't-fit floats and Manual mode's floats say so.
   bool announce = true;
+  ShortSide shortSide = ShortSide::Unknown;  // CannotFit only.
 };
 
 struct PendingWindowOverflow {
@@ -240,10 +245,9 @@ struct PendingWindowOverflow {
   std::wstring sourceMonitorId;
   bool monitorFixed = false;
   uint64_t tilingGeneration = 0;
-  // The releasing layout's LayoutPolicy::overflowMayCreateDesktop, kept even after rebasing.
-  bool allowNewDesktop = true;
   SpaceFloatReason reason = SpaceFloatReason::CannotFit;
   bool announceLocalFloat = false;  // SpaceFloat::announce if routing ends in a local float.
+  ShortSide shortSide = ShortSide::Unknown;  // SpaceFloat::shortSide, likewise.
 };
 
 // A requested switch to the desktop a window was moved to, cancelled if the

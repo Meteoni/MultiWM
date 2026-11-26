@@ -14,9 +14,9 @@ struct HintInputs {
   uint32_t flags = 0;
   bool tracked = false;  // MultiWM already has a record for the window.
   bool bspLayout = false;
-  bool bspFloatsLocally = false;
   // BSP: the tiles an arrival tries, in MultiWM's order; count 0 when unknown.
-  CompanionAbi::BspArrivalTiles bspArrivals{};
+  // Null in other layouts. On the heap: a few kilobytes, and hints run on app stacks.
+  std::unique_ptr<CompanionAbi::BspArrivalTiles> bspArrivals;
   PlacementIntent intent = PlacementIntent::Admission;
   std::optional<CompanionAbi::WorkspaceHint> workspace;  // The workspace on the window's monitor.
   // Where MultiWM will tile the window once restored (visible frame). Absent
@@ -164,8 +164,7 @@ static bool ReadHintInputs(HWND hwnd, const RECT& monitorRect, HintInputs* out) 
     out->rules = g_reader.rules;
     out->workspace.reset();
     out->bspLayout = false;
-    out->bspFloatsLocally = false;
-    out->bspArrivals = {};
+    out->bspArrivals.reset();
     out->restoreFrame.reset();
     out->restoreFrameMargins.reset();
     out->restoreMarginsDpi = 0;
@@ -175,8 +174,7 @@ static bool ReadHintInputs(HWND hwnd, const RECT& monitorRect, HintInputs* out) 
       if (EqualRect(&body.workspaces[i].monitorRect, &monitorRect)) {
         out->workspace = body.workspaces[i];
         out->bspLayout = (body.bspWorkspaces & (1u << i)) != 0;
-        out->bspFloatsLocally = (body.bspLocalFloats & (1u << i)) != 0;
-        if (out->bspLayout) out->bspArrivals = body.bspArrivals[i];
+        if (out->bspLayout) out->bspArrivals = std::make_unique<CompanionAbi::BspArrivalTiles>(body.bspArrivals[i]);
         workspaceIndex = i;
         break;
       }

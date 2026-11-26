@@ -809,21 +809,62 @@ static bool TryNearbyIndices(size_t origin, size_t count, TryIndex&& tryIndex) {
   return false;
 }
 
-// Moves BSP arrival `arrival` from the tile it split to a split of the largest
-// other tile, measured without the arrival. False, changing nothing, when that
-// is the tile it already split (MoveBspLeaf refuses its sibling) or there is
-// none. The new split may still turn (PlanOrTurnNewBspSplit).
-static bool MoveBspArrivalToLargestTile(Workspace& workspace, HWND arrival) {
-  BspTree without = workspace.Bsp();
+// The tiles BSP arrival `arrival` tries after the one it split, in order
+// (ADR 0004). Following focus (After focused, with a focused tile): outward
+// through the tree from the arrival, its sibling's subtree first, then each
+// level up, tiles equally near largest first. Otherwise every other tile,
+// largest first. Sizes are measured without the arrival. Never its sibling
+// leaf: that is the tile it already split (MoveBspLeaf refuses it anyway).
+static std::vector<HWND> BspFallbackTiles(const Workspace& workspace, HWND arrival) {
+  const BspTree& tree = workspace.Bsp();
+  const size_t leaf = tree.FindLeaf(arrival);
+  const size_t parent = leaf == BspTree::kNotFound ? BspTree::kNotFound : tree.Parent(leaf);
+  if (parent == BspTree::kNotFound) return {};
+
+  BspTree without = tree;
   without.Remove(arrival);
-  const HWND largest = without.LargestLeaf([&](HWND window) { return window != arrival && workspace.IsTiled(window); });
-  return largest && workspace.MoveBspLeaf(arrival, largest, true);
+  const auto shares = without.LeafShares([&](HWND window) { return window != arrival && workspace.IsTiled(window); });
+  auto shareOf = [&](HWND window) {
+    for (const auto& [shown, share] : shares) {
+      if (shown == window) return share;
+    }
+    return -1.0;  // Not tiled: not a tile to try.
+  };
+  auto largestFirst = [&](std::vector<HWND>& windows) {
+    std::stable_sort(windows.begin(), windows.end(), [&](HWND a, HWND b) { return shareOf(a) > shareOf(b); });
+  };
+  auto keep = [&](HWND window) { return shareOf(window) >= 0.0; };
+
+  std::vector<HWND> order;
+  const bool nearestFirst = g_settings.automaticNewWindowPosition == AutomaticNewWindowPosition::AfterFocused &&
+                            workspace.LastFocusedTiledWindow(arrival);
+  if (!nearestFirst) {
+    for (const auto& [window, share] : shares) order.push_back(window);
+    largestFirst(order);
+  } else {
+    // At each ancestor of the arrival, the leaves of the side it isn't on.
+    for (size_t child = leaf, split = parent; split != BspTree::kNotFound; child = split, split = tree.Parent(split)) {
+      const size_t other = child == split + 1 ? tree.SecondChild(split) : split + 1;
+      std::vector<HWND> level;
+      for (size_t i = other, end = tree.SubtreeEnd(other); i < end; ++i) {
+        if (!BspTree::IsSplit(tree.Nodes()[i]) && keep(tree.Nodes()[i].window)) level.push_back(tree.Nodes()[i].window);
+      }
+      largestFirst(level);
+      order.insert(order.end(), level.begin(), level.end());
+    }
+  }
+
+  const size_t sibling = leaf == parent + 1 ? tree.SecondChild(parent) : parent + 1;
+  if (!BspTree::IsSplit(tree.Nodes()[sibling])) {
+    std::erase(order, tree.Nodes()[sibling].window);
+  }
+  return order;
 }
 
 // BSP's fallback for an arrival that fits neither direction of the tile it
-// split (the focused or the largest): the largest other tile, once, in either
-// direction. When that tile is the one it already split, or doesn't fit
-// either, the window floats. Same contract as TryRecoverSettlingWindow.
+// split (the focused or the largest): each tile of BspFallbackTiles in turn,
+// in either direction. When none fits, the window goes to overflow. Same
+// contract as TryRecoverSettlingWindow.
 static bool TryRecoverSettlingBspWindow(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     const std::vector<ConstraintCandidate>& candidates, HWND preferredTiledWindow,
@@ -834,23 +875,25 @@ static bool TryRecoverSettlingBspWindow(
         !workspace.IsTiled(candidate.hwnd)) {
       continue;
     }
-    Workspace trial = workspace;
-    std::vector<RECT> rects;
-    if (!MoveBspArrivalToLargestTile(trial, candidate.hwnd) ||
-        PlanOrTurnNewBspSplit(trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
-      continue;
+    for (HWND tile : BspFallbackTiles(workspace, candidate.hwnd)) {
+      Workspace trial = workspace;
+      std::vector<RECT> rects;
+      if (!trial.MoveBspLeaf(candidate.hwnd, tile, true) ||
+          PlanOrTurnNewBspSplit(trial, workArea, gap, &rects) != LayoutPlanStatus::Success) {
+        continue;
+      }
+      const size_t fromIndex = workspace.TiledIndex(candidate.hwnd);
+      const size_t toIndex = trial.TiledIndex(candidate.hwnd);
+      *outPlan = {std::move(trial), candidate.hwnd, fromIndex, toIndex, std::move(rects)};
+      return true;
     }
-    const size_t fromIndex = workspace.TiledIndex(candidate.hwnd);
-    const size_t toIndex = trial.TiledIndex(candidate.hwnd);
-    *outPlan = {std::move(trial), candidate.hwnd, fromIndex, toIndex, std::move(rects)};
-    return true;
   }
   return false;
 }
 
 // Precondition: the current order already failed its ordinary layout plan.
 // Search nearby slots for each settling window, preserving the other windows' order.
-// BSP tries the largest other tile instead (TryRecoverSettlingBspWindow).
+// BSP tries its other tiles instead (TryRecoverSettlingBspWindow).
 // The input workspace and native windows are untouched.
 // A failed search leaves outPlan untouched. ArrangeWorkspace commits a
 // successful trial after preserving rollback state.

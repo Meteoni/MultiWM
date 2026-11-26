@@ -53,6 +53,13 @@ A possible fix: treat restores that arrive within one reconcile burst as one
 arrival group, splitting the largest tiles in turn, and publish restore frames
 for that case.
 
+## BSP: an arrival on a crowded monitor may get no hint
+
+The snapshot holds 16 of the tiles a BSP arrival tries, two per tile, so about 8
+tiles. A window that fits none of those on a monitor with more tiles gets no
+hint: it shows where the app puts it, then MultiWM moves it to a later tile or
+sends it to overflow.
+
 ## BSP: an arrival right after another may get no hint
 
 Until a window holds its tile, arrangement may still turn its new split to fit a

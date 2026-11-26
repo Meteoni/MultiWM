@@ -27,7 +27,8 @@ struct FloatingPlacementHint {
   POINT anchor{};  // Physical screen pixels; used only by PreserveAnchor.
 };
 // Defined in placement/arrangement.h.
-static void ArrangeWorkspace(const DesktopMonitorKey& key, HWND preferredTiledWindow = nullptr);
+static void ArrangeWorkspace(const DesktopMonitorKey& key, HWND preferredTiledWindow = nullptr,
+                             bool mayRebuildBspTree = false);
 static bool RefreshWorkspaceNativeConstraints(Workspace& workspace, bool forceAll, const wchar_t* reason);
 static std::wstring ProcessDisplayName(HWND hwnd);
 static void ShowWindowConstraintConflict(

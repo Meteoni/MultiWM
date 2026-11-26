@@ -6,7 +6,8 @@
 // one for every departure:
 //  - An arriving window (new, restored, re-tiled or moved here) splits the
 //    focused window's leaf, as bspwm does, or the largest leaf, and takes the
-//    second half.
+//    second half. If it doesn't fit there, it tries the other leaves in turn
+//    (Layout::BspFallbackTiles, ADR 0004).
 //  - A leaving window (closed, floated, minimized, hidden or moved away) gives
 //    its space to its sibling, so only the sibling's windows change size
 //    (moving up a level turns splits that still follow the depth rule).
@@ -111,20 +112,15 @@ class BspTree {
     }
   }
 
-  // The window whose leaf gets the largest share of the area when only the
-  // leaves `shown` accepts are laid out, the first of equals; null when none
-  // is shown. Shares come from the ratios alone, so no work area is needed:
-  // gaps and rounding move them by a few pixels at most.
-  HWND LargestLeaf(const std::function<bool(HWND)>& shown) const {
-    if (nodes_.empty()) return nullptr;
-    HWND largest = nullptr;
-    double largestShare = 0.0;
+  // Each leaf `shown` accepts, in leaf order, with its share of the area when
+  // only those leaves are laid out. Shares come from the ratios alone, so no
+  // work area is needed: gaps and rounding move them by a few pixels at most.
+  std::vector<std::pair<HWND, double>> LeafShares(const std::function<bool(HWND)>& shown) const {
+    std::vector<std::pair<HWND, double>> shares;
+    if (nodes_.empty()) return shares;
     auto visit = [&](auto&& self, size_t node, double share) -> void {
       if (!IsSplit(nodes_[node])) {
-        if (shown(nodes_[node].window) && share > largestShare * (1.0 + 1e-9)) {
-          largest = nodes_[node].window;
-          largestShare = share;
-        }
+        if (shown(nodes_[node].window)) shares.emplace_back(nodes_[node].window, share);
         return;
       }
       // A side with nothing shown gives the whole share to the other, as the layout does.
@@ -134,6 +130,20 @@ class BspTree {
       self(self, second, AnyLeaf(node + 1, shown) ? share * (1.0 - ratio) : share);
     };
     visit(visit, 0, 1.0);
+    return shares;
+  }
+
+  // The window whose leaf gets the largest share (LeafShares), the first of
+  // equals; null when none is shown.
+  HWND LargestLeaf(const std::function<bool(HWND)>& shown) const {
+    HWND largest = nullptr;
+    double largestShare = 0.0;
+    for (const auto& [window, share] : LeafShares(shown)) {
+      if (share > largestShare * (1.0 + 1e-9)) {
+        largest = window;
+        largestShare = share;
+      }
+    }
     return largest;
   }
 

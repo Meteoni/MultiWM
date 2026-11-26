@@ -171,15 +171,7 @@ static void AppendWorkspaceHints(const GUID& desktop, CompanionAbi::SnapshotBody
     body->bspArrivals[workspaceIndex] = limitReached
         ? CompanionAbi::BspArrivalTiles{}
         : Placement::PredictBspArrivalTiles(workspace, metrics, insertAfterFocused);
-    if (workspace.Layout() == TileLayout::Bsp) {
-      const auto workspaceBit = static_cast<uint16_t>(1u << workspaceIndex);
-      body->bspWorkspaces |= workspaceBit;
-      const bool overflowRoutes =
-          Placement::AutomaticOverflowRoutes(LayoutPolicyOf(workspace.Layout()).overflowMayCreateDesktop);
-      if (prediction.newWindowFloats && (!limitReached || !overflowRoutes)) {
-        body->bspLocalFloats |= workspaceBit;
-      }
-    }
+    if (workspace.Layout() == TileLayout::Bsp) body->bspWorkspaces |= static_cast<uint16_t>(1u << workspaceIndex);
     CompanionAbi::WorkspaceHint& hint = body->workspaces[workspaceIndex];
     hint.monitorRect = monitorInfo.rcMonitor;
     hint.workArea = metrics.workArea;

@@ -375,18 +375,18 @@ int main() {
     hinted("a minimum wider than the work area gives no hint while overflow routes", false, 0, 0);
 
     body.bspWorkspaces = 1;
-    hinted("BSP centres a window larger than the work area even when overflow routes", true, Width(work) + 200,
-           std::max<LONG>(600, floatHeight));
+    hinted("BSP, like the other layouts, gives no hint for a window larger than the work area while overflow routes",
+           false, 0, 0);
     limits.minimum = {700, 600};
     hinted("BSP defers a too-small tile to the full layout planner", false, 0, 0);
     workspace.hasTiledFrame = 0;
     workspace.newWindowFloats = 1;
-    hinted("the BSP count limit can still route to another monitor", false, 0, 0);
-    body.bspLocalFloats = 1;
+    hinted("a BSP window that goes to overflow gets no hint while overflow routes", false, 0, 0);
+    body.flags = completeFlags | CompanionAbi::kFlagOverflowCentersFloat;
     limits.minimum = {100, 100};
-    hinted("a definite BSP fit failure centres the window on this monitor", true, floatWidth, floatHeight);
+    hinted("a BSP overflow float centres the window when overflow doesn't route", true, floatWidth, floatHeight);
+    body.flags = completeFlags;
     body.bspWorkspaces = 0;
-    body.bspLocalFloats = 0;
     workspace.hasTiledFrame = 1;
     workspace.newWindowFloats = 0;
 
@@ -433,7 +433,19 @@ int main() {
     limits.minimum = {wide, tall};
     tiledAt("too tall for that too, it takes the next tile", work);
     limits.minimum = {Width(work) + 200, 500};
-    hinted("a BSP arrival no tile fits floats on this monitor", true, Width(work) + 200, std::max<LONG>(500, floatHeight));
+    hinted("a BSP arrival no tile fits gets no hint while overflow routes", false, 0, 0);
+    body.flags = completeFlags | CompanionAbi::kFlagOverflowCentersFloat;
+    hinted("a BSP arrival no tile fits is centred when overflow floats it", true, Width(work) + 200,
+           std::max<LONG>(500, floatHeight));
+    body.flags = completeFlags;
+    arrivals.truncated = 1;
+    limits.minimum = {wide, tall};
+    tiledAt("a truncated list still places a window that fits a published tile", work);
+    limits.minimum = {Width(work) + 200, 500};
+    body.flags = completeFlags | CompanionAbi::kFlagOverflowCentersFloat;
+    hinted("one that fits none of a truncated list gets no hint", false, 0, 0);
+    body.flags = completeFlags;
+    arrivals.truncated = 0;
     arrivals.othersSettled = 0;
     limits.minimum = {wide, 200};
     hinted("while another arrival settles, only the first tile is certain", false, 0, 0);

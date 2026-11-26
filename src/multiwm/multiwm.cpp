@@ -80,7 +80,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       - automatic: Automatic
   - AutomaticNewWindowPosition: last_slot
     $name: Automatic Window Insertion Position
-    $description: Where new or moved windows are tiled in Automatic mode. BSP tries both split directions in the selected tile, then in the biggest tile, before floating the window. If there is no focused tile, BSP starts with the biggest tile.
+    $description: Where new or moved windows are tiled in Automatic mode. BSP tries both split directions in the selected tile, then in each other tile until one fits, before the window goes to Overflow. Focused tile tries the tiles nearest the focused one first; Biggest tile, or no focused tile, tries the biggest first.
     $options:
       - last_slot: Last slot / Biggest tile (BSP)
       - after_focused: After focused / Focused tile (BSP)
@@ -162,7 +162,7 @@ MultiWM has a dedicated [GitHub repository](https://github.com/Meteoni/MultiWM)!
       $description: Maximum tiled windows per monitor on each desktop. 0 means unlimited.
     - Action: float
       $name: Overflow Action
-      $description: Applies when tiled windows exceed the limit or cannot fit. BSP uses Float window and can try other monitors on the current desktop when enabled. A new or returning BSP window floats in place if neither its tile nor the biggest one can fit it. Created virtual desktops stay after their windows close or MultiWM is turned off.
+      $description: Applies in Automatic mode when tiled windows exceed the limit or cannot fit in any tile. Created virtual desktops stay after their windows close or MultiWM is turned off.
       $options:
         - float: Float window
         - new_desktop: New desktop after current

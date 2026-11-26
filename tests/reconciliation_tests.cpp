@@ -2528,6 +2528,15 @@ static void RunCommandReleaseTests() {
   check(Placement::SpaceFloatMessage({{nullptr, SpaceFloatReason::CannotFit}}) ==
             L"A window floated because it needs more space",
         "an unnamed constraint float still gets a message");
+  check(Placement::SpaceFloatMessage({{nullptr, SpaceFloatReason::CannotFit, true, ShortSide::Width}}) ==
+                L"A window floated: no tile is wide enough" &&
+            Placement::SpaceFloatMessage({{nullptr, SpaceFloatReason::CannotFit, true, ShortSide::Height}}) ==
+                L"A window floated: no tile is tall enough",
+        "a constraint float names the side no tile could give it");
+  check(Placement::SpaceFloatMessage({{nullptr, SpaceFloatReason::CannotFit, true, ShortSide::Width},
+                                      {nullptr, SpaceFloatReason::CannotFit, true, ShortSide::Height}}) ==
+            L"2 windows floated because they need more space",
+        "several floats keep the summary");
   check(Placement::SpaceFloatMessage({{nullptr, SpaceFloatReason::CountLimit}, {nullptr, SpaceFloatReason::CannotFit}}) ==
             L"2 windows floated due to space or the auto-tiling limit",
         "one summary covers both release reasons");
@@ -2565,14 +2574,13 @@ static void RunCommandReleaseTests() {
   f.Seed(TileLayout::Bsp);
   auto snapshot = std::make_unique<CompanionAbi::SnapshotBody>();
   CompanionSnapshot::BuildBody(f.key.desktopId, snapshot.get());
-  check(snapshot->workspaceCount == 1 && snapshot->bspLocalFloats == 1 &&
-            snapshot->workspaces[0].newWindowFloats && !(snapshot->flags & CompanionAbi::kFlagOverflowCentersFloat),
-        "the companion predicts a local float for a BSP count limit while other layouts can create desktops");
+  check(snapshot->workspaceCount == 1 && snapshot->workspaces[0].newWindowFloats &&
+            !(snapshot->flags & CompanionAbi::kFlagOverflowCentersFloat),
+        "the companion predicts no local float for a BSP count limit when overflow can create a desktop");
   for (const auto reason : {SpaceFloatReason::CountLimit, SpaceFloatReason::CannotFit}) {
-    FloatingWindowFixture::AppMove(hwnd, f.workArea.left + 20, f.workArea.top + 20, 400, 300);
-    check(release(reason, TileLayout::Bsp) && !g_wm.HasPendingOverflow(hwnd) &&
-              IsCenteredIn(FloatingWindowFixture::Frame(hwnd), f.center),
-          "BSP overflow floats in place when the only other option is a new desktop");
+    check(release(reason, TileLayout::Bsp) && g_wm.HasPendingOverflow(hwnd) && localFloats.empty(),
+          "BSP overflow can create a new desktop, as the other layouts do");
+    g_wm.CancelPendingOverflow(hwnd);
   }
   {
     Commands::CommandReleaseScope scope;
@@ -2598,11 +2606,8 @@ static void RunCommandReleaseTests() {
 
   if (GetSystemMetrics(SM_CMONITORS) != 1) {
     g_settings.overflowTryOtherMonitors = true;
-    check(release(SpaceFloatReason::CountLimit, TileLayout::Bsp), "BSP can overflow to another monitor");
-    const auto queued = std::find_if(g_wm.overflow.queue.begin(), g_wm.overflow.queue.end(),
-                                    [&](const PendingWindowOverflow& request) { return request.hwnd == hwnd; });
-    check(queued != g_wm.overflow.queue.end() && !queued->allowNewDesktop,
-          "the queued BSP overflow cannot create a new desktop after rebasing");
+    check(release(SpaceFloatReason::CountLimit, TileLayout::Bsp) && g_wm.HasPendingOverflow(hwnd),
+          "BSP can overflow to another monitor");
     g_wm.CancelPendingOverflow(hwnd);
   }
   RuntimeLifecycle::CancelActorTimer(g_wm.timers.lifecycle);
@@ -2777,11 +2782,12 @@ static void RunSettledWindowRecoveryTests() {
     return Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects);
   };
   std::vector<SpaceFloat> localFloats;
-  auto recover = [&](Workspace& workspace) {
+  auto recover = [&](Workspace& workspace, bool tileWorkspace = false) {
     std::vector<RECT> rects;
     Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects);
     g_workspaces.Save(key, workspace);
     Placement::ArrangementContext context{key, monitor, metrics, nullptr};
+    context.mayRebuildBspTree = tileWorkspace;
     const auto result = Placement::RecoverUnsatisfiableLayout(workspace, context, rects);
     localFloats = std::move(context.localFloats);
     return result;
@@ -2894,7 +2900,7 @@ static void RunSettledWindowRecoveryTests() {
   }
   {
     // BSP tries the configured tile (focused or largest) in both directions,
-    // then the largest other tile once, then floats the arrival.
+    // then each other tile (BspFallbackTiles), then sends the arrival to overflow.
     g_wm.managementMode = ManagementMode::Automatic;
     g_settings.overflowCreateDesktop = true;
     auto& hideDestroyHook = Platform::WindowEvents::g_hooks.hideDestroy;
@@ -2933,11 +2939,17 @@ static void RunSettledWindowRecoveryTests() {
       check(Layout::PlanOrTurnNewBspSplit(workspace, metrics.workArea, metrics.gap, &rects) ==
                 Layout::LayoutPlanStatus::Unsatisfiable, "neither direction of the selected BSP split fits");
       if (!splitFocused) {
-        // The first try was already the largest tile, so there is no fallback.
-        check(recover(workspace) == Placement::ArrangementStep::Replan && !tiled(workspace, d) &&
-                  localFloats.size() == 1 && localFloats[0].reason == SpaceFloatReason::NoBspTileFits,
-              "with the largest tile already tried, BSP floats the arrival");
-        check(!restoreHint, "the companion predicts no tile for a restore that will float");
+        // The first try was the largest tile; a smaller one, turned, still fits.
+        check(recover(workspace) == Placement::ArrangementStep::Replan && tiled(workspace, d) && localFloats.empty(),
+              "BSP tries a smaller tile once the largest can't hold the arrival");
+        const auto& tree = workspace.Bsp();
+        const size_t divider = tree.Parent(tree.FindLeaf(d));
+        check(divider == tree.Parent(tree.FindLeaf(a)) && tree.Nodes()[divider].direction,
+              "the arrival takes the next-largest tile, split the other way");
+        check(Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects) ==
+                  Layout::LayoutPlanStatus::Success &&
+                  restoreHint && EqualRect(&*restoreHint, &rects[workspace.TiledIndex(d)]),
+              "the companion predicts the same smaller tile on restore");
       } else {
         check(recover(workspace) == Placement::ArrangementStep::Replan && tiled(workspace, d) && localFloats.empty(),
               "BSP falls back to the largest tile and keeps the arrival tiled");
@@ -2958,15 +2970,92 @@ static void RunSettledWindowRecoveryTests() {
       newcomer.constraints = {900, 900, 96, true};
       workspace = established;
       check(workspace.AdmitTiled(newcomer), "admit a BSP window that can't fit any split");
-      check(recover(workspace) == Placement::ArrangementStep::Replan &&
-                localFloats.size() == 1 && localFloats[0].window == d &&
-                localFloats[0].reason == SpaceFloatReason::NoBspTileFits &&
-                Placement::SpaceFloatMessage(localFloats) == L"A window floated because no tile fits",
-            "a BSP admission reports a single toast after every split fails");
+      check(recover(workspace) == Placement::ArrangementStep::Replan && localFloats.empty(),
+            "a BSP arrival no tile fits goes to overflow, not a local float");
       const WindowRecord* rejected = workspace.Find(d);
-      check(rejected && rejected->state == ManageState::Floating && !g_wm.overflow.windows.contains(d) &&
+      check(rejected && rejected->state == ManageState::Floating && g_wm.overflow.windows.contains(d) &&
                 workspace.Bsp() == established.Bsp(),
-            "an arrival with no fitting tile floats in place");
+            "overflow routes it, as Overflow Action says, and its tile goes back");
+      g_wm.CancelPendingOverflow(d);
+    }
+
+    // The order BSP tries the other tiles in. d split a (focused); c is a's
+    // neighbour, b the larger tile across the root.
+    {
+      g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
+      Workspace workspace = makeWorkspace(TileLayout::Bsp, {{a, 1}, {b, 1}, {c, 1}});
+      check(workspace.RememberFocusedWindow(a), "focus a quarter tile");
+      WindowRecord newcomer;
+      newcomer.hwnd = d;
+      newcomer.pid = 901;
+      check(workspace.AdmitTiled(newcomer) &&
+                workspace.Bsp().Parent(workspace.Bsp().FindLeaf(d)) ==
+                    workspace.Bsp().Parent(workspace.Bsp().FindLeaf(a)),
+            "the arrival splits the focused tile");
+      check(Layout::BspFallbackTiles(workspace, d) == std::vector<HWND>({c, b}),
+            "Focused tile: the nearest tile first, even though another is larger");
+      g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+      check(Layout::BspFallbackTiles(workspace, d) == std::vector<HWND>({b, c}),
+            "Biggest tile: the largest first");
+      g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
+      Workspace unfocused = makeWorkspace(TileLayout::Bsp, {{a, 1}, {b, 1}, {c, 1}});
+      check(unfocused.AdmitTiled(newcomer) && Layout::BspFallbackTiles(unfocused, d) == std::vector<HWND>({a, c}),
+            "Focused tile with nothing focused: d split the largest, then the largest first");
+    }
+
+    // Manual mode floats in place, and the toast names the side no tile could give.
+    {
+      g_wm.managementMode = ManagementMode::Manual;
+      g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+      const Workspace established = makeWorkspace(TileLayout::Bsp, {{a, 1}, {b, 1}, {c, 1}});
+      Workspace workspace = established;
+      WindowRecord newcomer;
+      newcomer.hwnd = d;
+      newcomer.pid = 901;
+      newcomer.constraints = {900, 100, 96, true};
+      check(workspace.AdmitTiled(newcomer), "admit a window wider than any BSP tile");
+      check(recover(workspace) == Placement::ArrangementStep::Replan && !tiled(workspace, d) &&
+                localFloats.size() == 1 && localFloats[0].shortSide == ShortSide::Width &&
+                Placement::SpaceFloatMessage(localFloats) == L"A window floated: no tile is wide enough" &&
+                !g_wm.overflow.windows.contains(d),
+            "Manual mode floats it in place: no tile is wide enough");
+      // The right half turned gives a full-height tile, so only a window taller
+      // than the work area is too tall for every tile.
+      workspace = established;
+      newcomer.constraints = {100, 1100, 96, true};
+      check(workspace.AdmitTiled(newcomer) && recover(workspace) == Placement::ArrangementStep::Replan &&
+                localFloats.size() == 1 && localFloats[0].shortSide == ShortSide::Height,
+            "a window taller than any tile: no tile is tall enough");
+      workspace = established;
+      newcomer.constraints = {1100, 1100, 96, true};
+      check(workspace.AdmitTiled(newcomer) && recover(workspace) == Placement::ArrangementStep::Replan &&
+                localFloats.size() == 1 && localFloats[0].shortSide == ShortSide::Unknown,
+            "too wide and too tall: the toast names neither side");
+      g_wm.managementMode = ManagementMode::Automatic;
+    }
+
+    // Tile Workspace lays the tree out afresh before a window goes to overflow.
+    // Four quarter tiles: d fits none of their halves, but an even five-way
+    // tree gives it a quarter of its own.
+    {
+      g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::LastSlot;
+      const HWND e = reinterpret_cast<HWND>(0x7400010);
+      const Workspace established = makeWorkspace(TileLayout::Bsp, {{a, 1}, {b, 1}, {c, 1}, {e, 1}});
+      WindowRecord newcomer;
+      newcomer.hwnd = d;
+      newcomer.pid = 901;
+      newcomer.constraints = {450, 450, 96, true};
+      Workspace workspace = established;
+      check(workspace.AdmitTiled(newcomer) && plan(workspace) == Layout::LayoutPlanStatus::Unsatisfiable,
+            "a 450-pixel square doesn't fit half a quarter tile");
+      check(recover(workspace, true) == Placement::ArrangementStep::Replan && tiled(workspace, d) &&
+                plan(workspace) == Layout::LayoutPlanStatus::Success,
+            "Tile Workspace rebuilds the tree, and everyone fits");
+      workspace = established;
+      check(workspace.AdmitTiled(newcomer) && recover(workspace) == Placement::ArrangementStep::Replan &&
+                !tiled(workspace, d) && g_wm.overflow.windows.contains(d),
+            "other arrangements keep the user's splits and send the window to overflow");
+      g_wm.CancelPendingOverflow(d);
     }
     g_settings.automaticNewWindowPosition = AutomaticNewWindowPosition::AfterFocused;
     Workspace focused = makeWorkspace(TileLayout::Bsp, {{a, 1}, {b, 1}, {c, 1}});

@@ -923,10 +923,7 @@ static OverflowRequestResult ProcessOverflowRequest(
 
   OverflowRequestResult result{OverflowOutcome::NoDestination};
   // Try source capacity first, then other monitors, then at most one new desktop.
-  // The source may have changed layout since the release.
-  const bool allowNewDesktop =
-      request.allowNewDesktop && LayoutPolicyOf(source.workspace.Layout()).overflowMayCreateDesktop;
-  const size_t candidateCount = monitors.size() + (allowNewDesktop && g_settings.overflowCreateDesktop ? 1 : 0);
+  const size_t candidateCount = monitors.size() + (g_settings.overflowCreateDesktop ? 1 : 0);
   for (size_t index = 0; index < candidateCount; ++index) {
     const bool createDesktop = index == monitors.size();
     const HMONITOR monitor = createDesktop ? source.monitor : monitors[index];
@@ -995,7 +992,7 @@ static void ProcessWindowOverflow() {
     if (result.outcome == OverflowOutcome::Retry) {
       g_wm.overflow.queue.push_back(std::move(request));
     } else if (HMONITOR monitor = FinishedOverflowFloatMonitor(request, result)) {
-      floatsByMonitor[monitor].push_back({request.hwnd, request.reason, request.announceLocalFloat});
+      floatsByMonitor[monitor].push_back({request.hwnd, request.reason, request.announceLocalFloat, request.shortSide});
     }
     if (result.follow.hwnd) follow = result.follow;
   }

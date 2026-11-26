@@ -355,6 +355,10 @@ class Workspace {
   bool SwapBspSiblingTiles(HWND first, HWND second);
   // Gives the source's space to its sibling and splits another BSP tile with it.
   bool MoveBspLeaf(HWND source, HWND target, bool allowAlternateDirection = false);
+  // Lays the BSP tree out afresh, as a switch to BSP does: every saved split is
+  // gone and the windows fill the largest leaves in their current order. False
+  // in other layouts.
+  bool RebuildBspTree();
   // Moves a settling window to another tiled index, shifting suspended slots so
   // every window keeps a unique position.
   bool MoveSettlingWindowToIndex(HWND hwnd, size_t targetIndex);

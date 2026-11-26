@@ -1457,7 +1457,7 @@ static void RunRestorePublicationTests() {
     CompanionSnapshot::AppendWorkspaceHints(desktop, bspHints.get());
     const auto& arrival = bspHints->workspaces[0];
     const auto& restore = bspHints->restoreWindows[0];
-    check(bspHints->workspaceCount == 1 && bspHints->bspWorkspaces == 1 && bspHints->bspLocalFloats == 0 &&
+    check(bspHints->workspaceCount == 1 && bspHints->bspWorkspaces == 1 && !arrival.newWindowFloats &&
               arrival.hasTiledFrame && bspHints->restoreWindowCount == 1 && restore.hasFrame,
           "publish BSP arrival and restore frames");
     Workspace expected = bsp;
@@ -1480,9 +1480,9 @@ static void RunRestorePublicationTests() {
   g_workspaces.Save(key, bsp);
   auto bspFloat = std::make_unique<CompanionAbi::SnapshotBody>();
   CompanionSnapshot::AppendWorkspaceHints(desktop, bspFloat.get());
-  check(bspFloat->bspWorkspaces == 1 && bspFloat->bspLocalFloats == 1 &&
-            !bspFloat->workspaces[0].hasTiledFrame && bspFloat->workspaces[0].newWindowFloats,
-        "a BSP split that cannot fit even a minimal window publishes a local float");
+  check(bspFloat->bspWorkspaces == 1 && !bspFloat->workspaces[0].hasTiledFrame &&
+            bspFloat->workspaces[0].newWindowFloats,
+        "a BSP split that cannot fit even a minimal window publishes an overflow");
   g_settings = SettingsState{};
   std::printf("Passed %d restore publication checks.\n", checks);
 }
@@ -2100,9 +2100,30 @@ static void RunBspArrivalTileTests() {
 
   const CompanionAbi::BspArrivalTiles tiles = Placement::PredictBspArrivalTiles(established, metrics, true);
   auto same = [](const RECT& x, const RECT& y) { return EqualRect(&x, &y) != FALSE; };
-  check(tiles.count == 4 && same(tiles.tiles[0].tile, {400, 0, 800, 450}) && same(tiles.tiles[1].tile, {0, 225, 800, 450}) &&
-            same(tiles.tiles[2].tile, {800, 450, 1600, 900}) && same(tiles.tiles[3].tile, {1200, 0, 1600, 900}),
-        "the focused tile, turned, then the largest other tile, turned");
+  check(tiles.count == 6 && !tiles.truncated && same(tiles.tiles[0].tile, {400, 0, 800, 450}) &&
+            same(tiles.tiles[1].tile, {0, 225, 800, 450}) && same(tiles.tiles[2].tile, {400, 450, 800, 900}) &&
+            same(tiles.tiles[3].tile, {0, 675, 800, 900}) && same(tiles.tiles[4].tile, {800, 450, 1600, 900}) &&
+            same(tiles.tiles[5].tile, {1200, 0, 1600, 900}),
+        "the focused tile, turned, then its neighbour, turned, then the larger tile beyond, turned");
+
+  // More tiles than the snapshot holds: the list says so, and a window that
+  // fits none of them gets no hint rather than a predicted float.
+  {
+    Workspace crowded;
+    crowded.SetLayout(TileLayout::Bsp);
+    for (uintptr_t i = 0; i < 10; ++i) {
+      const HWND hwnd = reinterpret_cast<HWND>(0x7A00 + 4 * i);
+      check(crowded.AdmitTiled({.hwnd = hwnd}), "admit a window to a crowded BSP workspace");
+      crowded.MarkSettled(hwnd);
+    }
+    const CompanionAbi::BspArrivalTiles many = Placement::PredictBspArrivalTiles(crowded, metrics, false);
+    check(many.count <= CompanionAbi::kMaxBspArrivalTiles && many.count >= CompanionAbi::kMaxBspArrivalTiles - 1 &&
+              many.truncated,
+          "a crowded workspace fills the tile list and marks it truncated");
+    check(CompanionAbi::ChooseBspArrivalTile(many, metrics.workArea, 2000, 2000).outcome ==
+              CompanionAbi::BspArrivalChoice::Outcome::Unknown,
+          "a window that fits no published tile of a truncated list gets no hint");
+  }
 
   for (LONG minWidth = 50; minWidth <= 1650; minWidth += 100) {
     for (LONG minHeight = 50; minHeight <= 950; minHeight += 75) {

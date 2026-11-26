@@ -58,7 +58,7 @@ glossary, and testing.
 - Floating
 - Master + Stack (vertical or horizontal)
 - Dwindle
-- BSP (new and restored windows split the focused or biggest tile, trying both directions, then the biggest tile, before floating; closing or minimizing a window gives its space to its neighbour)
+- BSP (new and restored windows split the focused or biggest tile, trying both directions, then each other tile until one fits, before going to Overflow; closing or minimizing a window gives its space to its neighbour)
 - Columns / Rows
 - Monocle
 
