@@ -334,11 +334,11 @@ static bool CommitUserLayoutMutation(const UserLayoutMutation& mutation, Workspa
 
 // --- Keeping or rolling back the pending mutation -----------------------------
 
-// The user layout mutation pending on `key`, or nullptr. One whose windows have
-// changed since (`workspace` no longer has its candidate's membership) can't be
-// rolled back safely: it is discarded, and the discard is logged as found
-// during `stage`.
-static const PendingLayoutMutation* CurrentLayoutMutation(
+// Discards the user layout mutation pending on `key` if its windows have changed
+// since (`workspace` no longer has its candidate's membership), which makes it
+// unsafe to roll back, and logs the discard as found during `stage`. Returns
+// the mutation still pending, or nullptr.
+static const PendingLayoutMutation* DropStaleLayoutMutation(
     const DesktopMonitorKey& key, const Workspace& workspace, const wchar_t* stage) {
   const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
   if (!pending || workspace.HasSameWindowMembershipAs(pending->candidate)) return pending;
@@ -373,7 +373,7 @@ static bool TryRollbackPendingLayoutMutation(
   // of the same delayed transaction, not evidence that the transaction is stale.
   // Only a membership/participation change makes the saved rollback snapshot
   // unsafe to apply.
-  const PendingLayoutMutation* pending = CurrentLayoutMutation(key, *workspace, L"rollback");
+  const PendingLayoutMutation* pending = DropStaleLayoutMutation(key, *workspace, L"rollback");
   if (!pending) return false;
 
   // Work from a copy: every exit below discards the stored mutation.
@@ -420,7 +420,7 @@ static bool TryRollbackPendingLayoutMutation(
 
 static void ClearSettledLayoutMutation(
     const DesktopMonitorKey& key, const Workspace& workspace) {
-  const PendingLayoutMutation* pending = CurrentLayoutMutation(key, workspace, L"settle");
+  const PendingLayoutMutation* pending = DropStaleLayoutMutation(key, workspace, L"settle");
   if (!pending) return;
   if (HasOutstandingConformanceLease(workspace)) return;
   Diagnostics::RecordEvent(

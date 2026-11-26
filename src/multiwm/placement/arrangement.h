@@ -1065,8 +1065,7 @@ static void ArrangeWorkspace(
   ObserveAndRepairWorkspaceForArrangement(workspace);
   ArrangementContext context{key, monitor, metrics, preferredTiledWindow};
   EnforceAutomaticWindowLimit(key, workspace, monitor, context.localFloats);
-  // Drops a pending user layout mutation whose windows have changed since.
-  CurrentLayoutMutation(key, workspace, L"before arrangement");
+  DropStaleLayoutMutation(key, workspace, L"before arrangement");
   // Native reports are cached between arrangements. The first pass below probes
   // missing/stale reports and pending admissions/restores before geometry is solved.
   const size_t maxPasses = workspace.ActiveCount() * 5 + 8;
