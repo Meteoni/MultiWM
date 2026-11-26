@@ -3,7 +3,7 @@
 
 namespace Layout {
 
-struct AdmissionRecoveryPlan {
+struct SettlingRecoveryPlan {
   Workspace workspace;
   HWND window = nullptr;
   size_t fromIndex = 0;
@@ -47,7 +47,7 @@ static std::vector<WindowConstraints> ActiveWindowConstraints(
 // True when `slot` is at least the window's reported minimum size. A window
 // without a valid minimum-size report fits any slot.
 //
-// This is the single fit predicate for the planner: admission recovery,
+// This is the single fit predicate for the planner: settling recovery,
 // conflict reporting and plan validation all use it so they can never disagree
 // about whether a slot is usable.
 static bool WindowConstraintFitsSlot(
@@ -337,7 +337,7 @@ static void TurnBspSplit(Workspace& workspace, size_t node, const RECT& workArea
 }
 
 // Plans `workspace` (BuildWorkspaceLayoutPlan). In BSP, when that is
-// unsatisfiable, turns the split of a still-settling arrival to its
+// unsatisfiable, turns the split of a settling window to its
 // perpendicular direction, trying the newest first, and keeps the first turn
 // that fits: `workspace` then holds the turned split. Unchanged otherwise. An
 // explicit edge drop (`merge`) never turns: it keeps its direction and must
@@ -823,14 +823,14 @@ static bool MoveBspArrivalToLargestTile(Workspace& workspace, HWND arrival) {
 // BSP's fallback for an arrival that fits neither direction of the tile it
 // split (the focused or the largest): the largest other tile, once, in either
 // direction. When that tile is the one it already split, or doesn't fit
-// either, the window floats. Same contract as TryRecoverPendingAdmission.
-static bool TryRecoverPendingBspAdmission(
+// either, the window floats. Same contract as TryRecoverSettlingWindow.
+static bool TryRecoverSettlingBspWindow(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     const std::vector<ConstraintCandidate>& candidates, HWND preferredTiledWindow,
-    AdmissionRecoveryPlan* outPlan) {
+    SettlingRecoveryPlan* outPlan) {
   for (const ConstraintCandidate& candidate : candidates) {
     const WindowRecord* record = workspace.Find(candidate.hwnd);
-    if (!record || !record->pendingInsertionPlacement || candidate.hwnd == preferredTiledWindow ||
+    if (!record || !record->settling || candidate.hwnd == preferredTiledWindow ||
         !workspace.IsTiled(candidate.hwnd)) {
       continue;
     }
@@ -849,25 +849,25 @@ static bool TryRecoverPendingBspAdmission(
 }
 
 // Precondition: the current order already failed its ordinary layout plan.
-// Search nearby slots for each pending admission, preserving the other windows' order.
-// BSP tries the largest other tile instead (TryRecoverPendingBspAdmission).
+// Search nearby slots for each settling window, preserving the other windows' order.
+// BSP tries the largest other tile instead (TryRecoverSettlingBspWindow).
 // The input workspace and native windows are untouched.
 // A failed search leaves outPlan untouched. ArrangeWorkspace commits a
 // successful trial after preserving rollback state.
-static bool TryRecoverPendingAdmission(
+static bool TryRecoverSettlingWindow(
     const Workspace& workspace, const RECT& workArea, LONG gap,
     const std::vector<ConstraintCandidate>& candidates, HWND preferredTiledWindow,
-    AdmissionRecoveryPlan* outPlan) {
+    SettlingRecoveryPlan* outPlan) {
   const TileLayout layout = workspace.Layout();
   if (layout == TileLayout::Bsp) {
-    return TryRecoverPendingBspAdmission(workspace, workArea, gap, candidates, preferredTiledWindow, outPlan);
+    return TryRecoverSettlingBspWindow(workspace, workArea, gap, candidates, preferredTiledWindow, outPlan);
   }
   if (!IsMasterStackLayout(layout) && !IsGridLayout(layout) && layout != TileLayout::Dwindle) return false;
 
   const size_t preferredTiledIndex = workspace.TiledIndex(preferredTiledWindow);
   for (const ConstraintCandidate& candidate : candidates) {
     const WindowRecord* record = workspace.Find(candidate.hwnd);
-    if (!record || !record->pendingInsertionPlacement || candidate.hwnd == preferredTiledWindow) {
+    if (!record || !record->settling || candidate.hwnd == preferredTiledWindow) {
       continue;
     }
 
@@ -876,7 +876,7 @@ static bool TryRecoverPendingAdmission(
 
     auto trySlot = [&](size_t targetIndex) {
       Workspace trial = workspace;
-      const bool moved = trial.MovePendingAdmissionToIndex(candidate.hwnd, targetIndex);
+      const bool moved = trial.MoveSettlingWindowToIndex(candidate.hwnd, targetIndex);
       if (!moved || (preferredTiledIndex < workspace.ActiveCount() &&
                      trial.TiledIndex(preferredTiledWindow) != preferredTiledIndex)) {
         return false;

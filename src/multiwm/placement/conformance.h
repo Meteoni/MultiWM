@@ -164,27 +164,27 @@ void PendingProofs::DiscardLayoutMutation(const DesktopMonitorKey& key) {
   mutations_.erase(key);
 }
 
-const PendingAdmissionRecovery* PendingProofs::FindAdmissionRecovery(
+const SettlingRecovery* PendingProofs::FindSettlingRecovery(
     HWND hwnd) const {
   const auto it = recoveries_.find(hwnd);
   return it == recoveries_.end() ? nullptr : &it->second;
 }
 
-void PendingProofs::RememberAdmissionRecovery(
-    HWND hwnd, PendingAdmissionRecovery recovery) {
+void PendingProofs::RememberSettlingRecovery(
+    HWND hwnd, SettlingRecovery recovery) {
   recoveries_[hwnd] = std::move(recovery);
 }
 
-std::optional<PendingAdmissionRecovery> PendingProofs::TakeAdmissionRecovery(
+std::optional<SettlingRecovery> PendingProofs::TakeSettlingRecovery(
     HWND hwnd) {
   const auto it = recoveries_.find(hwnd);
   if (it == recoveries_.end()) return std::nullopt;
-  PendingAdmissionRecovery recovery = std::move(it->second);
+  SettlingRecovery recovery = std::move(it->second);
   recoveries_.erase(it);
   return recovery;
 }
 
-void PendingProofs::DiscardAdmissionRecovery(HWND hwnd) {
+void PendingProofs::DiscardSettlingRecovery(HWND hwnd) {
   recoveries_.erase(hwnd);
 }
 
@@ -233,7 +233,7 @@ static bool CancelTiledConformanceLease(HWND hwnd) {
 }
 
 // Forgets every unproven placement change (conformance leases, pending layout
-// mutations and admission-recovery baselines) and stops the conformance timer,
+// mutations and settling-recovery baselines) and stops the conformance timer,
 // which has nothing left to wait for.
 static void DiscardAllPendingProofs() {
   RuntimeLifecycle::AssertWmThread(L"DiscardAllPendingProofs");
@@ -352,14 +352,14 @@ static bool GetCurrentAuthoritativeTiledRect(
 // An admission remains movable until every placement produced by its reflow has
 // survived conformance. This matters because an existing sibling, not only the
 // new HWND, can reveal the constraint that requires an alternate insertion slot.
-static bool ClearSettledInsertionPlacements(
+static bool MarkSettledWindows(
     const DesktopMonitorKey& key, Workspace& workspace) {
   if (HasOutstandingConformanceLease(workspace)) return false;
 
   bool changed = false;
   for (HWND hwnd : workspace.TiledWindows()) {
     const WindowRecord* record = workspace.Find(hwnd);
-    if (!record || !record->pendingInsertionPlacement ||
+    if (!record || !record->settling ||
         Platform::Windows::IsSuspendedOrCloaked(hwnd)) {
       continue;
     }
@@ -370,9 +370,9 @@ static bool ClearSettledInsertionPlacements(
             key, workspace, hwnd, &authoritative) &&
         Platform::Windows::GetWindowFrameRect(hwnd, &current) &&
         Layout::RectsNear(current, authoritative)) {
-      if (workspace.ClearInsertionPlacement(hwnd)) {
+      if (workspace.MarkSettled(hwnd)) {
         changed = true;
-        DiscardPendingAdmissionRecovery(hwnd);
+        DiscardPendingSettlingRecovery(hwnd);
       }
     }
   }
@@ -466,7 +466,7 @@ static void FinalizeExpiredConformanceLease(
     Diagnostics::RecordEvent(
         L"conformance lease completed compliant hwnd=%p attempts=%u",
         hwnd, lease.attempts);
-    if (ClearSettledInsertionPlacements(key, workspace)) {
+    if (MarkSettledWindows(key, workspace)) {
       g_workspaces.Save(key, workspace);
     }
     ClearSettledLayoutMutation(key, workspace);

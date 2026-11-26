@@ -566,11 +566,11 @@ struct PendingLayoutMutation {
   const wchar_t* action = L"Layout mutation";
 };
 
-// Admission recovery can move the pending member and reassign siblings before
+// Settling recovery can move a settling window and reassign siblings before
 // conformance has proved the resulting arrangement. Keep the pre-recovery order
-// until that member settles so a suspend/restore race cannot strand established
-// members in slots chosen only for the pending admission.
-struct PendingAdmissionRecovery {
+// until that window settles so a suspend/restore race cannot strand established
+// members in slots chosen only for the settling window.
+struct SettlingRecovery {
   DesktopMonitorKey key;
   Workspace baseline;
   uint64_t generation = 0;
@@ -627,7 +627,7 @@ struct DueConformanceWork {
 };
 
 // Placement changes that have been applied but not yet proven: conformance
-// leases, user layout mutations awaiting settlement, and admission-recovery
+// leases, user layout mutations awaiting settlement, and settling-recovery
 // baselines. All three describe the same unproven arrangement, so they share one
 // owner and one reset (Clear). The store keeps generations and expiry rules;
 // repair, rollback and float policy stay in placement/user_layout_mutation.h,
@@ -674,13 +674,13 @@ class PendingProofs {
   void DiscardLayoutMutation(const DesktopMonitorKey& key);
   size_t LayoutMutationCount() const { return mutations_.size(); }
 
-  // --- Admission-recovery baselines (one per window) ---
+  // --- Settling-recovery baselines (one per window) ---
   // The pointer is valid until the next change to this store.
-  const PendingAdmissionRecovery* FindAdmissionRecovery(HWND hwnd) const;
-  void RememberAdmissionRecovery(HWND hwnd, PendingAdmissionRecovery recovery);
-  std::optional<PendingAdmissionRecovery> TakeAdmissionRecovery(HWND hwnd);
-  void DiscardAdmissionRecovery(HWND hwnd);
-  size_t AdmissionRecoveryCount() const { return recoveries_.size(); }
+  const SettlingRecovery* FindSettlingRecovery(HWND hwnd) const;
+  void RememberSettlingRecovery(HWND hwnd, SettlingRecovery recovery);
+  std::optional<SettlingRecovery> TakeSettlingRecovery(HWND hwnd);
+  void DiscardSettlingRecovery(HWND hwnd);
+  size_t SettlingRecoveryCount() const { return recoveries_.size(); }
 
   // Forgets every unproven change. Lease generations keep increasing, so an
   // observation copied before Clear can never match a later lease.
@@ -697,7 +697,7 @@ class PendingProofs {
   std::unordered_map<DesktopMonitorKey, PendingLayoutMutation,
                      Model::DesktopMonitorKeyHash, Model::DesktopMonitorKeyEqual>
       mutations_;
-  std::unordered_map<HWND, PendingAdmissionRecovery> recoveries_;
+  std::unordered_map<HWND, SettlingRecovery> recoveries_;
 };
 
 static PendingProofs g_pendingProofs;

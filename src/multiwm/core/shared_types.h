@@ -265,7 +265,7 @@ struct LayoutPolicy {
   // after the previous arrival, preserving enumeration order. Otherwise every
   // arrival splits the same anchor (BSP keeps splitting the focused leaf).
   bool burstChainsArrivals = true;
-  // A pending admission that no tile fits floats where it is (and says so)
+  // A settling window that no tile fits floats where it is (and says so)
   // instead of going to Automatic overflow.
   bool rejectedArrivalFloatsInPlace = false;
   // Automatic overflow's can't-fit floats are toasted even outside a user
@@ -277,7 +277,7 @@ struct LayoutPolicy {
   // Drops near a tile's edge (BSP Split Edge Size) split it instead of swapping.
   bool edgeDropZones = false;
   // Companion hints for a new or restored window whose first slot can't fit
-  // use the slot admission recovery moves it to. Otherwise they give no tile.
+  // use the slot settling recovery moves it to. Otherwise they give no tile.
   bool predictsRecoveredTile = false;
   LayoutAction layoutAction = LayoutAction::PromoteToMaster;
 };

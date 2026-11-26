@@ -25,7 +25,7 @@ struct BspNode {
   HWND window = nullptr;
   double ratio = 0.5;  // Splits only: the first side's saved share.
   std::optional<Layout::Axis> direction = std::nullopt;
-  HWND pendingDirectionWindow = nullptr;  // Arrival that created this split, until it settles.
+  HWND pendingDirectionWindow = nullptr;  // Settling window that created this split, until it settles.
   bool operator==(const BspNode&) const = default;
 };
 

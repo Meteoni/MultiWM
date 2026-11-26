@@ -1252,7 +1252,7 @@ static void RunAdmissionPredictionTests() {
     // gap makes 1923 > 1920.
     record.constraints = {955, 300, 96, true};
     check(crowded.AdmitTiled(record), "admit crowded column");
-    crowded.ClearInsertionPlacement(record.hwnd);
+    crowded.MarkSettled(record.hwnd);
   }
   const auto overfull = Placement::PredictAutomaticAdmission(crowded, metrics, false, false);
   check(!overfull.tiledFrame && overfull.newWindowFloats, "no slot fits: overflow floats the window");
@@ -1830,11 +1830,11 @@ static void RunBspLayoutTests() {
     arriving.SetLayout(TileLayout::Bsp);
     for (HWND hwnd : {a, b, c}) {
       admit(arriving, hwnd);
-      arriving.ClearInsertionPlacement(hwnd);
+      arriving.MarkSettled(hwnd);
     }
     if (splitFocused) {
       admit(arriving, d);
-      arriving.ClearInsertionPlacement(d);
+      arriving.MarkSettled(d);
       check(arriving.RememberFocusedWindow(a), "select the smaller focused tile");
     }
     g_settings.automaticNewWindowPosition = splitFocused ? AutomaticNewWindowPosition::AfterFocused
@@ -1873,7 +1873,7 @@ static void RunBspLayoutTests() {
                 !provisional.Bsp().Nodes()[split].direction.has_value(),
             "an unsettled admission can return to the original direction when its minimum changes");
     }
-    arriving.ClearInsertionPlacement(f);
+    arriving.MarkSettled(f);
     arriving.UpdateConstraints(f, {1, 1, 96, true});
     const RECT relaxed = splitFocused ? RECT{0, 225, 800, 450} : RECT{1200, 0, 1600, 900};
     check(Layout::BuildWorkspaceLayoutPlan(arriving, area, 0, &rects) == Layout::LayoutPlanStatus::Success &&
@@ -1885,7 +1885,7 @@ static void RunBspLayoutTests() {
   settled.SetLayout(TileLayout::Bsp);
   for (HWND hwnd : {a, b}) {
     admit(settled, hwnd);
-    settled.ClearInsertionPlacement(hwnd);
+    settled.MarkSettled(hwnd);
     settled.UpdateConstraints(hwnd, {900, 1, 96, true});
   }
   check(Layout::PlanOrTurnNewBspSplit(settled, area, 0, &rects) == Layout::LayoutPlanStatus::Unsatisfiable &&
@@ -2043,7 +2043,7 @@ static void RunBspPropertyTests() {
 // What arrangement does with a BSP arrival of minimum `minWidth` x `minHeight`
 // admitted into `workspace` (after `anchor` when given): its tile, or no
 // value when it floats. The same steps as ArrangeWorkspace: the plan with the
-// new split turned if needed, then admission recovery, then a float.
+// new split turned if needed, then settling recovery, then a float.
 static std::optional<RECT> ArrangeBspArrival(Workspace workspace, const Platform::Monitors::WorkspaceMetrics& metrics,
                                              HWND arrival, HWND anchor, LONG minWidth, LONG minHeight) {
   WindowRecord record{.hwnd = arrival};
@@ -2052,9 +2052,9 @@ static std::optional<RECT> ArrangeBspArrival(Workspace workspace, const Platform
   std::vector<RECT> rects;
   if (Layout::PlanOrTurnNewBspSplit(workspace, metrics.workArea, metrics.gap, &rects) !=
       Layout::LayoutPlanStatus::Success) {
-    Layout::AdmissionRecoveryPlan recovery;
-    if (!Layout::TryRecoverPendingAdmission(workspace, metrics.workArea, metrics.gap, {{arrival, 0}}, nullptr,
-                                            &recovery)) {
+    Layout::SettlingRecoveryPlan recovery;
+    if (!Layout::TryRecoverSettlingWindow(workspace, metrics.workArea, metrics.gap, {{arrival, 0}}, nullptr,
+                                          &recovery)) {
       return std::nullopt;
     }
     workspace = std::move(recovery.workspace);
@@ -2095,7 +2095,7 @@ static void RunBspArrivalTileTests() {
   for (HWND hwnd : {a, b, c}) check(established.AdmitTiled({.hwnd = hwnd}), "admit a BSP window");
   // Settled, as arrangement leaves them once they hold their tiles: only the
   // arrival's own split may then turn.
-  for (HWND hwnd : {a, b, c}) established.ClearInsertionPlacement(hwnd);
+  for (HWND hwnd : {a, b, c}) established.MarkSettled(hwnd);
   check(established.RememberFocusedWindow(a), "focus the top-left quarter");
 
   const CompanionAbi::BspArrivalTiles tiles = Placement::PredictBspArrivalTiles(established, metrics, true);
@@ -2141,7 +2141,7 @@ static void RunBspArrivalTileTests() {
       const size_t index = static_cast<size_t>(pick(0, count - 1));
       workspace.StepTiledSize(randomMetrics.workArea, randomMetrics.gap, index, pick(0, 1) != 0, pick(1, 20));
     }
-    for (HWND hwnd : members) workspace.ClearInsertionPlacement(hwnd);
+    for (HWND hwnd : members) workspace.MarkSettled(hwnd);
     workspace.RememberFocusedWindow(members[static_cast<size_t>(pick(0, count - 1))]);
     std::vector<RECT> rects;
     if (Layout::BuildWorkspaceLayoutPlan(workspace, randomMetrics.workArea, randomMetrics.gap, &rects) !=

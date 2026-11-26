@@ -169,10 +169,11 @@ struct WindowRecord {
   // raised its native minimum at the same DPI. Constraint recovery treats the
   // newest demand, admission or growth, as the likeliest cause of a conflict.
   uint64_t minimumGrowthGeneration = 0;
-  // True for a newly admitted or restored window that has not yet settled in its
-  // slot. While true, arrangement may move it to a nearby slot that fits its
-  // minimum size instead of floating it. Cleared once its placement holds.
-  bool pendingInsertionPlacement = false;
+  // True for a settling window (see the Vocabulary in CONTRIBUTING.md): newly
+  // admitted or restored, and not yet settled in its slot. While true,
+  // arrangement may move it to a nearby slot that fits its minimum size instead
+  // of floating it. Cleared once its placement holds.
+  bool settling = false;
   // True when an "Open on monitor" rule chose this window's monitor, so overflow
   // must not move it to another monitor.
   bool automaticOverflowMonitorFixed = false;
@@ -354,11 +355,11 @@ class Workspace {
   bool SwapBspSiblingTiles(HWND first, HWND second);
   // Gives the source's space to its sibling and splits another BSP tile with it.
   bool MoveBspLeaf(HWND source, HWND target, bool allowAlternateDirection = false);
-  // Moves a still-settling window (pendingInsertionPlacement) to another tiled
-  // index, shifting suspended slots so every window keeps a unique position.
-  bool MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex);
-  // Marks a window as settled in its slot (clears pendingInsertionPlacement).
-  bool ClearInsertionPlacement(HWND hwnd);
+  // Moves a settling window to another tiled index, shifting suspended slots so
+  // every window keeps a unique position.
+  bool MoveSettlingWindowToIndex(HWND hwnd, size_t targetIndex);
+  // Marks a settling window as settled in its slot.
+  bool MarkSettled(HWND hwnd);
   // Clears the request to center a default-floating window once it is placed.
   bool ClearDefaultFloatingCenter(HWND hwnd);
   // Applies an Always-floating rule: marks the record and floats it if needed.

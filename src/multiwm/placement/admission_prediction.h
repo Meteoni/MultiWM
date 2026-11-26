@@ -77,10 +77,10 @@ static AdmissionPrediction PredictAutomaticAdmission(
     // for a slot. Otherwise it blames the admission if the settled tiles fit.
     if (FindWindowLargerThanWorkArea(trial, Layout::ActiveWindowConstraints(trial), metrics.workArea)) return prediction;
     const auto candidates = OrderRemovalCandidates(trial, nullptr);
-    Layout::AdmissionRecoveryPlan recovery;
-    if (!Layout::TryRecoverPendingAdmission(trial, metrics.workArea, metrics.gap, candidates, nullptr, &recovery)) {
+    Layout::SettlingRecoveryPlan recovery;
+    if (!Layout::TryRecoverSettlingWindow(trial, metrics.workArea, metrics.gap, candidates, nullptr, &recovery)) {
       prediction.newWindowFloats =
-          FindIntroducingPendingAdmission(trial, candidates, metrics.workArea, metrics.gap) == kPredictedWindow;
+          FindIntroducingSettlingWindow(trial, candidates, metrics.workArea, metrics.gap) == kPredictedWindow;
       return prediction;
     }
     if (!LayoutPolicyOf(trial.Layout()).predictsRecoveredTile) return prediction;
@@ -120,14 +120,14 @@ static std::optional<CompanionAbi::BspArrivalTile> MeasureBspArrivalTile(
 static bool BspArrivalsSettled(const Workspace& workspace) {
   return std::none_of(workspace.TiledWindows().begin(), workspace.TiledWindows().end(), [&](HWND hwnd) {
     const WindowRecord* record = workspace.Find(hwnd);
-    return hwnd != kPredictedWindow && record && record->pendingInsertionPlacement;
+    return hwnd != kPredictedWindow && record && record->settling;
   });
 }
 
 // The tiles the next Automatic arrival in BSP `workspace` tries, in
 // arrangement's order (CompanionAbi::BspArrivalTiles): the tile admission
 // splits, then that split turned (PlanOrTurnNewBspSplit), then the same
-// two at the largest other tile (TryRecoverPendingBspAdmission). Empty for
+// two at the largest other tile (TryRecoverSettlingBspWindow). Empty for
 // other layouts. Pure; a few plans, published for the companion. WM thread only.
 static CompanionAbi::BspArrivalTiles PredictBspArrivalTiles(
     const Workspace& workspace, const Platform::Monitors::WorkspaceMetrics& metrics, bool insertAfterFocused) {
@@ -176,10 +176,10 @@ static std::optional<RECT> PredictRestoredFrame(
   std::vector<RECT> rects;
   if (Layout::PlanOrTurnNewBspSplit(trial, metrics.workArea, metrics.gap, &rects) !=
       Layout::LayoutPlanStatus::Success) {
-    Layout::AdmissionRecoveryPlan recovery;
+    Layout::SettlingRecoveryPlan recovery;
     if (!LayoutPolicyOf(trial.Layout()).predictsRecoveredTile ||
-        !Layout::TryRecoverPendingAdmission(trial, metrics.workArea, metrics.gap, OrderRemovalCandidates(trial, nullptr),
-                                            nullptr, &recovery)) {
+        !Layout::TryRecoverSettlingWindow(trial, metrics.workArea, metrics.gap, OrderRemovalCandidates(trial, nullptr),
+                                          nullptr, &recovery)) {
       return std::nullopt;
     }
     trial = std::move(recovery.workspace);

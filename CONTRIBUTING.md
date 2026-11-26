@@ -91,6 +91,8 @@ These practices draw on the [C++ Core Guidelines](https://isocpp.github.io/CppCo
 | Observed geometry | The native window frame sampled from Windows. | An application reports a 700-pixel frame after a 650-pixel placement request. |
 | Conformance lease | A bounded period for a window to settle on its assigned tile, or, in the Floating layout, on the frame MultiWM just gave it. | A snap-back can trigger a repair; expiry checks the current tile before floating a persistently displaced window. A floating lease's expiry instead keeps the app's frame. |
 | User layout mutation | A change the user asks for to a workspace's order, weights or layout. It applies at once, but is rolled back if the windows refuse their new tiles. | Promoting a window whose app then refuses its new tile puts the previous order back and names the app in a toast. |
+| Settling window | A tiled window that has just joined the layout (opened, found when its workspace was created, restored, re-tiled or moved in) and hasn't yet been seen holding its tile. Until it has, MultiWM may move it to another tile that fits rather than float it, and blames it first for a conflict it brings. | Un-minimizing an editor whose old slot is now too narrow moves it to a wider slot instead of floating it. |
+| Held window | Companion only: a window the companion has just placed at its predicted tile. Until MultiWM takes the window over, the companion keeps the app's own moves at that frame. | WeChat restores its old position 64 ms after showing; the companion keeps it on its tile, so there is no visible jump. |
 
 ## Verification and review tools
 

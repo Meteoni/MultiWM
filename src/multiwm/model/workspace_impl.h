@@ -389,7 +389,7 @@ bool Workspace::ActivateTiled(HWND hwnd) {
     record->hasSavedSlot = false;
     if (previousState == ManageState::Floating) {
       record->tilingGeneration = NextTilingGeneration();
-      record->pendingInsertionPlacement = true;
+      record->settling = true;
       // Explicitly re-tiling a floating window is a new placement attempt, but
       // the app's last valid native minimum remains authoritative. If it changed
       // while floating, a corrected placement will trigger a bounded re-probe.
@@ -400,7 +400,7 @@ bool Workspace::ActivateTiled(HWND hwnd) {
   }
   if (!ContainsWindow(windows_, hwnd)) {
     AppendTiledWithDefaultWeight(hwnd);
-    record->pendingInsertionPlacement = true;
+    record->settling = true;
     changed = true;
   }
   if (changed) DebugValidateMutation(L"Workspace::ActivateTiled");
@@ -414,7 +414,7 @@ bool Workspace::AdmitFloating(WindowRecord record) {
 
   record.state = ManageState::Floating;
   record.tilingGeneration = 0;
-  record.pendingInsertionPlacement = false;
+  record.settling = false;
   record.suspensionReason = SuspensionReason::None;
   record.savedSlot = {};
   record.hasSavedSlot = false;
@@ -477,7 +477,7 @@ bool Workspace::AdmitTiledAfter(WindowRecord record, HWND anchor) {
   }
 
   record.state = ManageState::Tiled;
-  record.pendingInsertionPlacement = true;
+  record.settling = true;
   record.suspensionReason = SuspensionReason::None;
   record.savedSlot = {};
   record.hasSavedSlot = false;
@@ -809,7 +809,7 @@ bool Workspace::AdmitInitial(
   record.state = reason == SuspensionReason::None
                      ? ManageState::Tiled
                      : ManageState::Suspended;
-  record.pendingInsertionPlacement = true;
+  record.settling = true;
   if (reason == SuspensionReason::None) {
     AppendTiledWithDefaultWeight(hwnd, false);
   } else {
@@ -850,7 +850,7 @@ bool Workspace::AdmitInitialAfter(
     record.tilingGeneration = NextTilingGeneration();
   }
   record.state = ManageState::Suspended;
-  record.pendingInsertionPlacement = true;
+  record.settling = true;
   record.suspensionReason = reason;
   record.savedSlot.index = insertionLogicalIndex;
   if (IsGridLayout(layout_) || IsMasterStackLayout(layout_)) {
@@ -920,8 +920,8 @@ bool Workspace::Restore(HWND hwnd) {
   }
 
   record->state = ManageState::Tiled;
-  // Keep the restored member pending until it settles so it can use admission recovery.
-  record->pendingInsertionPlacement = layout_ != TileLayout::Floating;
+  // Keep the restored member settling so it can use settling recovery.
+  record->settling = layout_ != TileLayout::Floating;
   record->suspensionReason = SuspensionReason::None;
   record->savedSlot = {};
   record->hasSavedSlot = false;
@@ -948,7 +948,7 @@ bool Workspace::Float(HWND hwnd) {
   WindowRecord* record = FindMutable(hwnd);
   if (!record) return false;
   record->state = ManageState::Floating;
-  record->pendingInsertionPlacement = false;
+  record->settling = false;
   record->pendingDefaultFloatingCenter = false;
   record->suspensionReason = SuspensionReason::None;
   record->savedSlot = {};
@@ -1069,7 +1069,7 @@ void Workspace::AdmitMigrated(WindowRecord record, HWND anchor) {
     // A destination workspace admission is newer than its existing members and
     // receives the first opportunity to find a viable destination slot.
     record.tilingGeneration = NextTilingGeneration();
-    record.pendingInsertionPlacement = true;
+    record.settling = true;
   }
   Forget(hwnd);
 
@@ -1278,8 +1278,8 @@ bool Workspace::RestoreLayoutStateFrom(const Workspace& source) {
 
 // Restore only the active layout/order geometry from a compatible snapshot.
 // Unlike RestoreLayoutStateFrom, this intentionally tolerates extra/missing
-// inactive records. It is used when a pending admission has already left active
-// participation: the established tiled membership must match, while the pending
+// inactive records. It is used when a settling window has already left active
+// participation: the established tiled membership must match, while the settling
 // HWND itself may now be Suspended instead of Tiled.
 bool Workspace::RestoreCompatibleActiveLayoutStateFrom(
     const Workspace& source) {
@@ -1390,8 +1390,8 @@ bool Workspace::MoveBspLeaf(HWND source, HWND target, bool allowAlternateDirecti
   return true;
 }
 
-bool Workspace::MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex) {
-  RuntimeLifecycle::AssertWmThread(L"Workspace::MovePendingAdmissionToIndex");
+bool Workspace::MoveSettlingWindowToIndex(HWND hwnd, size_t targetIndex) {
+  RuntimeLifecycle::AssertWmThread(L"Workspace::MoveSettlingWindowToIndex");
   if (layout_ == TileLayout::Bsp) return false;
   auto current = std::find(windows_.begin(), windows_.end(), hwnd);
   if (current == windows_.end()) return false;
@@ -1399,7 +1399,7 @@ bool Workspace::MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex) {
   WindowRecord* record = FindMutable(hwnd);
   const size_t currentIndex =
       static_cast<size_t>(std::distance(windows_.begin(), current));
-  if (!record || !record->pendingInsertionPlacement ||
+  if (!record || !record->settling ||
       targetIndex >= windows_.size() || targetIndex == currentIndex) {
     return false;
   }
@@ -1432,17 +1432,17 @@ bool Workspace::MovePendingAdmissionToIndex(HWND hwnd, size_t targetIndex) {
   }
 
   SyncLayoutState();
-  DebugValidateMutation(L"Workspace::MovePendingAdmissionToIndex");
+  DebugValidateMutation(L"Workspace::MoveSettlingWindowToIndex");
   return true;
 }
 
-bool Workspace::ClearInsertionPlacement(HWND hwnd) {
-  RuntimeLifecycle::AssertWmThread(L"Workspace::ClearInsertionPlacement");
+bool Workspace::MarkSettled(HWND hwnd) {
+  RuntimeLifecycle::AssertWmThread(L"Workspace::MarkSettled");
   WindowRecord* record = FindMutable(hwnd);
-  if (!record || !record->pendingInsertionPlacement) return false;
-  record->pendingInsertionPlacement = false;
+  if (!record || !record->settling) return false;
+  record->settling = false;
   bspTree_.ClearPendingDirection(hwnd);
-  DebugValidateMutation(L"Workspace::ClearInsertionPlacement");
+  DebugValidateMutation(L"Workspace::MarkSettled");
   return true;
 }
 

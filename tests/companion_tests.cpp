@@ -266,9 +266,9 @@ int main() {
     Companion::ShowWindowHook(hwnd, SW_SHOWNOACTIVATE);
     check(positionCalls.empty() && showCommands == std::vector<int>{SW_SHOWNOACTIVATE},
           "a window already in its tile shows without a companion positioning call");
-    check(Companion::g_settling.hwnd == hwnd && EqualRect(&Companion::g_settling.windowRect, &current),
-          "an already tiled window still settles at its exact frame");
-    Companion::EndSettling();
+    check(Companion::g_held.hwnd == hwnd && EqualRect(&Companion::g_held.windowRect, &current),
+          "an already tiled window is still held at its exact frame");
+    Companion::EndHold();
 
     OffsetRect(&workspace.tiledFrame, 40, 30);
     ++body.generation;
@@ -278,9 +278,9 @@ int main() {
     check(positionCalls.size() == 1 && positionCalls[0].x == movedFrame.left &&
               positionCalls[0].y == movedFrame.top && (positionCalls[0].flags & SWP_NOSIZE),
           "moving to a tile of the same size uses a move-only positioning call");
-    check(Companion::g_settling.hwnd == hwnd && EqualRect(&Companion::g_settling.windowRect, &movedFrame),
-          "a move-only placement still settles at its exact frame");
-    Companion::EndSettling();
+    check(Companion::g_held.hwnd == hwnd && EqualRect(&Companion::g_held.windowRect, &movedFrame),
+          "a move-only placement is still held at its exact frame");
+    Companion::EndHold();
 
     workspace.tiledFrame.right += 20;
     ++body.generation;
@@ -289,7 +289,7 @@ int main() {
     check(positionCalls.size() == 1 && !(positionCalls[0].flags & SWP_NOSIZE) &&
               positionCalls[0].width == Companion::Width(current) + 20,
           "a tile with a different size still resizes the window");
-    Companion::EndSettling();
+    Companion::EndHold();
     workspace.tiledFrame = savedTile;
     nativeResult = savedResult;
     ++body.generation;
@@ -514,11 +514,11 @@ int main() {
           "a window that can't resize keeps its size despite a size rule");
   }
 
-  // Settling: after the companion places a window at its show, the app's own
+  // Holding: after the companion places a window at its show, the app's own
   // moves are held at that frame until MultiWM takes the window over (its
   // snapshot entry changes, or its own SWP_NOSENDCHANGING placement arrives).
   // UWP launches reuse a spare ApplicationFrameWindow shown, cloaked, long
-  // before; the launch sets its empty title, which places and settles it.
+  // before; the launch sets its empty title, which places and holds it.
   {
     WNDCLASSW frameClass = windowClass;
     frameClass.lpszClassName = L"ApplicationFrameWindow";
@@ -535,7 +535,7 @@ int main() {
     };
     Companion::g_unhookedDefWindowProcW = DefWindowProcW;
     const BOOL savedResult = nativeResult;
-    nativeResult = TRUE;  // The companion's own placement succeeds, so settling starts.
+    nativeResult = TRUE;  // The companion's own placement succeeds, so the hold starts.
     constexpr UINT moveFlags = SWP_NOZORDER | SWP_NOACTIVATE;
     // The app's own move, as its WM_WINDOWPOSCHANGING reaches DefWindowProc.
     auto appMove = [&](HWND window, UINT flags = moveFlags) {
@@ -578,7 +578,7 @@ int main() {
     check(positionCalls.empty(), "later title changes don't place the frame");
     check(heldAt(appMove(spare), margins), "an unrelated republish keeps the frame held");
     ++body.generation;
-    check(heldAt(appMove(spare), margins), "a new generation alone doesn't end settling");
+    check(heldAt(appMove(spare), margins), "a new generation alone doesn't end the hold");
 
     // MultiWM takes the frame (it uncloaked and was admitted): its entry appears.
     body.trackedCount = 1;
@@ -586,7 +586,7 @@ int main() {
                               GUID{1}, workspace.monitorRect, CompanionAbi::WindowTreatment::Tiled, {}, 0};
     ++body.generation;
     check(unchanged(appMove(spare)), "once MultiWM tracks the frame, its moves are its own again");
-    check(unchanged(appMove(spare)), "settling stays ended");
+    check(unchanged(appMove(spare)), "the hold stays ended");
     body.trackedCount = 0;
     body.trackedWindows[0] = {};
     ++body.generation;
@@ -604,21 +604,21 @@ int main() {
       positionCalls.clear();
       showCommands.clear();
       Companion::ShowWindowHook(hwnd, SW_SHOWNORMAL);
-      check(positionCalls.size() == 1, "a shown window is placed and settles");
+      check(positionCalls.size() == 1, "a shown window is placed and held");
     };
     showPlaced();
     check(heldAt(appMove(hwnd), testMargins), "the app's own move after its show is held at the tile");
-    // MultiWM's own placement arrives (SWP_NOSENDCHANGING): settling ends.
+    // MultiWM's own placement arrives (SWP_NOSENDCHANGING): the hold ends.
     WINDOWPOS multiwm{hwnd, nullptr, 1, 2, 3, 4, SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING};
     Companion::DefWindowProcWHook(hwnd, WM_WINDOWPOSCHANGED, 0, reinterpret_cast<LPARAM>(&multiwm));
     check(unchanged(appMove(hwnd)), "after MultiWM's own placement, the app's moves are its own");
     showPlaced();
-    check(unchanged(appMove(hwnd, moveFlags | Companion::kSwpStateChanged)), "a maximize or minimize ends settling");
-    check(unchanged(appMove(hwnd)), "settling stays ended after a state change");
+    check(unchanged(appMove(hwnd, moveFlags | Companion::kSwpStateChanged)), "a maximize or minimize ends the hold");
+    check(unchanged(appMove(hwnd)), "the hold stays ended after a state change");
     showPlaced();
     WINDOWPOS hide{hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_HIDEWINDOW};
     Companion::DefWindowProcWHook(hwnd, WM_WINDOWPOSCHANGING, 0, reinterpret_cast<LPARAM>(&hide));
-    check(hide.x == 0 && hide.cx == 0 && unchanged(appMove(hwnd)), "hiding the window ends settling");
+    check(hide.x == 0 && hide.cx == 0 && unchanged(appMove(hwnd)), "hiding the window ends the hold");
 
     // WinUI can initially look resizable, then switch to a fixed-size overlay.
     showPlaced();
@@ -652,31 +652,31 @@ int main() {
     const int width = SharedGeometry::Width(monitor);
     const int height = SharedGeometry::Height(monitor);
     WINDOWPOS fullscreen{hwnd, nullptr, monitor.left, monitor.top, width, height, moveFlags};
-    Companion::SteerSettlingWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&fullscreen));
+    Companion::SteerHeldWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&fullscreen));
     check(fullscreen.x == monitor.left && fullscreen.y == monitor.top &&
               fullscreen.cx == width && fullscreen.cy == height && fullscreen.flags == moveFlags &&
               unchanged(appMove(hwnd)),
-          "a fullscreen request passes through and ends settling");
+          "a fullscreen request passes through and ends the hold");
 
     // Borderless fullscreen in two steps (move to the monitor's corner, then
     // size to it): each step is read against the app's last request, not the
     // held tile, so the second asks for the whole monitor and gets it.
     showPlaced();
     WINDOWPOS corner{hwnd, nullptr, monitor.left, monitor.top, 0, 0, moveFlags | SWP_NOSIZE};
-    Companion::SteerSettlingWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&corner));
+    Companion::SteerHeldWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&corner));
     check(heldAt(corner, testMargins), "the move to the monitor's corner is held");
     WINDOWPOS size{hwnd, nullptr, 0, 0, width, height, moveFlags | SWP_NOMOVE};
-    Companion::SteerSettlingWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&size));
+    Companion::SteerHeldWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&size));
     check(size.x == monitor.left && size.y == monitor.top && size.cx == width && size.cy == height &&
               !(size.flags & (SWP_NOMOVE | SWP_NOSIZE)) && unchanged(appMove(hwnd)),
-          "sizing to the monitor after the held move is fullscreen: the app's frame passes and settling ends");
+          "sizing to the monitor after the held move is fullscreen: the app's frame passes and the hold ends");
 
     // Size first, move second: the monitor-sized request is fullscreen already.
     showPlaced();
     WINDOWPOS sizeFirst{hwnd, nullptr, 0, 0, width, height, moveFlags | SWP_NOMOVE};
-    Companion::SteerSettlingWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&sizeFirst));
+    Companion::SteerHeldWindow(hwnd, WM_WINDOWPOSCHANGING, reinterpret_cast<LPARAM>(&sizeFirst));
     check(sizeFirst.cx == width && sizeFirst.cy == height && unchanged(appMove(hwnd)),
-          "sizing to the monitor before moving there is fullscreen and ends settling");
+          "sizing to the monitor before moving there is fullscreen and ends the hold");
 
     // Requests the hold replaced aren't lost when the window turns out ineligible:
     // the release moves it to the app's last request, not its creation frame.
@@ -734,7 +734,7 @@ int main() {
     SetWindowLongPtrW(hwnd, GWL_STYLE, resizeStyle);
     check(positionCalls.size() == 1, "an ineligible window is released after an undecided show");
 
-    Companion::EndSettling();
+    Companion::EndHold();
     nativeResult = savedResult;
     ++body.generation;
   }

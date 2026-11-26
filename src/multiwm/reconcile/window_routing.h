@@ -581,7 +581,7 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
   if (trial.Layout() == TileLayout::Floating) {
     if (!initial) return std::nullopt; // Another monitor must have room to tile.
     WindowRecord record = incoming;
-    record.pendingInsertionPlacement = false;
+    record.settling = false;
     trial.AdmitFloating(std::move(record));
     destination.frame = sourceFrame;
     return destination;
@@ -610,7 +610,7 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
     if (member == hwnd) continue;
     const WindowRecord* cached = trial.Find(member);
     if (cached && cached->constraints.valid && cached->constraints.dpi == metrics.dpi &&
-        !cached->pendingInsertionPlacement) {
+        !cached->settling) {
       continue;
     }
     const WindowConstraints constraints = Platform::Windows::ProbeWindowConstraints(member);
@@ -627,13 +627,13 @@ static std::optional<OverflowDestination> PlanOverflowDestination(
   };
   if (fits(trial)) return destination;
   // Otherwise what arrangement's recovery does with the saved destination
-  // (RecoverUnsatisfiableLayout): move a pending admission, this one or a newer
+  // (RecoverUnsatisfiableLayout): move a settling window, this one or a newer
   // one, to a slot where everyone fits while preserving the other windows' order.
   // Its later steps aren't modelled: when this fails, the incoming window is
   // normally the admission that introduced the conflict, and would be floated.
-  Layout::AdmissionRecoveryPlan recovery;
-  if (!Layout::TryRecoverPendingAdmission(trial, metrics.workArea, metrics.gap,
-                                          Placement::OrderRemovalCandidates(trial, nullptr), nullptr, &recovery)) {
+  Layout::SettlingRecoveryPlan recovery;
+  if (!Layout::TryRecoverSettlingWindow(trial, metrics.workArea, metrics.gap,
+                                        Placement::OrderRemovalCandidates(trial, nullptr), nullptr, &recovery)) {
     return std::nullopt;
   }
   const size_t index = recovery.workspace.TiledIndex(hwnd);

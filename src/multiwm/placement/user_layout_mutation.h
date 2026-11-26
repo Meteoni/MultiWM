@@ -351,8 +351,8 @@ static const PendingLayoutMutation* DropStaleLayoutMutation(
 
 // Plans `workspace` for arrangement as the mutation pending on `key` requires. A
 // rotated split is planned as it is, without turning a new split; an edge drop
-// must keep overlapping its requested edge. Otherwise, in BSP, a still-settling
-// arrival's split may be turned to fit (Layout::PlanOrTurnNewBspSplit).
+// must keep overlapping its requested edge. Otherwise, in BSP, a settling
+// window's split may be turned to fit (Layout::PlanOrTurnNewBspSplit).
 static Layout::LayoutPlanStatus PlanWithPendingLayoutMutation(
     const DesktopMonitorKey& key, Workspace& workspace, const RECT& workArea, LONG gap, std::vector<RECT>* rects) {
   const PendingLayoutMutation* pending = g_pendingProofs.FindLayoutMutation(key);
@@ -368,8 +368,8 @@ static bool TryRollbackPendingLayoutMutation(
     const DesktopMonitorKey& key, HMONITOR monitor, Workspace* workspace,
     const std::vector<RECT>& rejectedRects, HWND culpritHint = nullptr) {
   if (!workspace) return false;
-  // Constraint learning and admission recovery are allowed to adjust ratios or
-  // reorder pending admissions downstream of the user's command. Those are part
+  // Constraint learning and settling recovery are allowed to adjust ratios or
+  // reorder settling windows downstream of the user's command. Those are part
   // of the same delayed transaction, not evidence that the transaction is stale.
   // Only a membership/participation change makes the saved rollback snapshot
   // unsafe to apply.

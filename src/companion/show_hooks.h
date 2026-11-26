@@ -29,7 +29,7 @@ static decltype(&DefWindowProcA) g_unhookedDefWindowProcA = nullptr;
 // The launch is recognised by the spare's title going from empty to set. Other
 // cloaked frames (an app on another virtual desktop, say) already have a title,
 // so their title changes are left alone. ApplicationFrameHost's follow-up move
-// to the app's saved position is held by settling (placement.h).
+// to the app's saved position is kept by the hold (placement.h).
 static bool IsCloakedUwpFrame(HWND hwnd) {
   if (!IsWindowVisible(hwnd) || !IsUwpFrame(hwnd)) return false;
   DWORD cloaked = 0;
@@ -48,7 +48,7 @@ static bool MayAttachUwpFrame(HWND hwnd, UINT message) {
 }
 
 // After the title is set (so title rules match): place the frame at the current
-// prediction, which also starts settling it.
+// prediction, which also starts holding it.
 static void PlaceAttachingUwpFrame(HWND hwnd) {
   if (HasTitle(hwnd) && IsCloakedUwpFrame(hwnd)) PlaceAtPredictedFrame(hwnd, "UWP frame launch");
 }
@@ -91,11 +91,11 @@ static void SetWindowPosFrame(WINDOWPOS& position, const RECT& frame) {
   position.flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
 }
 
-// Why the hold on a settling window ends at the app's `requested` frame
+// Why the hold on a window ends at the app's `requested` frame
 // (physical), or nullptr: the window turned ineligible, or the request is its
 // monitor's size (fullscreen without maximizing, as MultiWM reads it).
-static const char* SettlingReleaseForRequest(HWND hwnd, const std::optional<RECT>& requested) {
-  if (const char* reason = SettlingIneligibility(hwnd)) return reason;
+static const char* HoldReleaseForRequest(HWND hwnd, const std::optional<RECT>& requested) {
+  if (const char* reason = HoldIneligibility(hwnd)) return reason;
   if (!requested) return nullptr;
   PhysicalCoordinatesScope physical;
   MONITORINFO monitorInfo{sizeof(monitorInfo)};
@@ -105,41 +105,41 @@ static const char* SettlingReleaseForRequest(HWND hwnd, const std::optional<RECT
   return fullscreen ? "fullscreen" : nullptr;
 }
 
-// A style change alone moves nothing, so a settling window that turned
+// A style change alone moves nothing, so a held window that turned
 // ineligible would sit in a tile MultiWM won't keep: release it now.
-static void ReleaseSettlingAfterStyleChange(HWND hwnd) {
-  const char* reason = SettlingIneligibility(hwnd);
+static void ReleaseHoldAfterStyleChange(HWND hwnd) {
+  const char* reason = HoldIneligibility(hwnd);
   if (!reason) return;
   PlacementScope placing;
   PhysicalCoordinatesScope physical;
   LogDecision(hwnd, "WM_STYLECHANGED", reason);
-  ReleaseIneligibleSettling(hwnd, "WM_STYLECHANGED");
+  ReleaseIneligibleHold(hwnd, "WM_STYLECHANGED");
 }
 
-// Holds a settling window (placement.h) at the companion's frame. Every
+// Keeps a held window (placement.h) at the companion's frame. Every
 // positioning call (SetWindowPos, MoveWindow, SetWindowPlacement, the end of a
 // DeferWindowPos batch) sends WM_WINDOWPOSCHANGING, and changing its WINDOWPOS
 // changes the move (documented), so this one place covers them all. Runs before
-// DefWindowProc, after the window's own procedure. Settling ends:
+// DefWindowProc, after the window's own procedure. The hold ends:
 //  - when MultiWM has taken the window: its snapshot entry changed, or its own
 //    placement arrived (WM_WINDOWPOSCHANGED from another thread; MultiWM uses
 //    SWP_NOSENDCHANGING, so its moves never reach the steering);
 //  - when anything but the app's own thread positions it, the user moves or
 //    resizes it, or it is minimized, maximized, hidden or destroyed;
-//  - when an untracked window turns ineligible (SettlingIneligibility), or the
+//  - when an untracked window turns ineligible (HoldIneligibility), or the
 //    app asks for fullscreen (its whole monitor, maximized or not). The window
 //    then gets the frame the app last asked for, which the hold had replaced.
 // From then on MultiWM handles the app's moves as before. Each request is read
 // against the app's last one, not the held frame: an app that sizes a window to
 // its monitor in two steps (move, then size) asks for the whole monitor.
-static void SteerSettlingWindow(HWND hwnd, UINT message, LPARAM lparam) {
-  if (!hwnd || hwnd != g_settling.hwnd || g_placing) return;
+static void SteerHeldWindow(HWND hwnd, UINT message, LPARAM lparam) {
+  if (!hwnd || hwnd != g_held.hwnd || g_placing) return;
   if (message == WM_NCDESTROY) {
-    EndSettling();
+    EndHold();
     return;
   }
   if (message == WM_STYLECHANGED) {
-    ReleaseSettlingAfterStyleChange(hwnd);
+    ReleaseHoldAfterStyleChange(hwnd);
     return;
   }
   if (message != WM_WINDOWPOSCHANGING && message != WM_WINDOWPOSCHANGED) return;
@@ -147,7 +147,7 @@ static void SteerSettlingWindow(HWND hwnd, UINT message, LPARAM lparam) {
   if (!position || position->hwnd != hwnd) return;
   const bool fromOtherThread = InSendMessageEx(nullptr) != ISMEX_NOSEND;
   if (message == WM_WINDOWPOSCHANGED) {
-    if (fromOtherThread || (position->flags & SWP_NOSENDCHANGING)) EndSettling();
+    if (fromOtherThread || (position->flags & SWP_NOSENDCHANGING)) EndHold();
     return;
   }
   if ((position->flags & (SWP_NOMOVE | SWP_NOSIZE)) == (SWP_NOMOVE | SWP_NOSIZE) &&
@@ -158,26 +158,26 @@ static void SteerSettlingWindow(HWND hwnd, UINT message, LPARAM lparam) {
   WindowFacts facts;
   if (fromOtherThread || (position->flags & (SWP_HIDEWINDOW | kSwpStateChanged)) || IsIconic(hwnd) ||
       IsZoomed(hwnd) || (GetGUIThreadInfo(GetCurrentThreadId(), &gui) && (gui.flags & GUI_INMOVESIZE)) ||
-      !ReadWindowFacts(hwnd, &facts) || !(facts == g_settling.facts)) {
-    EndSettling();
+      !ReadWindowFacts(hwnd, &facts) || !(facts == g_held.facts)) {
+    EndHold();
     return;
   }
-  const RECT appRect = g_settling.appRect;
+  const RECT appRect = g_held.appRect;
   const auto requested = ProposedPhysicalWindowRect(*position, IsRectEmpty(&appRect) ? nullptr : &appRect);
-  if (const char* release = SettlingReleaseForRequest(hwnd, requested)) {
-    EndSettling();
+  if (const char* release = HoldReleaseForRequest(hwnd, requested)) {
+    EndHold();
     // This move becomes the app's whole request, including what the hold kept.
     if (requested) SetWindowPosFrame(*position, *requested);
     LogDecision(hwnd, "WM_WINDOWPOSCHANGING", release);
     LogDecision(hwnd, "WM_WINDOWPOSCHANGING", "released the predicted frame: moved to the app's own frame");
     return;
   }
-  const auto target = ConvertScreenRect(hwnd, g_settling.windowRect, PhysicalToLogicalPointForPerMonitorDPI);
+  const auto target = ConvertScreenRect(hwnd, g_held.windowRect, PhysicalToLogicalPointForPerMonitorDPI);
   if (!target) {
-    EndSettling();
+    EndHold();
     return;
   }
-  if (requested) g_settling.appRect = *requested;
+  if (requested) g_held.appRect = *requested;
   position->x = target->left;
   position->y = target->top;
   position->cx = Width(*target);
@@ -211,7 +211,7 @@ static BOOL WINAPI ShowWindowAsyncHook(HWND hwnd, int command) {
 }
 
 // DefWindowProcW and DefWindowProcA: default SC_RESTORE handling restores a
-// member into its tile; every message passes through the settling and UWP-frame
+// member into its tile; every message passes through the hold and UWP-frame
 // checks. `defWindowProc` is the original, read at call time.
 static LRESULT DefWindowProcWithHint(
     decltype(&DefWindowProcW) defWindowProc, HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -220,7 +220,7 @@ static LRESULT DefWindowProcWithHint(
     PlacementScope placing;
     return defWindowProc(hwnd, message, wparam, lparam);
   }
-  SteerSettlingWindow(hwnd, message, lparam);
+  SteerHeldWindow(hwnd, message, lparam);
   const bool attaching = MayAttachUwpFrame(hwnd, message);
   const LRESULT result = defWindowProc(hwnd, message, wparam, lparam);
   if (attaching) PlaceAttachingUwpFrame(hwnd);
@@ -238,14 +238,14 @@ static LRESULT WINAPI DefWindowProcAHook(HWND hwnd, UINT message, WPARAM wparam,
 // Both immediate and deferred placement take the same geometry. Rewrite it
 // without committing a move; a deferred batch must remain deferred. Callers
 // hold PlacementScope through the original API call to prevent nested hints.
-// Returns the frame to settle at (physical) when the hint set an exact frame,
+// Returns the frame to hold at (physical) when the hint set an exact frame,
 // with the app's request it replaced in `*appRect`.
 static std::optional<RECT> AdjustPositionForHint(WINDOWPOS& position, const char* path, RECT* appRect) {
   const HWND hwnd = position.hwnd;
-  // A settling window's frame is the companion's; its app's is the last request.
-  const bool settling = hwnd == g_settling.hwnd && !IsRectEmpty(&g_settling.appRect);
-  const RECT settlingApp = g_settling.appRect;
-  if (const auto proposed = ProposedPhysicalWindowRect(position, settling ? &settlingApp : nullptr)) {
+  // A held window's frame is the companion's; its app's is the last request.
+  const bool held = hwnd == g_held.hwnd && !IsRectEmpty(&g_held.appRect);
+  const RECT heldApp = g_held.appRect;
+  if (const auto proposed = ProposedPhysicalWindowRect(position, held ? &heldApp : nullptr)) {
     *appRect = *proposed;
     NoHint noHint = NoHint::Unmanaged;
     const auto prediction = PredictWindowPlacement(hwnd, *proposed, path, &noHint);
@@ -263,16 +263,16 @@ static std::optional<RECT> AdjustPositionForHint(WINDOWPOS& position, const char
       LogDecision(hwnd, path, "using MultiWM's predicted placement");
       if (!prediction->keepSize) return prediction->windowRect;
     }
-    // A settling window this show finds ineligible gets the app's whole request,
+    // A held window this show finds ineligible gets the app's whole request,
     // including what the hold kept from it. One the snapshot can't place yet
     // stays held, with the request remembered for a later release.
-    if (!prediction && hwnd == g_settling.hwnd) {
+    if (!prediction && hwnd == g_held.hwnd) {
       if (noHint == NoHint::Undecided) {
-        g_settling.appRect = *proposed;
-        SetWindowPosFrame(position, g_settling.windowRect);
+        g_held.appRect = *proposed;
+        SetWindowPosFrame(position, g_held.windowRect);
         LogDecision(hwnd, path, "no hint yet: kept at the held frame");
       } else {
-        EndSettling();
+        EndHold();
         SetWindowPosFrame(position, *proposed);
       }
     }
@@ -285,16 +285,16 @@ static BOOL WINAPI SetWindowPosHook(HWND hwnd, HWND after, int x, int y, int cx,
     return g_unhookedSetWindowPos(hwnd, after, x, y, cx, cy, flags);
   }
   BOOL result = FALSE;
-  std::optional<RECT> settleAt;
+  std::optional<RECT> holdAt;
   RECT appRect{};
   {
     PlacementScope placing;
     WINDOWPOS position{hwnd, after, x, y, cx, cy, flags};
-    settleAt = AdjustPositionForHint(position, "SetWindowPos", &appRect);
+    holdAt = AdjustPositionForHint(position, "SetWindowPos", &appRect);
     // Preserve the app's single native call, flags and result, including failure.
     result = g_unhookedSetWindowPos(hwnd, after, position.x, position.y, position.cx, position.cy, position.flags);
   }
-  if (result && settleAt) BeginSettling(hwnd, *settleAt, appRect);
+  if (result && holdAt) BeginHold(hwnd, *holdAt, appRect);
   return result;
 }
 
@@ -328,7 +328,7 @@ static BOOL WINAPI SetWindowPlacementHook(HWND hwnd, const WINDOWPLACEMENT* plac
       IsWindowVisible(hwnd) || RejectStructurally(hwnd)) {
     return g_unhookedSetWindowPlacement(hwnd, placement);
   }
-  std::optional<RECT> settleAt;
+  std::optional<RECT> holdAt;
   RECT appRect{};
   BOOL result = FALSE;
   {
@@ -348,14 +348,14 @@ static BOOL WINAPI SetWindowPlacementHook(HWND hwnd, const WINDOWPLACEMENT* plac
         adjusted->rcNormalPosition = ScreenToWorkspace(*target, monitorInfo);
         LogDecision(hwnd, "SetWindowPlacement", "using MultiWM's predicted placement");
         if (!prediction->keepSize) {
-          settleAt = prediction->windowRect;
+          holdAt = prediction->windowRect;
           appRect = *proposed;
         }
       }
     }
     result = g_unhookedSetWindowPlacement(hwnd, adjusted ? &*adjusted : placement);
   }
-  if (result && settleAt) BeginSettling(hwnd, *settleAt, appRect);
+  if (result && holdAt) BeginHold(hwnd, *holdAt, appRect);
   return result;
 }
 

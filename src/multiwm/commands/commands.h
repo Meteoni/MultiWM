@@ -181,7 +181,7 @@ void FloatFocusedWindow() {
   hint.intent = Placement::FloatingPlacementIntent::CenterWithFloatingSize;
 
   Placement::CancelConformanceLease(tiled);
-  Placement::DiscardPendingAdmissionRecovery(tiled);
+  Placement::DiscardPendingSettlingRecovery(tiled);
   if (!workspace.Float(tiled)) return;
   Placement::PlaceFloatingWindowByHint(key, workspace, tiled, hint);
   g_workspaces.Save(key, workspace);
@@ -580,7 +580,7 @@ static void HandleUserMove(
     const MoveSizeGesture& gesture, const RECT& workArea) {
   if (g_settings.mouseMoveBehavior == MouseMoveBehavior::Float) {
     Placement::CancelConformanceLease(hwnd);
-    Placement::DiscardPendingAdmissionRecovery(hwnd);
+    Placement::DiscardPendingSettlingRecovery(hwnd);
     if (workspace.Float(hwnd)) {
       Placement::PlaceFloatingWindowByHint(
           key, workspace, hwnd, Placement::MakeFloatingPlacementHintFromGesture(gesture));

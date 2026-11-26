@@ -490,7 +490,7 @@ static void RunConformanceLocationTests() {
       record.pid = member == hwnd ? pid : 4242;
       record.canMove = true;
       workspace.AdmitTiled(record);
-      workspace.ClearInsertionPlacement(member);
+      workspace.MarkSettled(member);
     }
     g_workspaces.Save(key, workspace);
     return workspace;
@@ -690,7 +690,7 @@ class FloatingWindowFixture {
     Workspace workspace;
     workspace.SetLayout(layout);
     workspace.AdmitTiled(Record(hwnd));
-    workspace.ClearInsertionPlacement(hwnd);
+    workspace.MarkSettled(hwnd);
     g_workspaces.Save(key, workspace);
   }
 
@@ -802,9 +802,9 @@ static void RunOverflowDestinationProbeTests() {
     Workspace initial;
     initial.SetLayout(TileLayout::Columns);
     initial.AdmitTiled(record(cachedMember, cachedMinimum, cachedDpi, true));
-    if (settled) initial.ClearInsertionPlacement(cachedMember);
+    if (settled) initial.MarkSettled(cachedMember);
     initial.AdmitTiled(record(unknownMember, 1, dpi, false));
-    initial.ClearInsertionPlacement(unknownMember);
+    initial.MarkSettled(unknownMember);
     const uint64_t before = Diagnostics::g_runtime.counters.constraintProbeAttempts;
     const auto destination = Reconcile::PlanOverflowDestination(
         fixture.key, incoming, FloatingWindowFixture::Frame(incomingWindow), &initial);
@@ -864,7 +864,7 @@ static void RunOverflowDestinationFitTests() {
     const size_t memberCount = 2 + next(4);
     for (size_t i = 0; i < memberCount; ++i) {
       initial.AdmitTiled(record(windows[i], {span(width), span(height)}));
-      initial.ClearInsertionPlacement(windows[i]);
+      initial.MarkSettled(windows[i]);
     }
     const WindowRecord incoming = record(incomingWindow, {span(width), span(height)});
 
@@ -873,8 +873,8 @@ static void RunOverflowDestinationFitTests() {
     expected.AdmitTiled(incoming);
     std::vector<RECT> rects;
     const bool fits = Layout::BuildWorkspaceLayoutPlan(expected, area, gap, &rects) == Layout::LayoutPlanStatus::Success;
-    Layout::AdmissionRecoveryPlan recovery;
-    const bool recovered = !fits && Layout::TryRecoverPendingAdmission(
+    Layout::SettlingRecoveryPlan recovery;
+    const bool recovered = !fits && Layout::TryRecoverSettlingWindow(
         expected, area, gap, Placement::OrderRemovalCandidates(expected, nullptr), nullptr, &recovery);
     if (!recovered && compared >= 300) continue;
     ++compared;
@@ -1178,7 +1178,7 @@ static void RunTileWorkspaceGeometryTests() {
   Workspace workspace = fixture.Load();
   for (HWND window : {second, third}) {
     check(workspace.AdmitTiled(FloatingWindowFixture::Record(window)), "admit a Tile Workspace test window");
-    workspace.ClearInsertionPlacement(window);
+    workspace.MarkSettled(window);
   }
   // A split the user turned, which a rebuilt tree would put back.
   const size_t turned = workspace.Bsp().Parent(workspace.Bsp().FindLeaf(third));
@@ -1227,7 +1227,7 @@ static void RunDraggedWindowPlacementTests() {
   fixture.Seed(TileLayout::MasterStack);
   Workspace workspace = fixture.Load();
   check(workspace.AdmitTiled(FloatingWindowFixture::Record(other)), "admit a second tiled window");
-  workspace.ClearInsertionPlacement(other);
+  workspace.MarkSettled(other);
   g_workspaces.Save(fixture.key, workspace);
   Placement::ArrangeWorkspace(fixture.key);
 
@@ -1296,7 +1296,7 @@ static void RunBspDragTests() {
   Workspace initial = fixture.Load();
   for (HWND window : {target, sibling}) {
     check(initial.AdmitTiled(FloatingWindowFixture::Record(window)), "admit a BSP drag test window");
-    initial.ClearInsertionPlacement(window);
+    initial.MarkSettled(window);
   }
   g_workspaces.Save(fixture.key, initial);
   Placement::ArrangeWorkspace(fixture.key);
@@ -1554,7 +1554,7 @@ static void RunBspDragTests() {
   fixture.Seed(TileLayout::Bsp);
   Workspace uneven = fixture.Load();
   check(uneven.AdmitTiled(FloatingWindowFixture::Record(target)), "admit a second tile under the root divider");
-  uneven.ClearInsertionPlacement(target);
+  uneven.MarkSettled(target);
   check(uneven.StepTiledSize(fixture.workArea, fixture.metrics.gap, uneven.TiledIndex(target), true, 10),
         "make the target tile larger than the source tile");
   g_workspaces.Save(fixture.key, uneven);
@@ -2768,7 +2768,7 @@ static void RunSettledWindowRecoveryTests() {
       record.canMove = false;
       workspace.AdmitTiled(record);
       if (minWidth > 1) workspace.UpdateConstraints(hwnd, {minWidth, 150, 96, true});
-      workspace.ClearInsertionPlacement(hwnd);
+      workspace.MarkSettled(hwnd);
     }
     return workspace;
   };
@@ -2841,11 +2841,11 @@ static void RunSettledWindowRecoveryTests() {
     record.canMove = false;
     workspace.AdmitTiled(record);
     workspace.UpdateConstraints(c, {300, 150, 96, true});
-    check(plan(workspace) == Layout::LayoutPlanStatus::Success, "pending admission fits");
+    check(plan(workspace) == Layout::LayoutPlanStatus::Success, "settling window fits");
     workspace.UpdateConstraints(b, {500, 150, 96, true});
     check(recover(workspace) == Placement::ArrangementStep::Replan, "recovery floats one window");
-    check(!tiled(workspace, b) && tiled(workspace, a) && tiled(workspace, c), "growth, not pending admission, is floated");
-    check(workspace.Find(c)->pendingInsertionPlacement, "admission keeps settling");
+    check(!tiled(workspace, b) && tiled(workspace, a) && tiled(workspace, c), "growth, not the settling window, is floated");
+    check(workspace.Find(c)->settling, "admission keeps settling");
   }
   {
     // A newcomer that does not fit is still rejected rather than reordering or
@@ -2950,7 +2950,7 @@ static void RunSettledWindowRecoveryTests() {
         check(divider == tree.Parent(tree.FindLeaf(b)) && tree.Nodes()[divider].ratio == 0.5,
               "the fallback splits the largest tile, the right half");
         check(workspace.Suspend(d, SuspensionReason::Minimized) &&
-                  Placement::RestorePendingAdmissionRecoveryAfterSuspension(key, d, &workspace) &&
+                  Placement::RestorePendingSettlingRecoveryAfterSuspension(key, d, &workspace) &&
                   workspace.Bsp() == established.Bsp(),
               "suspending an unsettled BSP arrival restores the established tree");
       }
@@ -3018,7 +3018,7 @@ static void RunConstraintRecoveryDigest() {
     Workspace workspace;
     workspace.SetLayout(layouts[random(std::size(layouts))]);
     const size_t count = 2 + random(5);
-    const size_t pending = random(count + 2);  // >= count: no pending admission.
+    const size_t pending = random(count + 2);  // >= count: no settling window.
     std::vector<HWND> hwnds;
     for (size_t i = 0; i < count; ++i) {
       const HWND hwnd = reinterpret_cast<HWND>(0x7300000 + i * 4);
@@ -3037,7 +3037,7 @@ static void RunConstraintRecoveryDigest() {
         constraints.minHeight = 1 + static_cast<LONG>(random(static_cast<uint32_t>(height + height / 4)));
         workspace.UpdateConstraints(hwnd, constraints);
       }
-      if (i != pending) workspace.ClearInsertionPlacement(hwnd);
+      if (i != pending) workspace.MarkSettled(hwnd);
     }
     std::vector<RECT> rects;
     if (Layout::BuildWorkspaceLayoutPlan(workspace, metrics.workArea, metrics.gap, &rects) !=
@@ -3057,7 +3057,7 @@ static void RunConstraintRecoveryDigest() {
       for (HWND hwnd : hwnds) {
         const WindowRecord* record = state.Find(hwnd);
         mix(record ? 1 + static_cast<uint64_t>(record->state) : 0);
-        mix(record && record->pendingInsertionPlacement);
+        mix(record && record->settling);
       }
     };
     mix(iteration);
@@ -3068,7 +3068,7 @@ static void RunConstraintRecoveryDigest() {
     mix(g_workspaces.Load(key, &saved));
     mixWorkspace(saved);
     mix(g_wm.overflow.queue.size());
-    mix(Placement::g_pendingProofs.AdmissionRecoveryCount());
+    mix(Placement::g_pendingProofs.SettlingRecoveryCount());
 
     g_workspaces.Save(key, Workspace{});
     TestAdmissionRecoveries().clear();
@@ -3166,7 +3166,7 @@ static void RunDiagnosticReportShapeTest() {
   }
   // Includes the adaptive split settings measured from saved dividers.
   // Intentional report format changes must update this value.
-  if (digest != 0xa30386e69b842811ull) {
+  if (digest != 0x8b240aa0738a3375ull) {
     std::fprintf(stderr, "FAILED: diagnostic report shape changed (%016llx)\n", static_cast<unsigned long long>(digest));
     std::exit(1);
   }
@@ -3701,7 +3701,7 @@ static void RunOverflowFloatPredictionTests() {
         constraints.minHeight = 1 + static_cast<LONG>(random(random(2) ? 1030 : 400));
       }
       workspace.UpdateConstraints(hwnd, constraints);
-      workspace.ClearInsertionPlacement(hwnd);
+      workspace.MarkSettled(hwnd);
     }
     std::vector<RECT> rects;
     // Only settled workspaces that fit: arrangement keeps them that way.

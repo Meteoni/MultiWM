@@ -441,7 +441,7 @@ static bool MigrateManagedWindow(
     HWND hwnd, const DesktopMonitorKey& sourceKey, const DesktopMonitorKey& targetKey) {
   if (!hwnd || sourceKey == targetKey) return false;
   Placement::CancelConformanceLease(hwnd);
-  Placement::DiscardPendingAdmissionRecovery(hwnd);
+  Placement::DiscardPendingSettlingRecovery(hwnd);
 
   Workspace source;
   if (!g_workspaces.Load(sourceKey, &source)) return false;
@@ -585,7 +585,7 @@ static void ForgetWindowFromOwners(
     HWND hwnd, const std::vector<DesktopMonitorKey>& ownerKeys,
     std::vector<DesktopMonitorKey>* changedKeys) {
   Placement::CancelConformanceLease(hwnd);
-  Placement::DiscardPendingAdmissionRecovery(hwnd);
+  Placement::DiscardPendingSettlingRecovery(hwnd);
   g_workspaces.UpdateEach(
       ownerKeys,
       [&](const DesktopMonitorKey&, Workspace& workspace) { return workspace.Forget(hwnd); },
@@ -685,9 +685,9 @@ static void ReconcileWindowParticipation(
 
     bool changed = false;
     bool restoredIntoFloatingLayout = false;
-    const bool pendingInsertionBeforeSuspension =
+    const bool settlingBeforeSuspension =
         record->state == ManageState::Tiled &&
-        record->pendingInsertionPlacement;
+        record->settling;
 
     if (record->state == ManageState::Tiled &&
         reason != SuspensionReason::None) {
@@ -695,8 +695,8 @@ static void ReconcileWindowParticipation(
       Gestures::ClearMoveSizeSamples(hwnd);
       const bool suspended = workspace.Suspend(hwnd, reason);
       changed |= suspended;
-      if (suspended && pendingInsertionBeforeSuspension) {
-        changed |= Placement::RestorePendingAdmissionRecoveryAfterSuspension(
+      if (suspended && settlingBeforeSuspension) {
+        changed |= Placement::RestorePendingSettlingRecoveryAfterSuspension(
             ownerKey, hwnd, &workspace);
       }
     } else if (record->state == ManageState::Suspended) {

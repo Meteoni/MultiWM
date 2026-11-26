@@ -39,7 +39,7 @@ static void BeginConformanceLease(
     ConformanceLeaseKind kind = ConformanceLeaseKind::Tiled);
 static bool CancelConformanceLease(HWND hwnd, uint64_t generation = 0);
 static bool CancelTiledConformanceLease(HWND hwnd);
-static bool ClearSettledInsertionPlacements(const DesktopMonitorKey& key, Workspace& workspace);
+static bool MarkSettledWindows(const DesktopMonitorKey& key, Workspace& workspace);
 static bool HasOutstandingConformanceLease(const Workspace& workspace);
 }  // namespace Placement
 

@@ -241,7 +241,7 @@ static std::optional<SharedGeometry::FloatingPlacement> PredictFloatingPlacement
 }
 
 // Why there is no hint, which decides what happens to a window the companion
-// is holding (settling) when a later show finds none:
+// is holding when a later show finds none:
 //  - Unmanaged: MultiWM won't tile the window as asked (fullscreen, fixed-size,
 //    a rule, Manual mode, a float), so the hold ends at the app's own frame;
 //  - Undecided: a running MultiWM's snapshot can't say yet (another BSP
@@ -492,19 +492,19 @@ static std::optional<PredictedPlacement> PredictWindowPlacement(
   return PredictedPlacement{placement, kind == TargetKind::KeepSize};
 }
 
-// --- Settling ----------------------------------------------------------------------
+// --- Holding -----------------------------------------------------------------------
 //
 // After the companion places a window at its show, the app may still move it
 // before MultiWM gets to it: WeChat restores its pre-hide position 64 ms after
 // showing, ApplicationFrameHost the app's last position just before uncloaking
 // (traced). MultiWM would move it back, so the move is a visible jump. Until
 // MultiWM takes the window over, the app's own moves are kept at the frame the
-// companion chose (show_hooks.h, SteerSettlingWindow).
+// companion chose (show_hooks.h, SteerHeldWindow).
 //
 // "Taken over" is read from MultiWM itself, never guessed: its snapshot entry
 // for the window changes once it has processed the show (WindowFacts), or its
 // own placement arrives. One window per thread: the last one placed.
-struct SettlingWindow {
+struct HeldWindow {
   HWND hwnd = nullptr;
   RECT windowRect{};  // Physical screen pixels, including resize borders.
   WindowFacts facts;  // MultiWM's view of the window when it was placed.
@@ -514,7 +514,7 @@ struct SettlingWindow {
   // no request the app made while held is lost. Empty when unknown.
   RECT appRect{};
 };
-static thread_local SettlingWindow g_settling;
+static thread_local HeldWindow g_held;
 
 static bool IsUwpFrame(HWND hwnd) {
   wchar_t className[32];
@@ -527,35 +527,35 @@ static bool HasTitle(HWND hwnd) {
   return InternalGetWindowText(hwnd, first, ARRAYSIZE(first)) > 0;
 }
 
-static void EndSettling() { g_settling = {}; }
+static void EndHold() { g_held = {}; }
 
-// Starts settling `hwnd` at `windowRect`, replacing any earlier window on this
-// thread. A spare UWP frame (no title yet) is not settled: no app uses it yet,
+// Starts holding `hwnd` at `windowRect`, replacing any earlier window on this
+// thread. A spare UWP frame (no title yet) is not held: no app uses it yet,
 // and the launch that takes it places it again (show_hooks.h).
-// `appRect` (physical) is the frame the app asked for (SettlingWindow::appRect).
-static void BeginSettling(HWND hwnd, const RECT& windowRect, const RECT& appRect) {
+// `appRect` (physical) is the frame the app asked for (HeldWindow::appRect).
+static void BeginHold(HWND hwnd, const RECT& windowRect, const RECT& appRect) {
   WindowFacts facts;
   if ((IsUwpFrame(hwnd) && !HasTitle(hwnd)) || !ReadWindowFacts(hwnd, &facts)) {
-    EndSettling();
+    EndHold();
     return;
   }
-  g_settling = {hwnd, windowRect, facts, appRect};
+  g_held = {hwnd, windowRect, facts, appRect};
 }
 
 // The app's frame for a window about to be placed at `current`: while it is
-// already settling, `current` is the companion's frame, so the app's last
+// already held, `current` is the companion's frame, so the app's last
 // request is kept instead.
 static RECT AppFrameBeforePlacing(HWND hwnd, const RECT& current) {
-  return g_settling.hwnd == hwnd ? g_settling.appRect : current;
+  return g_held.hwnd == hwnd ? g_held.appRect : current;
 }
 
-// Why MultiWM's discovery will now refuse an untracked settling window that
+// Why MultiWM's discovery will now refuse an untracked held window that
 // passed at its show, or nullptr: the parts of WindowCanBeManaged and its
 // enabled check that an app can change after showing. A framework window
 // created resizable can drop its resize border by its show (PowerToys' WinUI
 // overlays, traced). Tracked windows tolerate these, as in MultiWM.
-static const char* SettlingIneligibility(HWND hwnd) {
-  if (g_settling.facts.entry.hwnd) return nullptr;
+static const char* HoldIneligibility(HWND hwnd) {
+  if (g_held.facts.entry.hwnd) return nullptr;
   if (!(GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_SIZEBOX)) return "fixed-size window";
   if (const char* reason = SharedRules::RejectNonTopLevel(hwnd)) return reason;
   if (const char* reason = SharedRules::RejectToolOrShellWindow(hwnd)) return reason;
@@ -563,15 +563,15 @@ static const char* SettlingIneligibility(HWND hwnd) {
   return nullptr;
 }
 
-// Ends settling `hwnd` because it turned out ineligible after all (a later show
-// found it so, or SettlingIneligibility). MultiWM won't tile it, so holding its
+// Ends the hold on `hwnd` because it turned out ineligible after all (a later show
+// found it so, or HoldIneligibility). MultiWM won't tile it, so holding its
 // moves would only fight the app. It goes to the frame the app last asked for,
 // as if the companion had never acted. Callers hold PlacementScope and
 // PhysicalCoordinatesScope.
-static void ReleaseIneligibleSettling(HWND hwnd, const char* path) {
-  if (!hwnd || g_settling.hwnd != hwnd) return;
-  const RECT appRect = g_settling.appRect;
-  EndSettling();
+static void ReleaseIneligibleHold(HWND hwnd, const char* path) {
+  if (!hwnd || g_held.hwnd != hwnd) return;
+  const RECT appRect = g_held.appRect;
+  EndHold();
   if (IsRectEmpty(&appRect)) return;
   g_setWindowPosForOwnMoves(hwnd, nullptr, appRect.left, appRect.top, Width(appRect), Height(appRect),
                             SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
@@ -585,14 +585,14 @@ static bool PlaceAtPredictedFrame(HWND hwnd, const char* path) {
   PhysicalCoordinatesScope physical;
   RECT current{};
   if (RejectStructurally(hwnd) || !GetWindowRect(hwnd, &current)) {
-    ReleaseIneligibleSettling(hwnd, path);
+    ReleaseIneligibleHold(hwnd, path);
     return false;
   }
   NoHint noHint = NoHint::Unmanaged;
   const auto prediction = PredictWindowPlacement(hwnd, current, path, &noHint);
   if (!prediction) {
     // Undecided: MultiWM will still tile it, so it stays where the hold has it.
-    if (noHint == NoHint::Unmanaged) ReleaseIneligibleSettling(hwnd, path);
+    if (noHint == NoHint::Unmanaged) ReleaseIneligibleHold(hwnd, path);
     return false;
   }
 
@@ -611,7 +611,7 @@ static bool PlaceAtPredictedFrame(HWND hwnd, const char* path) {
     LogDecision(hwnd, path, placed ? "placed at MultiWM's frame" : "SetWindowPos failed");
   }
   // A window MultiWM only centres (keepSize) has no exact frame to hold.
-  if (placed && !prediction->keepSize) BeginSettling(hwnd, placement, AppFrameBeforePlacing(hwnd, current));
+  if (placed && !prediction->keepSize) BeginHold(hwnd, placement, AppFrameBeforePlacing(hwnd, current));
   return placed;
 }
 

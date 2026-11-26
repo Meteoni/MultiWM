@@ -74,7 +74,7 @@ a monitor that disappears is freed on the next display change.
 Code outside `layout/` and `model/` asks `LayoutPolicyOf(layout)`
 (`core/shared_types.h`) rather than naming a layout. For example: may overflow
 create a desktop? Does a rejected arrival float in place? Are can't-fit floats
-announced? Do drops have edge zones? Do companion hints follow admission recovery
+announced? Do drops have edge zones? Do companion hints follow settling recovery
 to another tile? What does the layout action do?
 A new layout states these once in `kLayoutPolicies`. The planner and the model
 still branch by layout, because how a layout divides space is theirs.
