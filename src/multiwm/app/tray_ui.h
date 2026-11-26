@@ -1,7 +1,7 @@
 //
 // UI boundary for the tool mod: no Explorer hooks, XAML, WinUI, or Windows App
 // SDK dependency. The tray uses two-letter mode abbreviations that are fitted to
-// the full icon canvas. Status flyouts are toasts that Overlay (app/overlay.h)
+// the full icon canvas. Status toasts are what Overlay (app/overlay.h)
 // draws; this chapter decides their text, monitor, position and theme.
 
 namespace TrayUi {
@@ -18,7 +18,7 @@ constexpr int kTrayTextDesignSize = 32;
 constexpr int kTrayFontHeight = 26;
 // Each icon pixel averages this many aliased samples per axis (TextCoverage).
 constexpr int kTraySupersample = 8;
-constexpr DWORD kFlyoutHoldMs = 850;
+constexpr DWORD kToastHoldMs = 850;
 constexpr wchar_t kPersonalizeSettings[] = LR"(Software\Microsoft\Windows\CurrentVersion\Themes\Personalize)";
 using LayoutIconSet = std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>;
 
@@ -26,10 +26,10 @@ using LayoutIconSet = std::array<HICON, static_cast<size_t>(TileLayout::COUNT)>;
 // applies them to the next session.
 struct TrayPreferences {
   bool showToasts = true;
-  bool flyoutAtTop = false;
+  bool toastAtTop = false;
   bool clickOpensMenu = false;
-  int flyoutOffsetXDip = 0;
-  int flyoutOffsetYDip = 0;
+  int toastOffsetXDip = 0;
+  int toastOffsetYDip = 0;
   std::array<std::wstring, static_cast<size_t>(TileLayout::COUNT)> customIconPaths{};
 };
 
@@ -64,9 +64,9 @@ static const wchar_t* LayoutTrayText(TileLayout layout) {
   return names ? names->trayIcon : L"??";
 }
 
-static const wchar_t* LayoutFlyoutText(TileLayout layout) {
+static const wchar_t* LayoutToastText(TileLayout layout) {
   const LayoutNames* names = FindLayoutNames(layout);
-  return names ? names->flyout : L"Unknown";
+  return names ? names->toast : L"Unknown";
 }
 
 // The layout `key`'s workspace uses, or the one it will start with.
@@ -81,9 +81,9 @@ static void LoadSettings() {
   g_preferences.clickOpensMenu = _wcsicmp(trayClickAction.get(), L"context_menu") == 0;
   g_preferences.showToasts = Wh_GetIntSetting(L"appearance.ShowToasts") != 0;
   auto position = StringSetting::make(L"appearance.FlyoutPosition");
-  g_preferences.flyoutAtTop = _wcsicmp(position.get(), L"top") == 0;
-  g_preferences.flyoutOffsetXDip = Wh_GetIntSetting(L"appearance.FlyoutOffsetX");
-  g_preferences.flyoutOffsetYDip = Wh_GetIntSetting(L"appearance.FlyoutOffsetY");
+  g_preferences.toastAtTop = _wcsicmp(position.get(), L"top") == 0;
+  g_preferences.toastOffsetXDip = Wh_GetIntSetting(L"appearance.FlyoutOffsetX");
+  g_preferences.toastOffsetYDip = Wh_GetIntSetting(L"appearance.FlyoutOffsetY");
 
   for (auto& path : g_preferences.customIconPaths) path.clear();
   for (int i = 0; i < 32; ++i) {
@@ -113,13 +113,13 @@ static bool ReadSystemLightTheme() {
   return GetRValue(fallback) + GetGValue(fallback) + GetBValue(fallback) >= 384;
 }
 
-static COLORREF FlyoutBackgroundColor() {
+static COLORREF ToastBackgroundColor() {
   return g_session.systemLightTheme ? RGB(243, 243, 243) : RGB(36, 36, 36);
 }
 
 // The colors of toasts and drag-preview badge cards for the current theme.
 static Overlay::PopupAppearance CurrentPopupAppearance() {
-  return {FlyoutBackgroundColor(), g_session.systemLightTheme};
+  return {ToastBackgroundColor(), g_session.systemLightTheme};
 }
 
 // The tray's icon size: the small-icon size at the taskbar's DPI, so the shell
@@ -292,7 +292,7 @@ static void SetTooltip(TileLayout layout) {
         tooltip += monitor == g_session.displayedMonitor ? L"\x25B8 " : L"\u2007 ";
         tooltip += MonitorTooltipLabel(monitor, i);
         tooltip += L": ";
-        tooltip += LayoutFlyoutText(monitorLayout);
+        tooltip += LayoutToastText(monitorLayout);
       }
     }
   }
@@ -428,15 +428,15 @@ static void RebuildIconsIfResized() {
 
 // Shows `text` on `monitor` (else the command monitor), with the icons of
 // `apps`, the windows of the apps it names, one each, before it.
-static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor, const std::vector<HWND>& apps = {}) {
+static void ShowStatusToast(const wchar_t* text, HMONITOR monitor, const std::vector<HWND>& apps = {}) {
   if ((!g_session.trayWindowClass && !g_session.trayWindow) || !g_preferences.showToasts || !text || !*text) return;
   if (!monitor) monitor = Platform::Monitors::GetWorkspaceCommandMonitor();
   if (!monitor) return;
-  Overlay::ToastRequest request{monitor, text, CurrentPopupAppearance(), g_preferences.flyoutOffsetXDip,
-                                g_preferences.flyoutOffsetYDip, g_preferences.flyoutAtTop};
+  Overlay::ToastRequest request{monitor, text, CurrentPopupAppearance(), g_preferences.toastOffsetXDip,
+                                g_preferences.toastOffsetYDip, g_preferences.toastAtTop};
   // Allow roughly 75 ms per character, retaining the minimum for short hints.
   request.holdMs = static_cast<DWORD>(std::max<size_t>(
-      kFlyoutHoldMs, std::min<size_t>(request.text.size(), 1000000) * 75));
+      kToastHoldMs, std::min<size_t>(request.text.size(), 1000000) * 75));
   for (HWND hwnd : apps) {
     if (request.apps.size() == Overlay::kMaxToastIcons) break;
     DWORD processId = 0;
@@ -447,29 +447,29 @@ static void ShowStatusFlyout(const wchar_t* text, HMONITOR monitor, const std::v
   Overlay::PublishToast(std::move(request));
 }
 
-static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor) {
+static void ShowLayoutToast(TileLayout layout, HMONITOR monitor) {
   if (layout == TileLayout::COUNT) return;
-  ShowStatusFlyout(LayoutFlyoutText(layout), monitor);
+  ShowStatusToast(LayoutToastText(layout), monitor);
 }
 
-static void ShowCommandFailureFlyout(
+static void ShowCommandFailureToast(
     const wchar_t* text, HMONITOR monitor) {
   if (!text || !*text) return;
-  ShowStatusFlyout(text, monitor);
+  ShowStatusToast(text, monitor);
 }
 
 // A toast about apps (Placement::AppToast): its text after their icons.
-static void ShowAppFlyout(const std::wstring& text, const std::vector<HWND>& apps, HMONITOR monitor) {
-  ShowStatusFlyout(text.c_str(), monitor, apps);
+static void ShowAppToast(const std::wstring& text, const std::vector<HWND>& apps, HMONITOR monitor) {
+  ShowStatusToast(text.c_str(), monitor, apps);
 }
 
-static void ShowManagementModeFlyout(bool automatic) {
-  ShowStatusFlyout(
+static void ShowManagementModeToast(bool automatic) {
+  ShowStatusToast(
       automatic ? L"Automatic Mode" : L"Manual Mode",
       Platform::Monitors::GetWorkspaceCommandMonitor());
 }
 
-static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
+static void ShowDesktopSwitchToasts(const GUID& desktopId) {
   if (!g_preferences.showToasts) return;
   std::vector<HMONITOR> monitors;
   Reconcile::EnumerateCurrentMonitors(monitors);
@@ -477,7 +477,7 @@ static void ShowDesktopSwitchFlyouts(const GUID& desktopId) {
     TileLayout layout = g_settings.defaultLayout;
     DesktopMonitorKey key{};
     if (DesktopMonitorKey::FromHMonitor(desktopId, monitor, &key)) layout = LayoutShownFor(key);
-    ShowLayoutFlyout(layout, monitor);
+    ShowLayoutToast(layout, monitor);
   }
 }
 

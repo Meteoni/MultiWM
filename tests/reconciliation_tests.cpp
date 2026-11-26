@@ -233,12 +233,12 @@ static void RunDesktopReconciliationTests() {
   {
     const HWND leased = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x5e11));
     auto observe = [&](const GUID& desktop, bool notified) {
-      g_wm.desktop.pendingSwitchFlyouts = false;
+      g_wm.desktop.pendingSwitchToasts = false;
       TestLeases()[leased] = Placement::ConformanceLease{};
       return Reconcile::ObserveCurrentDesktop(desktop, notified);
     };
     auto sideEffects = [&](bool expected) {
-      return g_wm.desktop.pendingSwitchFlyouts == expected && TestLeases().count(leased) == (expected ? 0u : 1u) &&
+      return g_wm.desktop.pendingSwitchToasts == expected && TestLeases().count(leased) == (expected ? 0u : 1u) &&
              g_wm.desktop.state == ReconciledDesktopState::Settled;
     };
     RuntimeLifecycle::ForgetReconciledDesktop();
@@ -256,7 +256,7 @@ static void RunDesktopReconciliationTests() {
           "a settled pass on another desktop is a switch");
     check(observe(source.desktopId, true) && sideEffects(true), "a notification of another desktop is a switch");
     TestLeases().clear();
-    g_wm.desktop.pendingSwitchFlyouts = false;
+    g_wm.desktop.pendingSwitchToasts = false;
     RuntimeLifecycle::ForgetReconciledDesktop();
   }
   std::printf("Passed %d desktop reconciliation checks.\n", checks);
@@ -724,7 +724,7 @@ class FloatingWindowFixture {
     Workspace workspace = Load();
     Placement::FloatingPlacementHint hint;
     hint.intent = intent;
-    if (!Placement::RepairFloatingGeometry(key, workspace, window, hint)) return false;
+    if (!Placement::PlaceFloatingWindowByHint(key, workspace, window, hint)) return false;
     g_workspaces.Save(key, workspace);
     return true;
   }
@@ -1755,7 +1755,7 @@ static void RunBspDragTests() {
   const bool savedLightTheme = TrayUi::g_session.systemLightTheme;
   const bool actualLightTheme = TrayUi::ReadSystemLightTheme();
   TrayUi::g_session.systemLightTheme = !actualLightTheme;
-  const COLORREF oldBadgeColor = TrayUi::FlyoutBackgroundColor();
+  const COLORREF oldBadgeColor = TrayUi::ToastBackgroundColor();
   const ULONGLONG badgeFadeStart = overlay.fadeStarted;
   TrayUi::TrayWindowProc(nullptr, WM_THEMECHANGED, 0, 0);
   check(TrayUi::g_session.systemLightTheme == actualLightTheme &&
@@ -2049,10 +2049,10 @@ static void RunBspDragTests() {
     check(waitFor([&] { return noneVisible(overlayThread); }), "the retained preview fades out on its thread");
     TrayUi::g_preferences.showToasts = true;
     const HWND savedTrayWindow = std::exchange(TrayUi::g_session.trayWindow, source);
-    const int savedOffset = std::exchange(TrayUi::g_preferences.flyoutOffsetXDip, 100000);
-    TrayUi::ShowStatusFlyout(L"Retained status", fixture.key.ResolveMonitor());
+    const int savedOffset = std::exchange(TrayUi::g_preferences.toastOffsetXDip, 100000);
+    TrayUi::ShowStatusToast(L"Retained status", fixture.key.ResolveMonitor());
     TrayUi::g_session.trayWindow = savedTrayWindow;
-    TrayUi::g_preferences.flyoutOffsetXDip = savedOffset;
+    TrayUi::g_preferences.toastOffsetXDip = savedOffset;
     check(waitFor([&] { return IsWindowVisible(host); }) && threadWindows(overlayThread).size() == 1,
           "a toast with an out-of-bounds offset still uses the same preview host");
     DragPreview::Show({wideTile, narrowTile, source, target}, true, 144, desktopId);

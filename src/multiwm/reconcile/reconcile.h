@@ -60,14 +60,14 @@ static bool ValidateSnapshotDesktop(const GUID& expectedDesktop) {
 // reconciled or, before any was, a native notification (only it proves a switch
 // happened). On a switch, drops the old desktop's pending proofs, since a lease
 // never carries across DWM's cloak/uncloak transition, and queues the switch
-// flyouts for the end of the next settled pass.
+// toasts for the end of the next settled pass.
 static bool ObserveCurrentDesktop(const GUID& currentDesktop, bool notified) {
   const bool switched = g_wm.desktop.state == ReconciledDesktopState::Unknown
                             ? notified
                             : !IsEqualGUID(g_wm.desktop.reconciled, currentDesktop);
   if (switched) {
     Placement::DiscardAllPendingProofs();
-    g_wm.desktop.pendingSwitchFlyouts = true;
+    g_wm.desktop.pendingSwitchToasts = true;
   }
   g_wm.desktop.reconciled = currentDesktop;
   g_wm.desktop.state = ReconciledDesktopState::Settled;
@@ -346,8 +346,8 @@ static bool AdoptSnapshotGeometryIfEligible(
     return false;
   }
 
-  const HWND preferredMaster = workspace.Empty() ? nullptr
-                                                 : workspace.TiledWindows().front();
+  const HWND preferredMaster = workspace.NoTiledWindows() ? nullptr
+                                                          : workspace.TiledWindows().front();
   std::vector<WorkspaceGeometryItem> geometry = Platform::Windows::CaptureWorkspaceGeometry(
       workspace.TiledWindows(), monitor, workArea);
   for (auto& item : geometry) {
@@ -477,7 +477,7 @@ static bool MigrateManagedWindow(
     // when the completed user gesture supplies an explicit anchor.
     if (RuntimeLifecycle::IsAutomaticMode() ||
         hint.intent == Placement::FloatingPlacementIntent::PreserveAnchor) {
-      const bool repaired = Placement::RepairFloatingGeometry(targetKey, target, hwnd, hint);
+      const bool repaired = Placement::PlaceFloatingWindowByHint(targetKey, target, hwnd, hint);
       if (repaired && hint.intent == Placement::FloatingPlacementIntent::PreserveAnchor) {
         // The completed gesture has already served as migration context. Clear it
         // so a deferred desktop migration cannot leave an old drag sample behind.
@@ -732,7 +732,7 @@ static void ReconcileWindowParticipation(
       // the layout-transition restore. Apply the same passive remembered-geometry
       // policy when it becomes active again.
       if (restoredIntoFloatingLayout) {
-        Placement::RepairFloatingGeometry(
+        Placement::PlaceFloatingWindowByHint(
             ownerKey, workspace, hwnd, Placement::FloatingPlacementHint{});
       }
       g_workspaces.Save(ownerKey, workspace);
@@ -965,7 +965,7 @@ static WorkspaceDiscovery DiscoverWorkspaceWindows(
           pendingDefaultCenter
               ? Placement::FloatingPlacementIntent::RuleFloatedCenter
               : Placement::FloatingPlacementIntent::NewWindowCenter;
-      if (Placement::RepairFloatingGeometry(key, workspace, hwnd, newWindowHint)) {
+      if (Placement::PlaceFloatingWindowByHint(key, workspace, hwnd, newWindowHint)) {
         workspace.ClearDefaultFloatingCenter(hwnd);
         changed = true;
       }
@@ -1094,7 +1094,7 @@ static void HandleVirtualDesktopChanged() {
   Diagnostics::RecordEvent(
       L"virtual desktop changed currentDesktop=%08X", currentDesktop.Data1);
   // Duplicate callbacks for the desktop already reconciled are not a switch, so
-  // they queue no second flyout. The incoming settled pass establishes fresh
+  // they queue no second toast. The incoming settled pass establishes fresh
   // leases for any placements it has to issue.
   ObserveCurrentDesktop(currentDesktop, true);
 
@@ -1453,9 +1453,9 @@ static void ReconcileDeferredLifecycle() {
   });
 
   g_wm.lifecycle.retryAfterPlatformRecovery = false;
-  if (g_wm.desktop.pendingSwitchFlyouts) {
-    g_wm.desktop.pendingSwitchFlyouts = false;
-    TrayUi::ShowDesktopSwitchFlyouts(currentDesktop);
+  if (g_wm.desktop.pendingSwitchToasts) {
+    g_wm.desktop.pendingSwitchToasts = false;
+    TrayUi::ShowDesktopSwitchToasts(currentDesktop);
   }
   ProcessWindowOverflow();
   FollowInitiallyPlacedWindow();

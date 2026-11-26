@@ -27,8 +27,8 @@ static void ArmMaintenanceTimer() {
 static void ReportPlatformFailureOnce(bool hooksReady, bool vdCoreReady) {
   if (g_wm.maintenance.failureReported || (hooksReady && vdCoreReady)) return;
   g_wm.maintenance.failureReported = true;
-  TrayUi::ShowCommandFailureFlyout(!vdCoreReady ? L"Virtual desktop support unavailable"
-                                                : L"Can't watch windows; tiling may not react");
+  TrayUi::ShowCommandFailureToast(!vdCoreReady ? L"Virtual desktop support unavailable"
+                                               : L"Can't watch windows; tiling may not react");
 }
 
 void RequestMaintenance(bool resetAttempts) {

@@ -1573,7 +1573,7 @@ static void WriteDiagnosticReport() {
            g_settings.diagnosticsOutputPath.c_str(), writeError);
     RecordEvent(L"diagnostic report write failed error=%lu", writeError);
     AccumulateDiagnosticSelfCost(reportStartTickMs, reportStartCpu);
-    TrayUi::ShowCommandFailureFlyout(L"Couldn't save the diagnostic report");
+    TrayUi::ShowCommandFailureToast(L"Couldn't save the diagnostic report");
     return;
   }
 
@@ -1591,7 +1591,7 @@ static void WriteDiagnosticReport() {
   g_runtime.lastReportTickMs = GetTickCount64();
   // Writing can take a moment on a busy system; this says it has finished, and
   // where, since the folder is a setting.
-  TrayUi::ShowStatusFlyout((L"Diagnostic report saved to " + outputPath).c_str(), nullptr);
+  TrayUi::ShowStatusToast((L"Diagnostic report saved to " + outputPath).c_str(), nullptr);
 }
 }  // namespace Diagnostics
 

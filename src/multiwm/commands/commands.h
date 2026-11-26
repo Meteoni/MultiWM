@@ -53,7 +53,7 @@ static std::optional<ForegroundWorkspace> LoadForegroundWorkspace(HWND foregroun
 // A window command that does nothing says why, rather than failing silently
 // (Show Toasts permitting). On the focused window's monitor when known.
 static void ReportCommandRefused(const wchar_t* text, const std::optional<ForegroundWorkspace>& current) {
-  TrayUi::ShowCommandFailureFlyout(text, current ? current->monitor : nullptr);
+  TrayUi::ShowCommandFailureToast(text, current ? current->monitor : nullptr);
 }
 
 // The command found no window to act on: MultiWM doesn't manage the focused
@@ -183,7 +183,7 @@ void FloatFocusedWindow() {
   Placement::CancelConformanceLease(tiled);
   Placement::DiscardPendingAdmissionRecovery(tiled);
   if (!workspace.Float(tiled)) return;
-  Placement::RepairFloatingGeometry(key, workspace, tiled, hint);
+  Placement::PlaceFloatingWindowByHint(key, workspace, tiled, hint);
   g_workspaces.Save(key, workspace);
   Placement::ArrangeWorkspace(key);
   Wh_Log(L"Focused window floated %p", tiled);
@@ -240,7 +240,7 @@ static void ResizeUnmanagedFocusedWindow(
   if (Placement::ResizeUnmanagedWindow(foreground, monitor, direction)) {
     Diagnostics::RecordEvent(L"%ls unmanaged hwnd=%p", action, foreground);
   } else {
-    TrayUi::ShowCommandFailureFlyout(L"Couldn't resize this window", monitor);
+    TrayUi::ShowCommandFailureToast(L"Couldn't resize this window", monitor);
   }
 }
 
@@ -272,14 +272,14 @@ void StepFocusedWindowSize(bool grow) {
   // A press that can't move the window says why, rather than doing nothing
   // silently. Rejections by the layout check report their own message.
   auto reportNoRoom = [&] {
-    TrayUi::ShowCommandFailureFlyout(grow ? L"No room to grow" : L"Already at its smallest size",
-                                     focused->monitor);
+    TrayUi::ShowCommandFailureToast(grow ? L"No room to grow" : L"Already at its smallest size",
+                                    focused->monitor);
   };
 
   if (focused->floating) {
     const WindowRecord* record = focused->workspace.Find(focused->hwnd);
     if ((record && !record->canResize) || Platform::Windows::GhostWindowOf(focused->hwnd)) {
-      TrayUi::ShowCommandFailureFlyout(L"This window can't be resized", focused->monitor);
+      TrayUi::ShowCommandFailureToast(L"This window can't be resized", focused->monitor);
     } else if (Placement::StepFloatingWindowSize(focused->key, focused->workspace, focused->hwnd, grow ? 1 : -1)) {
       g_workspaces.Save(focused->key, focused->workspace);
       Diagnostics::RecordEvent(L"%ls floating hwnd=%p", action, focused->hwnd);
@@ -289,7 +289,7 @@ void StepFocusedWindowSize(bool grow) {
     return;
   }
   if (focused->workspace.Layout() == TileLayout::Monocle) {
-    TrayUi::ShowCommandFailureFlyout(L"Nothing to resize in Monocle", focused->monitor);
+    TrayUi::ShowCommandFailureToast(L"Nothing to resize in Monocle", focused->monitor);
     return;
   }
 
@@ -319,7 +319,7 @@ void ResetFocusedWindowSize() {
   if (focused->floating) {
     Placement::FloatingPlacementHint hint;
     hint.intent = Placement::FloatingPlacementIntent::NewWindowCenter;
-    if (Placement::RepairFloatingGeometry(focused->key, focused->workspace, focused->hwnd, hint)) {
+    if (Placement::PlaceFloatingWindowByHint(focused->key, focused->workspace, focused->hwnd, hint)) {
       g_workspaces.Save(focused->key, focused->workspace);
       Diagnostics::RecordEvent(L"Reset window size floating hwnd=%p", focused->hwnd);
     }
@@ -327,7 +327,7 @@ void ResetFocusedWindowSize() {
   }
 
   if (focused->workspace.Layout() == TileLayout::Monocle) {
-    TrayUi::ShowCommandFailureFlyout(L"Nothing to resize in Monocle", focused->monitor);
+    TrayUi::ShowCommandFailureToast(L"Nothing to resize in Monocle", focused->monitor);
     return;
   }
   Platform::Monitors::WorkspaceMetrics metrics;
@@ -337,7 +337,7 @@ void ResetFocusedWindowSize() {
           metrics.workArea, metrics.gap, candidate.TiledIndex(focused->hwnd),
           g_settings.masterPercent / 100.0)) {
     // Nothing to reset: already at the layout's default, or the only window.
-    TrayUi::ShowCommandFailureFlyout(L"Already at its default size", focused->monitor);
+    TrayUi::ShowCommandFailureToast(L"Already at its default size", focused->monitor);
     return;
   }
   CommitWindowSizeChange(*focused, std::move(candidate), L"Reset window size");
@@ -396,7 +396,7 @@ static bool CommitWorkspaceLayoutChange(
     return false;
   }
   TrayUi::UpdateIcon(layout, monitor);
-  TrayUi::ShowLayoutFlyout(layout, monitor);
+  TrayUi::ShowLayoutToast(layout, monitor);
   return true;
 }
 
@@ -582,7 +582,7 @@ static void HandleUserMove(
     Placement::CancelConformanceLease(hwnd);
     Placement::DiscardPendingAdmissionRecovery(hwnd);
     if (workspace.Float(hwnd)) {
-      Placement::RepairFloatingGeometry(
+      Placement::PlaceFloatingWindowByHint(
           key, workspace, hwnd, Placement::MakeFloatingPlacementHintFromGesture(gesture));
       g_workspaces.Save(key, workspace);
       ++Diagnostics::g_runtime.counters.tiledFloatActions;

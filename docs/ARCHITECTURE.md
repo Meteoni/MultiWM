@@ -53,7 +53,7 @@ call it from the WM thread and depend on it, never on each other:
   calls `Overlay::ShowPreview` / `HidePreview`.
 - `TrayUi` decides a toast's text, monitor, offsets and theme, then calls
   `Overlay::PublishToast`. A theme change calls `Overlay::RefreshAppearance`.
-  A toast about apps (`Placement::AppToast`, through `TrayUi::ShowAppFlyout`)
+  A toast about apps (`Placement::AppToast`, through `TrayUi::ShowAppToast`)
   also names one window per app; the overlay shows it once a thread-pool worker
   has loaded their icons, which go before the text at the small-icon size.
 

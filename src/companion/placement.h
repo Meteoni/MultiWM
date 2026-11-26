@@ -218,7 +218,7 @@ enum class TargetKind {
 };
 
 // Where MultiWM will centre a new floating window, by the rule both mods share
-// (SharedGeometry::PlanFloatingPlacement, as RepairFloatingGeometry uses it):
+// (SharedGeometry::PlanFloatingPlacement, as PlaceFloatingWindowByHint uses it):
 // sized by `source` from the window's matching size rule (`sizeRule`, may be
 // null), its own frame `frame`, and the workspace's default floating frame. A
 // preserve-size rule is ignored when `ignorePreserveSize` (FailureCenter, for a

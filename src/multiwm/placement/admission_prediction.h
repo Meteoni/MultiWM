@@ -45,7 +45,7 @@ static bool AdmitPredictedWindow(Workspace& trial, bool insertAfterFocused) {
 //   (`newWindowFloats`), except an unsatisfiable plan that recovery resolves
 //   some other way.
 // - The floating frame centres the configured default size in the work area,
-//   as RepairFloatingGeometry does for NewWindowCenter and FailureCenter.
+//   as PlaceFloatingWindowByHint does for NewWindowCenter and FailureCenter.
 //
 // Pure model and geometry work: never queries or moves a window, never changes
 // `workspace`. Tiled migrations use these same insertion operations, so their

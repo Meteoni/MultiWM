@@ -297,7 +297,7 @@ class Workspace {
   Workspace EmptyWithInheritedLayoutSettings() const;
   size_t RecordCount() const { return records_.size(); }
   // True when no window is tiled (floating/suspended records may still exist).
-  bool Empty() const { return windows_.empty(); }
+  bool NoTiledWindows() const { return windows_.empty(); }
 
   bool HasRecord(HWND hwnd) const;
   // The record for `hwnd`, or nullptr. See the pointer-lifetime note above.

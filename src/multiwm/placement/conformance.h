@@ -709,7 +709,7 @@ static bool ReinforceConformanceTile(
 // --- Floating leases ---------------------------------------------------------
 //
 // In the Floating layout MultiWM owns a window's frame only right after placing
-// it (RepairFloatingGeometry, the window-size commands). An app that snaps back
+// it (PlaceFloatingWindowByHint, the window-size commands). An app that snaps back
 // within the lease is put back; one that answers the placement with its own
 // adjustment keeps it, and at the deadline the window keeps wherever it is. A
 // floating lease never floats a window or rolls back a layout.

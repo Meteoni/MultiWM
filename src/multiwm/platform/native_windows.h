@@ -335,7 +335,7 @@ static WindowRecord MakeWindowRecord(HWND hwnd, ManageState state = ManageState:
     // No floating frame yet. The frame a window has when it is first recorded
     // is often a placeholder (shown at the system minimum, sized afterwards) or,
     // with the companion, already its tile. Its first float uses an
-    // override-size rule or the configured default (RepairFloatingGeometry).
+    // override-size rule or the configured default (PlaceFloatingWindowByHint).
   }
 
   return record;

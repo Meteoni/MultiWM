@@ -323,7 +323,7 @@ struct AppToast {
 };
 
 static void ShowAppToast(const AppToast& toast, HMONITOR monitor) {
-  TrayUi::ShowAppFlyout(toast.text, toast.apps, monitor);
+  TrayUi::ShowAppToast(toast.text, toast.apps, monitor);
 }
 
 // The first of `windows` from each app (process name; the unnamed count as
@@ -415,7 +415,7 @@ static bool FloatWindowAfterFailure(
   if (!workspace.Float(hwnd)) return false;
   FloatingPlacementHint hint;
   hint.intent = FloatingPlacementIntent::FailureCenter;
-  if (!RepairFloatingGeometry(key, workspace, hwnd, hint)) {
+  if (!PlaceFloatingWindowByHint(key, workspace, hwnd, hint)) {
     Diagnostics::RecordEvent(
         L"failure float geometry reset failed hwnd=%p desktop=%08X",
         hwnd, key.desktopId.Data1);
@@ -837,7 +837,7 @@ static ArrangementStep ReleaseConstraintVictim(
   }
   ++Diagnostics::g_runtime.counters.constraintFloats;
   g_workspaces.Save(key, workspace);
-  return workspace.Empty() ? ArrangementStep::Finished : ArrangementStep::Replan;
+  return workspace.NoTiledWindows() ? ArrangementStep::Finished : ArrangementStep::Replan;
 }
 
 // Handles one failed plan, trying in order: roll back a provisional user change;
@@ -1033,7 +1033,7 @@ static ArrangementStep ApplyWorkspacePlacements(
     ClearSettledInsertionPlacements(key, workspace);
   }
   g_workspaces.Save(key, workspace);
-  if (!participationChanged || workspace.Empty()) {
+  if (!participationChanged || workspace.NoTiledWindows()) {
     ClearSettledLayoutMutation(key, workspace);
     return ArrangementStep::Finished;
   }
@@ -1072,7 +1072,7 @@ static void ArrangeWorkspace(
   size_t pass = 0;
   for (; pass < maxPasses; ++pass) {
     ++Diagnostics::g_runtime.counters.arrangePasses;
-    if (workspace.Layout() == TileLayout::Floating || workspace.Empty()) {
+    if (workspace.Layout() == TileLayout::Floating || workspace.NoTiledWindows()) {
       if (workspace.Layout() == TileLayout::Floating) {
         for (HWND hwnd : workspace.TiledWindows()) {
           CancelTiledConformanceLease(hwnd);

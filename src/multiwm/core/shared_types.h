@@ -230,7 +230,7 @@ enum class TileLayout { MasterStack, Columns, Rows, MasterStackH, Dwindle, Monoc
 struct LayoutNames {
   const wchar_t* setting;     // Settings value, e.g. "master_stack".
   const wchar_t* display;     // Tray menu and single-monitor tooltip.
-  const wchar_t* flyout;      // Toasts and the per-monitor tooltip rows.
+  const wchar_t* toast;       // Toasts and the per-monitor tooltip rows.
   const wchar_t* trayIcon;    // Two-letter text of the built-in tray icon.
   const wchar_t* diagnostic;  // Diagnostic reports.
 };

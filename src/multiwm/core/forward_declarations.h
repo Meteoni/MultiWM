@@ -7,7 +7,7 @@
 // file, add its declaration here, next to its owner's namespace. Keep the
 // signature (including default arguments) identical to the definition.
 namespace Placement {
-// Where Placement::RepairFloatingGeometry (placement/floating.h) should put a
+// Where Placement::PlaceFloatingWindowByHint (placement/floating.h) should put a
 // window that becomes floating.
 enum class FloatingPlacementIntent {
   PassiveRestore,          // Reuse the remembered floating frame when it is on this monitor.
@@ -93,11 +93,11 @@ static void LoadSettings();
 static bool Initialize();
 static void Shutdown();
 static void UpdateIcon(TileLayout layout, HMONITOR monitor = nullptr);
-static void ShowLayoutFlyout(TileLayout layout, HMONITOR monitor = nullptr);
-static void ShowCommandFailureFlyout(const wchar_t* text, HMONITOR monitor = nullptr);
-static void ShowAppFlyout(const std::wstring& text, const std::vector<HWND>& apps, HMONITOR monitor = nullptr);
-static void ShowManagementModeFlyout(bool automatic);
-static void ShowDesktopSwitchFlyouts(const GUID& desktopId);
+static void ShowLayoutToast(TileLayout layout, HMONITOR monitor = nullptr);
+static void ShowCommandFailureToast(const wchar_t* text, HMONITOR monitor = nullptr);
+static void ShowAppToast(const std::wstring& text, const std::vector<HWND>& apps, HMONITOR monitor = nullptr);
+static void ShowManagementModeToast(bool automatic);
+static void ShowDesktopSwitchToasts(const GUID& desktopId);
 static void RefreshForMonitor(HMONITOR monitor);
 static void RefreshDisplayedMonitor();
 static void RefreshForCurrentWorkspace();

@@ -51,7 +51,7 @@ static std::wstring StartupProblemsText(const std::vector<const wchar_t*>& unava
 // Needs the tray UI.
 static void ReportStartupProblems(const std::vector<const wchar_t*>& unavailableHotkeys) {
   const std::wstring text = StartupProblemsText(unavailableHotkeys, g_settings.problems);
-  if (!text.empty()) TrayUi::ShowCommandFailureFlyout(text.c_str());
+  if (!text.empty()) TrayUi::ShowCommandFailureToast(text.c_str());
 }
 
 static void UnregisterConfiguredHotkeys() {
@@ -94,7 +94,7 @@ static void SetWindowManagementMode(ManagementMode mode) {
   Wh_Log(L"Window management mode: %s", automatic ? L"Automatic" : L"Manual");
   Diagnostics::RecordEvent(
       L"management mode changed to %ls", automatic ? L"Automatic" : L"Manual");
-  TrayUi::ShowManagementModeFlyout(automatic);
+  TrayUi::ShowManagementModeToast(automatic);
 
   // Entering Automatic mode runs the normal discovery path for every monitor.
   // Known Floating records remain managed-but-excluded and are never re-adopted.

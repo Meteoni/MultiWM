@@ -12,8 +12,8 @@ constexpr ULONGLONG kOverflowFollowTimeoutMs = 2000;
 static void ReportMissingRouteTarget(HWND hwnd, const wchar_t* target) {
   std::wstring name = Placement::ProcessDisplayName(hwnd);
   if (name.empty()) name = L"A window";
-  TrayUi::ShowAppFlyout(name + L": rule's " + target + L" not found", {hwnd},
-                        Platform::Windows::GetWindowPhysicalMonitor(hwnd));
+  TrayUi::ShowAppToast(name + L": rule's " + target + L" not found", {hwnd},
+                       Platform::Windows::GetWindowPhysicalMonitor(hwnd));
 }
 
 // Freezes a matching initial-placement rule into a pending request. Native
@@ -417,7 +417,7 @@ static void RollbackOverflowMove(const PendingDesktopFollow& pending) {
   if (!returned) {
     std::wstring name = Placement::ProcessDisplayName(pending.hwnd);
     if (name.empty()) name = L"a window";
-    TrayUi::ShowAppFlyout(L"Couldn't return " + name + L" to its desktop", {pending.hwnd});
+    TrayUi::ShowAppToast(L"Couldn't return " + name + L" to its desktop", {pending.hwnd});
   }
 }
 
@@ -944,7 +944,7 @@ static OverflowRequestResult ProcessOverflowRequest(
     if (g_workspaces.Load(source.key, &fallback)) {
       Placement::FloatingPlacementHint hint;
       hint.intent = Placement::FloatingPlacementIntent::FailureCenter;
-      if (Placement::RepairFloatingGeometry(source.key, fallback, hwnd, hint)) g_workspaces.Save(source.key, fallback);
+      if (Placement::PlaceFloatingWindowByHint(source.key, fallback, hwnd, hint)) g_workspaces.Save(source.key, fallback);
     }
   }
   if (result.outcome == OverflowOutcome::Retry) result.outcome = OverflowOutcome::Failed;

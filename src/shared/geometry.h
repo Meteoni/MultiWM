@@ -203,7 +203,7 @@ inline RECT MoveInsideArea(const RECT& frame, const RECT& area) {
 // --- Floating placement -------------------------------------------------------
 //
 // Where a floating window goes. One rule for both mods: MultiWM places windows
-// with it (RepairFloatingGeometry) and the companion predicts where MultiWM will
+// with it (PlaceFloatingWindowByHint) and the companion predicts where MultiWM will
 // put a new window with it (PredictWindowPlacement). Each mod reads the size
 // limits its own way (docs/ARCHITECTURE.md).
 

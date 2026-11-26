@@ -70,7 +70,7 @@ static bool RefuseMovingAGhost(
   if (!ghosted) return false;
   std::wstring name = ProcessDisplayName(ghosted);
   if (name.empty()) name = L"A window";
-  TrayUi::ShowAppFlyout(name + L" isn't responding and can't be moved", {ghosted}, monitor);
+  TrayUi::ShowAppToast(name + L" isn't responding and can't be moved", {ghosted}, monitor);
   Diagnostics::RecordEvent(L"layout mutation rejected action=%ls: hung window can't move hwnd=%p",
                            action ? action : L"Layout mutation", ghosted);
   return true;
@@ -194,7 +194,7 @@ static void ReportRejectedLayoutMutation(
       rejectedWorkspace, rejectedRects, subject);
   if (!culprit) culprit = culpritHint;
   if (kind == UserLayoutMutationKind::BspMerge) {
-    TrayUi::ShowCommandFailureFlyout(L"Not enough space to split that tile", monitor);
+    TrayUi::ShowCommandFailureToast(L"Not enough space to split that tile", monitor);
   } else {
     ShowWindowConstraintConflict(rejectedWorkspace, rejectedRects, culprit, monitor);
   }

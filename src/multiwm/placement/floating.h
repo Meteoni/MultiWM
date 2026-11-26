@@ -101,7 +101,7 @@ static SharedGeometry::FloatingSizeSource FloatingSizeSourceFor(FloatingPlacemen
 // (SharedGeometry::PlanFloatingPlacement). A drag keeps the user's drop point;
 // a passive restore or a failed tile keeps a remembered frame's center on its
 // own monitor; every other placement is centered on the work area.
-static bool RepairFloatingGeometry(
+static bool PlaceFloatingWindowByHint(
     const DesktopMonitorKey& key, Workspace& workspace, HWND hwnd,
     const FloatingPlacementHint& hint) {
   const WindowRecord* record = workspace.Find(hwnd);
@@ -297,7 +297,7 @@ static void RestoreWorkspaceFloatingGeometry(
   const std::vector<HWND> active = workspace.TiledWindows();
   const FloatingPlacementHint passiveRestore{};
   for (HWND hwnd : active) {
-    RepairFloatingGeometry(key, workspace, hwnd, passiveRestore);
+    PlaceFloatingWindowByHint(key, workspace, hwnd, passiveRestore);
   }
 }
 
